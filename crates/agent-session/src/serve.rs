@@ -3683,7 +3683,12 @@ async fn create_handler(
         format: nils_common::cli_contract::OutputFormat::Json,
     };
     match tokio::task::spawn_blocking(move || {
-        start_session(&context, args, StartFailureDisposition::ReturnSession)
+        start_session(
+            &context,
+            args,
+            StartFailureDisposition::ReturnSession,
+            crate::PromptDelivery::ResilientBeforeSubmit,
+        )
     })
     .await
     {

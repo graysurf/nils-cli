@@ -148,9 +148,9 @@ _arguments "${_arguments_options[@]}" : \
             (start)
 _arguments "${_arguments_options[@]}" : \
 '(--batch)--assignment-file=[Private assignment packet JSON file (single-lane launch)]:PATH:_files' \
-'--batch=[Directory of assignment packet JSON files to launch as one batch. Each lane is fenced independently (T2 decouple), so one lane failing isolates to its own typed result rather than aborting the batch]:DIR:_files -/' \
+'(--await-ready)--batch=[Directory of assignment packet JSON files to launch as one transport-only batch. Each lane is fenced independently (T2 decouple), so one lane failing isolates to its own typed result rather than aborting the batch]:DIR:_files -/' \
 '--if-run-revision=[Optional expected run revision. Omit to launch without a run-revision fence\: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.]:IF_RUN_REVISION:_default' \
-'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. A fresh Codex or Claude launch that remains \`starting\` receives one runtime-owned recovery Enter before the same deadline. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
+'--await-ready=[For a single assignment launch, wait up to this bounded duration (0 = launch-only) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. A fresh Codex or Claude launch that remains \`starting\` receives one runtime-owned recovery Enter before the same deadline. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-5m (integer with optional s/m/h suffix). Batch launch is transport-only]:AWAIT_READY:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -252,6 +252,85 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (retire)
 _arguments "${_arguments_options[@]}" : \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(diagnose)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(supervise)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(submit-recovery)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--timeout=[Bounded wait for an authenticated checkpoint after the single guarded Enter. 1-30s (integer with optional s/m/h suffix)]:TIMEOUT:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(reconcile-recovery)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(cancel)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--reason=[Bounded durable reason for cancelling this failed pre-claim assignment]:REASON:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(reassign)
+_arguments "${_arguments_options[@]}" : \
+'--assignment-file=[Private packet for a distinct replacement assignment and clean worktree]:PATH:_files' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--reason=[Bounded durable reason recorded on the cancelled assignment]:REASON:_default' \
+'--await-ready=[Bounded readiness wait for the replacement worker. 0-5m]:AWAIT_READY:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -488,6 +567,12 @@ _main-agent__subcmd__worker_commands() {
 'release:Mark an accepted assignment terminal before worker deletion' \
 'delete:Delete a released worker through guarded agent-session cleanup' \
 'retire:Retire an accepted assignment in one call\: release -> delete -> confirm the worker is absent from a fresh list' \
+'diagnose:Inspect assignment, provider activity, claim, operation, and worktree progress without mutating the worker' \
+'supervise:Repeatable bounded supervision macro with a typed classification and deterministic next action' \
+'submit-recovery:Send at most one guarded recovery Enter from a proven startup state' \
+'reconcile-recovery:Terminalize an unknown recovery without sending input after the exact worker runtime is stopped and coordination state is quiescent' \
+'cancel:Terminalize only a proven failed pre-claim assignment' \
+'reassign:Cancel and retire a safely reassignable worker, then start one distinct clean replacement assignment without reusing its prompt or worktree' \
     )
     _describe -t commands 'main-agent worker commands' commands "$@"
 }
@@ -496,10 +581,20 @@ _main-agent__subcmd__worker__subcmd__accept_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker accept commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__worker__subcmd__cancel_commands] )) ||
+_main-agent__subcmd__worker__subcmd__cancel_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker cancel commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__worker__subcmd__delete_commands] )) ||
 _main-agent__subcmd__worker__subcmd__delete_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker delete commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__diagnose_commands] )) ||
+_main-agent__subcmd__worker__subcmd__diagnose_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker diagnose commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__list_commands] )) ||
 _main-agent__subcmd__worker__subcmd__list_commands() {
@@ -510,6 +605,16 @@ _main-agent__subcmd__worker__subcmd__list_commands() {
 _main-agent__subcmd__worker__subcmd__message_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker message commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__reassign_commands] )) ||
+_main-agent__subcmd__worker__subcmd__reassign_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker reassign commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__reconcile-recovery_commands] )) ||
+_main-agent__subcmd__worker__subcmd__reconcile-recovery_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker reconcile-recovery commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__release_commands] )) ||
 _main-agent__subcmd__worker__subcmd__release_commands() {
@@ -530,6 +635,16 @@ _main-agent__subcmd__worker__subcmd__show_commands() {
 _main-agent__subcmd__worker__subcmd__start_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker start commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__submit-recovery_commands] )) ||
+_main-agent__subcmd__worker__subcmd__submit-recovery_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker submit-recovery commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__supervise_commands] )) ||
+_main-agent__subcmd__worker__subcmd__supervise_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker supervise commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__wait_commands] )) ||
 _main-agent__subcmd__worker__subcmd__wait_commands() {

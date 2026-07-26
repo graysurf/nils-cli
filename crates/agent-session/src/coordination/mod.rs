@@ -259,6 +259,72 @@ pub(crate) fn session_has_active_claim_or_operation(
     Ok((!active_claim_ids.is_empty(), has_operation))
 }
 
+pub(crate) struct SessionQuiescenceGuard {
+    _locked: LockedRegistry,
+    pub broker_present: bool,
+    pub broker_identity_matched: bool,
+    pub broker_authoritative: bool,
+    pub active_claim: bool,
+    pub active_operation: bool,
+    pub uncertain_operation: bool,
+}
+
+impl SessionQuiescenceGuard {
+    pub(crate) fn has_active_claim(&self, session_id: &str, incarnation: &str) -> bool {
+        self._locked.registry.claims.iter().any(|claim| {
+            claim.session_id == session_id
+                && claim.session_incarnation == incarnation
+                && claim.state == "active"
+        })
+    }
+}
+
+pub(crate) fn lock_session_quiescence(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<SessionQuiescenceGuard, CliError> {
+    let locked = lock_registry(context)?;
+    let broker = locked.registry.brokers.get(session_id);
+    let broker_present = broker.is_some();
+    let broker_identity_matched = broker.is_some_and(|broker| broker.incarnation == incarnation);
+    let broker_authoritative = broker.is_some_and(|broker| {
+        broker.incarnation == incarnation
+            && broker.state == "ready"
+            && broker::capability_available(
+                context,
+                session_id,
+                incarnation,
+                &broker.capability_digest,
+            )
+            && broker::heartbeat_fresh(context, session_id, incarnation, broker.heartbeat_epoch)
+    });
+    let active_claim = locked.registry.claims.iter().any(|claim| {
+        claim.session_id == session_id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    });
+    let active_operation = locked.registry.operations.iter().any(|operation| {
+        operation.session_id == session_id
+            && operation.session_incarnation == incarnation
+            && operation.state == "active"
+    });
+    let uncertain_operation = locked.registry.operations.iter().any(|operation| {
+        operation.session_id == session_id
+            && operation.session_incarnation == incarnation
+            && matches!(operation.state.as_str(), "completing" | "reconcile_pending")
+    });
+    Ok(SessionQuiescenceGuard {
+        _locked: locked,
+        broker_present,
+        broker_identity_matched,
+        broker_authoritative,
+        active_claim,
+        active_operation,
+        uncertain_operation,
+    })
+}
+
 fn render_coordination(
     command: &'static str,
     format: nils_common::cli_contract::OutputFormat,

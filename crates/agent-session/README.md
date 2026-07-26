@@ -61,7 +61,13 @@ main-agent init --packet-file objective.json --if-absent --idempotency-key init-
 main-agent self show --format json
 main-agent rehydrate --format markdown
 main-agent status --format json
-main-agent worker start --assignment-file assignment.json --if-run-revision 1 --await-ready 5m --idempotency-key start-001 --format json
+main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json
+main-agent worker supervise ASSIGNMENT_ID --format json
+main-agent worker diagnose ASSIGNMENT_ID --format json
+main-agent worker submit-recovery ASSIGNMENT_ID --if-revision 2 --timeout 5s --idempotency-key recover-001 --format json
+main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision 3 --idempotency-key reconcile-001 --format json
+main-agent worker cancel ASSIGNMENT_ID --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key cancel-001 --format json
+main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key reassign-001 --format json
 main-agent worker list --format json
 main-agent checkpoint --file checkpoint.json --if-revision 2 --idempotency-key checkpoint-001 --format json
 ```
@@ -73,11 +79,63 @@ list/serve/activity projections expose bounded relationship metadata only.
 Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
 for packet examples, revision and retry rules, interactive worker acceptance,
 resume/rebind, relationship transfers, and terminal cleanup. In particular,
-`worker start --await-ready` keeps startup inside one typed boundary. A fresh
+Bare single-assignment `worker start` defaults to a bounded five-minute
+readiness wait, keeping startup inside one typed boundary; `--await-ready 0`
+is the explicit launch-only opt-out. Batch launch remains transport-only so
+its bounded lane count cannot multiply readiness deadlines. A nonzero wait
+persists one fixed readiness deadline and leased finalizer, so concurrent exact
+replays join the same attempt and return the same final receipt. A fresh
 Codex or Claude worker that remains `starting` receives at most one
-runtime-owned recovery Enter; the prompt is never resent. Readiness still
-requires the interactive worker to be visible, attachable, authenticated, and
-checkpointed.
+runtime-owned recovery Enter; automatic and explicit recovery share one durable
+attempt reservation, and prompt load, paste, and Enter each occur at most once
+for a completed start stage. An exact retry can replace only a matching record
+that durably proves tmux was never launched. The serialized send
+boundary rechecks exact worker, activity, broker, claim, and operation evidence
+immediately before input, then revalidates the reserving Main Agent
+session/incarnation and its run/assignment ownership while preserving the
+coordination-to-orchestration lock order. Broker evidence must be
+incarnation-matched, ready, fresh, and backed by the matching private
+capability. Explicit recovery stores
+a provisional replay receipt. Every manager-owned assignment mutation is
+fenced until the bounded attempt resolves or a newer worker checkpoint proves
+that input was consumed. An interrupted automatic reservation can be adopted
+for observation, but adoption never sends input or revokes a potentially live
+sender. An unknown send outcome remains mutation-fenced while that incarnation
+may still act. `worker reconcile-recovery` is the explicit non-resend terminal
+escape: it succeeds only while holding the exact worker record and
+coordination-quiescence guards after proving the runtime/tmux command stopped,
+the worker claim absent, operations quiescent, and Main Agent authority still
+active. Guarded cancellation of that absorbing terminal record reacquires the
+same stopped-runtime and quiescence boundaries and therefore remains available
+after the exact worker broker has stopped and cleared its capability. Otherwise
+it fails closed. Cancellation also revalidates the exact Main Agent claim while
+holding coordination quiescence through the orchestration commit. A newer
+authenticated worker checkpoint can also resolve the attempt. Its provisional receipt stays
+resumable: an exact-key retry observes the same attempt without resending and
+may upgrade the receipt once that checkpoint or a definitive failure resolves
+the outcome.
+Readiness still requires the interactive worker to
+be visible, attachable, authenticated, and checkpointed after that reservation.
+An authoritative completed or failed provider turn ends the wait early when no
+checkpoint exists. Use `worker supervise` as the repeatable macro-first health
+check; it combines assignment, activity, claim, operation, and clean-worktree
+evidence into a typed classification and deterministic next action. Missing,
+corrupt, or identity-mismatched evidence fails closed as `worker_unreachable`
+or `evidence_unavailable`. `worker reassign` performs only a proven-safe
+pre-claim cancellation, guarded retirement, and distinct clean replacement
+launch. Its exact retry resumes after the last completed stage without
+repeating it. If a macro stops, continue from `last_proven_safe_state` with
+`worker diagnose`, `submit-recovery`, `cancel`, or `retire`; never resend the
+prompt, inject a second Enter, or accept a trust, update, authentication,
+permission, or MCP dialog automatically.
+
+Handoff moves the assignment run and primary manager atomically under the
+source coordination guard. It refuses upstream or reverse dependency edges
+that would become cross-run. `worker message` revalidates the exact run,
+primary manager, worker, and active sender claim while holding the same
+coordination-to-orchestration lock order through mailbox persistence. Handoff
+also revalidates that claim from its retained coordination guard, so released
+or stale source authority cannot mutate after the initial check.
 
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
 (`--key enter|escape|backspace|c-c|up|down|left|right|tab`), so codex/claude approval prompts and terminal editing

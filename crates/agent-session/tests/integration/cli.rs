@@ -54,8 +54,11 @@ if [ "$operation" = "if-shell" ]; then
   operation="kill-session"
 fi
 if [ "${AGENT_SESSION_FAKE_TMUX_FAIL:-}" = "$operation" ]; then
-  echo "fake tmux failed at $operation" >&2
-  exit 42
+  fail_once_dir="${AGENT_SESSION_FAKE_TMUX_FAIL_ONCE_DIR:-}"
+  if [ -z "$fail_once_dir" ] || mkdir "$fail_once_dir" 2>/dev/null; then
+    echo "fake tmux failed at $operation" >&2
+    exit 42
+  fi
 fi
 
 if [ "${AGENT_SESSION_FAKE_TMUX_ABSENT:-0}" = "1" ] && { [ "$1" = "display-message" ] || [ "$1" = "has-session" ]; }; then
@@ -273,8 +276,20 @@ if [ "$1" = "send-keys" ] && [ "${AGENT_SESSION_FAKE_TMUX_ENTER_HOOK+x}" = "x" ]
     count=$((count + 1))
     printf '%s\n' "$count" > "$count_file"
     if [ "$count" -eq "${AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT:-2}" ]; then
-      "$AGENT_SESSION_FAKE_TMUX_ENTER_HOOK"
+      "$AGENT_SESSION_FAKE_TMUX_ENTER_HOOK" &
     fi
+  fi
+fi
+
+if [ "$1" = "send-keys" ] && [ -n "${AGENT_SESSION_FAKE_TMUX_SEND_KEYS_SLEEP:-}" ]; then
+  sleep "$AGENT_SESSION_FAKE_TMUX_SEND_KEYS_SLEEP"
+fi
+
+if [ "${AGENT_SESSION_FAKE_TMUX_FAIL_AFTER:-}" = "$operation" ]; then
+  fail_once_dir="${AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR:-}"
+  if [ -z "$fail_once_dir" ] || mkdir "$fail_once_dir" 2>/dev/null; then
+    echo "fake tmux failed after $operation" >&2
+    exit 42
   fi
 fi
 
@@ -344,7 +359,7 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-struct TestProcessGroup {
+pub(super) struct TestProcessGroup {
     pid: u32,
     child: Arc<Mutex<Child>>,
     stop_reaper: Arc<AtomicBool>,
@@ -352,11 +367,11 @@ struct TestProcessGroup {
 }
 
 impl TestProcessGroup {
-    fn pid(&self) -> u32 {
+    pub(super) fn pid(&self) -> u32 {
         self.pid
     }
 
-    fn is_running(&self) -> bool {
+    pub(super) fn is_running(&self) -> bool {
         self.child
             .lock()
             .expect("test process lock")
@@ -389,9 +404,64 @@ impl Drop for TestProcessGroup {
     }
 }
 
-fn spawn_test_process_group() -> TestProcessGroup {
+pub(super) fn spawn_test_process_group() -> TestProcessGroup {
     let mut command = Command::new("sleep");
     command.arg("30");
+    spawn_test_process_group_command(command)
+}
+
+pub(super) fn spawn_scoped_test_process_group() -> TestProcessGroup {
+    #[cfg(target_os = "linux")]
+    let command = {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .expect("Linux scoped process test requires XDG_RUNTIME_DIR");
+        assert!(
+            runtime_dir.join("systemd/private").exists(),
+            "Linux scoped process test requires a reachable systemd user manager"
+        );
+        let mut command = Command::new("systemd-run");
+        command
+            .arg("--user")
+            .arg("--scope")
+            .arg("--quiet")
+            .arg("--collect")
+            .arg("--unit")
+            .arg(format!("tmux-spawn-{}", uuid::Uuid::new_v4()))
+            .arg("--")
+            .arg("sleep")
+            .arg("30");
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let command = {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command
+    };
+    let process = spawn_test_process_group_command(command);
+    #[cfg(target_os = "linux")]
+    {
+        let cgroup_path = format!("/proc/{}/cgroup", process.pid());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let in_scope = fs::read_to_string(&cgroup_path).is_ok_and(|value| {
+                value.contains("/app.slice/tmux-spawn-") && value.contains(".scope")
+            });
+            if in_scope {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test process never entered its dedicated transient cgroup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    process
+}
+
+fn spawn_test_process_group_command(mut command: Command) -> TestProcessGroup {
     // SAFETY: this test-only child must own a dedicated process session.
     unsafe {
         command.pre_exec(|| {
@@ -3414,6 +3484,25 @@ fn start_creates_session_state_without_printing_prompt() {
             ]),
         "missing paste-buffer -d call: {calls:?}"
     );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+            .count(),
+        2,
+        "an ordinary start must retry a proven ignored pre-submit paste"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| {
+                call.first().is_some_and(|arg| arg == "send-keys")
+                    && call.last().is_some_and(|arg| arg == "Enter")
+            })
+            .count(),
+        1,
+        "the resilient pre-submit retry must still submit exactly once"
+    );
 }
 
 #[test]
@@ -6012,6 +6101,7 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let main_id = "main-agent-session";
+    let worker_id = "managed-worker-session";
     let standalone_id = "standalone-session";
     let main_record_dir =
         write_session_record(&state_dir, main_id, "codex", "hs-codex-main-agent-session");
@@ -6020,6 +6110,12 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
         standalone_id,
         "claude",
         "hs-claude-standalone-session",
+    );
+    let worker_record_dir = write_session_record(
+        &state_dir,
+        worker_id,
+        "codex",
+        "hs-codex-managed-worker-session",
     );
 
     let main_record_path = main_record_dir.join("session.json");
@@ -6038,6 +6134,22 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
         serde_json::to_vec_pretty(&main_record).expect("main session json"),
     )
     .expect("write main session");
+    let worker_record_path = worker_record_dir.join("session.json");
+    let mut worker_record: Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
+            .expect("worker session json");
+    worker_record["runtime"] = json!({
+        "kind": "tmux",
+        "tmux_session": "hs-codex-managed-worker-session",
+        "generation": 2,
+        "started_at": "2030-01-01T00:00:02Z",
+        "launch_id": "worker-replacement-incarnation"
+    });
+    fs::write(
+        &worker_record_path,
+        serde_json::to_vec_pretty(&worker_record).expect("worker session json"),
+    )
+    .expect("write worker session");
 
     let orchestration_root = state_dir.join("orchestration");
     fs::create_dir_all(&orchestration_root).expect("orchestration root");
@@ -6047,7 +6159,7 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
     fs::write(
         &registry,
         serde_json::to_vec_pretty(&json!({
-            "schema_version": "agent-session.orchestration-registry.v1",
+            "schema_version": "agent-session.orchestration-registry.v2",
             "runs": {
                 "run-one": {
                     "schema_version": "agent-session.orchestration-run.v1",
@@ -6069,7 +6181,64 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
                     "updated_at": "2030-01-01T00:00:00Z"
                 }
             },
-            "assignments": {},
+            "assignments": {
+                "assignment-one": {
+                    "schema_version": "agent-session.orchestration-assignment.v2",
+                    "assignment_id": "assignment-one",
+                    "run_id": "run-one",
+                    "revision": 7,
+                    "state": "working",
+                    "task_summary": "Project a resumed worker relationship",
+                    "private_packet_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "primary_manager": {
+                        "machine": "sympoies",
+                        "session_id": main_id,
+                        "session_incarnation": "main-incarnation",
+                        "session_created_at": "2000-01-01T00:00:00Z"
+                    },
+                    "worker": {
+                        "machine": "sympoies",
+                        "session_id": worker_id,
+                        "session_incarnation": "worker-prior-incarnation",
+                        "session_created_at": "2000-01-01T00:00:00Z"
+                    },
+                    "collaborators": [],
+                    "borrowed_by": [
+                        {
+                            "session": {
+                                "machine": "sympoies",
+                                "session_id": "expired-borrower",
+                                "session_incarnation": "expired-borrower-incarnation",
+                                "session_created_at": "2000-01-01T00:00:00Z"
+                            },
+                            "expires_at": "2000-01-01T00:00:00Z",
+                            "expires_at_epoch": 1
+                        },
+                        {
+                            "session": {
+                                "machine": "sympoies",
+                                "session_id": "active-borrower",
+                                "session_incarnation": "active-borrower-incarnation",
+                                "session_created_at": "2000-01-01T00:00:00Z"
+                            },
+                            "expires_at": "9999-12-31T23:59:59Z",
+                            "expires_at_epoch": 9223372036854775807_i64
+                        }
+                    ],
+                    "repository": "example/repository",
+                    "worktree": "/tmp/worker",
+                    "base_ref": "main",
+                    "scopes": ["crates/agent-session"],
+                    "durable_refs": [],
+                    "depends_on": [],
+                    "checkpoint": null,
+                    "result_summary": null,
+                    "blocker_summary": null,
+                    "submit_recovery": null,
+                    "created_at": "2030-01-01T00:00:01Z",
+                    "updated_at": "2030-01-01T00:00:02Z"
+                }
+            },
             "receipts": {}
         }))
         .expect("orchestration registry json"),
@@ -6095,6 +6264,10 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
         .iter()
         .find(|session| session["id"] == standalone_id)
         .expect("standalone session");
+    let worker = sessions
+        .iter()
+        .find(|session| session["id"] == worker_id)
+        .expect("worker session");
 
     assert_eq!(
         main["orchestration"]["schema_version"],
@@ -6112,6 +6285,42 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
             .get("objective_packet_digest")
             .is_none()
     );
+    assert_eq!(worker["orchestration"]["role"], "worker");
+    assert_eq!(worker["orchestration"]["run_id"], "run-one");
+    assert_eq!(worker["orchestration"]["assignment_id"], "assignment-one");
+    assert_eq!(
+        worker["orchestration"]["primary_manager"]["session_id"],
+        main_id
+    );
+    assert_eq!(worker["orchestration"]["relationship_revision"], 7);
+    assert_eq!(
+        worker["orchestration"]["relationship_state"], "rebind_required",
+        "a same-id/same-created_at replacement runtime must take precedence over borrowing"
+    );
+    assert_eq!(
+        worker["orchestration"]["borrowed_by"]
+            .as_array()
+            .expect("active borrowers")
+            .len(),
+        1,
+        "expired borrowers must be omitted"
+    );
+    assert_eq!(
+        worker["orchestration"]["borrowed_by"][0]["session_id"],
+        "active-borrower"
+    );
+    for private_field in [
+        "private_packet_digest",
+        "repository",
+        "worktree",
+        "scopes",
+        "durable_refs",
+    ] {
+        assert!(
+            worker["orchestration"].get(private_field).is_none(),
+            "private assignment field leaked: {private_field}"
+        );
+    }
     assert!(standalone.get("orchestration").is_none());
 }
 

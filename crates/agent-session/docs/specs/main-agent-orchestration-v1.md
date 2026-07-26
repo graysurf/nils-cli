@@ -22,9 +22,9 @@ modes fail closed, and registry replacement is atomic under a bounded lock.
 
 The supported schemas are:
 
-- `agent-session.orchestration-registry.v1`
+- `agent-session.orchestration-registry.v2`
 - `agent-session.orchestration-run.v1`
-- `agent-session.orchestration-assignment.v1`
+- `agent-session.orchestration-assignment.v2`
 - `agent-session.session-orchestration.v1`
 - `main-agent.objective-packet.v1`
 - `main-agent.assignment-input.v1`
@@ -34,6 +34,11 @@ Unknown fields, schema versions, and lifecycle states reject registry reads and
 therefore reject mutations. Every identity reference is fenced by public
 session ID, runtime incarnation, and original session `created_at`; `machine`
 is an advisory routing/display hint only.
+
+The current reader upgrades registry/assignment v1 state in memory and writes
+v2 on the next successful mutation. Version 2 makes the durable
+submit-recovery record explicit; older binaries fail closed on the registry
+version instead of misreading an additive v1 assignment field.
 
 ## Public projection and privacy
 
@@ -72,6 +77,11 @@ main-agent worker start --assignment-file FILE [--if-run-revision N] [--await-re
 main-agent worker start --batch DIR --idempotency-key KEY --format json
 main-agent worker list|show ...
 main-agent worker wait [ASSIGNMENT_ID | --any] --until submitted|blocked|terminal [--timeout D] --format json
+main-agent worker diagnose|supervise ASSIGNMENT_ID --format json
+main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
+main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
+main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
+main-agent worker reassign ASSIGNMENT_ID --assignment-file FILE --if-revision N --reason TEXT [--await-ready D] --idempotency-key KEY --format json
 main-agent worker message|accept|release|delete ...
 main-agent worker retire ID --if-revision N --idempotency-key KEY --format json
 main-agent collaborate|borrow|handoff|adopt ...
@@ -110,14 +120,17 @@ access-control boundary.
 as one call, fencing each lane independently so a failing lane isolates to its
 own typed result (`{assignment_file, ok, result | error}`) instead of aborting
 the batch; the command itself succeeds and the caller branches on each lane's
-`ok`. `main-agent quick --assignment-file FILE` is the L0/L1 fast-path: it
+`ok`. Batch launch is transport-only and rejects `--await-ready`, so its
+bounded lane count cannot multiply single-assignment readiness deadlines.
+`main-agent quick --assignment-file FILE` is the L0/L1 fast-path: it
 synthesizes an ephemeral run and work-context claim from the assignment (the
 packet MUST declare a `repository`), launches the single worker in one call, and
 marks the run ephemeral so it auto-closes once that worker is torn down — no
 explicit `close`. A session that already controls a run must use the granular
-`init` + `worker start` path instead. `quick` runs the same `--await-ready`
+`init` + `worker start` path instead. Bare `worker start` and `quick` run the
+same `--await-ready`
 readiness proof and runtime-owned single-Enter recovery described below, but
-defaults to `5m` instead of launch-only: the fast path exists to hand back a
+default to `5m` instead of launch-only: the normal paths exist to hand back a
 working worker, so a dropped submit key must be the runtime's problem rather
 than something its caller has to notice and repair by hand. `--await-ready 0`
 selects the old launch-only result. A malformed duration is rejected before the
@@ -128,21 +141,44 @@ worker is bound it waits up to a bounded `D` (0-5m; `0` = launch-only) for the
 worker's authenticated, revision-fenced, incarnation-matched checkpoint to
 advance the assignment past `starting`, then returns a typed `readiness`
 (`ready` once it advanced, else `readiness_failed` with a `safe_state`). That
+nonzero wait persists one fixed deadline and leased finalizer. Concurrent exact
+replays join the same readiness attempt, a superseded finalizer cannot overwrite
+its successor, and every replay converges on the same final receipt. The
 checkpoint advancing is the readiness + newer-turn + identity proof, so the Main
 Agent branches on one typed result instead of hand-running the verified-startup
 sequence. `readiness.delivery.state: confirmed` requires that checkpoint and
 names `authenticated-worker-checkpoint` as its proof. While a fresh Codex or
-Claude launch remains `starting`, the runtime rechecks its exact incarnation
-and live tmux status, sends at most one recovery Enter, and keeps waiting inside
-the original deadline. It never resends the prompt. The additive
+Claude launch remains `starting`, automatic readiness recovery and
+`worker submit-recovery` share one durable reservation. The serialized send
+boundary rechecks the exact incarnation, live tmux status, authoritative
+`starting` activity with no turn or dialog, an incarnation-matched broker that
+is ready, heartbeat-fresh, and backed by its matching capability, and the
+absence of claims or active/uncertain operations. With those coordination
+guards still held it revalidates the reserving Main Agent session/incarnation,
+active controller claim, run controller, assignment manager, and exact
+reservation immediately before sending at most one recovery Enter. A
+definitive pre-delivery failure is recorded against that
+reservation. A tmux timeout or wait failure is an unknown external-effect
+outcome and preserves the `attempting` reservation plus mutation fences. No
+path may retry input. The runtime keeps waiting inside the original deadline
+and never resends the prompt. The additive
 `submit_key_recovery` projection reports eligibility, attempt count, and
-result; a recovered checkpoint uses
+result; confirmation requires a newer authenticated checkpoint from the
+reserved worker incarnation. A later accepted, released, or relationship
+revision does not invalidate that worker-authored proof. Before such proof,
+every manager-owned assignment mutation is fenced. A recovered checkpoint uses
 `delivery.transport_state: submit-key-recovery-succeeded`. Existing/replayed
 sessions, Hermes, stopped or replaced sessions, and any second recovery
 keypress are ineligible. A final timeout reports `delivery.state: unverified`,
 `automatic_retry_safe: false`, and explicitly forbids duplicate prompt or
 further Enter injection. A successful terminal submit command alone is not
-provider acceptance. The wait takes no registry lock, so it never blocks the
+provider acceptance. When privacy-safe activity proves that an authoritative
+provider turn completed or failed while the assignment still lacks a
+checkpoint, readiness returns immediately with
+`classification: submitted_or_waiting_without_checkpoint` and
+`proof: authoritative-provider-turn-terminated`; it never waits for the outer
+deadline or sends a recovery Enter after that proof. The wait takes no registry
+lock, so it never blocks the
 worker's own checkpoint; `--await-ready 0` preserves the launch-only
 `pending-worker-checkpoint` result. `worker retire ID` is the teardown macro: it
 composes release -> delete and reports the worker's absence in one call,
@@ -150,6 +186,10 @@ replacing the hand-run
 release -> delete -> confirm sequence. An accepted assignment is released first;
 an already-terminal one goes straight to delete. Per-step idempotency keys are
 derived from the retire key so a retry converges through each step's receipt.
+Prompt load-buffer, paste-buffer, and Enter effects occur exactly once for a
+completed worker-start stage. A retry may remove and relaunch only an exact
+matching worker record that durably proves tmux never launched; it never treats
+that failed record as a completed launch.
 
 The generated worker prompt starts with one deterministic,
 worker-authenticated `main-agent bootstrap` command. The prompt names the exact
@@ -157,7 +197,12 @@ running `main-agent` executable rather than relying on the worker's `PATH`, so
 bootstrap uses the same release that created the assignment. Bootstrap resolves
 only the caller's bound assignment, reads that worker's private assignment
 packet, derives the coordination claim from the packet's
-repository/worktree/scopes, and records the initial `working` checkpoint. Its
+repository/scopes plus the HMAC fingerprint derived from the authenticated
+worker session's canonical `cwd`, and records the initial `working` checkpoint.
+The optional absolute assignment `worktree` remains durable routing metadata
+and MUST NOT be serialized into the fingerprint-only claim field. A failure
+before claim acquisition advances the exact assignment to `blocked` with a
+durable typed pre-claim blocker. Its
 idempotency key is stable for the assignment, so an exact replay converges. A
 claim conflict or stale assignment produces a typed failure before mutation;
 it is not evidence that the prompt was undelivered and MUST NOT trigger prompt
@@ -201,20 +246,118 @@ worker may atomically rebind the assignment to its new incarnation only when
 the session ID and original `created_at` still match and the prior incarnation
 is no longer live. A worker checkpoint cannot regress a `submitted`,
 `accepted`, `released`, or `cancelled` assignment to a pre-terminal worker
-state. Accept/release are explicit Main Agent transitions. The ordinary public
-V1 terminal path is `submitted -> accepted -> released`. `cancelled` is a
-reserved terminal state retained for compatible registry reads and a possible
-future transition; V1 exposes no `worker cancel` command or other public
-transition into it. Operators MUST NOT synthesize cancellation by editing the
-private registry.
+state. Accept/release are explicit Main Agent transitions. The ordinary
+successful path is `submitted -> accepted -> released`. Once an assignment is
+`accepted`, `released`, or `cancelled`, worker checkpoints are rejected before
+any result, checkpoint, worker binding, state, or revision mutation. The
+`worker cancel` command is the only public transition into `cancelled`. It may
+terminalize only the named
+failed pre-claim assignment, with an exact revision, active Main Agent claim,
+no worker claim, and no active or uncertain worker operation. The coordination
+registry lock remains held across the orchestration transition so claim
+acquisition cannot race cancellation. Operators MUST NOT synthesize
+cancellation by editing the private registry.
+
+### Supervision and primitive recovery
+
+`worker diagnose` reads assignment, exact worker identity, provider activity,
+claim, active/uncertain operation counts, and clean-worktree progress without
+mutation. `worker supervise` is the repeatable bounded macro over the same
+evidence. Its closed classifications are `healthy_progress`,
+`startup_dialog_failure`, `pre_claim_failure`, `uncertain_mutation`,
+`submitted_or_waiting_without_checkpoint`, `safe_reassignment`,
+`worker_unreachable`, and `evidence_unavailable`; every result includes a
+deterministic `next_action`. Packet, session, activity, coordination, and
+worktree evidence is projected as `present`, `absent`, `unavailable`, or
+`identity_mismatch`. A missing bound worker is `worker_unreachable`; corrupt,
+unreadable, or identity-mismatched required evidence is
+`evidence_unavailable`. Both classifications are non-retry-safe and forbid
+automatic input or mutation.
+
+`worker submit-recovery` is eligible only for an incarnation-matched
+assignment in the initial provider startup state, with no dialog, claim,
+active/uncertain operation, prior recovery record, or authoritative terminal
+turn. It durably reserves its single attempt before sending exactly one Enter,
+uses the same serialized send boundary as automatic recovery, waits for the
+exact newer worker checkpoint, never resends the prompt, and refuses every
+second attempt even under a different idempotency key.
+The explicit command stores a provisional idempotency receipt atomically with
+the reservation. An exact replay joins or reconstructs that attempt without
+resending input; a different key is refused for an explicit attempt. An
+interrupted automatic attempt may be adopted under an explicit receipt for
+observation, but that path never sends input or revokes a potentially live
+sender. An unknown pre-send outcome remains mutation-fenced while the reserved
+incarnation might act; only a newer worker checkpoint or the guarded non-resend
+reconciliation primitive resolves it after the sender returns.
+While recovery is `attempting` or `sent` and no newer worker checkpoint exists,
+all manager-owned assignment mutations fail with
+`submit-recovery-in-flight`, including relationship changes and force group
+cleanup. Timeout, terminal provider activity, send failure, or checkpoint
+confirmation after a recorded send resolves that fence. An observer timeout
+while the record is still `attempting` reports
+`submit-recovery-send-outcome-unknown` and preserves the fence. That unknown
+outcome does not finalize the provisional idempotency receipt: an exact-key
+retry remains observation-only and can later upgrade the receipt when a newer
+reserved-worker checkpoint or definitive failure resolves the attempt.
+
+`worker reconcile-recovery` is eligible only for an unknown `attempting`
+reservation bound to the current run, controller, assignment, and exact worker
+incarnation. It acquires the exact session-record lock, proves the tmux/runtime
+is stopped, then retains the worker coordination-quiescence guard while proving
+the worker claim absent and active/uncertain operations quiescent. Under the
+established coordination-to-orchestration lock order it revalidates current
+Main Agent authority and the unchanged revision before terminalizing the record
+as `reconciled`. The result records stopped/quiescent proof and
+`input_sent:false`. No path through this command loads, pastes, sends Enter, or
+clears a fence while the reserved incarnation might still execute. Cancellation
+of this absorbing record reacquires the exact session-record boundary, reproves
+the stopped runtime/tmux state, and holds coordination quiescence through the
+revision-fenced transition. A stopped or absent matching broker is therefore
+not a liveness dependency; a present incarnation mismatch still fails closed.
+The exact Main Agent claim is revalidated from the held coordination guard
+immediately before the orchestration mutation, so concurrent claim release
+cannot terminalize the assignment.
+
+`worker reassign` composes diagnosis, `worker cancel`, ordinary guarded
+retirement, and `worker start`. Both retained and replacement worktrees MUST be
+clean; replacement assignment ID, session ID, and canonical worktree MUST be
+distinct when a session ID is supplied; omission uses the ordinary deterministic
+`worker start` derivation. The reason is recorded on the cancelled assignment.
+The macro stores progress after cancel, retire, and start. Exact retries inspect
+the top-level receipt before mutable preconditions and resume from the last
+completed stage without repeating it. A transient delete/kill failure retains
+the old session and its pending retire receipt; the exact replay skips
+cancellation, converges that retirement once, and starts the replacement once.
+A failed never-launched replacement is safely replaced under its stable session
+ID, so completed prompt transport is not repeated. A macro failure returns `failed_stage`
+and `last_proven_safe_state`. Ordinary retirement treats a proven-absent exact
+session as an idempotent logical delete, records the normal
+tombstone/receipt/revision, and never fabricates inner success. Trust, update,
+authentication, permission, and MCP dialogs are diagnostic classifications
+only and MUST never be accepted automatically.
+
+Composite commands derive bounded, digest-backed child idempotency keys.
+`worker retire` stores top-level progress before release, after release, and
+after delete, so retrying the original key and revision resumes an accepted
+assignment whose release already committed.
 
 Collaborators and bounded borrowers are visible routing metadata, not write
 authority. Borrow expiry does not change primary ownership. Handoff requires a
-live target Main Agent and a quiescent current manager; adoption requires the
-old manager reference to be stale. Delete requires a released/cancelled
-assignment, released worker claim, no active or uncertain operation, and the
-producer's exact logical-delete/tombstone checks. Physical cleanup failure is a
-maintenance record and cannot restore the live session projection.
+live target Main Agent and a quiescent current manager. The source coordination
+guard is held through one atomic run-plus-primary-manager update. Handoff
+rejects both the assignment's own dependencies and reverse source-run
+dependents, because moving either edge would make it cross-run. Worker-message
+delivery uses the same coordination-to-orchestration lock order and retains
+both locks after revalidating the exact active sender claim, run, primary
+manager, and worker through mailbox persistence. Handoff revalidates the
+source claim from its retained coordination guard. Thus a source message
+commits before handoff or fails after it, and a concurrent claim release
+invalidates either mutation at its boundary. Adoption requires the old manager
+reference to be stale. Delete
+requires a released/cancelled assignment, released worker claim, no active or
+uncertain operation, and the producer's exact logical-delete/tombstone checks.
+Physical cleanup failure is a maintenance record and cannot restore the live
+session projection.
 
 ### Daemon-owned group cleanup
 

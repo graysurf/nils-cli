@@ -13,13 +13,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{CliContext, CliError, SessionRecord};
 
-pub(crate) const REGISTRY_SCHEMA: &str = "agent-session.orchestration-registry.v1";
+pub(crate) const REGISTRY_SCHEMA: &str = "agent-session.orchestration-registry.v2";
+const LEGACY_REGISTRY_SCHEMA: &str = "agent-session.orchestration-registry.v1";
 pub(crate) const RUN_SCHEMA: &str = "agent-session.orchestration-run.v1";
-pub(crate) const ASSIGNMENT_SCHEMA: &str = "agent-session.orchestration-assignment.v1";
+pub(crate) const ASSIGNMENT_SCHEMA: &str = "agent-session.orchestration-assignment.v2";
+const LEGACY_ASSIGNMENT_SCHEMA: &str = "agent-session.orchestration-assignment.v1";
 pub(crate) const SESSION_PROJECTION_SCHEMA: &str = "agent-session.session-orchestration.v1";
 pub(crate) const PACKET_SCHEMA: &str = "main-agent.objective-packet.v1";
 pub(crate) const ASSIGNMENT_INPUT_SCHEMA: &str = "main-agent.assignment-input.v1";
 pub(crate) const CHECKPOINT_INPUT_SCHEMA: &str = "main-agent.checkpoint-input.v1";
+pub(crate) const SUBMIT_RECOVERY_SCHEMA: &str = "main-agent.submit-recovery.v1";
 
 const ORCHESTRATION_DIR: &str = "orchestration";
 const REGISTRY_FILE: &str = "registry.json";
@@ -81,6 +84,30 @@ pub(crate) struct TimedRelationship {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct SubmitRecoveryRecord {
+    pub schema_version: String,
+    pub attempt_id: String,
+    #[serde(default = "default_submit_recovery_origin")]
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<SessionRef>,
+    pub session_incarnation: String,
+    pub reserved_revision: u64,
+    pub state: String,
+    pub attempt_count: u8,
+    pub result: String,
+    pub attempted_at: String,
+    pub updated_at: String,
+}
+
+fn default_submit_recovery_origin() -> String {
+    "explicit".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AssignmentRecord {
     pub schema_version: String,
     pub assignment_id: String,
@@ -118,6 +145,8 @@ pub(crate) struct AssignmentRecord {
     pub result_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_recovery: Option<SubmitRecoveryRecord>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -240,6 +269,44 @@ impl Registry {
             validate_session_ref(&assignment.primary_manager)?;
             if let Some(worker) = &assignment.worker {
                 validate_session_ref(worker)?;
+            }
+            if let Some(recovery) = &assignment.submit_recovery {
+                if recovery.schema_version != SUBMIT_RECOVERY_SCHEMA
+                    || recovery.attempt_id.is_empty()
+                    || recovery.attempt_id.len() > 128
+                    || !matches!(recovery.origin.as_str(), "automatic" | "explicit")
+                    || recovery.attempt_count != 1
+                    || recovery.reserved_revision == 0
+                    || recovery.session_incarnation.is_empty()
+                    || recovery.session_incarnation.len() > 128
+                {
+                    return Err(store_invalid(
+                        "orchestration submit recovery identity is invalid",
+                    ));
+                }
+                match (&recovery.run_id, &recovery.controller) {
+                    (Some(run_id), Some(controller)) => {
+                        validate_slug("submit recovery run id", run_id, 128)?;
+                        validate_session_ref(controller)?;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(store_invalid(
+                            "orchestration submit recovery controller binding is incomplete",
+                        ));
+                    }
+                }
+                validate_state(
+                    &recovery.state,
+                    &[
+                        "attempting",
+                        "sent",
+                        "failed",
+                        "checkpoint_confirmed",
+                        "reconciled",
+                    ],
+                )?;
+                validate_summary("submit recovery result", &recovery.result)?;
             }
             for collaborator in &assignment.collaborators {
                 validate_session_ref(collaborator)?;
@@ -431,8 +498,16 @@ pub(crate) fn load_registry_readonly(context: &CliContext) -> Result<Registry, C
         return Err(store_invalid("orchestration registry exceeds byte limit"));
     }
     let bytes = fs::read(&path).map_err(|_| store_unavailable())?;
-    let registry: Registry = serde_json::from_slice(&bytes)
+    let mut registry: Registry = serde_json::from_slice(&bytes)
         .map_err(|_| store_invalid("orchestration registry is invalid"))?;
+    if registry.schema_version == LEGACY_REGISTRY_SCHEMA {
+        registry.schema_version = REGISTRY_SCHEMA.to_string();
+    }
+    for assignment in registry.assignments.values_mut() {
+        if assignment.schema_version == LEGACY_ASSIGNMENT_SCHEMA {
+            assignment.schema_version = ASSIGNMENT_SCHEMA.to_string();
+        }
+    }
     registry.validate()?;
     Ok(registry)
 }

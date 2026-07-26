@@ -102,6 +102,29 @@ struct UntrustedBody {
 }
 
 pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value, CliError> {
+    send_impl(context, args, false, || Ok(()))
+}
+
+pub(crate) fn send_with_commit_authorization<G, F>(
+    context: &CliContext,
+    args: MessageSendArgs,
+    authorize: F,
+) -> Result<Value, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    send_impl(context, args, true, authorize)
+}
+
+fn send_impl<G, F>(
+    context: &CliContext,
+    args: MessageSendArgs,
+    require_active_sender_claim: bool,
+    authorize: F,
+) -> Result<Value, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
     let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, sender_incarnation) =
         authenticate_from_file(context, &args.from_session, Some(&capability_file))?;
@@ -121,6 +144,8 @@ pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value,
         None,
         None,
         None,
+        require_active_sender_claim,
+        authorize,
     )
 }
 
@@ -438,6 +463,8 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
         Some(&original.sender_incarnation),
         Some(args.if_revision),
         Some(digest),
+        false,
+        || Ok(()),
     )
 }
 
@@ -540,7 +567,7 @@ pub(crate) fn wait_with_cancellation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn send_authenticated(
+fn send_authenticated<G, F>(
     context: &CliContext,
     sender_session_id: &str,
     sender_incarnation: &str,
@@ -555,7 +582,12 @@ fn send_authenticated(
     expected_recipient_incarnation: Option<&str>,
     expected_parent_revision: Option<u64>,
     request_digest_override: Option<String>,
-) -> Result<Value, CliError> {
+    require_active_sender_claim: bool,
+    authorize: F,
+) -> Result<Value, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
     if sender_session_id == recipient_session_id && reply_to.is_some() {
         return Err(CliError::data(
             "reply-depth-exceeded",
@@ -644,6 +676,25 @@ fn send_authenticated(
     )? {
         return Ok(replay);
     }
+    if require_active_sender_claim
+        && !locked.registry.claims.iter().any(|claim| {
+            claim.session_id == sender_session_id
+                && claim.session_incarnation == sender_incarnation
+                && claim.state == "active"
+        })
+    {
+        return Err(CliError::data(
+            "claim-not-active",
+            "no matching active work claim exists",
+            None,
+        ));
+    }
+    // Keep the returned guard alive through the coordination save. Main Agent
+    // delivery uses this to hold the orchestration registry after revalidating
+    // assignment ownership, while handoff takes the same locks in coordination
+    // -> orchestration order. A message therefore commits wholly before a
+    // handoff or is rejected against the handed-off assignment.
+    let _authorization_guard = authorize()?;
     let broker = locked
         .registry
         .brokers

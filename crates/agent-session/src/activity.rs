@@ -1972,10 +1972,17 @@ fn arm_auto_resume_from_event(
 
 pub(crate) fn activity_status(context: &CliContext, id: &str) -> Result<ActivityResult, CliError> {
     let record = load_session_record(context, id)?;
-    let state = state_for_view(context, &record).unwrap_or_else(|| TurnState {
+    activity_status_for_record(context, &record)
+}
+
+pub(crate) fn activity_status_for_record(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<ActivityResult, CliError> {
+    let state = state_for_view(context, record).unwrap_or_else(|| TurnState {
         schema_version: TURN_STATE_VERSION.to_string(),
         phase: TurnPhase::Unknown,
-        phase_changed_at: record.updated_at,
+        phase_changed_at: record.updated_at.clone(),
         revision: 0,
         source: runtime_source(),
         current_turn: None,
@@ -1983,7 +1990,7 @@ pub(crate) fn activity_status(context: &CliContext, id: &str) -> Result<Activity
         extra: Map::new(),
     });
     Ok(ActivityResult {
-        id: record.id,
+        id: record.id.clone(),
         turn_state: state,
         duplicate: false,
     })

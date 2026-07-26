@@ -99,6 +99,7 @@ const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBMIT_RECOVERY_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const POST_PASTE_KEY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const PANE_PASTE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PANE_PASTE_READY_DEADLINE: Duration = Duration::from_secs(15);
@@ -389,7 +390,12 @@ fn render_clap_message(err: &clap::Error) -> String {
 
 fn run_start(context: &CliContext, args: cli::StartArgs) -> i32 {
     let format = args.format;
-    match start_session(context, args, StartFailureDisposition::ReturnError) {
+    match start_session(
+        context,
+        args,
+        StartFailureDisposition::ReturnError,
+        PromptDelivery::ResilientBeforeSubmit,
+    ) {
         Ok(view) => render_single_success(
             START_COMMAND,
             view.format,
@@ -1064,7 +1070,7 @@ fn startup_projection_for_view(record: &SessionRecord) -> Option<StartupProjecti
     Some(startup)
 }
 
-fn runtime_is_proven_never_launched(record: &SessionRecord) -> bool {
+pub(crate) fn runtime_is_proven_never_launched(record: &SessionRecord) -> bool {
     let Some(current_launch_id) = record
         .runtime
         .as_ref()
@@ -1672,10 +1678,21 @@ enum StartFailureDisposition {
     ReturnSession,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptDelivery {
+    /// Ordinary interactive starts may retry a paste while it is still proven
+    /// unsubmitted. This covers provider TUIs that draw before accepting input.
+    ResilientBeforeSubmit,
+    /// Managed worker startup owns later recovery through a durable, guarded
+    /// Enter. Its private assignment prompt must never be pasted more than once.
+    ManagedWorkerExactlyOnce,
+}
+
 fn start_session(
     context: &CliContext,
     args: cli::StartArgs,
     failure_disposition: StartFailureDisposition,
+    prompt_delivery: PromptDelivery,
 ) -> Result<StartView, CliError> {
     validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
@@ -1838,20 +1855,27 @@ fn start_session(
         return Err(err);
     }
     let _ = advance_owned_startup_stage(context, &mut created.record, "runtime");
+    let mut prompt_delivery_error = None;
     if created.prompt_file.is_some() {
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
-        if let Err(err) = paste_prompt(&tmux_bin, &created.record) {
-            recover_failed_tmux_launch(
-                context,
-                &mut created.record,
-                &tmux_bin,
-                Some(&launch_identity),
-                SessionTerminationOperation::FailedLaunch,
-            )?;
-            cleanup_created_record(context, &created);
-            return Err(err);
+        if let Err(err) = paste_prompt(&tmux_bin, &created.record, prompt_delivery) {
+            if prompt_delivery == PromptDelivery::ManagedWorkerExactlyOnce
+                && err.code() == "managed-worker-prompt-delivery-outcome-unknown"
+            {
+                prompt_delivery_error = Some(err);
+            } else {
+                recover_failed_tmux_launch(
+                    context,
+                    &mut created.record,
+                    &tmux_bin,
+                    Some(&launch_identity),
+                    SessionTerminationOperation::FailedLaunch,
+                )?;
+                cleanup_created_record(context, &created);
+                return Err(err);
+            }
         }
     }
     if created.record.provider_resume.is_none()
@@ -1878,10 +1902,13 @@ fn start_session(
     } else {
         created.release_lifecycle_lock();
     }
-    Ok(StartView {
-        format: args.format,
-        result,
-    })
+    match prompt_delivery_error {
+        Some(error) => Err(error),
+        None => Ok(StartView {
+            format: args.format,
+            result,
+        }),
+    }
 }
 
 fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartView, CliError> {
@@ -3188,7 +3215,11 @@ fn collect_codex_resume_candidates(
     }
 }
 
-fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError> {
+fn paste_prompt(
+    tmux_bin: &Path,
+    record: &SessionRecord,
+    delivery: PromptDelivery,
+) -> Result<(), CliError> {
     let prompt_file = record.prompt_file.as_ref().ok_or_else(|| {
         CliError::runtime(
             "missing-prompt-file",
@@ -3207,13 +3238,16 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     await_pane_drawn_before_paste(tmux_bin, &target);
 
     // A drawn pane is still not proof that the provider reads stdin yet: Claude
-    // Code parks its cursor on the input line about a second before it accepts
-    // input, and tmux exposes no signal that separates those two moments. So
-    // confirm the pane actually reacted to the paste, and re-deliver when it did
-    // not. This runs strictly before the submit key, so a re-delivery can never
-    // double-submit — nothing has been submitted yet.
-    let before = capture_pane_digest(tmux_bin, &target);
-    load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
+    // Code parks its cursor on the input line before it accepts input. Ordinary
+    // starts may therefore use a pane digest to prove that the first paste was
+    // ignored and retry it while no submit key has been sent. Managed workers
+    // deliberately skip this probe because their private assignment prompt is
+    // exactly-once transport and later recovery may only send one guarded Enter.
+    let before = (delivery == PromptDelivery::ResilientBeforeSubmit)
+        .then(|| capture_pane_digest(tmux_bin, &target))
+        .flatten();
+    load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
+        .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
 
     // The initial prompt is submitted; `send` deliberately leaves this to
     // an explicit `--key enter`. Tmux confirms that it wrote the paste bytes,
@@ -3221,13 +3255,22 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     // immediately adjacent Enter arrives. Keep the key a separate command and
     // give both Codex and Claude one bounded settle interval first.
     thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
-    if pane_ignored_paste(before, capture_pane_digest(tmux_bin, &target)) {
-        load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
+    if delivery == PromptDelivery::ResilientBeforeSubmit
+        && pane_ignored_paste(before, capture_pane_digest(tmux_bin, &target))
+    {
+        load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
+            .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
         thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
     }
     let mut enter = ProcessCommand::new(tmux_bin);
     enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
-    run_status(enter, "tmux send-keys")
+    run_status(enter, "tmux send-keys").map_err(|error| {
+        if delivery == PromptDelivery::ManagedWorkerExactlyOnce {
+            managed_worker_prompt_delivery_outcome_unknown(error, "submit")
+        } else {
+            error
+        }
+    })
 }
 
 /// Parse `#{cursor_y}|#{cursor_x}` from a tmux `display-message` reply. `None`
@@ -3276,9 +3319,9 @@ fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str) {
     }
 }
 
-/// Digest of the pane's visible content, used only to tell whether the pane
-/// reacted to a paste. `None` when tmux cannot answer, which must not be read as
-/// "unchanged".
+/// Digest of the pane's visible content, used only to tell whether an ordinary
+/// start reacted to a paste. `None` when tmux cannot answer, which must not be
+/// read as "unchanged".
 fn capture_pane_digest(tmux_bin: &Path, target: &str) -> Option<u64> {
     let output = ProcessCommand::new(tmux_bin)
         .arg("capture-pane")
@@ -3295,11 +3338,8 @@ fn capture_pane_digest(tmux_bin: &Path, target: &str) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// A pane that is byte-identical before and after a paste received nothing: any
-/// accepted paste changes the display, whether the provider echoes the text or
-/// collapses it into a placeholder. Unobservable digests are never treated as
-/// evidence, so a missing signal leaves the single delivery in place instead of
-/// adding a speculative second one.
+/// Byte-identical observable panes prove that the provider ignored an ordinary
+/// pre-submit paste. Missing observations never authorize another delivery.
 fn pane_ignored_paste(before: Option<u64>, after: Option<u64>) -> bool {
     match (before, after) {
         (Some(before), Some(after)) => before == after,
@@ -3308,17 +3348,45 @@ fn pane_ignored_paste(before: Option<u64>, after: Option<u64>) -> bool {
 }
 
 /// Load `file` into a named tmux buffer and paste it into `target`, deleting the
-/// buffer after paste (`-d`) or on failure. Shared by `paste_prompt` (initial
-/// prompt) and `send` (steering text) so the buffer lifecycle lives in one place.
+/// buffer after paste (`-d`) or on failure. The staged error distinguishes a
+/// proven pre-delivery load failure from a paste result that may have landed.
+enum PromptPasteFailure {
+    BeforeDelivery(CliError),
+    OutcomeUnknown(CliError),
+}
+
+fn prompt_delivery_failure(delivery: PromptDelivery, failure: PromptPasteFailure) -> CliError {
+    match failure {
+        PromptPasteFailure::BeforeDelivery(error) => error,
+        PromptPasteFailure::OutcomeUnknown(error)
+            if delivery == PromptDelivery::ManagedWorkerExactlyOnce =>
+        {
+            managed_worker_prompt_delivery_outcome_unknown(error, "paste")
+        }
+        PromptPasteFailure::OutcomeUnknown(error) => error,
+    }
+}
+
+fn managed_worker_prompt_delivery_outcome_unknown(error: CliError, phase: &str) -> CliError {
+    CliError::runtime(
+        "managed-worker-prompt-delivery-outcome-unknown",
+        "managed worker prompt delivery may have reached the provider; preserve the exact session and retry only the durable worker-start request",
+        Some(json!({
+            "phase": phase,
+            "transport_error": error.code()
+        })),
+    )
+}
+
 fn load_and_paste_buffer(
     tmux_bin: &Path,
     buffer_name: &str,
     target: &str,
     file: &Path,
-) -> Result<(), CliError> {
+) -> Result<(), PromptPasteFailure> {
     let mut load = ProcessCommand::new(tmux_bin);
     load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
-    run_status(load, "tmux load-buffer")?;
+    run_status(load, "tmux load-buffer").map_err(PromptPasteFailure::BeforeDelivery)?;
 
     let mut paste = ProcessCommand::new(tmux_bin);
     paste
@@ -3330,7 +3398,7 @@ fn load_and_paste_buffer(
         .arg(target);
     if let Err(err) = run_status(paste, "tmux paste-buffer") {
         delete_tmux_buffer(tmux_bin, buffer_name);
-        return Err(err);
+        return Err(PromptPasteFailure::OutcomeUnknown(err));
     }
     Ok(())
 }
@@ -3406,6 +3474,137 @@ fn send_input_serialized(
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
     send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, false)
+}
+
+/// Deliver the one Main Agent submit-recovery Enter while every mutable
+/// authority source is fenced. The record, activity, and coordination locks
+/// remain held through the tmux write, so an incarnation replacement, startup
+/// dialog/turn transition, claim, or operation cannot cross the final check.
+pub(crate) fn send_submit_recovery_input_serialized<G, F>(
+    context: &CliContext,
+    expected: &SessionRecord,
+    expected_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    tmux_bin: &Path,
+    authorize: F,
+) -> Result<(), CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    let record_lock = acquire_session_record_lock(context, &expected.id)?;
+    let mut manual_input = ManualInputSection::new(record_lock);
+    let mut current = load_session_record(context, &expected.id)?;
+    ensure_same_session_identity(expected, &current)?;
+    let current_incarnation = current
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "worker-incarnation-unavailable",
+                "worker session incarnation is unavailable at submit recovery",
+                None,
+            )
+        })?;
+    if current_incarnation != expected_incarnation {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "worker session incarnation changed at submit recovery",
+            None,
+        ));
+    }
+    let _activity_lock = activity::acquire_coordination_activity_lock(context, &current.id)?;
+    if live_status(tmux_bin, &current.tmux_session) != "running" {
+        return Err(CliError::runtime(
+            "session-not-running",
+            format!("session is not running: {}", current.id),
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    codex_app_server::ensure_manual_input_capability(context, &current)?;
+    codex_account::ensure_input_allowed(&current)?;
+    // The global coordination lock is acquired only for the final authority
+    // check and a one-second Enter write. Potentially slower capability,
+    // account, and liveness checks above remain protected by the per-session
+    // record/activity fences without blocking unrelated coordination traffic.
+    let quiescence =
+        coordination::lock_session_quiescence(context, &current.id, expected_incarnation)?;
+    if !quiescence.broker_present {
+        return Err(CliError::runtime(
+            "coordination-broker-unavailable",
+            "worker coordination broker evidence is unavailable at submit recovery",
+            None,
+        ));
+    }
+    if !quiescence.broker_identity_matched {
+        return Err(CliError::data(
+            "coordination-broker-incarnation-conflict",
+            "worker coordination broker belongs to a different incarnation",
+            None,
+        ));
+    }
+    if !quiescence.broker_authoritative {
+        return Err(CliError::runtime(
+            "coordination-broker-unavailable",
+            "worker coordination broker is not ready, fresh, and capability-backed at submit recovery",
+            None,
+        ));
+    }
+    if quiescence.active_claim || quiescence.active_operation || quiescence.uncertain_operation {
+        return Err(CliError::data(
+            "worker-not-quiescent",
+            "submit recovery refuses a worker claim or active/uncertain operation",
+            None,
+        ));
+    }
+    let activity = activity::activity_status_for_record(context, &current)?;
+    let turn = activity.turn_state;
+    if turn.phase != activity::TurnPhase::Starting
+        || turn.source.confidence != activity::Confidence::Authoritative
+        || turn.current_turn.is_some()
+        || turn.last_turn.is_some()
+    {
+        return Err(CliError::data(
+            "worker-activity-not-authoritative-starting",
+            "submit recovery requires authoritative startup evidence with no current or last turn",
+            Some(json!({
+                "phase": turn.phase,
+                "confidence": turn.source.confidence,
+                "current_turn": turn.current_turn.is_some(),
+                "last_turn": turn.last_turn.is_some()
+            })),
+        ));
+    }
+    if !quiescence.has_active_claim(controller_session_id, controller_incarnation) {
+        return Err(CliError::data(
+            "claim-not-active",
+            "reserving Main Agent claim is no longer active at submit recovery",
+            None,
+        ));
+    }
+    // Coordination remains locked while this guard revalidates and retains the
+    // controller/run/assignment binding. This preserves the established
+    // coordination -> orchestration lock order through the Enter side effect.
+    let _authorization_guard = authorize()?;
+    // These durable input side effects are intentionally last. Every liveness,
+    // broker, quiescence, activity, claim, and orchestration rejection above is
+    // proven pre-send and must leave both the Codex account fence and
+    // auto-resume state untouched.
+    auto_resume::cancel_for_manual_input_locked(
+        context,
+        &current.id,
+        &Timestamp::now().to_string(),
+    )?;
+    codex_account::authorize_input_locked(context, &mut current)?;
+    manual_input.arm(context, &current)?;
+    send_tmux_key_with_timeout(
+        tmux_bin,
+        &format!("{}:0.0", current.tmux_session),
+        SpecialKey::Enter,
+        SUBMIT_RECOVERY_INPUT_COMMAND_TIMEOUT,
+    )
 }
 
 fn send_title_rename_serialized(
@@ -3581,13 +3780,22 @@ fn post_paste_settle_delay(text_pasted: bool, has_keys: bool) -> Option<Duration
 }
 
 fn send_tmux_key(tmux_bin: &Path, target: &str, key: SpecialKey) -> Result<(), CliError> {
+    send_tmux_key_with_timeout(tmux_bin, target, key, PANE_INPUT_COMMAND_TIMEOUT)
+}
+
+fn send_tmux_key_with_timeout(
+    tmux_bin: &Path,
+    target: &str,
+    key: SpecialKey,
+    timeout: Duration,
+) -> Result<(), CliError> {
     let mut command = ProcessCommand::new(tmux_bin);
     command
         .arg("send-keys")
         .arg("-t")
         .arg(target)
         .arg(key.tmux_key());
-    run_status_with_timeout(command, "tmux send-keys", PANE_INPUT_COMMAND_TIMEOUT)
+    run_status_with_timeout(command, "tmux send-keys", timeout)
 }
 
 fn load_and_paste_buffer_with_timeout(
@@ -7634,7 +7842,7 @@ pub(crate) fn coordination_runtime_evidence(
             None,
         )
     })?;
-    let status = match process_runtime_status(&identity) {
+    let status = match coordination_process_runtime_status(&identity) {
         ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
         ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
         ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
@@ -7656,7 +7864,7 @@ pub(crate) fn coordination_runtime_status_for_identity(value: &Value) -> Coordin
     let Ok(identity) = serde_json::from_value::<TmuxRuntimeIdentity>(value.clone()) else {
         return CoordinationRuntimeStatus::Unknown;
     };
-    match process_runtime_status(&identity) {
+    match coordination_process_runtime_status(&identity) {
         ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
         ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
         ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
@@ -7672,6 +7880,19 @@ fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
         Some(libc::EPERM) => ProcessGroupStatus::Running,
         _ => ProcessGroupStatus::Unknown,
     }
+}
+
+fn coordination_process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
+    #[cfg(target_os = "linux")]
+    if identity.control_group.is_some()
+        || (identity.process_session_id.is_some() && !identity.process_session_members.is_empty())
+    {
+        return process_runtime_status(identity);
+    }
+    identity
+        .process_group_id
+        .map(process_group_status)
+        .unwrap_or(ProcessGroupStatus::Unknown)
 }
 
 fn process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
@@ -9308,7 +9529,7 @@ fn run_output_with_timeout(
     run_output_with_timeout_and_cap(command, timeout, DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES)
 }
 
-fn run_output_with_timeout_and_cap(
+pub(crate) fn run_output_with_timeout_and_cap(
     mut command: ProcessCommand,
     timeout: Duration,
     max_output_bytes: usize,
@@ -10022,7 +10243,7 @@ mod tests {
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record, pane_drawn,
-        pane_ignored_paste, parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
+        parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
         resolve_agent_session_executable_from, resolve_session_id, session_dir,
         strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
@@ -10038,18 +10259,6 @@ mod tests {
         }
         assert_eq!(parse_pane_cursor("9|25\n"), Some((9, 25)));
         assert_eq!(parse_pane_cursor(" 0 | 0 "), Some((0, 0)));
-    }
-
-    #[test]
-    fn an_unchanged_pane_is_the_only_evidence_a_paste_was_ignored() {
-        // Identical digests mean the display did not react, so nothing arrived.
-        assert!(pane_ignored_paste(Some(7), Some(7)));
-        assert!(!pane_ignored_paste(Some(7), Some(8)));
-        // An unanswerable capture must never be read as "unchanged", or a
-        // delivered prompt would be pasted a second time.
-        assert!(!pane_ignored_paste(None, Some(7)));
-        assert!(!pane_ignored_paste(Some(7), None));
-        assert!(!pane_ignored_paste(None, None));
     }
 
     #[test]

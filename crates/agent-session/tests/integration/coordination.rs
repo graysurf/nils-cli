@@ -1,7 +1,11 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nils_test_support::bin;
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
@@ -9,7 +13,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::cli::{fake_agent, fake_tmux, tmux_calls};
+use super::cli::{fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls};
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved("agent-session", args, &CmdOptions::new().with_cwd(dir))
@@ -90,6 +94,40 @@ fn seed_session_at(
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("record mode");
 }
 
+fn seed_activity_state(
+    state_dir: &Path,
+    id: &str,
+    incarnation: &str,
+    phase: &str,
+    current_turn: serde_json::Value,
+    last_turn: serde_json::Value,
+) {
+    let path = state_dir.join("sessions").join(id).join("activity.json");
+    write_private_json(
+        &path,
+        &json!({
+            "schema_version": "agent-session.activity.v1",
+            "runtime_id": incarnation,
+            "runtime_generation": 1,
+            "state": {
+                "schema_version": "agent-session.turn-state.v1",
+                "phase": phase,
+                "phase_changed_at": "2030-01-01T00:00:00Z",
+                "revision": 1,
+                "source": {
+                    "kind": "runtime",
+                    "provider": null,
+                    "confidence": "authoritative"
+                },
+                "current_turn": current_turn,
+                "last_turn": last_turn
+            },
+            "pending_attention": [],
+            "seen_event_count": 0
+        }),
+    );
+}
+
 fn init_checkout(path: &Path, remote: &str) {
     fs::create_dir_all(path).expect("checkout directory");
     let init = Command::new("git")
@@ -137,6 +175,14 @@ fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Optio
     let mut brokers = serde_json::Map::new();
     for (id, incarnation, capability, cwd, coordination_mode) in sessions {
         seed_session_at(state_dir, id, incarnation, cwd, *coordination_mode);
+        seed_activity_state(
+            state_dir,
+            id,
+            incarnation,
+            "starting",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
         let capability_dir = state_dir.join("sessions").join(id).join("coordination");
         fs::create_dir(&capability_dir).expect("capability directory");
         fs::set_permissions(&capability_dir, fs::Permissions::from_mode(0o700))
@@ -411,6 +457,44 @@ fn seed_active_claim(state_dir: &Path, session_id: &str, incarnation: &str, clai
     });
 }
 
+fn seed_operation(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+    lease_id: &str,
+    state: &str,
+) {
+    rewrite_registry(state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": lease_id,
+                "session_id": session_id,
+                "session_incarnation": incarnation,
+                "claim_id": format!("{lease_id}-claim"),
+                "claim_revision": 1,
+                "operation": "test mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": state,
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": 1,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+    });
+}
+
 fn rewrite_registry(state_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
     let path = state_dir.join("coordination/registry.json");
     let mut registry: serde_json::Value =
@@ -422,6 +506,13 @@ fn rewrite_registry(state_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value
     )
     .expect("write registry");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("registry mode");
+}
+
+fn orchestration_registry(state_dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("orchestration registry"),
+    )
+    .expect("orchestration registry json")
 }
 
 #[test]
@@ -515,7 +606,9 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
     for lifecycle_step in [
         "SAFE LIFECYCLE",
         "init -> rehydrate/status -> worker start --await-ready -> worker bootstrap",
-        "submit/release claim -> accept -> retire -> close",
+        "worker supervise -> accept -> retire -> close",
+        "MACRO-FIRST RECOVERY",
+        "never resend a prompt or inject an unbounded/manual Enter",
     ] {
         assert!(
             root_help.contains(lifecycle_step),
@@ -547,6 +640,23 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
             &[
                 "expected current assignment revision",
                 "same idempotency key",
+            ][..],
+        ),
+        (
+            &["worker", "reassign", "--help"][..],
+            &[
+                "distinct replacement assignment",
+                "clean worktree",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
+            &["worker", "submit-recovery", "--help"][..],
+            &[
+                "single guarded enter",
+                "expected current assignment revision",
+                "1-30s",
             ][..],
         ),
     ] {
@@ -3826,6 +3936,8 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
         assignment_path.to_str().expect("assignment path"),
         "--if-run-revision",
         "1",
+        "--await-ready",
+        "0",
         "--idempotency-key",
         idempotency_key,
         "--format",
@@ -3860,6 +3972,170 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
             .count(),
         1,
         "replay must not launch a duplicate worker"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    let codex_session = codex_home.join("sessions/2026/07/26/session.jsonl");
+    let assignment_path = tmp.path().join("assignment-ambiguous-enter.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-ambiguous-enter",
+            "task_summary": "Preserve an ambiguous initial Enter",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-ambiguous-enter",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let codex_session_arg = codex_session.to_string_lossy().into_owned();
+    let checkout_arg = checkout.to_string_lossy().into_owned();
+    let fail_once_dir = tmp.path().join("fail-after-initial-enter-once");
+    let fail_once_arg = fail_once_dir.to_string_lossy().into_owned();
+    let args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-ambiguous-enter-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+            (
+                "AGENT_SESSION_FAKE_CODEX_SESSION_FILE",
+                codex_session_arg.as_str(),
+            ),
+            (
+                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+                "codex-ambiguous-enter-resume",
+            ),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", checkout_arg.as_str()),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL_AFTER", "send-keys"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR",
+                fail_once_arg.as_str(),
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "managed-worker-prompt-delivery-outcome-unknown"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-ambiguous-enter/session.json")
+            .is_file(),
+        "an ambiguous initial Enter must retain the exact worker record"
+    );
+
+    let resumed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(resumed.code, 0, "stderr={}", resumed.stderr_text());
+    assert_eq!(
+        data(&resumed)["worker"]["session_id"],
+        "worker-ambiguous-enter"
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "retry must preserve the original worker without another {operation}: {calls:?}"
+        );
+    }
+    assert!(
+        calls.iter().all(|call| {
+            call.first().is_none_or(|arg| arg != "if-shell")
+                || call.iter().all(|arg| !arg.starts_with("kill-session -t "))
+        }),
+        "an outcome-unknown Enter must never tear down its worker: {calls:?}"
+    );
+    let worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions/worker-ambiguous-enter/session.json"))
+            .expect("retained worker record"),
+    )
+    .expect("worker record json");
+    assert_eq!(
+        worker_record["provider_resume"]["session_id"], "codex-ambiguous-enter-resume",
+        "preserving an ambiguous Enter must still finalize durable resume metadata"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-ambiguous-enter/resume.json")
+            .is_file(),
+        "the retained worker must remain resumable after a later runtime loss"
     );
 }
 
@@ -3939,6 +4215,8 @@ fn main_agent_worker_start_binds_broker_to_same_release_agent_session_sibling() 
             assignment_path.to_str().expect("assignment path"),
             "--if-run-revision",
             "1",
+            "--await-ready",
+            "0",
             "--idempotency-key",
             "worker-start-facade-broker-0001",
             "--format",
@@ -4732,6 +5010,34 @@ fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
     assert_eq!(data(&accepted)["assignment"]["state"], "accepted");
     assert_eq!(data(&accepted)["assignment"]["revision"], 7);
 
+    let terminal_checkpoint = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "7",
+            "--idempotency-key",
+            "worker-checkpoint-after-accept-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(terminal_checkpoint.code, 65);
+    assert_eq!(
+        terminal_checkpoint.stdout_json()["error"]["code"],
+        "assignment-terminal"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-one"]["revision"],
+        7,
+        "terminal worker checkpoint rejection must preserve the manager revision"
+    );
+
     let released = run_main_agent(
         &checkout,
         &[
@@ -4847,7 +5153,7 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
             ),
         ],
     );
-    let _main_capability = init_main_run(
+    let main_capability = init_main_run(
         tmp.path(),
         &state_dir,
         &main_checkout,
@@ -4868,7 +5174,7 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
             "agent_args": []
         },
         "repository": "example/repository",
-        "worktree": null,
+        "worktree": worker_checkout,
         "base_ref": "main",
         "scopes": ["docs/bootstrap-canary"],
         "durable_refs": []
@@ -4897,7 +5203,7 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
             "collaborators": [],
             "borrowed_by": [],
             "repository": "example/repository",
-            "worktree": null,
+            "worktree": worker_checkout,
             "base_ref": "main",
             "scopes": ["docs/bootstrap-canary"],
             "durable_refs": [],
@@ -4940,6 +5246,52 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
         data(&bootstrapped)["assignment"]["assignment_packet"]["task"]["private_note"],
         "bootstrap-private-canary"
     );
+    assert_eq!(
+        data(&bootstrapped)["assignment"]["record"]["worktree"],
+        worker_checkout.to_string_lossy().as_ref(),
+        "the absolute managed-worktree path remains durable routing metadata"
+    );
+    let coordination_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    let worker_claim = coordination_registry["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "worker-one" && claim["state"] == "active")
+        .expect("worker claim");
+    assert!(
+        worker_claim["worktrees"]
+            .as_array()
+            .expect("worker claim worktrees")
+            .iter()
+            .all(|value| value.as_str().is_some_and(|value| {
+                value.starts_with("hmac-sha256:")
+                    && !value.contains(worker_checkout.to_string_lossy().as_ref())
+            })),
+        "claim worktrees must contain only HMAC fingerprints: {worker_claim}"
+    );
+    let diagnosed = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "diagnose",
+            "assignment-bootstrap",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(diagnosed.code, 0, "stderr={}", diagnosed.stderr_text());
+    assert_eq!(data(&diagnosed)["classification"], "healthy_progress");
+    assert_eq!(
+        data(&diagnosed)["coordination"]["claim_active"],
+        true,
+        "authenticated bootstrap claim is supervision evidence"
+    );
 
     let replay = run_main_agent(
         &worker_checkout,
@@ -4948,6 +5300,943 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     );
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
     assert_eq!(replay.stdout_text(), bootstrapped.stdout_text());
+}
+
+#[test]
+fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isolation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let failed_checkout = tmp.path().join("failed-checkout");
+    let replacement_checkout = tmp.path().join("replacement-checkout");
+    let unrelated_checkout = tmp.path().join("unrelated-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [
+        &main_checkout,
+        &failed_checkout,
+        &replacement_checkout,
+        &unrelated_checkout,
+    ] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-failed",
+                "worker-failed-incarnation",
+                "worker-failed-private-capability-0000000001",
+                failed_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-unrelated",
+                "worker-unrelated-incarnation",
+                "worker-unrelated-private-capability-00000001",
+                unrelated_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let failed_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-failed",
+        "task_summary": "Conflict before claim acquisition",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": failed_checkout,
+            "title": null,
+            "session_id": "worker-failed",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": failed_checkout,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-failed",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-failed",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Conflict before claim acquisition",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-failed",
+                "session_incarnation": "worker-failed-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": failed_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &failed_packet,
+    );
+    let unrelated_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-unrelated",
+        "task_summary": "Unrelated active worker",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": unrelated_checkout,
+            "title": null,
+            "session_id": "worker-unrelated",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": unrelated_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/unrelated"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-unrelated",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-unrelated",
+            "run_id": "run-one",
+            "revision": 4,
+            "state": "working",
+            "task_summary": "Unrelated active worker",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-unrelated",
+                "session_incarnation": "worker-unrelated-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": unrelated_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/unrelated"],
+            "durable_refs": [],
+            "checkpoint": {
+                "revision": 4,
+                "summary": "Unrelated work continues",
+                "next_action": "Continue",
+                "updated_at": "2030-01-01T00:00:03Z"
+            },
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:03Z"
+        }),
+        &unrelated_packet,
+    );
+
+    let worker_capability = capability(&state_dir, "worker-failed");
+    let bootstrap = run_main_agent(
+        &failed_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "failed-bootstrap-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(bootstrap.code, 65);
+    assert_eq!(bootstrap.stdout_json()["error"]["code"], "claim-conflict");
+    let migrated = orchestration_registry(&state_dir);
+    assert_eq!(
+        migrated["schema_version"],
+        "agent-session.orchestration-registry.v2"
+    );
+    assert_eq!(
+        migrated["assignments"]["assignment-failed"]["schema_version"],
+        "agent-session.orchestration-assignment.v2"
+    );
+
+    let supervised = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-failed",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(supervised.code, 0, "stderr={}", supervised.stderr_text());
+    assert_eq!(data(&supervised)["classification"], "pre_claim_failure");
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["reassignment_safe"],
+        true
+    );
+
+    let stale_cancel = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "cancel",
+            "assignment-failed",
+            "--if-revision",
+            "2",
+            "--reason",
+            "replace failed pre-claim worker",
+            "--idempotency-key",
+            "stale-cancel-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(stale_cancel.code, 65);
+    assert_eq!(
+        stale_cancel.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    let coordination_path = state_dir.join("coordination/registry.json");
+    let coordination_registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&coordination_path).expect("coordination registry"))
+            .expect("coordination registry json");
+    let worker_broker = coordination_registry["brokers"]["worker-failed"].clone();
+    for (case, expected_code) in [
+        ("absent", "coordination-broker-unavailable"),
+        ("mismatched", "coordination-broker-incarnation-conflict"),
+        ("stopped", "coordination-broker-unavailable"),
+        ("capability-missing", "coordination-broker-unavailable"),
+    ] {
+        rewrite_registry(&state_dir, |registry| match case {
+            "absent" => {
+                registry["brokers"]
+                    .as_object_mut()
+                    .expect("brokers")
+                    .remove("worker-failed");
+            }
+            "mismatched" => {
+                registry["brokers"]["worker-failed"]["incarnation"] =
+                    json!("replacement-incarnation");
+            }
+            "stopped" => {
+                registry["brokers"]["worker-failed"]["state"] = json!("stopped");
+            }
+            "capability-missing" => {
+                registry["brokers"]["worker-failed"]["capability_digest"] = json!("");
+            }
+            _ => unreachable!(),
+        });
+        let refused = run_main_agent(
+            &main_checkout,
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "cancel",
+                "assignment-failed",
+                "--if-revision",
+                "3",
+                "--reason",
+                "broker evidence is not authoritative",
+                "--idempotency-key",
+                &format!("cancel-broker-{case}-0001"),
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+        );
+        assert_ne!(refused.code, 0, "outcome={}", refused.stdout_text());
+        assert_eq!(refused.stdout_json()["error"]["code"], expected_code);
+        rewrite_registry(&state_dir, |registry| {
+            registry["brokers"]["worker-failed"] = worker_broker.clone();
+        });
+        let orchestration = orchestration_registry(&state_dir);
+        assert_eq!(
+            orchestration["assignments"]["assignment-failed"]["state"],
+            "blocked"
+        );
+        assert_eq!(
+            orchestration["assignments"]["assignment-failed"]["revision"],
+            3
+        );
+    }
+
+    let replacement_path = tmp.path().join("replacement.json");
+    write_private_json(
+        &replacement_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-replacement",
+            "task_summary": "Continue in a distinct clean worktree",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": replacement_checkout,
+                "title": null,
+                "session_id": null,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": replacement_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/replacement"],
+            "durable_refs": []
+        }),
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let reassign_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "reassign",
+        "assignment-failed",
+        "--assignment-file",
+        replacement_path.to_str().expect("replacement packet"),
+        "--if-revision",
+        "3",
+        "--reason",
+        "replace failed pre-claim worker",
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-reassign-0001",
+        "--format",
+        "json",
+    ];
+    let reassign_env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+    let stale_reassign = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "reassign",
+            "assignment-failed",
+            "--assignment-file",
+            replacement_path.to_str().expect("replacement packet"),
+            "--if-revision",
+            "2",
+            "--reason",
+            "replace failed pre-claim worker",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-reassign-stale-cancel-0001",
+            "--format",
+            "json",
+        ],
+        &reassign_env,
+    );
+    assert_eq!(
+        stale_reassign.code,
+        0,
+        "stderr={}",
+        stale_reassign.stderr_text()
+    );
+    assert_eq!(data(&stale_reassign)["state"], "failed");
+    assert_eq!(data(&stale_reassign)["failed_stage"], "cancel");
+    assert_eq!(
+        data(&stale_reassign)["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    let pane_process = spawn_scoped_test_process_group();
+    let pane_pid_arg = pane_process.pid().to_string();
+    let state_runtime_arg = state_dir.to_string_lossy().into_owned();
+    let delete_failure_marker = tmp.path().join("delete-kill-failure-once");
+    let delete_failure_marker_arg = delete_failure_marker.to_string_lossy().into_owned();
+    let retire_failure_env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_FAIL_ONCE_DIR",
+            delete_failure_marker_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid_arg.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            pane_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_STATE_DIR",
+            state_runtime_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-failed-incarnation",
+        ),
+    ];
+    let retire_failed = run_main_agent(&main_checkout, &reassign_args, &retire_failure_env);
+    assert_eq!(
+        retire_failed.code,
+        0,
+        "stderr={}",
+        retire_failed.stderr_text()
+    );
+    assert_eq!(data(&retire_failed)["state"], "failed");
+    assert_eq!(data(&retire_failed)["failed_stage"], "retire");
+    assert_eq!(
+        data(&retire_failed)["last_proven_safe_state"]["assignment"]["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        data(&retire_failed)["error"]["details"]["reason"],
+        "kill-failed"
+    );
+    assert!(
+        state_dir.join("sessions/worker-failed").exists(),
+        "transient retirement failure must retain the exact worker fixture"
+    );
+    for retained in ["session.json", "activity.json"] {
+        assert!(
+            state_dir
+                .join("sessions/worker-failed")
+                .join(retained)
+                .exists(),
+            "the failed kill boundary must retain {retained}"
+        );
+    }
+    assert!(
+        Path::new(&worker_capability).exists(),
+        "the failed kill boundary must retain the worker capability"
+    );
+    assert!(
+        delete_failure_marker.is_dir(),
+        "the one-shot kill failure injection must be consumed once"
+    );
+    assert!(
+        pane_process.is_running(),
+        "the failed kill-session invocation must retain the live runtime"
+    );
+    let kill_attempts_after_failure = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.iter().any(|arg| arg.starts_with("kill-session -t "))
+        })
+        .count();
+    assert_eq!(
+        kill_attempts_after_failure, 1,
+        "the first retirement must reach and fail one real kill-session boundary"
+    );
+
+    let retire_retry_env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid_arg.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            pane_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_STATE_DIR",
+            state_runtime_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-failed-incarnation",
+        ),
+    ];
+    let reassigned = run_main_agent(&main_checkout, &reassign_args, &retire_retry_env);
+    assert_eq!(reassigned.code, 0, "stderr={}", reassigned.stderr_text());
+    assert_eq!(
+        data(&reassigned)["state"],
+        "reassigned",
+        "outcome={}",
+        data(&reassigned)
+    );
+    assert!(
+        !state_dir.join("sessions/worker-failed").exists(),
+        "the retry must retire the retained fixture through the real delete path"
+    );
+    assert!(
+        !pane_process.is_running(),
+        "the successful kill-session retry must terminate the exact runtime"
+    );
+    let kill_attempts_after_retry = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.iter().any(|arg| arg.starts_with("kill-session -t "))
+        })
+        .count();
+    assert_eq!(
+        kill_attempts_after_retry, 2,
+        "the exact retry must invoke kill-session once more and then converge"
+    );
+    assert_eq!(
+        data(&reassigned)["replacement_assignment_id"],
+        "assignment-replacement"
+    );
+    assert!(!state_dir.join("sessions/worker-failed").exists());
+    let replacement_session = data(&reassigned)["start"]["worker"]["session_id"]
+        .as_str()
+        .expect("derived replacement session")
+        .to_string();
+    assert!(
+        state_dir
+            .join("sessions")
+            .join(&replacement_session)
+            .exists()
+    );
+    assert!(
+        state_dir.join("sessions/worker-unrelated").exists(),
+        "reassignment must not touch an unrelated worker"
+    );
+    let calls_before_replay = tmux_calls(&tmux_log);
+    let load_count_before_replay = calls_before_replay
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "load-buffer"))
+        .count();
+    let paste_count_before_replay = calls_before_replay
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+        .count();
+    let enter_count_before_replay = calls_before_replay
+        .iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        load_count_before_replay, 1,
+        "the replacement prompt must be loaded exactly once"
+    );
+    assert_eq!(
+        paste_count_before_replay, 1,
+        "the replacement prompt must be pasted exactly once"
+    );
+    assert_eq!(
+        enter_count_before_replay, 1,
+        "the replacement prompt must be submitted exactly once"
+    );
+    fs::write(
+        replacement_checkout.join("legitimate-worker-progress"),
+        "dirty after start",
+    )
+    .expect("replacement progress");
+    let replay = run_main_agent(&main_checkout, &reassign_args, &reassign_env);
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay)["state"], "reassigned");
+    let calls_after_replay = tmux_calls(&tmux_log);
+    let load_count_after_replay = calls_after_replay
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "load-buffer"))
+        .count();
+    let paste_count_after_replay = calls_after_replay
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+        .count();
+    let enter_count_after_replay = calls_after_replay
+        .iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        load_count_after_replay, load_count_before_replay,
+        "an idempotent reassign retry must not reload the prompt"
+    );
+    assert_eq!(
+        paste_count_after_replay, paste_count_before_replay,
+        "an idempotent reassign retry must not repaste the prompt"
+    );
+    assert_eq!(
+        enter_count_after_replay, enter_count_before_replay,
+        "an idempotent reassign retry must not resend the prompt or Enter"
+    );
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    assert_eq!(
+        registry["assignments"]["assignment-failed"]["state"],
+        "cancelled"
+    );
+    assert!(
+        registry["assignments"]["assignment-failed"]["blocker_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replace failed pre-claim worker")
+    );
+    assert_eq!(
+        registry["assignments"]["assignment-unrelated"]["state"],
+        "working"
+    );
+}
+
+#[test]
+fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mutation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(
+        &main_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-matrix",
+                "worker-matrix-incarnation",
+                "worker-matrix-private-capability-000000001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-matrix",
+        "task_summary": "Exercise supervisor classifications",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-matrix",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/matrix"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-matrix",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-matrix",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "working",
+            "task_summary": "Exercise supervisor classifications",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-matrix",
+                "session_incarnation": "worker-matrix-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/matrix"],
+            "durable_refs": [],
+            "checkpoint": {
+                "revision": 2,
+                "summary": "Worker active",
+                "next_action": "Continue",
+                "updated_at": "2030-01-01T00:00:00Z"
+            },
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:00Z",
+            "updated_at": "2030-01-01T00:00:00Z"
+        }),
+        &packet,
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let supervise = || {
+        run_main_agent(
+            &main_checkout,
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "supervise",
+                "assignment-matrix",
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ],
+        )
+    };
+
+    let healthy = supervise();
+    assert_eq!(healthy.code, 0, "stderr={}", healthy.stderr_text());
+    assert_eq!(data(&healthy)["classification"], "healthy_progress");
+    assert_eq!(
+        data(&healthy)["last_proven_safe_state"]["assignment_revision"],
+        2
+    );
+
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "needs_input",
+        json!({
+            "provider_turn_id": "turn-matrix",
+            "started_at": "2030-01-01T00:00:01Z",
+            "attention": {
+                "kind": "permission",
+                "requested_at": "2030-01-01T00:00:02Z",
+                "pending_count": 1
+            }
+        }),
+        serde_json::Value::Null,
+    );
+    let dialog = supervise();
+    assert_eq!(data(&dialog)["classification"], "startup_dialog_failure");
+    assert_eq!(data(&dialog)["automatic_retry_safe"], false);
+
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-matrix",
+            "started_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "worker-matrix-lease",
+                "session_id": "worker-matrix",
+                "session_incarnation": "worker-matrix-incarnation",
+                "claim_id": "worker-matrix-claim",
+                "claim_revision": 1,
+                "operation": "test mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": "reconcile_pending",
+                "revision": 2,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": 1,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+    });
+    let uncertain = supervise();
+    assert_eq!(data(&uncertain)["classification"], "uncertain_mutation");
+    assert_eq!(data(&uncertain)["automatic_retry_safe"], false);
+
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"] = json!([]);
+    });
+    fs::write(
+        state_dir.join("sessions/worker-matrix/session.json"),
+        "{not-json",
+    )
+    .expect("corrupt worker record");
+    let unavailable = supervise();
+    assert_eq!(data(&unavailable)["classification"], "evidence_unavailable");
+    assert_eq!(data(&unavailable)["automatic_retry_safe"], false);
+    assert_eq!(
+        data(&unavailable)["last_proven_safe_state"]["evidence"]["session"]["state"],
+        "unavailable"
+    );
+
+    seed_session_at(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        &worker_checkout,
+        Some("enforce"),
+    );
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "starting",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-matrix"]["incarnation"] =
+            json!("worker-matrix-other-incarnation");
+    });
+    let broker_mismatch = supervise();
+    assert_eq!(
+        data(&broker_mismatch)["classification"],
+        "evidence_unavailable"
+    );
+    assert_eq!(
+        data(&broker_mismatch)["last_proven_safe_state"]["evidence"]["coordination"]["state"],
+        "identity_mismatch"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-matrix"]["incarnation"] = json!("worker-matrix-incarnation");
+    });
+
+    fs::write(
+        state_dir.join("sessions/worker-matrix/activity.json"),
+        "{not-json",
+    )
+    .expect("corrupt activity");
+    let activity_unavailable = supervise();
+    assert_eq!(
+        data(&activity_unavailable)["classification"],
+        "evidence_unavailable"
+    );
+    assert_eq!(
+        data(&activity_unavailable)["last_proven_safe_state"]["evidence"]["activity"]["state"],
+        "unavailable"
+    );
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "starting",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    let packet_digest = registry["assignments"]["assignment-matrix"]["private_packet_digest"]
+        .as_str()
+        .expect("packet digest")
+        .trim_start_matches("sha256:");
+    let packet_path = state_dir.join("orchestration/packets").join(packet_digest);
+    let packet_bytes = fs::read(&packet_path).expect("packet bytes");
+    fs::write(&packet_path, "{not-json").expect("corrupt packet");
+    let packet_unavailable = supervise();
+    assert_eq!(
+        data(&packet_unavailable)["classification"],
+        "evidence_unavailable"
+    );
+    assert_eq!(
+        data(&packet_unavailable)["last_proven_safe_state"]["evidence"]["packet"]["state"],
+        "unavailable"
+    );
+    fs::write(&packet_path, packet_bytes).expect("restore packet");
+
+    fs::remove_dir_all(state_dir.join("sessions/worker-matrix")).expect("remove worker session");
+    let unreachable = supervise();
+    assert_eq!(data(&unreachable)["classification"], "worker_unreachable");
+    assert_eq!(data(&unreachable)["automatic_retry_safe"], false);
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-matrix"];
+        assignment["state"] = json!("cancelled");
+        assignment["revision"] = json!(3);
+        assignment["worker"] = serde_json::Value::Null;
+        assignment["checkpoint"] = serde_json::Value::Null;
+    });
+    let safe = supervise();
+    assert_eq!(data(&safe)["classification"], "safe_reassignment");
+    assert_eq!(data(&safe)["automatic_retry_safe"], true);
+    let send_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "send-keys"))
+        .count();
+    assert_eq!(send_calls, 0, "supervision must never send terminal input");
 }
 
 #[test]
@@ -4971,6 +6260,13 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
                 "main-two",
                 "main-incarnation-two",
                 "main-private-capability-material-0000000002",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-handoff",
+                "worker-handoff-incarnation",
+                "worker-private-capability-material-handoff",
                 checkout.as_path(),
                 Some("enforce"),
             ),
@@ -5045,7 +6341,15 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
                 "task_summary": "Exercise relationship lifecycle",
                 "private_packet_digest": "replaced-by-fixture",
                 "primary_manager": main_one_controller,
-                "worker": null,
+                "worker": if assignment_id == "handoff-one" {
+                    json!({
+                        "session_id": "worker-handoff",
+                        "session_incarnation": "worker-handoff-incarnation",
+                        "session_created_at": "2030-01-01T00:00:00Z"
+                    })
+                } else {
+                    serde_json::Value::Null
+                },
                 "collaborators": [],
                 "borrowed_by": [],
                 "repository": "example/repository",
@@ -5122,6 +6426,108 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
     rewrite_registry(&state_dir, |registry| {
         registry["operations"] = json!([]);
     });
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["handoff-one"]["depends_on"] = json!(["adopt-one"]);
+    });
+    let own_dependency_blocked = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "handoff-one",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "handoff-own-dependency-blocked-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(own_dependency_blocked.code, 65);
+    assert_eq!(
+        own_dependency_blocked.stdout_json()["error"]["code"],
+        "handoff-dependency-conflict"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["handoff-one"]["depends_on"] = json!([]);
+        registry["assignments"]["adopt-one"]["depends_on"] = json!(["handoff-one"]);
+    });
+    let reverse_dependency_blocked = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "handoff-one",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "handoff-reverse-dependency-blocked-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(reverse_dependency_blocked.code, 65);
+    assert_eq!(
+        reverse_dependency_blocked.stdout_json()["error"]["code"],
+        "handoff-dependency-conflict"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["adopt-one"]["depends_on"] = json!([]);
+    });
+    let message_body = tmp.path().join("handoff-message.txt");
+    fs::write(&message_body, "target-owned routing only").expect("message body");
+    fs::set_permissions(&message_body, fs::Permissions::from_mode(0o600))
+        .expect("message body mode");
+    let routing_barrier = tmp.path().join("message-routing-barrier");
+    fs::create_dir(&routing_barrier).expect("routing barrier");
+    let racing_message = Command::new(bin::resolve("main-agent"))
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "handoff-one",
+            "--body-file",
+            message_body.to_str().expect("message body"),
+            "--idempotency-key",
+            "handoff-racing-source-message-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_MESSAGE_ROUTING_BARRIER_DIR",
+            &routing_barrier,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_MESSAGE_ROUTING_ASSIGNMENT",
+            "handoff-one",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_MESSAGE_ROUTING_WORKER",
+            "worker-handoff@worker-handoff-incarnation",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn racing source message");
+    let routing_deadline = Instant::now() + Duration::from_secs(2);
+    while !routing_barrier.join("ready").is_file() && Instant::now() < routing_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        routing_barrier.join("ready").is_file(),
+        "message did not pause between its routing read and commit authorization"
+    );
     let handed_off = run_main_agent(
         &checkout,
         &[
@@ -5145,6 +6551,167 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
         data(&handed_off)["assignment"]["primary_manager"]["session_id"],
         "main-two"
     );
+    assert_eq!(data(&handed_off)["assignment"]["run_id"], "run-two");
+    fs::write(routing_barrier.join("release"), b"continue").expect("release routing barrier");
+    let racing_message_output = racing_message
+        .wait_with_output()
+        .expect("racing source message output");
+    assert_eq!(racing_message_output.status.code(), Some(65));
+    let racing_message_envelope: serde_json::Value =
+        serde_json::from_slice(&racing_message_output.stdout).expect("racing message json");
+    assert_eq!(
+        racing_message_envelope["error"]["code"], "assignment-not-found",
+        "handoff must commit before the paused old routing view is authorized"
+    );
+    let after_race: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    assert!(
+        after_race["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|message| message["recipient_session_id"] != "worker-handoff"),
+        "the losing old routing view must not create a mailbox record"
+    );
+    let source_status = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "status",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert!(
+        data(&source_status)["assignments"]
+            .as_array()
+            .expect("source assignments")
+            .iter()
+            .all(|assignment| assignment["assignment_id"] != "handoff-one"),
+        "the source run must lose all routing authority after handoff"
+    );
+    let target_status = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "status",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)],
+    );
+    assert!(
+        data(&target_status)["assignments"]
+            .as_array()
+            .expect("target assignments")
+            .iter()
+            .any(|assignment| {
+                assignment["assignment_id"] == "handoff-one"
+                    && assignment["primary_manager"]["session_id"] == "main-two"
+            }),
+        "the target run must gain coherent routing authority after handoff"
+    );
+    let stale_source_message = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "handoff-one",
+            "--body-file",
+            message_body.to_str().expect("message body"),
+            "--idempotency-key",
+            "handoff-source-message-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(stale_source_message.code, 65);
+    assert_eq!(
+        stale_source_message.stdout_json()["error"]["code"],
+        "assignment-not-found"
+    );
+    let target_message = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "handoff-one",
+            "--body-file",
+            message_body.to_str().expect("message body"),
+            "--idempotency-key",
+            "handoff-target-message-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)],
+    );
+    assert_eq!(
+        target_message.code,
+        0,
+        "stderr={}",
+        target_message.stderr_text()
+    );
+    let coordination_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    let handoff_messages = coordination_registry["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| message["recipient_session_id"] == "worker-handoff")
+        .collect::<Vec<_>>();
+    assert_eq!(handoff_messages.len(), 1);
+    assert_eq!(handoff_messages[0]["sender_session_id"], "main-two");
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["adopt-one"]["submit_recovery"] = json!({
+            "schema_version": "main-agent.submit-recovery.v1",
+            "attempt_id": "adopt-recovery-attempt",
+            "origin": "automatic",
+            "session_incarnation": "worker-incarnation",
+            "reserved_revision": 1,
+            "state": "attempting",
+            "attempt_count": 1,
+            "result": "single guarded Enter reserved",
+            "attempted_at": "2030-01-01T00:00:02Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        });
+    });
+    let adopt_during_recovery = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "adopt",
+            "adopt-one",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "adopt-recovery-fenced-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)],
+    );
+    assert_eq!(adopt_during_recovery.code, 65);
+    assert_eq!(
+        adopt_during_recovery.stdout_json()["error"]["code"],
+        "submit-recovery-in-flight"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["adopt-one"]["submit_recovery"] = serde_json::Value::Null;
+    });
 
     fs::rename(
         state_dir.join("sessions/main-one"),
@@ -5750,6 +7317,40 @@ fn main_agent_worker_start_batch_isolates_per_lane_results() {
         "worker-start-source"
     );
 
+    // Batch is deliberately transport-only so a bounded lane count cannot
+    // multiply the single-assignment readiness deadline.
+    let batch_readiness = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--batch",
+            batch_dir.to_str().expect("batch dir"),
+            "--await-ready",
+            "1s",
+            "--idempotency-key",
+            "batch-readiness-conflict-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(batch_readiness.code, 0);
+    assert_eq!(
+        batch_readiness.stdout_json()["error"]["code"],
+        "parse-error"
+    );
+    assert!(
+        batch_readiness.stdout_json()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be used with"),
+        "unexpected clap conflict: {}",
+        batch_readiness.stdout_text()
+    );
+
     // An empty batch directory is rejected.
     let empty_dir = tmp.path().join("empty");
     fs::create_dir(&empty_dir).expect("empty dir");
@@ -5829,6 +7430,24 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let explicit_hook = tmp.path().join("explicit-recovery-contender");
+    let explicit_hook_output = tmp.path().join("explicit-recovery-contender.json");
+    fs::write(
+        &explicit_hook,
+        format!(
+            "#!/usr/bin/env sh\nset -eu\nAGENT_SESSION_CAPABILITY_FILE='{capability}' '{main_agent}' --state-dir '{state_dir}' worker submit-recovery assignment-await-ready --if-revision 2 --timeout 1s --idempotency-key explicit-race-automatic-0001 --format json > '{output}'\n",
+            capability = main_capability,
+            main_agent = bin::resolve("main-agent").display(),
+            state_dir = state_dir.display(),
+            output = explicit_hook_output.display(),
+        ),
+    )
+    .expect("explicit recovery hook");
+    fs::set_permissions(&explicit_hook, fs::Permissions::from_mode(0o700))
+        .expect("explicit recovery hook mode");
+    let explicit_hook_arg = explicit_hook.to_string_lossy().into_owned();
+    let enter_count_file = tmp.path().join("automatic-explicit-enter-count");
+    let enter_count_arg = enter_count_file.to_string_lossy().into_owned();
     let started = run_main_agent(
         &checkout,
         &[
@@ -5852,6 +7471,9 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
             ("AGENT_SESSION_CODEX_BIN", &codex_arg),
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &explicit_hook_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT", "2"),
         ],
     );
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
@@ -5900,10 +7522,1914 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
         enter_calls, 2,
         "initial submission plus exactly one recovery Enter"
     );
+    let hook_deadline = Instant::now() + Duration::from_secs(10);
+    while fs::metadata(&explicit_hook_output).map_or(true, |metadata| metadata.len() == 0)
+        && Instant::now() < hook_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let explicit_contender: serde_json::Value = serde_json::from_slice(
+        &fs::read(&explicit_hook_output).expect("explicit recovery contender output"),
+    )
+    .expect("explicit recovery contender json");
+    assert_eq!(explicit_contender["ok"], true);
+    assert!(
+        matches!(
+            explicit_contender["data"]["result"].as_str(),
+            Some("submit-recovery-send-outcome-unknown" | "checkpoint-timeout")
+        ),
+        "the observer may see the sender before or after its durable sent transition: {explicit_contender}"
+    );
+    let start_replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "1s",
+            "--idempotency-key",
+            "worker-start-await-ready-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(
+        start_replay.code,
+        0,
+        "stderr={}",
+        start_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&start_replay),
+        data(&started),
+        "an exact start retry must replay the durable readiness decision"
+    );
+    let prompt_loads = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "load-buffer"))
+        .count();
+    let prompt_pastes = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+        .count();
+    assert_eq!(
+        prompt_loads, 1,
+        "startup loads the prompt once and recovery must not add another"
+    );
+    assert_eq!(
+        prompt_pastes, 1,
+        "startup pastes the prompt once and recovery must not add another"
+    );
+
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    let assignment = &registry["assignments"]["assignment-await-ready"];
+    assert_eq!(assignment["submit_recovery"]["attempt_count"], 1);
+    assert_eq!(assignment["submit_recovery"]["state"], "failed");
+    assert_eq!(
+        assignment["submit_recovery"]["result"],
+        "checkpoint-timeout"
+    );
+    assert_eq!(
+        assignment["submit_recovery"]["session_incarnation"],
+        data(&started)["worker"]["session_incarnation"]
+    );
+    let revision = assignment["revision"]
+        .as_u64()
+        .expect("assignment revision");
+    let revision_arg = revision.to_string();
+    let explicit = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            "assignment-await-ready",
+            "--if-revision",
+            &revision_arg,
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "worker-explicit-after-automatic-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(explicit.code, 0, "stderr={}", explicit.stderr_text());
+    assert_eq!(data(&explicit)["checkpoint_confirmed"], false);
+    assert_eq!(
+        data(&explicit)["result"],
+        assignment["submit_recovery"]["result"]
+    );
+    let explicit_replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            "assignment-await-ready",
+            "--if-revision",
+            &revision_arg,
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "worker-explicit-after-automatic-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(data(&explicit_replay), data(&explicit));
+    let enter_calls_after_explicit = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls_after_explicit, 2,
+        "automatic and explicit recovery share one durable attempt"
+    );
 }
 
 #[test]
-fn main_agent_worker_start_single_enter_recovery_confirms_checkpoint() {
+fn main_agent_worker_start_concurrent_replays_join_one_readiness_finalizer() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_path = tmp.path().join("assignment-concurrent-readiness.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-concurrent-readiness",
+            "task_summary": "Join one durable readiness finalizer",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-concurrent-readiness",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let assignment_arg = assignment_path.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let spawn_start = || {
+        Command::new(bin::resolve("main-agent"))
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_arg.as_str(),
+                "--await-ready",
+                "3s",
+                "--idempotency-key",
+                "worker-start-concurrent-readiness-0001",
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+            .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn worker start")
+    };
+    let owner = spawn_start();
+    let progress_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let registry = orchestration_registry(&state_dir);
+        let pending = registry["receipts"].as_object().is_some_and(|receipts| {
+            receipts.values().any(|receipt| {
+                receipt["outcome"]["schema_version"]
+                    == "main-agent.worker-start-readiness-progress.v1"
+            })
+        });
+        if pending {
+            break;
+        }
+        assert!(
+            Instant::now() < progress_deadline,
+            "worker start never persisted readiness progress"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let observer = spawn_start();
+    let owner_output = owner.wait_with_output().expect("owner output");
+    let observer_output = observer.wait_with_output().expect("observer output");
+    assert!(
+        owner_output.status.success(),
+        "owner stderr={}",
+        String::from_utf8_lossy(&owner_output.stderr)
+    );
+    assert!(
+        observer_output.status.success(),
+        "observer stderr={}",
+        String::from_utf8_lossy(&observer_output.stderr)
+    );
+    let owner_envelope: serde_json::Value =
+        serde_json::from_slice(&owner_output.stdout).expect("owner json");
+    let observer_envelope: serde_json::Value =
+        serde_json::from_slice(&observer_output.stdout).expect("observer json");
+    assert_eq!(
+        owner_envelope["data"], observer_envelope["data"],
+        "concurrent exact retries must return one committed readiness outcome"
+    );
+    assert_eq!(
+        owner_envelope["data"]["readiness"]["state"],
+        "readiness_failed"
+    );
+    let calls = tmux_calls(&tmux_log);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "load-buffer"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "paste-buffer"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| {
+                call.first().is_some_and(|arg| arg == "send-keys")
+                    && call.last().is_some_and(|arg| arg == "Enter")
+            })
+            .count(),
+        2,
+        "one prompt Enter plus one durable recovery Enter"
+    );
+}
+
+#[test]
+fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boundary() {
+    for (case, expected_result) in [
+        (
+            "activity-dialog",
+            "worker-activity-not-authoritative-starting",
+        ),
+        ("broker-absent", "coordination-broker-unavailable"),
+        (
+            "broker-mismatch",
+            "coordination-broker-incarnation-conflict",
+        ),
+        ("broker-stopped", "coordination-broker-unavailable"),
+        (
+            "broker-capability-missing",
+            "coordination-broker-unavailable",
+        ),
+        ("broker-heartbeat-stale", "coordination-broker-unavailable"),
+        ("active-claim", "worker-not-quiescent"),
+        ("active-operation", "worker-not-quiescent"),
+        ("uncertain-operation", "worker-not-quiescent"),
+        ("main-claim-revoked", "claim-not-active"),
+        (
+            "worker-checkpoint-before-enter",
+            "authenticated worker checkpoint confirmed",
+        ),
+        ("account-next-queued", "codex-account-next-pending"),
+        ("account-bound-control", "checkpoint-timeout"),
+        ("account-bound-active-operation", "worker-not-quiescent"),
+        ("tmux-timeout", "submit-recovery-send-outcome-unknown"),
+        (
+            "tmux-timeout-terminal-reconcile",
+            "submit-recovery-send-outcome-unknown",
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let checkout = tmp.path().join("checkout");
+        let worker_checkout = tmp.path().join("worker-checkout");
+        fs::create_dir(&state_dir).expect("state");
+        init_checkout(&checkout, "https://example.invalid/example/repository.git");
+        init_checkout(
+            &worker_checkout,
+            "https://example.invalid/example/repository.git",
+        );
+        seed_brokers_at(
+            &state_dir,
+            &[(
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            )],
+        );
+        let main_capability =
+            init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let codex_bin = fake_agent(tmp.path(), "codex-worker");
+        let assignment_path = tmp.path().join("assignment-race.json");
+        write_private_json(
+            &assignment_path,
+            &json!({
+                "schema_version": "main-agent.assignment-input.v1",
+                "assignment_id": "assignment-race",
+                "task_summary": "Race a startup dialog against submit recovery",
+                "task": {},
+                "launch": {
+                    "agent": "codex",
+                    "cwd": worker_checkout,
+                    "title": null,
+                    "session_id": "worker-race",
+                    "coordination_mode": "enforce",
+                    "agent_args": []
+                },
+                "repository": "example/repository",
+                "worktree": worker_checkout,
+                "base_ref": "main",
+                "scopes": ["crates/worker-race"],
+                "durable_refs": []
+            }),
+        );
+        let state_arg = state_dir.to_string_lossy().into_owned();
+        let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+        let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+        let codex_arg = codex_bin.to_string_lossy().into_owned();
+        let envs = [
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ];
+        let started = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "0",
+                "--idempotency-key",
+                "worker-start-race-0001",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+        let worker_incarnation = data(&started)["worker"]["session_incarnation"]
+            .as_str()
+            .expect("worker incarnation")
+            .to_string();
+
+        let record_lock_path = state_dir.join("session-locks/worker-race.lock");
+        let record_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&record_lock_path)
+            .expect("worker record lock");
+        // SAFETY: the test owns this descriptor and releases it before dropping it.
+        assert_eq!(
+            unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        let recovery = Command::new(bin::resolve("main-agent"))
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "submit-recovery",
+                "assignment-race",
+                "--if-revision",
+                "2",
+                "--timeout",
+                "1s",
+                "--idempotency-key",
+                "worker-recovery-race-0001",
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+            .env(
+                "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+                if matches!(
+                    case,
+                    "account-bound-control" | "account-bound-active-operation"
+                ) {
+                    r#"["/configured/broker"]"#
+                } else {
+                    ""
+                },
+            )
+            .env(
+                "AGENT_SESSION_FAKE_TMUX_SEND_KEYS_SLEEP",
+                if case.starts_with("tmux-timeout") {
+                    "2"
+                } else {
+                    ""
+                },
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn submit recovery");
+        let reservation_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let registry: serde_json::Value = serde_json::from_slice(
+                &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+            )
+            .expect("registry json");
+            if !registry["assignments"]["assignment-race"]["submit_recovery"].is_null() {
+                break;
+            }
+            assert!(
+                Instant::now() < reservation_deadline,
+                "submit recovery did not reserve its attempt"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut account_state_before = None;
+        let mut auto_resume_state_before = None;
+        let mut proxy_capability_lease = None;
+        match case {
+            "activity-dialog" => seed_activity_state(
+                &state_dir,
+                "worker-race",
+                &worker_incarnation,
+                "needs_input",
+                json!({
+                    "provider_turn_id": "turn-race",
+                    "started_at": "2030-01-01T00:00:01Z",
+                    "last_progress_at": null,
+                    "attention": {
+                        "kind": "trust",
+                        "requested_at": "2030-01-01T00:00:02Z",
+                        "pending_count": 1
+                    }
+                }),
+                serde_json::Value::Null,
+            ),
+            "broker-absent" => rewrite_registry(&state_dir, |registry| {
+                registry["brokers"]
+                    .as_object_mut()
+                    .expect("brokers")
+                    .remove("worker-race");
+            }),
+            "broker-mismatch" => rewrite_registry(&state_dir, |registry| {
+                registry["brokers"]["worker-race"]["incarnation"] =
+                    json!("replacement-incarnation");
+            }),
+            "broker-stopped" => rewrite_registry(&state_dir, |registry| {
+                registry["brokers"]["worker-race"]["state"] = json!("stopped");
+            }),
+            "broker-capability-missing" => rewrite_registry(&state_dir, |registry| {
+                registry["brokers"]["worker-race"]["capability_digest"] = json!("");
+            }),
+            "broker-heartbeat-stale" => {
+                fs::remove_file(state_dir.join("sessions/worker-race/coordination/heartbeat"))
+                    .expect("remove heartbeat");
+            }
+            "active-claim" => seed_active_claim(
+                &state_dir,
+                "worker-race",
+                &worker_incarnation,
+                "worker-race-claim",
+            ),
+            "active-operation" => seed_operation(
+                &state_dir,
+                "worker-race",
+                &worker_incarnation,
+                "worker-race-active-operation",
+                "active",
+            ),
+            "uncertain-operation" => seed_operation(
+                &state_dir,
+                "worker-race",
+                &worker_incarnation,
+                "worker-race-uncertain-operation",
+                "reconcile_pending",
+            ),
+            "main-claim-revoked" => {
+                let shown = run(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "show",
+                        "--session",
+                        "main-one",
+                        "--capability-file",
+                        &main_capability,
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(shown.code, 0, "stderr={}", shown.stderr_text());
+                let claim = data(&shown);
+                let released = run(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "release",
+                        "--session",
+                        "main-one",
+                        "--claim",
+                        claim["claim_id"].as_str().expect("main claim id"),
+                        "--if-revision",
+                        &claim["revision"].to_string(),
+                        "--capability-file",
+                        &main_capability,
+                        "--idempotency-key",
+                        "release-main-authority-before-recovery-enter-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+            }
+            "worker-checkpoint-before-enter" => {
+                let worker_capability = capability(&state_dir, "worker-race");
+                let worker_candidate = tmp.path().join("worker-race-enter-race-claim.json");
+                candidate(
+                    &worker_candidate,
+                    "crates/worker-race",
+                    "Checkpoint before recovery Enter authorization",
+                );
+                let claimed = run(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "claim",
+                        "--session",
+                        "worker-race",
+                        "--file",
+                        worker_candidate.to_str().expect("worker candidate"),
+                        "--capability-file",
+                        &worker_capability,
+                        "--idempotency-key",
+                        "claim-worker-before-recovery-enter-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(claimed.code, 0, "stderr={}", claimed.stderr_text());
+                let checkpoint_path = tmp.path().join("worker-race-enter-race-checkpoint.json");
+                write_private_json(
+                    &checkpoint_path,
+                    &json!({
+                        "schema_version": "main-agent.checkpoint-input.v1",
+                        "summary": "Worker checkpoint won the recovery Enter race",
+                        "next_action": "Continue without recovery input",
+                        "state": "working",
+                        "result_summary": null,
+                        "blocker_summary": null
+                    }),
+                );
+                let checkpointed = run_main_agent(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "checkpoint",
+                        "--file",
+                        checkpoint_path.to_str().expect("checkpoint path"),
+                        "--if-revision",
+                        "3",
+                        "--idempotency-key",
+                        "worker-checkpoint-before-recovery-enter-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+                );
+                assert_eq!(
+                    checkpointed.code,
+                    0,
+                    "stderr={}",
+                    checkpointed.stderr_text()
+                );
+                let released = run(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "release",
+                        "--session",
+                        "worker-race",
+                        "--claim",
+                        data(&claimed)["context"]["claim_id"]
+                            .as_str()
+                            .expect("worker claim id"),
+                        "--if-revision",
+                        &data(&claimed)["context"]["revision"].to_string(),
+                        "--capability-file",
+                        &worker_capability,
+                        "--idempotency-key",
+                        "release-worker-before-recovery-enter-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+            }
+            "account-next-queued" => {
+                let worker_record_path = state_dir.join("sessions/worker-race/session.json");
+                let mut worker_record: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&worker_record_path).expect("worker session record"),
+                )
+                .expect("worker session json");
+                let queued = json!({
+                    "schema_version": "agent-session.codex-account-next.v1",
+                    "account": "poies",
+                    "revision": 1,
+                    "state": "queued",
+                    "updated_at": "2030-01-01T00:00:03Z"
+                });
+                worker_record["codex_account_next"] = queued.clone();
+                write_private_json(&worker_record_path, &worker_record);
+                account_state_before = Some(queued);
+            }
+            "account-bound-control" | "account-bound-active-operation" => {
+                let worker_record_path = state_dir.join("sessions/worker-race/session.json");
+                let mut worker_record: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&worker_record_path).expect("worker session record"),
+                )
+                .expect("worker session json");
+                let runtime_root = tmp.path().join("bound-control-runtime");
+                fs::create_dir(&runtime_root).expect("bound control runtime");
+                worker_record["runtime"]["kind"] = json!("codex_app_server");
+                worker_record["runtime"]["codex_app_server_protocol"] = json!("v2");
+                worker_record["runtime"]["codex_app_server_socket"] =
+                    json!(runtime_root.join("codex.sock"));
+                worker_record["runtime"]["codex_app_server_proxy"] =
+                    json!(runtime_root.join("codex-proxy.sock"));
+                worker_record["runtime"]["codex_app_server_thread_handoff"] =
+                    json!(runtime_root.join("thread-handoff"));
+                worker_record["runtime"]["codex_app_server_thread_attached"] =
+                    json!(runtime_root.join("thread-attached"));
+                let binding = json!({
+                    "schema_version": "agent-session.codex-account-binding.v1",
+                    "selected_account": "gamania",
+                    "revision": 1,
+                    "state": "bound",
+                    "applied_runtime_id": worker_incarnation,
+                    "updated_at": "2030-01-01T00:00:03Z"
+                });
+                worker_record["codex_account_binding"] = binding.clone();
+                write_private_json(&worker_record_path, &worker_record);
+                account_state_before = Some(binding);
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_millis() as u64;
+                let capability_path =
+                    state_dir.join("sessions/worker-race/.codex-app-server-proxy-capability");
+                write_private_json(
+                    &capability_path,
+                    &json!({
+                        "schema_version": "agent-session.codex-manual-input-proxy.v1",
+                        "launch_id": worker_incarnation,
+                        "token": "00000000-0000-4000-8000-000000000001",
+                        "owner_pid": std::process::id(),
+                        "expires_at_epoch_ms": now_ms + 60_000
+                    }),
+                );
+                let lease = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&capability_path)
+                    .expect("proxy capability lease");
+                // SAFETY: the test owns this descriptor until recovery exits.
+                assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_SH) }, 0);
+                proxy_capability_lease = Some(lease);
+                if case == "account-bound-active-operation" {
+                    seed_operation(
+                        &state_dir,
+                        "worker-race",
+                        &worker_incarnation,
+                        "worker-race-bound-active-operation",
+                        "active",
+                    );
+                    let auto_resume = json!({
+                        "schema_version": "agent-session.auto-resume.v1",
+                        "enabled": true,
+                        "state": "armed",
+                        "updated_at": "2030-01-01T00:00:03Z",
+                        "scheduled_at": null,
+                        "next_check_at": null,
+                        "failure_reason": null,
+                        "blocked_turn_id": "turn-before-recovery",
+                        "blocked_revision": 1,
+                        "attempt": 0,
+                        "ever_scheduled": false,
+                        "fallback_schedules": 0
+                    });
+                    write_private_json(
+                        &state_dir.join("sessions/worker-race/auto-resume.json"),
+                        &auto_resume,
+                    );
+                    auto_resume_state_before = Some(auto_resume);
+                }
+            }
+            "tmux-timeout" | "tmux-timeout-terminal-reconcile" => {}
+            _ => unreachable!(),
+        }
+        // SAFETY: the test owns the locked descriptor.
+        assert_eq!(
+            unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        let output = recovery.wait_with_output().expect("submit recovery output");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("submit recovery json");
+        assert_eq!(
+            envelope["data"]["checkpoint_confirmed"],
+            case == "worker-checkpoint-before-enter"
+        );
+        assert_eq!(envelope["data"]["result"], expected_result, "case={case}");
+        let enter_calls = tmux_calls(&tmux_log)
+            .into_iter()
+            .filter(|call| {
+                call.first().is_some_and(|arg| arg == "send-keys")
+                    && call.last().is_some_and(|arg| arg == "Enter")
+            })
+            .count();
+        assert_eq!(
+            enter_calls,
+            if case.starts_with("tmux-timeout") || case == "account-bound-control" {
+                2
+            } else {
+                1
+            },
+            "{case} must preserve exactly-once recovery input"
+        );
+        if case == "account-next-queued" {
+            let registry = orchestration_registry(&state_dir);
+            assert_eq!(
+                registry["assignments"]["assignment-race"]["submit_recovery"]["state"],
+                "failed"
+            );
+            assert_eq!(
+                registry["assignments"]["assignment-race"]["submit_recovery"]["result"],
+                "codex-account-next-pending"
+            );
+            let replay = run_main_agent(
+                &checkout,
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "worker",
+                    "submit-recovery",
+                    "assignment-race",
+                    "--if-revision",
+                    "2",
+                    "--timeout",
+                    "1s",
+                    "--idempotency-key",
+                    "worker-recovery-race-0001",
+                    "--format",
+                    "json",
+                ],
+                &envs,
+            );
+            assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+            assert_eq!(
+                data(&replay),
+                envelope["data"],
+                "the fenced recovery reservation must replay without input"
+            );
+            assert_eq!(
+                tmux_calls(&tmux_log)
+                    .into_iter()
+                    .filter(|call| {
+                        call.first().is_some_and(|arg| arg == "send-keys")
+                            && call.last().is_some_and(|arg| arg == "Enter")
+                    })
+                    .count(),
+                1,
+                "a queued account intent must fence every recovery replay"
+            );
+        }
+        if let Some(expected_account_state) = account_state_before {
+            let worker_record: serde_json::Value = serde_json::from_slice(
+                &fs::read(state_dir.join("sessions/worker-race/session.json"))
+                    .expect("worker session record"),
+            )
+            .expect("worker session json");
+            let actual = if case == "account-next-queued" {
+                &worker_record["codex_account_next"]
+            } else {
+                &worker_record["codex_account_binding"]
+            };
+            assert_eq!(
+                actual, &expected_account_state,
+                "submit recovery must not mutate durable account intent"
+            );
+            if case == "account-bound-active-operation" {
+                assert!(
+                    worker_record.get("codex_account_input_fence").is_none(),
+                    "a rejected pre-send recovery must not persist an input fence"
+                );
+            }
+        }
+        if let Some(expected_auto_resume) = auto_resume_state_before {
+            let actual: serde_json::Value = serde_json::from_slice(
+                &fs::read(state_dir.join("sessions/worker-race/auto-resume.json"))
+                    .expect("auto-resume state"),
+            )
+            .expect("auto-resume json");
+            assert_eq!(
+                actual, expected_auto_resume,
+                "a rejected pre-send recovery must not cancel auto-resume"
+            );
+        }
+        drop(proxy_capability_lease);
+        if case.starts_with("tmux-timeout") {
+            let registry = orchestration_registry(&state_dir);
+            assert_eq!(
+                registry["assignments"]["assignment-race"]["submit_recovery"]["state"],
+                "attempting",
+                "an ambiguous tmux outcome must preserve the mutation fence"
+            );
+            let relationship = run_main_agent(
+                &checkout,
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "collaborate",
+                    "assignment-race",
+                    "--session",
+                    "main-one@main-incarnation-one",
+                    "--if-revision",
+                    "3",
+                    "--idempotency-key",
+                    "collaborate-after-unknown-send-0001",
+                    "--format",
+                    "json",
+                ],
+                &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+            );
+            assert_eq!(relationship.code, 65);
+            assert_eq!(
+                relationship.stdout_json()["error"]["code"],
+                "submit-recovery-in-flight"
+            );
+            let replay_args = [
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "submit-recovery",
+                "assignment-race",
+                "--if-revision",
+                "2",
+                "--timeout",
+                "1s",
+                "--idempotency-key",
+                "worker-recovery-race-0001",
+                "--format",
+                "json",
+            ];
+            let unknown_replay = run_main_agent(
+                &checkout,
+                &replay_args,
+                &[
+                    ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                    ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                    ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ],
+            );
+            assert_eq!(unknown_replay.code, 0);
+            assert_eq!(
+                data(&unknown_replay)["result"],
+                "submit-recovery-send-outcome-unknown"
+            );
+            assert_eq!(
+                tmux_calls(&tmux_log)
+                    .into_iter()
+                    .filter(|call| {
+                        call.first().is_some_and(|arg| arg == "send-keys")
+                            && call.last().is_some_and(|arg| arg == "Enter")
+                    })
+                    .count(),
+                2,
+                "observer replay cannot send another Enter"
+            );
+            if case == "tmux-timeout-terminal-reconcile" {
+                let worker_record_path = state_dir.join("sessions/worker-race/session.json");
+                let mut worker_record: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&worker_record_path).expect("worker session record"),
+                )
+                .expect("worker session json");
+                worker_record["delete_tmux_identity"] = json!({
+                    "launch_id": worker_incarnation,
+                    "session_id": "$77",
+                    "pane_id": "%77",
+                    "pane_pid": 2_000_000_000,
+                    "process_group_id": 2_000_000_000
+                });
+                write_private_json(&worker_record_path, &worker_record);
+                for quiescence_case in ["active-claim", "active-operation", "uncertain-operation"] {
+                    match quiescence_case {
+                        "active-claim" => seed_active_claim(
+                            &state_dir,
+                            "worker-race",
+                            &worker_incarnation,
+                            "worker-reconcile-active-claim",
+                        ),
+                        "active-operation" => seed_operation(
+                            &state_dir,
+                            "worker-race",
+                            &worker_incarnation,
+                            "worker-reconcile-active-operation",
+                            "active",
+                        ),
+                        "uncertain-operation" => seed_operation(
+                            &state_dir,
+                            "worker-race",
+                            &worker_incarnation,
+                            "worker-reconcile-uncertain-operation",
+                            "reconcile_pending",
+                        ),
+                        _ => unreachable!(),
+                    }
+                    let refused = run_main_agent(
+                        &checkout,
+                        &[
+                            "--state-dir",
+                            &state_arg,
+                            "worker",
+                            "reconcile-recovery",
+                            "assignment-race",
+                            "--if-revision",
+                            "3",
+                            "--idempotency-key",
+                            &format!("refuse-{quiescence_case}-recovery-0001"),
+                            "--format",
+                            "json",
+                        ],
+                        &[
+                            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                        ],
+                    );
+                    assert_eq!(refused.code, 65, "case={quiescence_case}");
+                    assert_eq!(
+                        refused.stdout_json()["error"]["code"],
+                        "worker-not-quiescent"
+                    );
+                    assert_eq!(
+                        orchestration_registry(&state_dir)["assignments"]["assignment-race"]["revision"],
+                        3,
+                        "quiescence refusal must not terminalize recovery"
+                    );
+                    rewrite_registry(&state_dir, |registry| {
+                        registry["claims"]
+                            .as_array_mut()
+                            .expect("claims")
+                            .retain(|claim| claim["session_id"] != "worker-race");
+                        registry["operations"]
+                            .as_array_mut()
+                            .expect("operations")
+                            .retain(|operation| operation["session_id"] != "worker-race");
+                    });
+                }
+                worker_record["delete_tmux_identity"] = json!({
+                    "launch_id": worker_incarnation,
+                    "session_id": "$77",
+                    "pane_id": "%77",
+                    "pane_pid": 2_000_000_000
+                });
+                write_private_json(&worker_record_path, &worker_record);
+                let incomplete_runtime = run_main_agent(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "worker",
+                        "reconcile-recovery",
+                        "assignment-race",
+                        "--if-revision",
+                        "3",
+                        "--idempotency-key",
+                        "refuse-incomplete-runtime-recovery-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(incomplete_runtime.code, 1);
+                assert_eq!(
+                    incomplete_runtime.stdout_json()["error"]["code"],
+                    "coordination-runtime-unverified"
+                );
+                worker_record["delete_tmux_identity"] = json!({
+                    "launch_id": worker_incarnation,
+                    "session_id": "$77",
+                    "pane_id": "%77",
+                    "pane_pid": std::process::id(),
+                    "process_group_id": unsafe { libc::getpgrp() }
+                });
+                write_private_json(&worker_record_path, &worker_record);
+                let live_runtime = run_main_agent(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "worker",
+                        "reconcile-recovery",
+                        "assignment-race",
+                        "--if-revision",
+                        "3",
+                        "--idempotency-key",
+                        "refuse-live-unknown-recovery-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(live_runtime.code, 65);
+                assert_eq!(
+                    live_runtime.stdout_json()["error"]["code"],
+                    "submit-recovery-runtime-still-live"
+                );
+                worker_record["delete_tmux_identity"] = json!({
+                    "launch_id": worker_incarnation,
+                    "session_id": "$77",
+                    "pane_id": "%77",
+                    "pane_pid": 2_000_000_000,
+                    "process_group_id": 2_000_000_000
+                });
+                write_private_json(&worker_record_path, &worker_record);
+                let reconciled = run_main_agent(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "worker",
+                        "reconcile-recovery",
+                        "assignment-race",
+                        "--if-revision",
+                        "3",
+                        "--idempotency-key",
+                        "reconcile-stopped-unknown-recovery-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+                assert_eq!(data(&reconciled)["reconciled"], true);
+                assert_eq!(data(&reconciled)["input_sent"], false);
+                assert_eq!(
+                    data(&reconciled)["assignment"]["submit_recovery"]["state"],
+                    "reconciled"
+                );
+                assert_eq!(data(&reconciled)["proof"]["worker_runtime"], "stopped");
+                assert_eq!(data(&reconciled)["proof"]["coordination"], "quiescent");
+                let replay_started = Instant::now();
+                let terminal_replay = run_main_agent(
+                    &checkout,
+                    &replay_args,
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                    ],
+                );
+                assert_eq!(
+                    terminal_replay.code,
+                    0,
+                    "outcome={}",
+                    terminal_replay.stdout_text()
+                );
+                assert!(
+                    replay_started.elapsed() < Duration::from_millis(500),
+                    "reconciled replay must not wait for the original timeout"
+                );
+                assert_eq!(
+                    data(&terminal_replay)["result"],
+                    "worker-runtime-stopped-without-checkpoint"
+                );
+                assert_eq!(
+                    data(&terminal_replay)["assignment"]["submit_recovery"]["state"],
+                    "reconciled"
+                );
+                assert_eq!(data(&terminal_replay)["assignment"]["revision"], 4);
+                assert_eq!(
+                    tmux_calls(&tmux_log)
+                        .into_iter()
+                        .filter(|call| {
+                            call.first().is_some_and(|arg| arg == "send-keys")
+                                && call.last().is_some_and(|arg| arg == "Enter")
+                        })
+                        .count(),
+                    2,
+                    "terminal reconciliation must never resend Enter"
+                );
+                let worker_capability = capability(&state_dir, "worker-race");
+                let stopped_broker = run(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "broker",
+                        "stop",
+                        "--session",
+                        "worker-race",
+                        "--capability-file",
+                        &worker_capability,
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(
+                    stopped_broker.code,
+                    0,
+                    "stderr={}",
+                    stopped_broker.stderr_text()
+                );
+                assert_eq!(data(&stopped_broker)["state"], "stopped");
+                let stopped_registry: serde_json::Value = serde_json::from_slice(
+                    &fs::read(state_dir.join("coordination/registry.json"))
+                        .expect("coordination registry"),
+                )
+                .expect("coordination registry json");
+                assert_eq!(
+                    stopped_registry["brokers"]["worker-race"]["state"],
+                    "stopped"
+                );
+                assert_eq!(
+                    stopped_registry["brokers"]["worker-race"]["capability_digest"],
+                    ""
+                );
+                let cancel_barrier = tmp.path().join("cancel-authority-barrier");
+                fs::create_dir(&cancel_barrier).expect("cancel barrier");
+                let cancel_barrier_arg = cancel_barrier.to_string_lossy().into_owned();
+                let mut raced_cancel = Command::new(bin::resolve("main-agent"));
+                raced_cancel
+                    .current_dir(&checkout)
+                    .args([
+                        "--state-dir",
+                        state_arg.as_str(),
+                        "worker",
+                        "cancel",
+                        "assignment-race",
+                        "--if-revision",
+                        "4",
+                        "--reason",
+                        "race terminal cancellation against controller claim release",
+                        "--idempotency-key",
+                        "cancel-after-terminal-reconcile-claim-race-0001",
+                        "--format",
+                        "json",
+                    ])
+                    .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+                    .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+                    .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+                    .env("AGENT_SESSION_FAKE_TMUX_ABSENT", "1")
+                    .env(
+                        "NILS_AGENT_SESSION_TEST_WORKER_CANCEL_BARRIER_DIR",
+                        &cancel_barrier_arg,
+                    )
+                    .env(
+                        "NILS_AGENT_SESSION_TEST_WORKER_CANCEL_ASSIGNMENT",
+                        "assignment-race",
+                    )
+                    .env(
+                        "NILS_AGENT_SESSION_TEST_WORKER_CANCEL_WORKER",
+                        format!("worker-race@{worker_incarnation}"),
+                    )
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let raced_cancel = raced_cancel.spawn().expect("spawn raced cancel");
+                let cancel_ready_deadline = Instant::now() + Duration::from_secs(10);
+                while !cancel_barrier.join("ready").is_file() {
+                    assert!(
+                        Instant::now() < cancel_ready_deadline,
+                        "worker cancel did not reach its admission barrier"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let shown = run(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "show",
+                        "--session",
+                        "main-one",
+                        "--capability-file",
+                        &main_capability,
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(shown.code, 0, "stderr={}", shown.stderr_text());
+                let main_claim = data(&shown);
+                let released_main = run(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "release",
+                        "--session",
+                        "main-one",
+                        "--claim",
+                        main_claim["claim_id"].as_str().expect("main claim id"),
+                        "--if-revision",
+                        &main_claim["revision"].to_string(),
+                        "--capability-file",
+                        &main_capability,
+                        "--idempotency-key",
+                        "release-main-during-terminal-cancel-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(
+                    released_main.code,
+                    0,
+                    "stderr={}",
+                    released_main.stderr_text()
+                );
+                fs::write(cancel_barrier.join("release"), b"release")
+                    .expect("release cancel barrier");
+                let raced_cancel = raced_cancel
+                    .wait_with_output()
+                    .expect("raced cancel output");
+                assert_eq!(raced_cancel.status.code(), Some(65));
+                let raced_cancel_envelope: serde_json::Value =
+                    serde_json::from_slice(&raced_cancel.stdout).expect("raced cancel json");
+                assert_eq!(raced_cancel_envelope["error"]["code"], "claim-not-active");
+                assert_eq!(
+                    orchestration_registry(&state_dir)["assignments"]["assignment-race"]["revision"],
+                    4,
+                    "claim-loss race must not mutate the assignment"
+                );
+                assert_eq!(
+                    orchestration_registry(&state_dir)["assignments"]["assignment-race"]["state"],
+                    "starting",
+                    "claim-loss race must preserve the assignment lifecycle state"
+                );
+                let main_reclaim = tmp.path().join("main-reclaim-after-cancel-race.json");
+                candidate(
+                    &main_reclaim,
+                    "crates/agent-session",
+                    "Reclaim Main Agent authority after cancellation race",
+                );
+                let reclaimed_main = run(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "claim",
+                        "--session",
+                        "main-one",
+                        "--file",
+                        main_reclaim.to_str().expect("main reclaim"),
+                        "--capability-file",
+                        &main_capability,
+                        "--idempotency-key",
+                        "reclaim-main-after-terminal-cancel-race-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(
+                    reclaimed_main.code,
+                    0,
+                    "stderr={}",
+                    reclaimed_main.stderr_text()
+                );
+                let cancelled = run_main_agent(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "worker",
+                        "cancel",
+                        "assignment-race",
+                        "--if-revision",
+                        "4",
+                        "--reason",
+                        "terminally reconciled pre-claim runtime stopped",
+                        "--idempotency-key",
+                        "cancel-after-terminal-reconcile-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(cancelled.code, 0, "outcome={}", cancelled.stdout_text());
+                assert_eq!(data(&cancelled)["assignment"]["state"], "cancelled");
+                let retired = run_main_agent(
+                    &checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "worker",
+                        "retire",
+                        "assignment-race",
+                        "--if-revision",
+                        "5",
+                        "--idempotency-key",
+                        "retire-after-terminal-reconcile-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(retired.code, 0, "outcome={}", retired.stdout_text());
+                assert_eq!(data(&retired)["retired"], true);
+                continue;
+            }
+            let worker_capability = capability(&state_dir, "worker-race");
+            let worker_candidate = tmp.path().join("worker-race-claim.json");
+            candidate(
+                &worker_candidate,
+                "crates/worker-race",
+                "Reconcile the ambiguous recovery through an authenticated checkpoint",
+            );
+            let claimed = run(
+                &worker_checkout,
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "work-context",
+                    "claim",
+                    "--session",
+                    "worker-race",
+                    "--file",
+                    worker_candidate.to_str().expect("worker candidate"),
+                    "--capability-file",
+                    &worker_capability,
+                    "--idempotency-key",
+                    "claim-worker-after-ambiguous-recovery-0001",
+                    "--format",
+                    "json",
+                ],
+            );
+            assert_eq!(claimed.code, 0, "stderr={}", claimed.stderr_text());
+            let checkpoint_path = tmp.path().join("worker-race-checkpoint.json");
+            write_private_json(
+                &checkpoint_path,
+                &json!({
+                    "schema_version": "main-agent.checkpoint-input.v1",
+                    "summary": "Authenticated worker checkpoint after ambiguous Enter",
+                    "next_action": "Continue without resending input",
+                    "state": "working",
+                    "result_summary": null,
+                    "blocker_summary": null
+                }),
+            );
+            let checkpointed = run_main_agent(
+                &worker_checkout,
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "checkpoint",
+                    "--file",
+                    checkpoint_path.to_str().expect("checkpoint path"),
+                    "--if-revision",
+                    "3",
+                    "--idempotency-key",
+                    "worker-checkpoint-after-ambiguous-recovery-0001",
+                    "--format",
+                    "json",
+                ],
+                &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+            );
+            assert_eq!(
+                checkpointed.code,
+                0,
+                "stderr={}",
+                checkpointed.stderr_text()
+            );
+            let confirmed = run_main_agent(
+                &checkout,
+                &replay_args,
+                &[
+                    ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                    ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                    ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ],
+            );
+            assert_eq!(confirmed.code, 0, "stderr={}", confirmed.stderr_text());
+            assert_eq!(data(&confirmed)["checkpoint_confirmed"], true);
+            assert_eq!(
+                data(&confirmed)["assignment"]["submit_recovery"]["state"],
+                "checkpoint_confirmed"
+            );
+            let confirmed_replay = run_main_agent(
+                &checkout,
+                &replay_args,
+                &[
+                    ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                    ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                    ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ],
+            );
+            assert_eq!(data(&confirmed_replay), data(&confirmed));
+        }
+    }
+}
+
+#[test]
+fn main_agent_submit_recovery_fences_concurrent_manager_mutations_until_resolved() {
+    for transition in ["cancel", "handoff", "collaborate", "borrow"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let checkout = tmp.path().join("checkout");
+        let worker_checkout = tmp.path().join("worker-checkout");
+        fs::create_dir(&state_dir).expect("state");
+        init_checkout(&checkout, "https://example.invalid/example/repository.git");
+        init_checkout(
+            &worker_checkout,
+            "https://example.invalid/example/repository.git",
+        );
+        seed_brokers_at(
+            &state_dir,
+            &[
+                (
+                    "main-one",
+                    "main-incarnation-one",
+                    "main-private-capability-material-0000000001",
+                    checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "main-two",
+                    "main-incarnation-two",
+                    "main-private-capability-material-0000000002",
+                    checkout.as_path(),
+                    Some("enforce"),
+                ),
+            ],
+        );
+        let main_capability =
+            init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+        if transition == "handoff" {
+            rewrite_orchestration_registry(&state_dir, |registry| {
+                let mut run_two = registry["runs"]["run-one"].clone();
+                let mut controller = run_two["controller"].clone();
+                run_two["run_id"] = json!("run-two");
+                controller["session_id"] = json!("main-two");
+                controller["session_incarnation"] = json!("main-incarnation-two");
+                run_two["controller"] = controller;
+                registry["runs"]["run-two"] = run_two;
+            });
+        }
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let codex_bin = fake_agent(tmp.path(), "codex-worker");
+        let assignment_path = tmp.path().join("assignment-transition.json");
+        write_private_json(
+            &assignment_path,
+            &json!({
+                "schema_version": "main-agent.assignment-input.v1",
+                "assignment_id": "assignment-transition",
+                "task_summary": "Reject manager transitions as worker checkpoints",
+                "task": {},
+                "launch": {
+                    "agent": "codex",
+                    "cwd": worker_checkout,
+                    "title": null,
+                    "session_id": "worker-transition",
+                    "coordination_mode": "enforce",
+                    "agent_args": []
+                },
+                "repository": "example/repository",
+                "worktree": worker_checkout,
+                "base_ref": "main",
+                "scopes": ["docs/transition"],
+                "durable_refs": []
+            }),
+        );
+        let state_arg = state_dir.to_string_lossy().into_owned();
+        let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+        let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+        let codex_arg = codex_bin.to_string_lossy().into_owned();
+        let started = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "0",
+                "--idempotency-key",
+                "worker-start-transition-0001",
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ],
+        );
+        assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+        if transition == "cancel" {
+            rewrite_orchestration_registry(&state_dir, |registry| {
+                registry["assignments"]["assignment-transition"]["blocker_summary"] =
+                    json!("[pre-claim:test] deterministic concurrent cancellation");
+            });
+        }
+
+        let hook = tmp.path().join("transition-on-recovery-enter");
+        let hook_output = tmp.path().join("transition-output.json");
+        let transition_args = match transition {
+            "cancel" => {
+                "worker cancel assignment-transition --if-revision 3 --reason concurrent-cancel --idempotency-key concurrent-cancel-0001"
+            }
+            "handoff" => {
+                "handoff assignment-transition --to main-two@main-incarnation-two --if-revision 3 --idempotency-key concurrent-handoff-0001"
+            }
+            "collaborate" => {
+                "collaborate assignment-transition --session main-two@main-incarnation-two --if-revision 3 --idempotency-key concurrent-collaborate-0001"
+            }
+            "borrow" => {
+                "borrow assignment-transition --session main-two@main-incarnation-two --duration 5m --if-revision 3 --idempotency-key concurrent-borrow-0001"
+            }
+            _ => unreachable!(),
+        };
+        fs::write(
+            &hook,
+            format!(
+                "#!/usr/bin/env sh\nset -eu\nAGENT_SESSION_CAPABILITY_FILE='{main_capability}' '{main_agent}' --state-dir '{state_dir}' {transition_args} --format json > '{output}'\n",
+                main_capability = main_capability,
+                main_agent = bin::resolve("main-agent").display(),
+                state_dir = state_dir.display(),
+                transition_args = transition_args,
+                output = hook_output.display(),
+            ),
+        )
+        .expect("transition hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
+        let hook_arg = hook.to_string_lossy().into_owned();
+        let enter_count = tmp.path().join("transition-enter-count");
+        let enter_count_arg = enter_count.to_string_lossy().into_owned();
+        let recovered = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                "submit-recovery",
+                "assignment-transition",
+                "--if-revision",
+                "2",
+                "--timeout",
+                "1s",
+                "--idempotency-key",
+                "submit-recovery-transition-0001",
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &hook_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT", "1"),
+            ],
+        );
+        assert_eq!(recovered.code, 0, "stderr={}", recovered.stderr_text());
+        let hook_deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&hook_output).map_or(true, |metadata| metadata.len() == 0)
+            && Instant::now() < hook_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let hook_envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&hook_output).expect("transition hook output"))
+                .expect("transition hook json");
+        assert_eq!(
+            hook_envelope["ok"], false,
+            "transition={transition}, envelope={hook_envelope}"
+        );
+        assert_eq!(
+            hook_envelope["error"]["code"], "submit-recovery-in-flight",
+            "transition={transition}, envelope={hook_envelope}"
+        );
+        assert_eq!(data(&recovered)["checkpoint_confirmed"], false);
+        assert_eq!(data(&recovered)["result"], "checkpoint-timeout");
+        assert_eq!(data(&recovered)["assignment"]["state"], "starting");
+        assert_eq!(
+            data(&recovered)["assignment"]["primary_manager"]["session_id"],
+            "main-one",
+            "a losing transition cannot change authority"
+        );
+    }
+}
+
+#[test]
+fn main_agent_worker_start_await_ready_stops_on_authoritative_terminal_turns() {
+    for kind in ["turn_completed", "turn_failed"] {
+        assert_main_agent_worker_start_stops_on_authoritative_turn(kind);
+    }
+}
+
+fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let worker_id = "worker-authoritative-complete";
+    let assignment_path = tmp.path().join("assignment-authoritative-complete.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-authoritative-complete",
+            "task_summary": "Stop readiness after the provider turn terminates",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/worker-lane"],
+            "durable_refs": []
+        }),
+    );
+
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let start = Command::new(bin::resolve("main-agent"))
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "4s",
+            "--idempotency-key",
+            "worker-start-authoritative-complete-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn worker start");
+
+    let worker_record_path = state_dir.join(format!("sessions/{worker_id}/session.json"));
+    let wait_deadline = Instant::now() + Duration::from_secs(10);
+    while !worker_record_path.is_file() && Instant::now() < wait_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
+            .expect("worker session json");
+    let runtime_id = worker_record["runtime"]["launch_id"]
+        .as_str()
+        .expect("worker runtime id");
+    let event = json!({
+        "schema_version": "agent-session.turn-event.v1",
+        "event_id": "worker-authoritative-complete-event",
+        "runtime_id": runtime_id,
+        "provider": "codex",
+        "provider_session_id": "provider-session",
+        "kind": kind,
+        "confidence": "authoritative"
+    })
+    .to_string();
+    let mut event_command = Command::new(bin::resolve("agent-session"))
+        .current_dir(tmp.path())
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "activity",
+            "event",
+            worker_id,
+            "--stdin",
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn authoritative completion event");
+    event_command
+        .stdin
+        .as_mut()
+        .expect("event stdin")
+        .write_all(event.as_bytes())
+        .expect("write completion event");
+    let event_output = event_command.wait_with_output().expect("completion event");
+    assert!(
+        event_output.status.success(),
+        "event stdout={} stderr={}",
+        String::from_utf8_lossy(&event_output.stdout),
+        String::from_utf8_lossy(&event_output.stderr)
+    );
+
+    let event_ingested_at = Instant::now();
+    let output = start.wait_with_output().expect("worker start output");
+    let completion_after_ingest = event_ingested_at.elapsed();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        completion_after_ingest < Duration::from_millis(1_500),
+        "{kind} should end readiness well before the 4s outer timeout; elapsed={completion_after_ingest:?}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("worker start json");
+    let readiness = &envelope["data"]["readiness"];
+    assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(
+        readiness["classification"],
+        "submitted_or_waiting_without_checkpoint"
+    );
+    assert_eq!(
+        readiness["delivery"]["proof"],
+        "authoritative-provider-turn-terminated"
+    );
+    let enter_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls, 1,
+        "provider termination forbids the recovery Enter"
+    );
+    let supervised = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "supervise",
+            "assignment-authoritative-complete",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(supervised.code, 0, "stderr={}", supervised.stderr_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "submitted_or_waiting_without_checkpoint"
+    );
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["reassignment_safe"],
+        true
+    );
+}
+
+#[test]
+fn main_agent_worker_start_single_enter_recovery_survives_immediate_acceptance() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
@@ -5960,6 +9486,9 @@ fn main_agent_worker_start_single_enter_recovery_confirms_checkpoint() {
     let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
     let enter_hook = tmp.path().join("bootstrap-on-second-enter");
     let enter_hook_output = tmp.path().join("bootstrap-on-second-enter.json");
+    let submitted_checkpoint = tmp.path().join("submitted-on-second-enter.json");
+    let checkpoint_output = tmp.path().join("checkpoint-on-second-enter.json");
+    let accept_output = tmp.path().join("accept-on-second-enter.json");
     fs::write(
         &enter_hook,
         format!(
@@ -5976,6 +9505,18 @@ cd {worker_checkout}
 AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
   {main_agent} --state-dir {state_dir} bootstrap \
   --idempotency-key {bootstrap_key} --format json > {output}
+cat > {submitted_checkpoint} <<'JSON'
+{{"schema_version":"main-agent.checkpoint-input.v1","summary":"Worker submitted immediately after recovery","next_action":"Manager acceptance","state":"submitted","result_summary":"ready for acceptance","blocker_summary":null}}
+JSON
+chmod 600 {submitted_checkpoint}
+AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+  {main_agent} --state-dir {state_dir} checkpoint \
+  --file {submitted_checkpoint} --if-revision 4 \
+  --idempotency-key checkpoint-after-recovery-0001 --format json > {checkpoint_output}
+AGENT_SESSION_CAPABILITY_FILE={main_capability} \
+  {main_agent} --state-dir {state_dir} worker accept {assignment_id} \
+  --if-revision 5 --idempotency-key accept-after-recovery-0001 \
+  --format json > {accept_output}
 "#,
             state_dir = state_dir.display(),
             worker_checkout = worker_checkout.display(),
@@ -5983,6 +9524,11 @@ AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
             main_agent = bin::resolve("main-agent").display(),
             bootstrap_key = bootstrap_key,
             output = enter_hook_output.display(),
+            submitted_checkpoint = submitted_checkpoint.display(),
+            checkpoint_output = checkpoint_output.display(),
+            main_capability = main_capability,
+            assignment_id = assignment_id,
+            accept_output = accept_output.display(),
         ),
     )
     .expect("enter hook");
@@ -6039,7 +9585,13 @@ AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
         "readiness={readiness} hook={enter_hook_result} stderr={}",
         started.stderr_text()
     );
-    assert_eq!(readiness["assignment_state"], "working");
+    assert!(
+        matches!(
+            readiness["assignment_state"].as_str(),
+            Some("working" | "submitted" | "accepted")
+        ),
+        "readiness may observe any authenticated checkpoint before acceptance: {readiness}"
+    );
     assert_eq!(readiness["delivery"]["state"], "confirmed");
     assert_eq!(
         readiness["delivery"]["transport_state"],
@@ -6056,6 +9608,81 @@ AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
         readiness["submit_key_recovery"]["result"],
         "checkpoint-confirmed"
     );
+    let acceptance_deadline = Instant::now() + Duration::from_secs(10);
+    while fs::metadata(&accept_output).map_or(true, |metadata| metadata.len() == 0)
+        && Instant::now() < acceptance_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let acceptance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&accept_output).unwrap_or_else(|error| {
+            panic!(
+                "acceptance hook did not finish: {error}; checkpoint={}",
+                fs::read_to_string(&checkpoint_output)
+                    .unwrap_or_else(|_| "missing checkpoint output".to_string())
+            )
+        }))
+        .expect("accept output json");
+    assert_eq!(acceptance["ok"], true, "acceptance={acceptance}");
+    let registry = orchestration_registry(&state_dir);
+    assert_eq!(registry["assignments"][assignment_id]["state"], "accepted");
+    assert_eq!(
+        registry["assignments"][assignment_id]["submit_recovery"]["state"],
+        "checkpoint_confirmed"
+    );
+    assert_eq!(
+        registry["assignments"][assignment_id]["submit_recovery"]["origin"],
+        "automatic"
+    );
+    let reconciled = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            assignment_id,
+            "--if-revision",
+            "6",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "reconcile-accepted-recovery-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(reconciled.code, 0, "stderr={}", reconciled.stderr_text());
+    assert_eq!(data(&reconciled)["checkpoint_confirmed"], true);
+    let replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            assignment_id,
+            "--if-revision",
+            "6",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "reconcile-accepted-recovery-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(data(&replay), data(&reconciled));
     let enter_calls = tmux_calls(&tmux_log)
         .into_iter()
         .filter(|call| {
@@ -6066,6 +9693,249 @@ AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
     assert_eq!(
         enter_calls, 2,
         "initial submission plus exactly one recovery Enter"
+    );
+}
+
+#[test]
+fn main_agent_submit_recovery_is_bounded_idempotent_and_never_sends_a_second_enter() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_path = tmp.path().join("assignment-submit-recovery.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-submit-recovery",
+            "task_summary": "Guard one submit recovery",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": "worker-submit-recovery",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/submit-recovery"],
+            "durable_refs": []
+        }),
+    );
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+    let started = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-submit-recovery-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    assert_eq!(data(&started)["assignment"]["revision"], 2);
+
+    let recover_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "submit-recovery",
+        "assignment-submit-recovery",
+        "--if-revision",
+        "2",
+        "--timeout",
+        "1s",
+        "--idempotency-key",
+        "submit-recovery-0001",
+        "--format",
+        "json",
+    ];
+    let competing_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "submit-recovery",
+        "assignment-submit-recovery",
+        "--if-revision",
+        "2",
+        "--timeout",
+        "1s",
+        "--idempotency-key",
+        "submit-recovery-0001",
+        "--format",
+        "json",
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let (first, second) = std::thread::scope(|scope| {
+        let first_barrier = Arc::clone(&barrier);
+        let first_checkout = &checkout;
+        let first_args = &recover_args;
+        let first_envs = &envs;
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            run_main_agent(first_checkout, first_args, first_envs)
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_checkout = &checkout;
+        let second_args = &competing_args;
+        let second_envs = &envs;
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            run_main_agent(second_checkout, second_args, second_envs)
+        });
+        barrier.wait();
+        (
+            first.join().expect("first recovery contender"),
+            second.join().expect("second recovery contender"),
+        )
+    });
+    let recovered = first;
+    let concurrent_replay = second;
+    assert_eq!(recovered.code, 0, "stderr={}", recovered.stderr_text());
+    assert_eq!(
+        concurrent_replay.code,
+        0,
+        "outcome={}",
+        concurrent_replay.stdout_text()
+    );
+    assert_eq!(
+        data(&concurrent_replay),
+        data(&recovered),
+        "same-key contenders must converge on one durable attempt"
+    );
+    assert_eq!(data(&recovered)["attempt_count"], 1);
+    assert_eq!(data(&recovered)["checkpoint_confirmed"], false);
+    assert_eq!(data(&recovered)["automatic_retry_safe"], false);
+    assert_eq!(
+        data(&recovered)["assignment"]["submit_recovery"]["state"],
+        "failed"
+    );
+    assert_eq!(data(&recovered)["result"], "checkpoint-timeout");
+    let enter_count = || {
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| {
+                call.first().is_some_and(|arg| arg == "send-keys")
+                    && call.last().is_some_and(|arg| arg == "Enter")
+            })
+            .count()
+    };
+    assert_eq!(
+        enter_count(),
+        2,
+        "initial submission plus one guarded recovery Enter"
+    );
+
+    let replay = run_main_agent(&checkout, &recover_args, &envs);
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay), data(&recovered));
+    assert_eq!(enter_count(), 2, "idempotent replay cannot send Enter");
+
+    // Simulate termination after automatic readiness recovery reserved its
+    // one attempt but before the sender could record whether Enter was sent.
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let recovery =
+            &mut registry["assignments"]["assignment-submit-recovery"]["submit_recovery"];
+        recovery["origin"] = json!("automatic");
+        recovery["state"] = json!("attempting");
+        recovery["result"] = json!("recovery reserved before guarded input");
+    });
+    let automatic_reconciliation = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            "assignment-submit-recovery",
+            "--if-revision",
+            "3",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "submit-recovery-0003",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(
+        automatic_reconciliation.code,
+        0,
+        "stderr={}",
+        automatic_reconciliation.stderr_text()
+    );
+    assert_eq!(
+        data(&automatic_reconciliation)["result"],
+        "submit-recovery-send-outcome-unknown"
+    );
+    assert_eq!(
+        enter_count(),
+        2,
+        "reconciling an automatic reservation cannot send another Enter"
+    );
+    let automatic_replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "submit-recovery",
+            "assignment-submit-recovery",
+            "--if-revision",
+            "3",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "submit-recovery-0003",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(
+        data(&automatic_replay),
+        data(&automatic_reconciliation),
+        "automatic recovery reconciliation must be exactly replayable"
     );
 }
 
@@ -6210,13 +10080,22 @@ fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
     init_checkout(&checkout, "https://example.invalid/example/repository.git");
     seed_brokers_at(
         &state_dir,
-        &[(
-            "main-one",
-            "main-incarnation-one",
-            "main-private-capability-material-0000000001",
-            checkout.as_path(),
-            Some("enforce"),
-        )],
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-retire",
+                "worker-retire-incarnation",
+                "worker-retire-private-capability-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
     );
     let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
     let private_packet = json!({
@@ -6288,6 +10167,110 @@ fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
         working.stdout_json()["error"]["code"],
         "assignment-not-retireable"
     );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-one"];
+        assignment["state"] = json!("cancelled");
+        assignment["revision"] = json!(3);
+        assignment["worker"] = json!({
+            "session_id": "worker-proven-absent",
+            "session_incarnation": "worker-proven-absent-incarnation",
+            "session_created_at": "2030-01-01T00:00:00Z"
+        });
+    });
+    let absent = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "retire",
+            "assignment-one",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "retire-absent-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(absent.code, 0, "stderr={}", absent.stderr_text());
+    assert_eq!(data(&absent)["retired"], true);
+    assert_eq!(data(&absent)["deleted"], true);
+    assert_eq!(data(&absent)["cleanup_pending"], false);
+
+    // An accepted assignment can resume the same retire request after release
+    // commits and deletion fails. The original revision remains attached to
+    // the top-level progress receipt rather than being re-applied to the
+    // already-released assignment.
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-one"];
+        assignment["state"] = json!("accepted");
+        assignment["revision"] = json!(5);
+        assignment["worker"] = json!({
+            "session_id": "worker-retire",
+            "session_incarnation": "worker-retire-incarnation",
+            "session_created_at": "2030-01-01T00:00:00Z"
+        });
+    });
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let retire_args = [
+        "--state-dir",
+        state,
+        "worker",
+        "retire",
+        "assignment-one",
+        "--if-revision",
+        "5",
+        "--idempotency-key",
+        "retire-resume-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &retire_args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
+        ],
+    );
+    assert_ne!(failed.code, 0, "outcome={}", failed.stdout_text());
+    let after_release = orchestration_registry(&state_dir);
+    assert_eq!(
+        after_release["assignments"]["assignment-one"]["state"],
+        "released"
+    );
+    assert_eq!(
+        after_release["assignments"]["assignment-one"]["revision"],
+        6
+    );
+    fs::remove_dir_all(state_dir.join("sessions/worker-retire"))
+        .expect("simulate confirmed absence before retire retry");
+    let resumed = run_main_agent(
+        &checkout,
+        &retire_args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(resumed.code, 0, "outcome={}", resumed.stdout_text());
+    assert_eq!(data(&resumed)["released"], true);
+    assert_eq!(data(&resumed)["retired"], true);
+    let replay = run_main_agent(
+        &checkout,
+        &retire_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay), data(&resumed));
 
     // A missing assignment is a clean not-found.
     let missing = run_main_agent(
