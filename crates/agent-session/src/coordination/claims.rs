@@ -10,9 +10,10 @@ use crate::cli::{
 use crate::{CliContext, CliError};
 
 use super::context::{
-    CheckoutBinding, ConflictClassification, ProviderRef, Scope, WORK_CONTEXT_VERSION,
-    WorkContextInput, WorkContextRecord, canonicalize_provider_refs, canonicalize_targets,
-    checkout_root, evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
+    CheckoutBinding, ConflictClassification, ProviderRef, Scope, ScopeKind, WORK_CONTEXT_VERSION,
+    WorkContextInput, WorkContextRecord, canonical_repository, canonicalize_provider_refs,
+    canonicalize_targets, checkout_root, evaluate, fingerprint_epoch, scope_covers,
+    validate_physical_targets,
 };
 use super::{
     Registry, authenticate_any_from_file, authenticate_from_file, clean_expired, digest_bytes,
@@ -104,21 +105,22 @@ struct ReconcileProof {
 }
 
 pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<Value, CliError> {
-    claim_impl(context, args, None)
+    claim_impl(context, args, None, false)
 }
 
-pub(crate) fn claim_resumed_worker(
+pub(crate) fn claim_main_agent_worker(
     context: &CliContext,
     args: WorkContextClaimArgs,
-    previous_incarnation: &str,
+    previous_incarnation: Option<&str>,
 ) -> Result<Value, CliError> {
-    claim_impl(context, args, Some(previous_incarnation))
+    claim_impl(context, args, previous_incarnation, true)
 }
 
 fn claim_impl(
     context: &CliContext,
     args: WorkContextClaimArgs,
     resume_from_incarnation: Option<&str>,
+    checkout_shell_grant: bool,
 ) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
@@ -149,6 +151,7 @@ fn claim_impl(
             "candidate": candidate,
             "if_revision": args.if_revision,
             "resume_from_incarnation": resume_from_incarnation,
+            "checkout_shell_grant": checkout_shell_grant,
         }),
     );
     clean_expired(&mut locked.registry, now);
@@ -245,6 +248,7 @@ fn claim_impl(
         tier: candidate.tier,
         repositories: candidate.repositories,
         worktrees: candidate.worktrees,
+        checkout_shell_grant,
         provider_refs: candidate.provider_refs,
         plan_refs: candidate.plan_refs,
         scopes: candidate.scopes,
@@ -358,6 +362,7 @@ pub(crate) fn set_declared(
         tier: candidate.tier,
         repositories: candidate.repositories,
         worktrees: candidate.worktrees,
+        checkout_shell_grant: false,
         provider_refs: candidate.provider_refs,
         plan_refs: candidate.plan_refs,
         scopes: candidate.scopes,
@@ -672,10 +677,18 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     if claim.claim_id != args.claim || claim.revision != args.if_revision {
         return Err(revision_conflict("claim-revision-conflict"));
     }
-    if targets
+    let ordinary_scope_coverage = targets
         .iter()
-        .any(|target| !claim.scopes.iter().any(|scope| scope_covers(scope, target)))
-    {
+        .all(|target| claim.scopes.iter().any(|scope| scope_covers(scope, target)));
+    let checkout_bound_shell = !ordinary_scope_coverage
+        && checkout_bound_shell_is_covered(
+            &args.operation,
+            &targets,
+            &input.checkouts,
+            claim,
+            &locked.registry,
+        )?;
+    if !ordinary_scope_coverage && !checkout_bound_shell {
         return Err(CliError::data(
             "uncovered-mutation-scope",
             "operation target is not covered by the active claim",
@@ -770,6 +783,35 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     )?;
     locked.save()?;
     Ok(outcome)
+}
+
+fn checkout_bound_shell_is_covered(
+    operation: &str,
+    targets: &[Scope],
+    bindings: &[CheckoutBinding],
+    claim: &WorkContextRecord,
+    registry: &Registry,
+) -> Result<bool, CliError> {
+    if !claim.checkout_shell_grant
+        || operation != "shell"
+        || targets.len() != 1
+        || bindings.len() != 1
+    {
+        return Ok(false);
+    }
+    let target = &targets[0];
+    if target.kind != ScopeKind::Repository || target.value != "." {
+        return Ok(false);
+    }
+    let binding = &bindings[0];
+    if canonical_repository(binding.repository.clone())? != target.repository
+        || !claim.repositories.contains(&target.repository)
+    {
+        return Ok(false);
+    }
+    let checkout = checkout_root(std::path::Path::new(&binding.path))?;
+    let fingerprint = worktree_fingerprint(registry, &checkout)?;
+    Ok(claim.worktrees.contains(&fingerprint))
 }
 
 pub(crate) fn complete(
@@ -1187,6 +1229,44 @@ pub(crate) fn active_claim<'a>(
         .ok_or_else(claim_unavailable)
 }
 
+/// Return whether the authenticated worker's active claim is the exact
+/// assignment-derived context carrying the private checkout-shell grant.
+///
+/// `None` means no active claim. `Some(false)` is deliberately distinct: a
+/// worker must not bootstrap over a pre-existing arbitrary claim.
+pub(crate) fn main_agent_worker_claim_match(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    candidate: &WorkContextInput,
+) -> Result<Option<bool>, CliError> {
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(claim_unavailable)?;
+    let mut expected = candidate.clone().validate_and_canonicalize()?;
+    let locked = lock_registry(context)?;
+    ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    let Some(claim) = locked.registry.claims.iter().find(|claim| {
+        claim.session_id == record.id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    }) else {
+        return Ok(None);
+    };
+    let record_cwd = std::path::Path::new(&record.cwd);
+    let checkout = checkout_root(record_cwd).unwrap_or_else(|_| record_cwd.to_path_buf());
+    let fingerprint = worktree_fingerprint(&locked.registry, &checkout)?;
+    if !expected.worktrees.contains(&fingerprint) {
+        expected.worktrees.push(fingerprint);
+        expected.worktrees.sort();
+    }
+    Ok(Some(
+        claim.checkout_shell_grant && input_from_record(claim) == expected,
+    ))
+}
+
 fn active_claim_for_session<'a>(
     registry: &'a Registry,
     session_id: &str,
@@ -1253,6 +1333,7 @@ pub(crate) fn public_context(claim: &WorkContextRecord) -> Result<Value, CliErro
         .expect("work context serializes as an object");
     object.remove("expires_at_epoch");
     object.remove("terminal_at_epoch");
+    object.remove("checkout_shell_grant");
     Ok(value)
 }
 

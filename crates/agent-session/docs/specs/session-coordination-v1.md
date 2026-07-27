@@ -202,6 +202,27 @@ operation names exactly one repository, an omitted binding uses the managed
 session record's canonical cwd; multi-repository operations require explicit
 bindings. A provider-only operation may omit `targets` and `checkouts`.
 
+An opaque checkout-local shell effect has one narrowly defined coverage rule.
+When `operation` is exactly `shell`, the target set is exactly one
+`repository` target with value `.`, and `checkouts` contains exactly one
+matching repository binding, `admit` fingerprints that checkout. The target is
+covered only when authenticated Main Agent worker bootstrap minted a private
+checkout-shell grant on the exact assignment-derived claim, the claim names
+the repository, and its existing worktree fingerprint matches the binding.
+Generic `work-context claim` and `set` cannot request or observe that grant;
+public work-context projections omit it, and older records deserialize it as
+absent. This does not add a scope kind, widen the claim to repository scope,
+cover explicit path targets, or authorize a different checkout. Missing,
+mismatched, or additional bindings fail normal scope coverage.
+
+The grant is an explicit coordination permission for an opaque effect in the
+worker's isolated checkout, not a filesystem sandbox or user authorization.
+Path scopes continue to describe semantic lane ownership and conflict, while
+the checkout lease prevents simultaneous physical writers. A worker remains
+untrusted: its final diff must be checked against the assignment scopes, and
+an adversarial same-user process requires an OS security boundary outside this
+contract.
+
 Authenticated operation reconcile reads
 `agent-session.operation-reconcile-proof.v1` with exact fields
 `schema_version`, `execution_token`, and `outcome` (`pass` or `fail`). Broker
@@ -342,8 +363,12 @@ States are `active`, `completing`, `reconcile_pending`, `completed`, `failed`, a
   scope and provider reference is a subset of the authenticated active claim
   before creating a 30-minute lease. Filesystem targets bind each repository to
   a canonical checkout whose `origin` matches the declared repository.
-- Opaque repository effects require an explicit repository scope. Symlink,
-  multi-target, and normalized path checks apply to every target.
+- Opaque repository effects require an explicit repository scope except for
+  the exact checkout-bound `shell` shape defined above, which may be covered by
+  the private bootstrap-minted claim grant, claim repository, and worktree
+  fingerprint. Symlink,
+  multi-target, origin, and normalized path checks still apply; the exception
+  never covers an explicit edit target or another checkout.
 - A 30-minute claim does not release a known long operation. Reaching the
   operation safety TTL moves `active` to fail-closed `completing`; it never
   asserts terminality or removes the bound claim's exclusion.

@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::{self, AgentKind, CoordinationMode};
 use crate::coordination::context::{
-    Scope, ScopeKind, WORK_CONTEXT_INPUT_VERSION, WorkContextInput,
+    Scope, ScopeKind, WORK_CONTEXT_INPUT_VERSION, WorkContextInput, checkout_root,
 };
 use crate::orchestration::{
     self, ACCOUNT_HANDOFF_RESERVATION_SCHEMA, ASSIGNMENT_INPUT_SCHEMA, ASSIGNMENT_SCHEMA,
@@ -940,6 +940,7 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
         &packet.work_context,
         &args.idempotency_key,
         None,
+        false,
     )?;
 
     let packet_value =
@@ -1101,6 +1102,7 @@ fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliE
         &packet.work_context,
         &args.idempotency_key,
         None,
+        false,
     )?;
 
     let request_digest = crate::coordination::request_digest(
@@ -1768,6 +1770,18 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
     let packet: AssignmentInput = serde_json::from_value(packet_value)
         .map_err(|_| invalid_input("stored assignment packet is invalid"))?;
     validate_assignment_input(&packet)?;
+    if let Err(error) = validate_bootstrap_checkout_binding(&record, &assignment, &packet) {
+        if rebind_from.is_none() {
+            record_preclaim_bootstrap_blocker(
+                context,
+                &record,
+                &incarnation,
+                &assignment,
+                error.code(),
+            )?;
+        }
+        return Err(error);
+    }
     let repository = packet.repository.clone().ok_or_else(|| {
         invalid_input("worker bootstrap requires the assignment packet to declare a repository")
     })?;
@@ -1801,6 +1815,7 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
         &work_context,
         &args.idempotency_key,
         rebind_from.as_ref(),
+        true,
     ) {
         if rebind_from.is_none() {
             record_preclaim_bootstrap_blocker(
@@ -3567,6 +3582,13 @@ fn readiness_from_state(state: &str) -> &'static str {
     }
 }
 
+fn assignment_has_preclaim_blocker(assignment: &AssignmentRecord) -> bool {
+    assignment
+        .blocker_summary
+        .as_deref()
+        .is_some_and(|summary| summary.starts_with("[pre-claim:"))
+}
+
 fn worker_readiness_checkpoint(
     assignment: &AssignmentRecord,
     main: &SessionRecord,
@@ -3577,6 +3599,7 @@ fn worker_readiness_checkpoint(
     assignment.primary_manager.session_id == main.id
         && assignment.primary_manager.session_incarnation == main_incarnation
         && assignment.worker.as_ref() == Some(worker)
+        && !assignment_has_preclaim_blocker(assignment)
         && matches!(
             assignment.state.as_str(),
             "working" | "blocked" | "submitted"
@@ -3951,6 +3974,18 @@ fn await_worker_readiness(
                 } else {
                     "worker-checkpoint-proof-unavailable"
                 };
+                if result == "worker-bootstrap-preclaim-failed"
+                    && let Some(reservation) = recovery.as_ref()
+                {
+                    let _ = update_submit_recovery(
+                        context,
+                        record,
+                        incarnation,
+                        reservation,
+                        "failed",
+                        result,
+                    )?;
+                }
                 return Ok(json!({
                     "state": "readiness_failed",
                     "classification": "checkpoint_proof_failed",
@@ -4616,6 +4651,9 @@ fn submit_recovery_checkpoint(
     }
     if assignment.worker.as_ref() != Some(&reservation.worker) {
         return SubmitRecoveryCheckpoint::Rejected("worker-incarnation-changed");
+    }
+    if assignment_has_preclaim_blocker(assignment) {
+        return SubmitRecoveryCheckpoint::Rejected("worker-bootstrap-preclaim-failed");
     }
     if assignment.state == "starting" {
         return SubmitRecoveryCheckpoint::Pending;
@@ -5532,10 +5570,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         || worktree_unavailable
         || guidance_unavailable
         || raw_rate_limit_diagnostic.is_unavailable();
-    let preclaim_blocker = assignment
-        .blocker_summary
-        .as_deref()
-        .is_some_and(|summary| summary.starts_with("[pre-claim:"));
+    let preclaim_blocker = assignment_has_preclaim_blocker(&assignment);
     let terminal_recovery_reconciled =
         terminal_recovery_recorded && worker_status == "stopped" && assignment.worker.is_some();
     let failed_preclaim = worker_failed_preclaim(PreClaimEvidence {
@@ -12624,7 +12659,14 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
             .collect(),
         summary: input.task_summary.clone(),
     };
-    ensure_or_acquire_claim(context, &record, &work_context, &idempotency_key, None)?;
+    ensure_or_acquire_claim(
+        context,
+        &record,
+        &work_context,
+        &idempotency_key,
+        None,
+        false,
+    )?;
 
     let objective = json!({
         "schema_version": PACKET_SCHEMA,
@@ -12872,11 +12914,28 @@ fn ensure_or_acquire_claim(
     candidate: &WorkContextInput,
     idempotency_key: &str,
     rebind_from: Option<&SessionRef>,
+    checkout_shell_grant: bool,
 ) -> Result<(), CliError> {
-    match ensure_active_claim(context, record) {
-        Ok(()) => return Ok(()),
-        Err(error) if error.code() == "claim-not-active" => {}
-        Err(error) => return Err(error),
+    if checkout_shell_grant {
+        match crate::coordination::claims::main_agent_worker_claim_match(
+            context, record, candidate,
+        )? {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                return Err(CliError::data(
+                    "worker-bootstrap-claim-mismatch",
+                    "worker bootstrap requires the exact assignment-derived claim and checkout-shell grant",
+                    None,
+                ));
+            }
+            None => {}
+        }
+    } else {
+        match ensure_active_claim(context, record) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code() == "claim-not-active" => {}
+            Err(error) => return Err(error),
+        }
     }
     let directory = session_dir(context, &record.id).join("coordination");
     fs::create_dir_all(&directory)
@@ -12894,13 +12953,14 @@ fn ensure_or_acquire_claim(
         if_revision: None,
         format: OutputFormat::Json,
     };
-    let result = match rebind_from {
-        Some(previous) => crate::coordination::claims::claim_resumed_worker(
+    let result = if checkout_shell_grant {
+        crate::coordination::claims::claim_main_agent_worker(
             context,
             claim_args,
-            &previous.session_incarnation,
-        ),
-        None => crate::coordination::claims::claim(context, claim_args),
+            rebind_from.map(|previous| previous.session_incarnation.as_str()),
+        )
+    } else {
+        crate::coordination::claims::claim(context, claim_args)
     };
     let _ = fs::remove_file(candidate_path);
     result.map(|_| ())
@@ -13305,6 +13365,51 @@ fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
     Ok(())
 }
 
+fn validate_bootstrap_checkout_binding(
+    record: &SessionRecord,
+    assignment: &AssignmentRecord,
+    input: &AssignmentInput,
+) -> Result<(), CliError> {
+    let declared = input.worktree.as_deref().ok_or_else(|| {
+        invalid_input("worker bootstrap requires the assignment packet to declare a worktree")
+    })?;
+    let durable = assignment.worktree.as_deref().ok_or_else(|| {
+        invalid_input("worker bootstrap requires the durable assignment to declare a worktree")
+    })?;
+    let declared_root = exact_assignment_checkout_root(declared, "assignment worktree")?;
+    let durable_root = exact_assignment_checkout_root(durable, "durable assignment worktree")?;
+    let launch_root = exact_assignment_checkout_root(&input.launch.cwd, "assignment launch cwd")?;
+    let session_root = exact_assignment_checkout_root(&record.cwd, "worker session cwd")?;
+    if declared_root != durable_root
+        || declared_root != launch_root
+        || declared_root != session_root
+    {
+        return Err(CliError::data(
+            "worker-bootstrap-checkout-mismatch",
+            "worker bootstrap requires the assignment worktree, launch cwd, durable worktree, and authenticated session cwd to resolve to the same checkout",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn exact_assignment_checkout_root(raw: &str, label: &str) -> Result<PathBuf, CliError> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(invalid_input(&format!("{label} must be an absolute path")));
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|_| invalid_input(&format!("{label} is unavailable")))?;
+    let root = checkout_root(&canonical)
+        .map_err(|_| invalid_input(&format!("{label} is not a valid checkout")))?;
+    if canonical != root {
+        return Err(invalid_input(&format!(
+            "{label} must name the checkout root"
+        )));
+    }
+    Ok(root)
+}
+
 fn validate_checkpoint(input: &CheckpointInput) -> Result<(), CliError> {
     if input.schema_version != CHECKPOINT_INPUT_SCHEMA {
         return Err(invalid_input(&format!(
@@ -13597,9 +13702,36 @@ fn run_completion(shell: crate::completion::CompletionShell) -> i32 {
 mod tests {
     use super::*;
     use nils_test_support::GlobalStateLock;
+    use std::os::unix::fs::symlink;
 
     fn busy() -> CliError {
         CliError::unavailable("orchestration-store-busy", "busy", None)
+    }
+
+    #[test]
+    fn exact_assignment_checkout_accepts_canonical_alias_and_rejects_non_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let checkout = tmp.path().join("checkout");
+        let nested = checkout.join("src");
+        fs::create_dir_all(&nested).expect("checkout");
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .expect("git init");
+        assert!(initialized.success());
+        let alias = tmp.path().join("checkout-alias");
+        symlink(&checkout, &alias).expect("checkout alias");
+
+        let checkout_root = exact_assignment_checkout_root(checkout.to_str().unwrap(), "checkout")
+            .expect("checkout root");
+        let alias_root = exact_assignment_checkout_root(alias.to_str().unwrap(), "checkout alias")
+            .expect("canonical alias");
+        assert_eq!(alias_root, checkout_root);
+        assert!(exact_assignment_checkout_root("checkout", "relative checkout").is_err());
+        assert!(
+            exact_assignment_checkout_root(nested.to_str().unwrap(), "nested checkout").is_err()
+        );
     }
 
     #[test]
@@ -14276,6 +14408,47 @@ mod tests {
                 "{state} must preserve the newer authenticated worker checkpoint"
             );
         }
+
+        let mut preclaim_failure = dep_assignment("assignment", "run-one", "blocked");
+        preclaim_failure.revision = 3;
+        preclaim_failure.worker = Some(worker.clone());
+        preclaim_failure.checkpoint = Some(RunCheckpoint {
+            revision: 3,
+            summary: "worker bootstrap failed before claim acquisition".to_string(),
+            next_action: "diagnose the failed pre-claim assignment".to_string(),
+            updated_at: "2030-01-01T00:00:03Z".to_string(),
+        });
+        preclaim_failure.blocker_summary = Some(
+            "[pre-claim:worker-bootstrap-checkout-mismatch] worker bootstrap failed".to_string(),
+        );
+        preclaim_failure.submit_recovery = Some(SubmitRecoveryRecord {
+            schema_version: SUBMIT_RECOVERY_SCHEMA.to_string(),
+            attempt_id: "attempt-one".to_string(),
+            origin: "explicit".to_string(),
+            run_id: Some("run-one".to_string()),
+            controller: Some(controller),
+            session_incarnation: worker.session_incarnation.clone(),
+            reserved_revision: 2,
+            state: "sent".to_string(),
+            attempt_count: 1,
+            result: "single guarded Enter sent".to_string(),
+            attempted_at: "2030-01-01T00:00:02Z".to_string(),
+            updated_at: "2030-01-01T00:00:02Z".to_string(),
+        });
+        assert!(matches!(
+            submit_recovery_checkpoint(&preclaim_failure, &main, "inc", &reservation),
+            SubmitRecoveryCheckpoint::Rejected("worker-bootstrap-preclaim-failed")
+        ));
+        assert!(
+            !worker_readiness_checkpoint(
+                &preclaim_failure,
+                &main,
+                "inc",
+                &worker,
+                reservation.reserved_revision,
+            ),
+            "a typed pre-claim blocker is not an authenticated ready checkpoint"
+        );
     }
 
     #[test]

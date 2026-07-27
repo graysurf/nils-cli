@@ -81,15 +81,21 @@ worker is launched:
   "task_summary": "Implement and validate the bounded worker task",
   "launch": {
     "agent": "codex",
-    "cwd": "/absolute/path/to/repository"
-  }
+    "cwd": "/absolute/path/to/managed-worktree",
+    "coordination_mode": "enforce"
+  },
+  "repository": "owner/repository",
+  "worktree": "/absolute/path/to/managed-worktree",
+  "scopes": ["src/owned", "tests/owned"]
 }
 ```
 
-`assignment_id`, `task`, `repository`, `worktree`, `base_ref`, `scopes`, and
-`durable_refs` are optional. Launch options also accept `title`, `session_id`,
-`coordination_mode`, and `agent_args`. An omitted `session_id` is derived
-deterministically so an exact retry does not create a second worker.
+`assignment_id`, `task`, `base_ref`, and `durable_refs` are optional. A
+mutating enforce-mode worker requires `repository`, narrow `scopes`, and an
+absolute `worktree` that resolves to the same checkout root as `launch.cwd`.
+Launch options also accept `title`, `session_id`, and `agent_args`. An omitted
+`session_id` is derived deterministically so an exact retry does not create a
+second worker.
 
 ### Checkpoint packet
 
@@ -284,10 +290,13 @@ proof. Any eligible single-Enter recovery is already owned and bounded by that
 runtime call. Do not add another Enter, resend the prompt, or manually repeat
 bootstrap after its typed result.
 
-An assignment's optional absolute `worktree` remains private durable routing
-metadata. It is never copied into the claim's fingerprint-only `worktrees`
-field. Bootstrap derives the HMAC worktree fingerprint from the authenticated
-worker session's canonical `cwd`. A failure before claim acquisition records a
+For a mutating worker, the assignment's absolute `worktree` is required private
+durable routing metadata. It is never copied into the claim's
+fingerprint-only `worktrees` field. Before bootstrap mints the private
+checkout-shell grant, the packet worktree, `launch.cwd`, durable assignment
+worktree, and authenticated worker session `cwd` must all resolve to the same
+canonical checkout root. Bootstrap then derives the HMAC fingerprint from that
+authenticated `cwd`. A failure before claim acquisition records a
 durable `[pre-claim:<code>]` blocker and advances the assignment to `blocked`,
 so the Main Agent can diagnose and cancel that exact worker without registry
 edits or group force cleanup.

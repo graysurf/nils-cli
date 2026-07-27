@@ -731,6 +731,7 @@ fn presence_record(
         tier: presence.tier,
         repositories: presence.repositories,
         worktrees: presence.worktrees,
+        checkout_shell_grant: false,
         provider_refs: presence.provider_refs,
         plan_refs: presence.plan_refs,
         scopes: presence.scopes,

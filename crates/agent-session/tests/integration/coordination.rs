@@ -12,7 +12,9 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::cli::{fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls};
+use super::cli::{
+    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls,
+};
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved("agent-session", args, &CmdOptions::new().with_cwd(dir))
@@ -267,6 +269,31 @@ fn seed_activity_state(
     );
 }
 
+fn seed_live_runtime_identity(
+    state_dir: &Path,
+    id: &str,
+    incarnation: &str,
+    tmux_slot: u32,
+) -> TestProcessGroup {
+    let runtime = spawn_scoped_test_process_group().expect("live runtime identity");
+    let runtime_pid = runtime.pid() as libc::pid_t;
+    let runtime_identity = json!({
+        "launch_id": incarnation,
+        "session_id": format!("${tmux_slot}"),
+        "pane_id": format!("%{tmux_slot}"),
+        "pane_pid": runtime_pid,
+        "process_group_id": runtime_pid,
+        "process_session_id": runtime_pid
+    });
+    let session_path = state_dir.join("sessions").join(id).join("session.json");
+    let mut session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_path).expect("session record"))
+            .expect("session json");
+    session["delete_tmux_identity"] = runtime_identity;
+    write_private_json(&session_path, &session);
+    runtime
+}
+
 fn init_checkout(path: &Path, remote: &str) {
     fs::create_dir_all(path).expect("checkout directory");
     let init = Command::new("git")
@@ -385,6 +412,20 @@ fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Optio
     )
     .expect("registry");
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).expect("registry mode");
+}
+
+fn grant_checkout_shell(state_dir: &Path, session_ids: &[&str]) {
+    rewrite_registry(state_dir, |registry| {
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            if session_ids
+                .iter()
+                .any(|session_id| claim["session_id"] == *session_id)
+                && claim["state"] == "active"
+            {
+                claim["checkout_shell_grant"] = json!(true);
+            }
+        }
+    });
 }
 
 fn capability(state_dir: &Path, id: &str) -> String {
@@ -2487,6 +2528,559 @@ fn atomic_claim_conflict_idempotency_and_uncovered_mutation_are_fenced() {
 }
 
 #[test]
+fn checkout_bound_shell_is_covered_by_the_claim_worktree() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let other_checkout = tmp.path().join("other-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &other_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    seed_activity_state(
+        &state_dir,
+        "alpha",
+        "incarnation-alpha",
+        "working",
+        json!({
+            "provider_turn_id": "turn-checkout-shell",
+            "started_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let _runtime = seed_live_runtime_identity(&state_dir, "alpha", "incarnation-alpha", 91);
+    let candidate_file = tmp.path().join("candidate.json");
+    candidate(&candidate_file, "src/owned/", "checkout shell context");
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let claimed = run(
+        &checkout,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "claim",
+            "--session",
+            "alpha",
+            "--file",
+            candidate_file.to_str().expect("candidate"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "claim-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        claimed.code,
+        0,
+        "stdout={} stderr={}",
+        claimed.stdout_text(),
+        claimed.stderr_text()
+    );
+    let claim = data(&claimed)["context"].clone();
+    assert_eq!(claim["scopes"][0]["kind"], "path-prefix");
+
+    let targets = tmp.path().join("checkout-shell-targets.json");
+    fs::write(
+        &targets,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "provider_refs": [],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": checkout
+            }]
+        }))
+        .expect("targets"),
+    )
+    .expect("targets file");
+    let execution_token = tmp.path().join("checkout-shell-token");
+    fs::write(&execution_token, "execution-token-checkout-shell").expect("execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+
+    let other_targets = tmp.path().join("other-checkout-shell-targets.json");
+    fs::write(
+        &other_targets,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "provider_refs": [],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": other_checkout
+            }]
+        }))
+        .expect("targets"),
+    )
+    .expect("targets file");
+    let wrong_checkout = run(
+        &checkout,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            other_targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-other-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(wrong_checkout.code, 0);
+    assert_eq!(
+        wrong_checkout.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+
+    let outside_edit_targets = tmp.path().join("outside-edit-targets.json");
+    fs::write(
+        &outside_edit_targets,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "tests/outside.rs"
+            }]
+        }))
+        .expect("targets"),
+    )
+    .expect("targets file");
+    let outside_edit = run(
+        &checkout,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            outside_edit_targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-outside-edit-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(outside_edit.code, 0);
+    assert_eq!(
+        outside_edit.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+
+    let unassigned_shell = run(
+        &checkout,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-unassigned-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(unassigned_shell.code, 0);
+    assert_eq!(
+        unassigned_shell.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+    grant_checkout_shell(&state_dir, &["alpha"]);
+    let missing_binding_targets = tmp.path().join("missing-binding-targets.json");
+    write_private_json(
+        &missing_binding_targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }]
+        }),
+    );
+    let additional_binding_targets = tmp.path().join("additional-binding-targets.json");
+    write_private_json(
+        &additional_binding_targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": checkout
+            }, {
+                "repository": "example/repository",
+                "path": other_checkout
+            }]
+        }),
+    );
+    let mismatched_repository_targets = tmp.path().join("mismatched-repository-targets.json");
+    write_private_json(
+        &mismatched_repository_targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "checkouts": [{
+                "repository": "other/repository",
+                "path": checkout
+            }]
+        }),
+    );
+    let multiple_targets = tmp.path().join("multiple-shell-targets.json");
+    write_private_json(
+        &multiple_targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }, {
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "src/owned/generated.rs"
+            }],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": checkout
+            }]
+        }),
+    );
+    for (operation, targets_file, key) in [
+        ("edit", targets.as_path(), "admit-repository-edit-0001"),
+        (
+            "shell",
+            missing_binding_targets.as_path(),
+            "admit-missing-binding-0001",
+        ),
+        (
+            "shell",
+            additional_binding_targets.as_path(),
+            "admit-additional-binding-0001",
+        ),
+        (
+            "shell",
+            mismatched_repository_targets.as_path(),
+            "admit-mismatched-repository-0001",
+        ),
+        (
+            "shell",
+            multiple_targets.as_path(),
+            "admit-multiple-shell-targets-0001",
+        ),
+        (
+            "shell",
+            other_targets.as_path(),
+            "admit-other-checkout-assigned-0001",
+        ),
+    ] {
+        let rejected = run(
+            &checkout,
+            &[
+                "--state-dir",
+                &state,
+                "work-context",
+                "admit",
+                "--session",
+                "alpha",
+                "--claim",
+                claim["claim_id"].as_str().expect("claim id"),
+                "--if-revision",
+                "1",
+                "--targets-file",
+                targets_file.to_str().expect("targets"),
+                "--operation",
+                operation,
+                "--execution-token-file",
+                execution_token.to_str().expect("execution token"),
+                "--capability-file",
+                &alpha_cap,
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ],
+        );
+        assert_ne!(rejected.code, 0, "operation={operation} key={key}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "uncovered-mutation-scope",
+            "operation={operation} key={key}"
+        );
+    }
+
+    let admitted = run(
+        &checkout,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        admitted.code,
+        0,
+        "stdout={} stderr={}",
+        admitted.stdout_text(),
+        admitted.stderr_text()
+    );
+    assert_eq!(data(&admitted)["operation"], "shell");
+    assert_eq!(data(&admitted)["targets"][0]["kind"], "repository");
+}
+
+#[test]
+fn checkout_bound_shells_in_distinct_worktrees_can_run_concurrently() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let alpha_checkout = tmp.path().join("alpha-checkout");
+    let beta_checkout = tmp.path().join("beta-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(
+        &alpha_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    init_checkout(
+        &beta_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                alpha_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                beta_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    for (id, incarnation, turn) in [
+        ("alpha", "incarnation-alpha", "turn-alpha-shell"),
+        ("beta", "incarnation-beta", "turn-beta-shell"),
+    ] {
+        seed_activity_state(
+            &state_dir,
+            id,
+            incarnation,
+            "working",
+            json!({
+                "provider_turn_id": turn,
+                "started_at": "2030-01-01T00:00:01Z"
+            }),
+            serde_json::Value::Null,
+        );
+    }
+    let _alpha_runtime = seed_live_runtime_identity(&state_dir, "alpha", "incarnation-alpha", 92);
+    let _beta_runtime = seed_live_runtime_identity(&state_dir, "beta", "incarnation-beta", 93);
+    let state = state_dir.to_string_lossy();
+
+    let mut claims = serde_json::Map::new();
+    for (id, checkout, prefix) in [
+        ("alpha", alpha_checkout.as_path(), "src/alpha/"),
+        ("beta", beta_checkout.as_path(), "src/beta/"),
+    ] {
+        let candidate_file = tmp.path().join(format!("{id}-candidate.json"));
+        candidate(&candidate_file, prefix, &format!("{id} checkout shell"));
+        let capability_file = capability(&state_dir, id);
+        let claimed = run(
+            checkout,
+            &[
+                "--state-dir",
+                &state,
+                "work-context",
+                "claim",
+                "--session",
+                id,
+                "--file",
+                candidate_file.to_str().expect("candidate"),
+                "--capability-file",
+                &capability_file,
+                "--idempotency-key",
+                &format!("claim-{id}-checkout-shell-0001"),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            claimed.code,
+            0,
+            "id={id} stdout={} stderr={}",
+            claimed.stdout_text(),
+            claimed.stderr_text()
+        );
+        claims.insert(id.to_string(), data(&claimed)["context"].clone());
+    }
+    grant_checkout_shell(&state_dir, &["alpha", "beta"]);
+
+    let mut admitted_leases = Vec::new();
+    for (id, checkout) in [
+        ("alpha", alpha_checkout.as_path()),
+        ("beta", beta_checkout.as_path()),
+    ] {
+        let targets_file = tmp.path().join(format!("{id}-shell-targets.json"));
+        fs::write(
+            &targets_file,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.operation-targets.v1",
+                "targets": [{
+                    "kind": "repository",
+                    "repository": "example/repository",
+                    "value": "."
+                }],
+                "provider_refs": [],
+                "checkouts": [{
+                    "repository": "example/repository",
+                    "path": checkout
+                }]
+            }))
+            .expect("targets"),
+        )
+        .expect("targets file");
+        let execution_token = tmp.path().join(format!("{id}-shell-token"));
+        fs::write(&execution_token, format!("execution-token-{id}-shell"))
+            .expect("execution token");
+        fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+            .expect("execution token mode");
+        let capability_file = capability(&state_dir, id);
+        let claim = &claims[id];
+        let admitted = run(
+            checkout,
+            &[
+                "--state-dir",
+                &state,
+                "work-context",
+                "admit",
+                "--session",
+                id,
+                "--claim",
+                claim["claim_id"].as_str().expect("claim id"),
+                "--if-revision",
+                "1",
+                "--targets-file",
+                targets_file.to_str().expect("targets"),
+                "--operation",
+                "shell",
+                "--execution-token-file",
+                execution_token.to_str().expect("execution token"),
+                "--capability-file",
+                &capability_file,
+                "--idempotency-key",
+                &format!("admit-{id}-checkout-shell-0001"),
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            admitted.code,
+            0,
+            "id={id} stdout={} stderr={}",
+            admitted.stdout_text(),
+            admitted.stderr_text()
+        );
+        admitted_leases.push(data(&admitted)["lease_id"].clone());
+    }
+    assert_ne!(admitted_leases[0], admitted_leases[1]);
+}
+
+#[test]
 fn concurrent_definite_contenders_admit_exactly_one_claim() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -4329,6 +4923,19 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
     );
     assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
     assert_eq!(data(&init)["run"]["run_id"], "run-one");
+    let init_coordination = load_coordination_registry(&state_dir);
+    let init_controller_claim = init_coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("controller claim");
+    assert!(
+        !init_controller_claim["checkout_shell_grant"]
+            .as_bool()
+            .unwrap_or(false),
+        "Main Agent controller init must not mint a worker checkout-shell grant"
+    );
     assert_eq!(data(&init)["run"]["revision"], 1);
 
     let replay = run_main_agent(
@@ -4566,6 +5173,23 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
     assert_eq!(
         data(&rebound)["run"]["controller"]["session_incarnation"],
         new_incarnation
+    );
+    let rebound_coordination = load_coordination_registry(&state_dir);
+    let rebound_controller_claim = rebound_coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| {
+            claim["session_id"] == "main-one"
+                && claim["session_incarnation"] == new_incarnation
+                && claim["state"] == "active"
+        })
+        .expect("rebound controller claim");
+    assert!(
+        !rebound_controller_claim["checkout_shell_grant"]
+            .as_bool()
+            .unwrap_or(false),
+        "Main Agent controller rebind must not mint a worker checkout-shell grant"
     );
 }
 
@@ -6271,6 +6895,354 @@ fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
 }
 
 #[test]
+fn main_agent_worker_bootstrap_rejects_assignment_checkout_mismatch_before_grant() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    let declared_checkout = tmp.path().join("declared-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [&main_checkout, &worker_checkout, &declared_checkout] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-checkout-mismatch",
+        "task_summary": "Reject mismatched assignment checkout",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": declared_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/bootstrap-canary"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-checkout-mismatch",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-checkout-mismatch",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Reject mismatched assignment checkout",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": declared_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/bootstrap-canary"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-one");
+    let rejected = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "worker-bootstrap-checkout-mismatch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "worker-bootstrap-checkout-mismatch"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != "worker-one"),
+        "checkout mismatch must fail before a worker claim or grant is persisted"
+    );
+    let orchestration = orchestration_registry(&state_dir);
+    assert_eq!(
+        orchestration["assignments"]["assignment-checkout-mismatch"]["state"],
+        "blocked"
+    );
+    assert_eq!(
+        orchestration["assignments"]["assignment-checkout-mismatch"]["revision"],
+        3
+    );
+    assert_eq!(
+        orchestration["assignments"]["assignment-checkout-mismatch"]["blocker_summary"],
+        "[pre-claim:worker-bootstrap-checkout-mismatch] worker bootstrap failed"
+    );
+
+    let diagnosed = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "diagnose",
+            "assignment-checkout-mismatch",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(diagnosed.code, 0, "stderr={}", diagnosed.stderr_text());
+    assert_eq!(data(&diagnosed)["classification"], "pre_claim_failure");
+    assert_eq!(data(&diagnosed)["failed_preclaim"], true);
+
+    let cancelled = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "cancel",
+            "assignment-checkout-mismatch",
+            "--if-revision",
+            "3",
+            "--reason",
+            "replace checkout-mismatched worker",
+            "--idempotency-key",
+            "worker-cancel-checkout-mismatch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(cancelled.code, 0, "stderr={}", cancelled.stderr_text());
+    assert_eq!(data(&cancelled)["assignment"]["state"], "cancelled");
+    assert_eq!(data(&cancelled)["assignment"]["revision"], 4);
+    assert_eq!(data(&cancelled)["claim_absent"], true);
+    assert_eq!(data(&cancelled)["operation_quiescent"], true);
+}
+
+#[test]
+fn main_agent_worker_bootstrap_rejects_an_existing_ungranted_claim() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(
+        &main_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let _main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-bootstrap-mismatch",
+        "task_summary": "Reject an ungranted pre-bootstrap claim",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/bootstrap-canary"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-bootstrap-mismatch",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-bootstrap-mismatch",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Reject an ungranted pre-bootstrap claim",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/bootstrap-canary"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-one");
+    let candidate_file = tmp.path().join("worker-ordinary-claim.json");
+    candidate(
+        &candidate_file,
+        "docs/bootstrap-canary/",
+        "Reject an ungranted pre-bootstrap claim",
+    );
+    let ordinary_claim = run(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "claim",
+            "--session",
+            "worker-one",
+            "--file",
+            candidate_file.to_str().expect("candidate"),
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "worker-ordinary-claim-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        ordinary_claim.code,
+        0,
+        "stderr={}",
+        ordinary_claim.stderr_text()
+    );
+
+    let rejected = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "worker-bootstrap-mismatch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "worker-bootstrap-claim-mismatch"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    let retained_claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "worker-one" && claim["state"] == "active")
+        .expect("ordinary worker claim");
+    assert!(
+        !retained_claim["checkout_shell_grant"]
+            .as_bool()
+            .unwrap_or(false),
+        "failed bootstrap must not upgrade an existing ordinary claim"
+    );
+    let orchestration = orchestration_registry(&state_dir);
+    assert_eq!(
+        orchestration["assignments"]["assignment-bootstrap-mismatch"]["state"],
+        "starting"
+    );
+    assert_eq!(
+        orchestration["assignments"]["assignment-bootstrap-mismatch"]["revision"],
+        2
+    );
+}
+
+#[test]
 fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -6434,6 +7406,10 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
         .iter()
         .find(|claim| claim["session_id"] == "worker-one" && claim["state"] == "active")
         .expect("worker claim");
+    assert_eq!(
+        worker_claim["checkout_shell_grant"], true,
+        "authenticated Main Agent bootstrap must mint the private checkout-shell grant"
+    );
     assert!(
         worker_claim["worktrees"]
             .as_array()
@@ -6444,6 +7420,26 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
                     && !value.contains(worker_checkout.to_string_lossy().as_ref())
             })),
         "claim worktrees must contain only HMAC fingerprints: {worker_claim}"
+    );
+    let shown_claim = run(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "show",
+            "--session",
+            "worker-one",
+            "--capability-file",
+            &worker_capability,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(shown_claim.code, 0, "stderr={}", shown_claim.stderr_text());
+    assert!(
+        data(&shown_claim).get("checkout_shell_grant").is_none(),
+        "private admission grants must not enter public work-context output"
     );
     let diagnosed = run_main_agent(
         &main_checkout,
@@ -13398,6 +14394,41 @@ fn main_agent_submit_recovery_fences_concurrent_manager_mutations_until_resolved
         let hook_envelope: serde_json::Value =
             serde_json::from_slice(&fs::read(&hook_output).expect("transition hook output"))
                 .expect("transition hook json");
+        if transition == "cancel" {
+            assert_eq!(
+                hook_envelope["ok"], true,
+                "a typed pre-claim failure terminalizes recovery before cancellation: {hook_envelope}"
+            );
+            assert_eq!(hook_envelope["data"]["assignment"]["state"], "cancelled");
+            assert_eq!(data(&recovered)["checkpoint_confirmed"], false);
+            assert_eq!(
+                data(&recovered)["result"],
+                "worker-bootstrap-preclaim-failed"
+            );
+            assert_eq!(
+                data(&recovered)["assignment"]["state"],
+                "starting",
+                "the recovery caller may snapshot before the concurrent cancellation commits"
+            );
+            assert_eq!(
+                data(&recovered)["assignment"]["submit_recovery"]["state"],
+                "failed"
+            );
+            assert_eq!(
+                data(&recovered)["assignment"]["submit_recovery"]["result"],
+                "worker-bootstrap-preclaim-failed"
+            );
+            assert_eq!(
+                data(&recovered)["assignment"]["primary_manager"]["session_id"],
+                "main-one"
+            );
+            assert_eq!(
+                orchestration_registry(&state_dir)["assignments"]["assignment-transition"]["state"],
+                "cancelled",
+                "the successful hook result proves the terminal cancellation eventually committed"
+            );
+            continue;
+        }
         assert_eq!(
             hook_envelope["ok"], false,
             "transition={transition}, envelope={hook_envelope}"
@@ -13658,7 +14689,7 @@ fn main_agent_worker_start_single_enter_recovery_survives_immediate_acceptance()
                 "agent_args": []
             },
             "repository": "example/repository",
-            "worktree": null,
+            "worktree": worker_checkout,
             "base_ref": "main",
             "scopes": ["crates/worker-lane"],
             "durable_refs": []
@@ -13869,6 +14900,174 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
         ],
     );
     assert_eq!(data(&replay), data(&reconciled));
+    let enter_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls, 2,
+        "initial submission plus exactly one recovery Enter"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_reports_checkout_preclaim_failure_as_not_ready() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    let declared_checkout = tmp.path().join("declared-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for path in [&checkout, &worker_checkout, &declared_checkout] {
+        init_checkout(path, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_id = "assignment-checkout-preclaim";
+    let worker_id = "worker-checkout-preclaim";
+    let assignment_path = tmp.path().join("assignment-checkout-preclaim.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": assignment_id,
+            "task_summary": "Reject a mismatched checkout before readiness",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": declared_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/worker-lane"],
+            "durable_refs": []
+        }),
+    );
+
+    let bootstrap_digest = orchestration_request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &json!(assignment_id),
+    );
+    let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
+    let enter_hook = tmp.path().join("bootstrap-mismatch-on-second-enter");
+    let enter_hook_output = tmp.path().join("bootstrap-mismatch-on-second-enter.json");
+    fs::write(
+        &enter_hook,
+        format!(
+            r#"#!/usr/bin/env sh
+set -u
+capability_file=""
+for candidate in {state_dir}/sessions/{worker_id}/coordination/capability-*; do
+  [ -f "$candidate" ] || continue
+  capability_file="$candidate"
+  break
+done
+[ -n "$capability_file" ]
+cd {worker_checkout}
+set +e
+AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+  {main_agent} --state-dir {state_dir} bootstrap \
+  --idempotency-key {bootstrap_key} --format json > {output}
+status=$?
+set -e
+[ "$status" -eq 65 ]
+grep -q worker-bootstrap-checkout-mismatch {output}
+"#,
+            state_dir = state_dir.display(),
+            worker_checkout = worker_checkout.display(),
+            worker_id = worker_id,
+            main_agent = bin::resolve("main-agent").display(),
+            bootstrap_key = bootstrap_key,
+            output = enter_hook_output.display(),
+        ),
+    )
+    .expect("enter hook");
+    fs::set_permissions(&enter_hook, fs::Permissions::from_mode(0o700)).expect("enter hook mode");
+    let enter_count = tmp.path().join("enter-count");
+
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let enter_hook_arg = enter_hook.to_string_lossy().into_owned();
+    let enter_count_arg = enter_count.to_string_lossy().into_owned();
+    let started = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "2s",
+            "--idempotency-key",
+            "worker-start-checkout-preclaim-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &enter_hook_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
+        ],
+    );
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    let readiness = &data(&started)["readiness"];
+    assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(readiness["classification"], "checkpoint_proof_failed");
+    assert_eq!(readiness["assignment_state"], "blocked");
+    assert_eq!(readiness["delivery"]["state"], "unverified");
+    assert_eq!(
+        readiness["delivery"]["transport_state"],
+        "submit-key-recovery-succeeded"
+    );
+    assert_eq!(
+        readiness["delivery"]["proof"],
+        "worker-bootstrap-preclaim-failed"
+    );
+    assert_eq!(
+        readiness["submit_key_recovery"]["result"],
+        "worker-bootstrap-preclaim-failed"
+    );
+    assert_eq!(readiness["automatic_retry_safe"], false);
+
+    let registry = orchestration_registry(&state_dir);
+    let assignment = &registry["assignments"][assignment_id];
+    assert_eq!(assignment["state"], "blocked");
+    assert_eq!(
+        assignment["blocker_summary"],
+        "[pre-claim:worker-bootstrap-checkout-mismatch] worker bootstrap failed"
+    );
+    assert_eq!(assignment["submit_recovery"]["state"], "failed");
+    assert_eq!(
+        assignment["submit_recovery"]["result"],
+        "worker-bootstrap-preclaim-failed"
+    );
     let enter_calls = tmux_calls(&tmux_log)
         .into_iter()
         .filter(|call| {

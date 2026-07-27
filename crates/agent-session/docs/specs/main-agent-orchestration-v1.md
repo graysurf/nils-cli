@@ -245,8 +245,11 @@ only the caller's bound assignment, reads that worker's private assignment
 packet, derives the coordination claim from the packet's
 repository/scopes plus the HMAC fingerprint derived from the authenticated
 worker session's canonical `cwd`, and records the initial `working` checkpoint.
-The optional absolute assignment `worktree` remains durable routing metadata
-and MUST NOT be serialized into the fingerprint-only claim field. A failure
+Before minting the private checkout-shell grant, bootstrap requires the
+packet's absolute `worktree`, `launch.cwd`, the durable assignment worktree,
+and the authenticated session `cwd` to resolve to the same canonical checkout
+root. The absolute assignment `worktree` remains private durable routing
+metadata and MUST NOT be serialized into the fingerprint-only claim field. A failure
 before claim acquisition advances the exact assignment to `blocked` with a
 durable typed pre-claim blocker. Its
 idempotency key is stable for the assignment, so an exact replay converges. A

@@ -79,6 +79,11 @@ pub struct WorkContextRecord {
     pub tier: String,
     pub repositories: Vec<String>,
     pub worktrees: Vec<String>,
+    /// Private admission grant minted only by authenticated Main Agent worker
+    /// bootstrap. It is persisted in the coordination registry but removed
+    /// from every public work-context projection.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub checkout_shell_grant: bool,
     pub provider_refs: Vec<ProviderRef>,
     pub plan_refs: Vec<String>,
     pub scopes: Vec<Scope>,
@@ -88,6 +93,10 @@ pub struct WorkContextRecord {
     pub expires_at_epoch: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at_epoch: Option<i64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
