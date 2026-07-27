@@ -1692,7 +1692,7 @@ pub(crate) fn ensure_session_not_quarantined(
     };
     Err(CliError::data(
         "worker-quarantined",
-        "worker execution authority is quarantined after stopped-runtime recovery reconciliation",
+        "worker execution authority is quarantined after stopped-runtime reconciliation",
         Some(json!({
             "assignment_id": marker.assignment_id,
             "current_revision": marker.assignment_revision
@@ -1877,6 +1877,30 @@ pub(crate) fn persist_session_authority_quarantine(
         .join(SESSION_AUTHORITY_QUARANTINE_FILE);
     write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())?;
     Ok(quarantine.clone())
+}
+
+pub(crate) fn require_session_authority_quarantine(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> Result<(), CliError> {
+    let marker = read_session_authority_quarantine(context, &worker.session_id)?
+        .ok_or_else(|| store_invalid("session authority quarantine is missing"))?;
+    validate_session_authority_quarantine(&marker)?;
+    if marker.assignment_id != assignment_id
+        || marker.assignment_revision != assignment_revision
+        || marker.quarantine.worker != *worker
+        || marker.quarantine.reason != reason
+        || marker.quarantine.runtime_identity_digest != runtime_identity_digest
+    {
+        return Err(store_invalid(
+            "session authority quarantine identity is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn read_session_authority_quarantine(

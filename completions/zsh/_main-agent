@@ -395,6 +395,20 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':assignment_id:_default' \
 && ret=0
 ;;
+(reconcile-stopped)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--reason=[Bounded durable reason for terminalizing this stopped post-claim assignment]:REASON:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
 (cancel)
 _arguments "${_arguments_options[@]}" : \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
@@ -666,6 +680,7 @@ _main-agent__subcmd__worker_commands() {
 'supervise:Repeatable bounded supervision macro with a typed classification and deterministic next action' \
 'submit-recovery:Send at most one guarded recovery Enter from a proven startup state' \
 'reconcile-recovery:Terminalize an unknown recovery without sending input after the exact worker runtime is stopped and coordination state is quiescent' \
+'reconcile-stopped:Terminalize a working assignment whose exact worker runtime is durably stopped, revoking only that worker'\''s claim without sending input, deleting the run, or touching its managed worktree' \
 'cancel:Terminalize only a proven failed pre-claim assignment' \
 'reassign:Cancel and retire a safely reassignable worker, then start one distinct clean replacement assignment without reusing its prompt or worktree' \
     )
@@ -730,6 +745,11 @@ _main-agent__subcmd__worker__subcmd__reassign_commands() {
 _main-agent__subcmd__worker__subcmd__reconcile-recovery_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker reconcile-recovery commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__reconcile-stopped_commands] )) ||
+_main-agent__subcmd__worker__subcmd__reconcile-stopped_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker reconcile-stopped commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__release_commands] )) ||
 _main-agent__subcmd__worker__subcmd__release_commands() {

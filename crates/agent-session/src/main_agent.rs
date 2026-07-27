@@ -256,6 +256,11 @@ enum WorkerCommand {
     /// worker runtime is stopped and coordination state is quiescent.
     #[command(name = "reconcile-recovery")]
     ReconcileRecovery(WorkerReconcileRecoveryArgs),
+    /// Terminalize a working assignment whose exact worker runtime is durably
+    /// stopped, revoking only that worker's claim without sending input,
+    /// deleting the run, or touching its managed worktree.
+    #[command(name = "reconcile-stopped")]
+    ReconcileStopped(WorkerReconcileStoppedArgs),
     /// Terminalize only a proven failed pre-claim assignment.
     Cancel(WorkerCancelArgs),
     /// Cancel and retire a safely reassignable worker, then start one distinct
@@ -324,6 +329,21 @@ struct WorkerReconcileRecoveryArgs {
     assignment_id: String,
     #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerReconcileStoppedArgs {
+    assignment_id: String,
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
+    if_revision: u64,
+    /// Bounded durable reason for terminalizing this stopped post-claim
+    /// assignment.
+    #[arg(long)]
+    reason: String,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -2089,6 +2109,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
         WorkerCommand::Supervise(args) => run_worker_supervise(context, args),
         WorkerCommand::SubmitRecovery(args) => run_worker_submit_recovery(context, args),
         WorkerCommand::ReconcileRecovery(args) => run_worker_reconcile_recovery(context, args),
+        WorkerCommand::ReconcileStopped(args) => run_worker_reconcile_stopped(context, args),
         WorkerCommand::Cancel(args) => run_worker_cancel(context, args),
         WorkerCommand::Reassign(args) => run_worker_reassign(context, args),
     }
@@ -5227,7 +5248,7 @@ fn run_worker_diagnose(context: &CliContext, args: WorkerDiagnoseArgs) -> Result
 fn run_worker_supervise(context: &CliContext, args: WorkerDiagnoseArgs) -> Result<Value, CliError> {
     let diagnosis = diagnose_worker(context, &args.assignment_id)?;
     Ok(json!({
-        "schema_version": "main-agent.worker-supervise-result.v1",
+        "schema_version": "main-agent.worker-supervise-result.v2",
         "assignment_id": args.assignment_id,
         "classification": diagnosis["classification"],
         "next_action": diagnosis["next_action"],
@@ -5583,6 +5604,28 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         provider_terminated,
         terminal_recovery_reconciled,
     });
+    // Durable process evidence, not just a tmux miss. `worker_status` alone is
+    // enough for a `starting` assignment because that state holds no claim, but
+    // terminalizing a `working` lane must not be triggered by an unavailable
+    // tmux query: a live or unknown runtime fails closed, and this is the same
+    // combined cgroup/process-session/process-group proof the terminalization
+    // re-establishes under the session-record lock.
+    let durable_runtime_stopped = session_evidence.value().is_some_and(|record| {
+        matches!(
+            crate::coordination_runtime_evidence(record).map(|evidence| evidence.status),
+            Ok(crate::CoordinationRuntimeStatus::Stopped)
+        )
+    });
+    // The B2 fact: bootstrap already recorded the `working` checkpoint, so the
+    // worker held its assignment-derived claim before its exact runtime died.
+    // `worker_failed_preclaim` deliberately refuses this state, and the claim
+    // may still be alive on TTL, so neither `worker cancel` nor `worker
+    // reassign` can close the lane.
+    let post_claim_runtime_gone = assignment.state == "working"
+        && assignment.worker.is_some()
+        && worker_status == "stopped"
+        && durable_runtime_stopped
+        && !terminal_recovery_reconciled;
     let starting_provider_terminated = assignment.state == "starting" && provider_terminated;
     let terminal_quiescent = matches!(assignment.state.as_str(), "cancelled" | "released")
         && !claim_active
@@ -5624,6 +5667,14 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         && !startup_dialog
         && !evidence_unavailable
         && !worker_unreachable;
+    // Deliberately independent of `worktree_clean`: preserving the stopped
+    // worker's unaccepted diff is the point of this transition, so a dirty
+    // worktree must not block it the way it blocks reassignment.
+    let post_claim_terminalization_safe = post_claim_runtime_gone
+        && !evidence_unavailable
+        && !worker_unreachable
+        && active_operations == 0
+        && uncertain_operations == 0;
     let orphan_guidance_quarantine_required =
         guidance.stale_incarnation_unread_count > 0 && assignment.previous_worker.is_none();
 
@@ -5631,6 +5682,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         evidence_unavailable,
         worker_unreachable,
         active_or_uncertain_operation: active_operations > 0 || uncertain_operations > 0,
+        post_claim_runtime_gone,
         coordination_broker_stale,
         edit_authority_stale,
         claim_renewal_required: claim_renewal_required && !failed_preclaim,
@@ -5668,7 +5720,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         })
     });
     Ok(json!({
-        "schema_version": "main-agent.worker-diagnose-result.v1",
+        "schema_version": "main-agent.worker-diagnose-result.v2",
         "assignment_id": assignment.assignment_id,
         "assignment_revision": assignment.revision,
         "assignment_state": assignment.state,
@@ -5677,6 +5729,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         "recovery_action": recovery_action,
         "automatic_retry_safe": automatic_retry_safe,
         "failed_preclaim": failed_preclaim,
+        "post_claim_terminalization_safe": post_claim_terminalization_safe,
         "cancel_then_reassign_safe": cancel_then_reassign_safe,
         "new_assignment_safe": new_assignment_safe,
         "reassignment_safe": new_assignment_safe,
@@ -5786,7 +5839,7 @@ fn worker_recovery_action(
         "json"
     ]);
     let mut action = json!({
-        "schema_version": "main-agent.worker-recovery-action.v1",
+        "schema_version": "main-agent.worker-recovery-action.v2",
         "classification": classification,
         "kind": "bounded_supervision_recheck",
         "owner": main_owner,
@@ -5889,6 +5942,25 @@ fn worker_recovery_action(
             action["executable"] = json!(false);
             action["required_inputs"] = json!(["allowlisted_account", "idempotency_key"]);
         }
+        "post_claim_failure" => {
+            action["kind"] = json!("stopped_worker_terminalization");
+            action["argv_template"] = json!([
+                "main-agent",
+                "worker",
+                "reconcile-stopped",
+                assignment.assignment_id,
+                "--if-revision",
+                assignment.revision.to_string(),
+                "--reason",
+                "<bounded-terminalization-reason>",
+                "--idempotency-key",
+                "<idempotency-key>",
+                "--format",
+                "json"
+            ]);
+            action["executable"] = json!(false);
+            action["required_inputs"] = json!(["terminalization_reason", "idempotency_key"]);
+        }
         "pre_claim_failure" | "safe_reassignment" => {
             action["kind"] = json!("distinct_assignment_replacement");
             action["argv_template"] = json!([
@@ -5956,6 +6028,12 @@ struct WorkerDiagnosisFacts {
     evidence_unavailable: bool,
     worker_unreachable: bool,
     active_or_uncertain_operation: bool,
+    /// The worker acquired its assignment-derived claim and then its exact
+    /// runtime died. Ranked above every live-worker recovery fact below,
+    /// because renewing a claim, rechecking edit authority, routing to a broker
+    /// owner, handing off an account, or reporting healthy progress are all
+    /// unexecutable instructions once the runtime is durably gone.
+    post_claim_runtime_gone: bool,
     coordination_broker_stale: bool,
     edit_authority_stale: bool,
     claim_renewal_required: bool,
@@ -5997,6 +6075,12 @@ fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'st
         (
             "uncertain_mutation",
             "preserve the exact worker and reconcile the operation before any retry, cancellation, retirement, or reassignment",
+            false,
+        )
+    } else if facts.post_claim_runtime_gone {
+        (
+            "post_claim_failure",
+            "run `main-agent worker reconcile-stopped` for the exact assignment with its current revision: the worker held its assignment-derived claim before its runtime died, so `worker cancel` and `worker reassign` refuse it. The action revokes only this stopped worker's claim, preserves its worktree, and leaves the run and Main Agent session intact so ordinary retirement or a distinct replacement assignment can follow. Never resend the prompt, send raw terminal input, or force group cleanup",
             false,
         )
     } else if facts.coordination_broker_stale {
@@ -7521,6 +7605,577 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
     locked.save()?;
     drop(quiescence);
     Ok(outcome)
+}
+
+const RECONCILE_STOPPED_RESULT_SCHEMA: &str = "main-agent.worker-reconcile-stopped-result.v2";
+const RECONCILE_STOPPED_PRIOR_RESULT_SCHEMA: &str = "main-agent.worker-reconcile-stopped-result.v1";
+const RECONCILE_STOPPED_PROGRESS_SCHEMA: &str = "main-agent.worker-reconcile-stopped-progress.v1";
+const RECONCILE_STOPPED_PROGRESS_STAGE: &str = "authority_quarantined";
+const RECONCILE_STOPPED_QUARANTINE_REASON: &str =
+    "stopped post-claim worker terminalized without input";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReconcileStoppedProgressReceipt {
+    schema_version: String,
+    state: String,
+    stage: String,
+    assignment_id: String,
+    worker: SessionRef,
+    controller_claim_id: String,
+    controller_claim_revision: u64,
+    controller_claim_expires_at_epoch: i64,
+    runtime_identity_digest: String,
+    worker_claim_observed: bool,
+    worker_claim_revoked: bool,
+}
+
+fn is_reconcile_stopped_terminal_result(value: &Value) -> bool {
+    matches!(
+        value["schema_version"].as_str(),
+        Some(RECONCILE_STOPPED_RESULT_SCHEMA | RECONCILE_STOPPED_PRIOR_RESULT_SCHEMA)
+    )
+}
+
+fn parse_reconcile_stopped_progress(
+    value: Value,
+    assignment_id: &str,
+) -> Result<ReconcileStoppedProgressReceipt, CliError> {
+    let progress: ReconcileStoppedProgressReceipt =
+        serde_json::from_value(value).map_err(|_| {
+            CliError::data(
+                "orchestration-store-invalid",
+                "worker reconcile-stopped progress receipt is invalid",
+                None,
+            )
+        })?;
+    let digest_valid = progress.runtime_identity_digest.len() == 64
+        && progress
+            .runtime_identity_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    if progress.schema_version != RECONCILE_STOPPED_PROGRESS_SCHEMA
+        || progress.state != "in_progress"
+        || progress.stage != RECONCILE_STOPPED_PROGRESS_STAGE
+        || progress.assignment_id != assignment_id
+        || progress.controller_claim_id.trim().is_empty()
+        || progress.controller_claim_id.len() > 256
+        || progress.controller_claim_revision == 0
+        || progress.controller_claim_expires_at_epoch <= 0
+        || !digest_valid
+        || progress.worker_claim_revoked
+    {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker reconcile-stopped progress receipt is invalid",
+            None,
+        ));
+    }
+    Ok(progress)
+}
+
+/// Terminalize a `working` assignment whose exact worker runtime is durably
+/// stopped.
+///
+/// `worker cancel` deliberately refuses this state: bootstrap already recorded
+/// the `working` checkpoint, so the failure is post-claim and the claim may
+/// still be alive on TTL. Before this transition existed the only remaining
+/// tool was daemon force group cleanup, which deletes the Main Agent session
+/// that would have to run it.
+///
+/// Two durable stages keep every mutation authorized and resumable:
+///
+/// 1. Under the exact worker session-record lock and the worker
+///    coordination guard, prove the runtime stopped and the exact controlling
+///    Main Agent claim active and unexpired, persist the session-owned
+///    incarnation-independent authority quarantine, terminalize the
+///    assignment, and store one strict typed progress receipt.
+/// 2. Reacquire and revalidate that same stopped lifecycle identity, then
+///    atomically bind either the unchanged original claim or a distinct
+///    active/unexpired successor for that exact controller, and seal only this
+///    worker's claim, broker, and capability under one coordination transaction
+///    before finalizing the public result.
+///
+/// The order matters: an interruption between stages leaves a terminal
+/// assignment whose retained session is already persistently quarantined. A
+/// racing resume therefore fails before provisioning authority, while an exact
+/// replay must parse the typed progress and converge stage 2. Without a current
+/// active claim, controller authority loss prevents every target authority
+/// mutation; a fresh same-controller successor makes the progress roll-forward
+/// explicit and auditable.
+fn run_worker_reconcile_stopped(
+    context: &CliContext,
+    args: WorkerReconcileStoppedArgs,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    orchestration::validate_summary("terminalization reason", &args.reason)?;
+    let (main, main_incarnation, continuation_claim) =
+        crate::coordination::authenticate_any_from_file_with_active_claim_observational(
+            context, None,
+        )?;
+    let request_digest = crate::coordination::request_digest(
+        "worker-reconcile-stopped",
+        &json!({
+            "assignment_id": args.assignment_id,
+            "if_revision": args.if_revision,
+            "reason": args.reason
+        }),
+    );
+    let registry = orchestration::load_registry_readonly(context)?;
+    let resumed = match idempotency_replay(
+        &registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-reconcile-stopped",
+        &request_digest,
+    )? {
+        Some(value) if is_reconcile_stopped_terminal_result(&value) => {
+            return Ok(value);
+        }
+        Some(value) => Some(parse_reconcile_stopped_progress(
+            value,
+            &args.assignment_id,
+        )?),
+        None => None,
+    };
+
+    let progress = if let Some(progress) = resumed {
+        // The terminal transition already committed. Re-prove ownership so a
+        // resumed stage 2 cannot revoke a worker claim for a caller that no
+        // longer controls the run.
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&registry, &main, &main_incarnation)?;
+        let assignment = registry
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        ensure_primary_manager(assignment, &main, &main_incarnation)?;
+        if assignment.state != "cancelled" || assignment.worker.as_ref() != Some(&progress.worker) {
+            return Err(CliError::data(
+                "orchestration-store-invalid",
+                "worker reconcile-stopped progress no longer matches the assignment",
+                None,
+            ));
+        }
+        orchestration::require_session_authority_quarantine(
+            context,
+            &assignment.assignment_id,
+            assignment.revision,
+            &progress.worker,
+            RECONCILE_STOPPED_QUARANTINE_REASON,
+            &format!("sha256:{}", progress.runtime_identity_digest),
+        )?;
+        progress
+    } else {
+        // Every precondition is proved directly rather than through the
+        // composite supervision boolean, so each refusal names its own
+        // cause and nothing here takes the session-record lock twice
+        // (`diagnose_worker` persists worktree progress under that lock).
+        // The classifier derives `post_claim_failure` from the same two
+        // runtime signals re-established below.
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&registry, &main, &main_incarnation)?;
+        let assignment = registry
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
+            .clone();
+        ensure_primary_manager(&assignment, &main, &main_incarnation)?;
+        ensure_revision(args.if_revision, assignment.revision, "assignment")?;
+        ensure_submit_recovery_not_in_flight(&assignment)?;
+        ensure_account_handoff_not_in_flight(&assignment)?;
+        if assignment.state != "working" {
+            return Err(CliError::data(
+                "assignment-state-conflict",
+                "worker reconcile-stopped requires a working assignment; a pre-claim failure stays on the worker cancel path",
+                Some(json!({ "state": assignment.state, "revision": assignment.revision })),
+            ));
+        }
+        let worker = assignment.worker.clone().ok_or_else(|| {
+            CliError::data(
+                "worker-incarnation-changed",
+                "assignment has no bound worker to reconcile",
+                None,
+            )
+        })?;
+
+        // The exact session-record lock is the lifecycle boundary: holding
+        // it prevents resume or replacement from restoring an executing
+        // runtime while stopped evidence and the transition commit.
+        let worker_lifecycle = acquire_session_record_lock(context, &worker.session_id)?;
+        let worker_record = load_session_record(context, &worker.session_id)?;
+        let record_incarnation = worker_record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .unwrap_or_default();
+        if !orchestration::session_ref_matches(&worker, &worker_record, record_incarnation) {
+            return Err(CliError::data(
+                "worker-incarnation-changed",
+                "bound worker identity changed before stopped-runtime reconciliation",
+                None,
+            ));
+        }
+        let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+        match runtime_evidence.status {
+            crate::CoordinationRuntimeStatus::Stopped => {}
+            crate::CoordinationRuntimeStatus::Running => {
+                return Err(CliError::data(
+                    "worker-runtime-still-live",
+                    "the assignment cannot be terminalized while the exact worker process runtime can still act",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
+            crate::CoordinationRuntimeStatus::Unknown => {
+                return Err(CliError::runtime(
+                    "coordination-runtime-unverified",
+                    "the assignment cannot be terminalized without stopped exact-runtime evidence",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
+        }
+        if session_status(&resolve_tmux_bin(None), &worker_record) != "stopped" {
+            return Err(CliError::data(
+                "worker-runtime-still-live",
+                "the assignment cannot be terminalized while the exact worker runtime can still act",
+                Some(json!({ "assignment_id": args.assignment_id })),
+            ));
+        }
+
+        // This guard binds the exact active, unexpired controller claim into
+        // the same coordination snapshot that proves target quiescence.
+        let terminalization = crate::coordination::lock_stopped_worker_terminalization(
+            context,
+            &worker.session_id,
+            &worker.session_incarnation,
+            &main.id,
+            &main_incarnation,
+            &continuation_claim,
+        )?;
+        let worker_claim_observed = terminalization.worker_claim_observed();
+        let controller_claim = terminalization.controller_claim().clone();
+
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(value) = idempotency_replay(
+            &locked.registry,
+            &main,
+            &main_incarnation,
+            &args.idempotency_key,
+            "worker-reconcile-stopped",
+            &request_digest,
+        )? {
+            if is_reconcile_stopped_terminal_result(&value) {
+                return Ok(value);
+            }
+            parse_reconcile_stopped_progress(value, &args.assignment_id)?;
+            return Err(CliError::unavailable(
+                "worker-reconcile-stopped-in-progress",
+                "another identical stopped-worker terminalization is in progress; retry the same request",
+                None,
+            ));
+        }
+        let current_run = require_current_main(&locked.registry, &main, &main_incarnation)?.clone();
+        let current = locked
+            .registry
+            .assignments
+            .get_mut(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == current_run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        ensure_primary_manager(current, &main, &main_incarnation)?;
+        ensure_revision(args.if_revision, current.revision, "assignment")?;
+        ensure_submit_recovery_not_in_flight(current)?;
+        ensure_account_handoff_not_in_flight(current)?;
+        if current.state != "working" {
+            return Err(CliError::data(
+                "assignment-state-conflict",
+                "worker reconcile-stopped requires a working assignment",
+                Some(json!({ "state": current.state, "revision": current.revision })),
+            ));
+        }
+        if current.worker.as_ref() != Some(&worker) {
+            return Err(CliError::data(
+                "worker-incarnation-changed",
+                "bound worker identity changed before the terminalization commit",
+                None,
+            ));
+        }
+        let terminalized_at = timestamp();
+        let terminal_revision = current.revision.saturating_add(1);
+        let proposed_quarantine = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: RECONCILE_STOPPED_QUARANTINE_REASON.to_string(),
+            runtime_identity_digest: format!("sha256:{}", runtime_evidence.identity_digest),
+            created_at: terminalized_at.clone(),
+        };
+        // This marker is session-owned and checked by both CLI and HTTP resume
+        // before any new launch identity, broker, or capability is provisioned.
+        // It must be durable before the terminal orchestration commit.
+        orchestration::persist_session_authority_quarantine(
+            context,
+            &current.assignment_id,
+            terminal_revision,
+            &proposed_quarantine,
+        )?;
+        current.state = "cancelled".to_string();
+        current.revision = terminal_revision;
+        current.updated_at = terminalized_at;
+        current.blocker_summary = Some(format!(
+            "Terminalized after the exact worker runtime stopped post-claim: {}",
+            args.reason
+        ));
+        let progress = ReconcileStoppedProgressReceipt {
+            schema_version: RECONCILE_STOPPED_PROGRESS_SCHEMA.to_string(),
+            state: "in_progress".to_string(),
+            stage: RECONCILE_STOPPED_PROGRESS_STAGE.to_string(),
+            assignment_id: args.assignment_id.clone(),
+            worker: worker.clone(),
+            controller_claim_id: controller_claim.claim_id,
+            controller_claim_revision: controller_claim.revision,
+            controller_claim_expires_at_epoch: controller_claim.expires_at_epoch,
+            runtime_identity_digest: runtime_evidence.identity_digest.clone(),
+            worker_claim_observed,
+            worker_claim_revoked: false,
+        };
+        store_receipt(
+            &mut locked.registry,
+            &main,
+            &main_incarnation,
+            &args.idempotency_key,
+            "worker-reconcile-stopped",
+            &request_digest,
+            serde_json::to_value(&progress).map_err(|_| {
+                CliError::data(
+                    "orchestration-store-invalid",
+                    "worker reconcile-stopped progress receipt is invalid",
+                    None,
+                )
+            })?,
+        )?;
+        locked.save()?;
+        drop(locked);
+        drop(terminalization);
+        drop(worker_lifecycle);
+        progress
+    };
+
+    pause_reconcile_stopped_for_test("after_terminal_commit")?;
+
+    // Stage 2 reacquires the exact lifecycle lock and re-proves stopped
+    // evidence before target authority is touched.
+    let worker_lifecycle = acquire_session_record_lock(context, &progress.worker.session_id)?;
+    let worker_record = load_session_record(context, &progress.worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&progress.worker, &worker_record, record_incarnation) {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker identity changed before the authority seal",
+            None,
+        ));
+    }
+    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    match runtime_evidence.status {
+        crate::CoordinationRuntimeStatus::Stopped => {}
+        crate::CoordinationRuntimeStatus::Running => {
+            return Err(CliError::data(
+                "worker-runtime-still-live",
+                "the assignment cannot seal authority while the exact worker runtime can still act",
+                Some(json!({ "assignment_id": args.assignment_id })),
+            ));
+        }
+        crate::CoordinationRuntimeStatus::Unknown => {
+            return Err(CliError::runtime(
+                "coordination-runtime-unverified",
+                "the assignment cannot seal authority without stopped exact-runtime evidence",
+                Some(json!({ "assignment_id": args.assignment_id })),
+            ));
+        }
+    }
+    if runtime_evidence.identity_digest != progress.runtime_identity_digest
+        || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+    {
+        return Err(CliError::data(
+            "worker-runtime-still-live",
+            "stopped worker lifecycle evidence changed before the authority seal",
+            Some(json!({ "assignment_id": args.assignment_id })),
+        ));
+    }
+
+    // The destructive seal and the exact active/unexpired continuation claim
+    // check share this one coordination transaction. Only the named worker is
+    // ever included. A successor must use a distinct claim id; an in-place
+    // revision or expiry drift does not silently inherit stage-1 authority.
+    let expected_controller_claim = crate::coordination::ControllerClaimTuple {
+        claim_id: progress.controller_claim_id.clone(),
+        revision: progress.controller_claim_revision,
+        expires_at_epoch: progress.controller_claim_expires_at_epoch,
+    };
+    let controller_authorization_mode = if continuation_claim == expected_controller_claim {
+        "original"
+    } else if continuation_claim.claim_id != expected_controller_claim.claim_id {
+        "successor"
+    } else {
+        return Err(CliError::data(
+            "claim-not-active",
+            "Main Agent continuation claim must preserve the original tuple or use a distinct successor claim",
+            None,
+        ));
+    };
+    let mut terminalization = crate::coordination::lock_stopped_worker_terminalization(
+        context,
+        &progress.worker.session_id,
+        &progress.worker.session_incarnation,
+        &main.id,
+        &main_incarnation,
+        &continuation_claim,
+    )?;
+
+    // Keep orchestration continuity locked across the destructive seal and
+    // final receipt. A concurrent retire or other assignment mutation cannot
+    // invalidate the typed progress after it authorizes target cleanup.
+    let mut locked = orchestration::lock_registry(context)?;
+    let committed = idempotency_replay(
+        &locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-reconcile-stopped",
+        &request_digest,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "orchestration-store-invalid",
+            "worker reconcile-stopped progress receipt is missing",
+            None,
+        )
+    })?;
+    if is_reconcile_stopped_terminal_result(&committed) {
+        return Ok(committed);
+    }
+    let committed_progress = parse_reconcile_stopped_progress(committed, &args.assignment_id)?;
+    if committed_progress != progress {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker reconcile-stopped progress changed before the authority seal",
+            None,
+        ));
+    }
+    let run = require_current_main(&locked.registry, &main, &main_incarnation)?;
+    let assignment = locked
+        .registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, &main, &main_incarnation)?;
+    if assignment.state != "cancelled" || assignment.worker.as_ref() != Some(&progress.worker) {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker reconcile-stopped progress no longer matches the assignment",
+            None,
+        ));
+    }
+    orchestration::require_session_authority_quarantine(
+        context,
+        &assignment.assignment_id,
+        assignment.revision,
+        &progress.worker,
+        RECONCILE_STOPPED_QUARANTINE_REASON,
+        &format!("sha256:{}", progress.runtime_identity_digest),
+    )?;
+    terminalization.seal(context)?;
+    pause_reconcile_stopped_for_test("after_authority_seal")?;
+    let assignment_view = public_assignment_view(assignment);
+    let outcome = json!({
+        "schema_version": RECONCILE_STOPPED_RESULT_SCHEMA,
+        "assignment": assignment_view,
+        "terminalized": true,
+        "worker_claim_active_after": false,
+        "input_sent": false,
+        "worktree_preserved": true,
+        "automatic_retry_safe": false,
+        "proof": {
+            "worker_runtime": "stopped",
+            "runtime_identity_digest": progress.runtime_identity_digest,
+            "lifecycle_boundary": "revalidated-exclusive-record-lock",
+            "coordination": "quiescent",
+            "worker_claim": {
+                "active_disposition": "absent",
+                "release_provenance": "not_attributed_to_attempt",
+                "observed_at_stage1": progress.worker_claim_observed
+            },
+            "controller_authorization": {
+                "mode": controller_authorization_mode,
+                "original": {
+                    "claim_id": expected_controller_claim.claim_id,
+                    "revision": expected_controller_claim.revision,
+                    "expires_at_epoch": expected_controller_claim.expires_at_epoch
+                },
+                "continuation": {
+                    "claim_id": continuation_claim.claim_id,
+                    "revision": continuation_claim.revision,
+                    "expires_at_epoch": continuation_claim.expires_at_epoch
+                }
+            },
+        },
+        "next_action": "retire this exact cancelled assignment, or start a distinct replacement assignment and clean worktree"
+    });
+    store_receipt(
+        &mut locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-reconcile-stopped",
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    drop(locked);
+    drop(terminalization);
+    drop(worker_lifecycle);
+    Ok(outcome)
+}
+
+fn pause_reconcile_stopped_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_RECONCILE_STOPPED_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_RECONCILE_STOPPED_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker reconcile-stopped test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), stage.as_bytes()).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker reconcile-stopped test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "worker reconcile-stopped test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_submit_recovery_not_in_flight(assignment: &AssignmentRecord) -> Result<(), CliError> {
@@ -13542,6 +14197,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::Supervise(_) => "worker-supervise",
             WorkerCommand::SubmitRecovery(_) => "worker-submit-recovery",
             WorkerCommand::ReconcileRecovery(_) => "worker-reconcile-recovery",
+            WorkerCommand::ReconcileStopped(_) => "worker-reconcile-stopped",
             WorkerCommand::Cancel(_) => "worker-cancel",
             WorkerCommand::Reassign(_) => "worker-reassign",
         },
@@ -13589,6 +14245,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             | WorkerCommand::Retire(args) => args.format,
             WorkerCommand::SubmitRecovery(args) => args.format,
             WorkerCommand::ReconcileRecovery(args) => args.format,
+            WorkerCommand::ReconcileStopped(args) => args.format,
             WorkerCommand::Cancel(args) => args.format,
             WorkerCommand::Reassign(args) => args.format,
         },
@@ -19664,6 +20321,7 @@ mod tests {
             evidence_unavailable: false,
             worker_unreachable: false,
             active_or_uncertain_operation: false,
+            post_claim_runtime_gone: false,
             coordination_broker_stale: false,
             edit_authority_stale: false,
             claim_renewal_required: false,
@@ -19769,6 +20427,185 @@ mod tests {
             }),
             "an in-flight or uncertain operation must dominate pre-claim cancellation"
         );
+    }
+
+    /// B2: once bootstrap recorded the `working` checkpoint the worker held its
+    /// assignment-derived claim, so a dead runtime is a post-claim failure with
+    /// a claim that may still be alive on TTL. It must outrank every
+    /// classification whose prescribed action needs a live worker, must stay
+    /// behind the fail-closed evidence guards, and must never borrow the
+    /// pre-claim verdict that `worker cancel` owns.
+    #[test]
+    fn stopped_worker_on_a_working_assignment_is_a_post_claim_failure() {
+        let base = base_diagnosis_facts();
+        let post_claim = classify_worker_diagnosis(WorkerDiagnosisFacts {
+            post_claim_runtime_gone: true,
+            ..base
+        });
+        assert_eq!(post_claim.0, "post_claim_failure");
+        assert!(
+            post_claim.1.contains("reconcile-stopped"),
+            "the next action must name the executable terminalization, got: {}",
+            post_claim.1
+        );
+        assert!(
+            !post_claim.2,
+            "terminalization stays an explicit Main Agent decision"
+        );
+
+        for live_worker_advice in [
+            WorkerDiagnosisFacts {
+                coordination_broker_stale: true,
+                ..base
+            },
+            WorkerDiagnosisFacts {
+                edit_authority_stale: true,
+                ..base
+            },
+            WorkerDiagnosisFacts {
+                claim_renewal_required: true,
+                ..base
+            },
+            WorkerDiagnosisFacts {
+                account_handoff_required: true,
+                ..base
+            },
+            WorkerDiagnosisFacts {
+                startup_dialog: true,
+                ..base
+            },
+            WorkerDiagnosisFacts {
+                provider_activity_stale: true,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                classify_worker_diagnosis(WorkerDiagnosisFacts {
+                    post_claim_runtime_gone: true,
+                    ..live_worker_advice
+                })
+                .0,
+                "post_claim_failure",
+                "a durably stopped post-claim runtime must dominate advice that needs a live worker"
+            );
+        }
+
+        for guard in [
+            "evidence_unavailable",
+            "worker_unreachable",
+            "uncertain_mutation",
+        ] {
+            assert_eq!(
+                classify_worker_diagnosis(WorkerDiagnosisFacts {
+                    post_claim_runtime_gone: true,
+                    evidence_unavailable: guard == "evidence_unavailable",
+                    worker_unreachable: guard == "worker_unreachable",
+                    active_or_uncertain_operation: guard == "uncertain_mutation",
+                    ..base
+                })
+                .0,
+                guard,
+                "fail-closed evidence and operation guards must stay ahead of terminalization"
+            );
+        }
+
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "working",
+                claim_active: true,
+                operations_quiescent: true,
+                worker_bound: true,
+                worker_status: "stopped",
+                preclaim_blocker: false,
+                provider_terminated: false,
+                terminal_recovery_reconciled: false,
+            }),
+            "a post-claim stopped worker must not be routed through pre_claim_failure"
+        );
+    }
+
+    #[test]
+    fn reconcile_stopped_progress_receipt_is_strictly_typed() {
+        let valid = json!({
+            "schema_version": RECONCILE_STOPPED_PROGRESS_SCHEMA,
+            "state": "in_progress",
+            "stage": RECONCILE_STOPPED_PROGRESS_STAGE,
+            "assignment_id": "assignment-stopped",
+            "worker": {
+                "session_id": "worker-stopped",
+                "session_incarnation": "worker-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "controller_claim_id": "controller-claim",
+            "controller_claim_revision": 3,
+            "controller_claim_expires_at_epoch": 1_900_000_000,
+            "runtime_identity_digest":
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "worker_claim_observed": true,
+            "worker_claim_revoked": false
+        });
+        let parsed = parse_reconcile_stopped_progress(valid.clone(), "assignment-stopped").unwrap();
+        assert_eq!(parsed.assignment_id, "assignment-stopped");
+
+        let mut cases = Vec::new();
+        for field in [
+            "controller_claim_id",
+            "controller_claim_revision",
+            "controller_claim_expires_at_epoch",
+            "runtime_identity_digest",
+            "worker_claim_observed",
+        ] {
+            let mut missing = valid.clone();
+            missing
+                .as_object_mut()
+                .expect("progress object")
+                .remove(field);
+            cases.push((format!("missing-{field}"), missing));
+        }
+        for (name, field, value) in [
+            ("empty-digest", "runtime_identity_digest", json!("")),
+            (
+                "bad-digest",
+                "runtime_identity_digest",
+                json!("not-a-digest"),
+            ),
+            (
+                "claim-flag-not-bool",
+                "worker_claim_observed",
+                json!("true"),
+            ),
+            ("empty-controller-claim", "controller_claim_id", json!("")),
+            (
+                "zero-controller-revision",
+                "controller_claim_revision",
+                json!(0),
+            ),
+            (
+                "invalid-controller-expiry",
+                "controller_claim_expires_at_epoch",
+                json!(0),
+            ),
+            (
+                "assignment-mismatch",
+                "assignment_id",
+                json!("another-assignment"),
+            ),
+            ("invalid-stage", "stage", json!("authority_sealed")),
+            ("invalid-state", "state", json!("completed")),
+            ("revoked-progress", "worker_claim_revoked", json!(true)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            cases.push((name.to_string(), invalid));
+        }
+        let mut unknown = valid;
+        unknown["unexpected"] = json!(true);
+        cases.push(("unknown-field".to_string(), unknown));
+
+        for (name, value) in cases {
+            let error = parse_reconcile_stopped_progress(value, "assignment-stopped").unwrap_err();
+            assert_eq!(error.code(), "orchestration-store-invalid", "case={name}");
+        }
     }
 
     #[test]
@@ -19951,7 +20788,7 @@ mod tests {
                 Some(7),
             );
             assert_eq!(
-                action["schema_version"], "main-agent.worker-recovery-action.v1",
+                action["schema_version"], "main-agent.worker-recovery-action.v2",
                 "classification={classification}"
             );
             assert_eq!(action["classification"], classification);

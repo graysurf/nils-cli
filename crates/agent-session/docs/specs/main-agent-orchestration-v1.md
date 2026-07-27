@@ -105,6 +105,7 @@ main-agent worker account-handoff-cancel ASSIGNMENT_ID --reservation-id RESERVAT
 main-agent worker request-changes ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
+main-agent worker reconcile-stopped ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker reassign ASSIGNMENT_ID --assignment-file FILE --if-revision N --reason TEXT [--await-ready D] --idempotency-key KEY --format json
 main-agent worker message|accept|release|delete ...
@@ -307,21 +308,145 @@ state fail closed.
 Accept/release are explicit Main Agent transitions. The ordinary successful
 path is `submitted -> accepted -> released`. Once an assignment is `accepted`,
 `released`, or `cancelled`, worker checkpoints are rejected before any result,
-checkpoint, worker binding, state, or revision mutation. The `worker cancel`
-command is the only public transition into `cancelled`. It may terminalize only the named
+checkpoint, worker binding, state, or revision mutation. `worker cancel` and
+`worker reconcile-stopped` are the only public facade transitions into
+`cancelled`; daemon-owned force group cleanup reaches the same state through its
+own contract below. `worker cancel` may terminalize only the named
 failed pre-claim assignment, with an exact revision, active Main Agent claim,
 no worker claim, and no active or uncertain worker operation. The coordination
 registry lock remains held across the orchestration transition so claim
 acquisition cannot race cancellation. Operators MUST NOT synthesize
 cancellation by editing the private registry.
 
+### Post-claim stopped-worker terminalization
+
+`worker reconcile-stopped` terminalizes a `working` assignment whose exact
+worker runtime is durably stopped. `worker cancel` deliberately refuses that
+state: bootstrap already recorded the `working` checkpoint, so the failure is
+post-claim and the worker's assignment-derived claim may still be alive on TTL.
+Without this transition such a lane could only be closed by daemon force group
+cleanup, which deletes the Main Agent session that would have to run it.
+
+Eligibility is exact. The caller MUST be the authenticated current Main Agent
+with an active claim, the run controller, and the assignment primary manager.
+Authentication and replay admission use a non-renewing coordination read, so a
+healthy broker cannot silently renew an expired claim before authorization is
+checked.
+The assignment MUST be `working` at the supplied `--if-revision`, with no submit
+recovery in flight and no account-handoff reservation in flight. The bound
+worker's session record MUST match the exact incarnation. Stopped proof combines
+the persisted cgroup, process-session, and process-group runtime identity with
+the tmux session state: live evidence dominates, unavailable or unresolvable
+evidence stays unknown, and both sources MUST agree the runtime is gone. A
+running runtime returns `worker-runtime-still-live`; unknown runtime evidence
+returns `coordination-runtime-unverified`. Neither is automatically retry-safe.
+
+Each stage holds the exact session-record lock as its lifecycle boundary, so
+resume or replacement cannot restore an executing runtime while stopped proof
+is established or authority is sealed. The first-stage coordination guard
+refuses any active, completing, or reconcile-pending operation lease and any
+present incarnation-mismatched broker, and binds the exact active, unexpired
+controlling Main Agent claim to the stopped-worker observation. The second
+stage reacquires both guards, re-proves the same stopped incarnation and
+runtime-identity digest, and revalidates the controller claim by claim ID,
+revision, state, incarnation, and expiry in the destructive coordination
+transaction. Unlike `worker cancel` an active worker claim is expected and
+permitted, and a stopped or absent worker broker is not a liveness dependency.
+Unaccepted worktree content is deliberately not a precondition: preserving the
+stopped worker's diff is the purpose of the transition.
+
+Execution is two durable stages under one idempotency key. The first stage
+first persists the session-owned authority quarantine, then terminalizes the
+assignment as `cancelled`, advances the revision once, records the bounded
+reason as the blocker summary, and stores a strict typed
+`main-agent.worker-reconcile-stopped-progress.v1` receipt in the same
+orchestration save. The session quarantine is deliberately not projected into
+`assignment.worker_quarantine`: that v3 field remains reserved for a
+`reconciled` submit recovery, so both interrupted and completed B2 registries
+remain readable by the released v3 contract. The progress receipt's closed
+fields include `state:
+"in_progress"`, `stage: "authority_quarantined"`, the exact assignment and
+worker, a 64-hex runtime-identity digest, Boolean claim observations, and the
+exact controlling claim ID, revision, and expiry epoch observed in stage one.
+Missing, mistyped, unknown, mismatched, or invalid-stage progress fails with
+`orchestration-store-invalid` before cleanup. Progress is never a public
+success result.
+
+The second stage revokes only that worker's coordination authority — stopping
+its broker, releasing its claim when still active, and removing its capability
+— and finalizes the receipt as
+`main-agent.worker-reconcile-stopped-result.v2` while the controller-claim
+transaction remains held. The unchanged original claim tuple authorizes normal
+continuation. If that claim was released or expired, a fresh exact replay by the
+same current run owner and exact Main Agent session/incarnation may explicitly
+bind one distinct active, unexpired successor claim. The original tuple stays
+in progress, and the final proof records both original and continuation tuples
+plus `mode: "original"|"successor"`. Same-claim revision or expiry drift is not
+a successor, and a different session, incarnation, or run owner cannot take
+over progress. Without a current active claim, replay returns
+`claim-not-active` and leaves target authority unchanged.
+
+The order is deliberate: an interruption between stages leaves a terminal
+assignment whose stopped worker may still hold a claim, but the retained
+session already carries an incarnation-independent authority quarantine.
+Direct CLI resume, HTTP resume, maintenance resume, claim, bootstrap, and
+checkpoint paths therefore fail with `worker-quarantined` before provisioning
+a launch identity, broker, or capability. An exact replay parses the progress,
+revalidates the session marker, ownership, and stopped lifecycle, and converges
+the second stage;
+concurrent exact calls either converge to the terminal result or receive the
+typed in-progress error, never a progress-shaped success. Exact replay of a
+completed request returns the original terminal receipt without advancing the
+revision again. If execution stops after the target-only seal is durable but
+before the terminal receipt save, the strict progress receipt remains. An
+identical retry proves the stopped lifecycle, binds the current original or
+explicit successor claim, observes the already-sealed target, and commits the
+final result; every later replay is side-effect free. All B2 capability
+authentication, claim capture, and target-seal snapshots use an observational
+coordination lock that performs no notification normalization, claim renewal,
+operation renewal probe, or maintenance write. Normal coordination callers
+retain full maintenance.
+
+The result reports `terminalized`, `worker_claim_active_after: false`,
+`input_sent: false`, `worktree_preserved: true`,
+`automatic_retry_safe: false`, and a bounded `proof` object naming the stopped
+runtime, its privacy-safe runtime identity digest, the exclusive record-lock
+lifecycle boundary, coordination quiescence, and original/continuation
+controller authorization. The worker-claim proof reports the stable terminal
+truth `active_disposition: "absent"`, the persisted stage-one observation, and
+the conservative `release_provenance: "not_attributed_to_attempt"`. It does not
+claim whether the normal attempt, a pre-receipt attempt that committed the seal,
+or a prior external release made the claim inactive. Therefore normal
+completion and recovery after the durable seal cannot report contradictory
+results for the same logical operation. The prior
+`main-agent.worker-reconcile-stopped-result.v1` shape is closed: existing
+completed v1 receipts remain byte-stable on exact replay, but new completions
+emit v2. No path
+through this command loads a prompt, pastes, sends Enter, deletes a session,
+closes the run, touches the managed worktree, or changes any other assignment,
+worker claim, or broker. After success the worker session record is retained
+until ordinary `worker retire`, and a distinct replacement assignment remains
+subject to the existing `worker reassign` clean-worktree requirement.
+
+The assignment registry admits `worker_quarantine` only for an exact
+`reconciled` submit recovery. B2 uses only the session-owned marker, which
+remains until guarded retirement/deletion removes the retained session
+directory; successful target sealing does not clear it.
+
 ### Supervision and primitive recovery
 
 `worker diagnose` reads assignment, exact worker identity, provider activity,
 claim, active/uncertain operation counts, and clean-worktree progress without
-mutation. `worker supervise` is the repeatable bounded macro over the same
-evidence. Its closed classifications are `healthy_progress`,
-`startup_dialog_failure`, `pre_claim_failure`, `uncertain_mutation`,
+mutation. `main-agent.worker-diagnose-result.v2` and
+`main-agent.worker-supervise-result.v2` publish the expanded closed
+classification union; `main-agent.worker-recovery-action.v2` publishes the
+matching closed action-kind union, including
+`stopped_worker_terminalization`. The v1 schema ids remain the prior closed
+contracts and are not emitted with the expanded union. `worker supervise` is
+the repeatable bounded macro over the same evidence. Its v2 closed
+classifications are `healthy_progress`,
+`startup_dialog_failure`, `pre_claim_failure`, `post_claim_failure`,
+`uncertain_mutation`,
 `submitted_or_waiting_without_checkpoint`, `safe_reassignment`,
 `worker_unreachable`, and `evidence_unavailable`; every result includes a
 deterministic `next_action`. Packet, session, activity, coordination, and
@@ -341,6 +466,24 @@ claim-expiry evidence: only `claim_renewal_required` directs the exact worker to
 renew its own claim. `coordination_broker_stale` routes to exact-incarnation
 broker-owner recovery; `edit_authority_stale` requests a bounded recheck while
 no durable broker-lost timestamp exists.
+
+`post_claim_failure` is the `working` counterpart of `pre_claim_failure`: the
+assignment is `working`, its bound worker still matches, and both the tmux
+session state and the persisted process runtime identity prove the exact
+incarnation is durably stopped. Only the fail-closed guards
+`evidence_unavailable`, `worker_unreachable`, and `uncertain_mutation` outrank
+it. It MUST outrank `coordination_broker_stale`, `edit_authority_stale`,
+`claim_renewal_required`, the guidance and account-handoff classifications,
+`startup_dialog_failure`, `stale_provider_activity`, and `healthy_progress`,
+because every one of those prescribes an action that requires a live worker.
+Its `next_action` names `worker reconcile-stopped`, its `recovery_action.kind` is
+`stopped_worker_terminalization`, and `automatic_retry_safe` is `false`.
+Diagnosis additionally publishes `post_claim_terminalization_safe`, which is
+independent of worktree cleanliness. This classification MUST NOT be reported as
+`pre_claim_failure`: `worker cancel` requires an absent worker claim and refuses
+a `working` assignment, so routing it there would publish an unexecutable
+instruction. An unknown or live runtime keeps its ordinary live-worker
+classification rather than becoming terminalizable.
 
 Worktree staleness uses a durable, privacy-safe material fingerprint scoped to
 the assignment and exact worker incarnation. The bounded input combines

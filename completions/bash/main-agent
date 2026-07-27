@@ -106,6 +106,9 @@ _main-agent() {
             main__agent__worker,reconcile-recovery)
                 cmd="main__agent__worker__reconcile__recovery"
                 ;;
+            main__agent__worker,reconcile-stopped)
+                cmd="main__agent__worker__reconcile__stopped"
+                ;;
             main__agent__worker,release)
                 cmd="main__agent__worker__release"
                 ;;
@@ -792,7 +795,7 @@ _main-agent() {
             return 0
             ;;
         main__agent__worker)
-            opts="-h --state-dir --host --help start list show wait message guidance-reconcile guidance-quarantine account-handoff account-handoff-cancel request-changes accept release delete retire diagnose supervise submit-recovery reconcile-recovery cancel reassign"
+            opts="-h --state-dir --host --help start list show wait message guidance-reconcile guidance-quarantine account-handoff account-handoff-cancel request-changes accept release delete retire diagnose supervise submit-recovery reconcile-recovery reconcile-stopped cancel reassign"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1273,6 +1276,47 @@ _main-agent() {
             fi
             case "${prev}" in
                 --if-revision)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --idempotency-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        main__agent__worker__reconcile__stopped)
+            opts="-h --if-revision --reason --idempotency-key --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --if-revision)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reason)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

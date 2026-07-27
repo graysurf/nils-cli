@@ -308,36 +308,102 @@ pub(crate) struct GroupCleanupQuiescenceGuard {
     sessions: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControllerClaimTuple {
+    pub(crate) claim_id: String,
+    pub(crate) revision: u64,
+    pub(crate) expires_at_epoch: i64,
+}
+
+pub(crate) struct StoppedWorkerTerminalizationGuard {
+    locked: LockedRegistry,
+    worker: (String, String),
+    controller: (String, String),
+    controller_claim: ControllerClaimTuple,
+    worker_claim_observed: bool,
+}
+
+impl StoppedWorkerTerminalizationGuard {
+    pub(crate) fn worker_claim_observed(&self) -> bool {
+        self.worker_claim_observed
+    }
+
+    pub(crate) fn controller_claim(&self) -> &ControllerClaimTuple {
+        &self.controller_claim
+    }
+
+    /// Seal only the exact stopped worker while the exact active, unexpired
+    /// controller claim remains unchanged under this same registry lock.
+    pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
+        let now = now_epoch();
+        let controller_claim_current = self.locked.registry.claims.iter().any(|claim| {
+            claim.session_id == self.controller.0
+                && claim.session_incarnation == self.controller.1
+                && claim.claim_id == self.controller_claim.claim_id
+                && claim.revision == self.controller_claim.revision
+                && claim.expires_at_epoch == self.controller_claim.expires_at_epoch
+                && claim.state == "active"
+                && claim.expires_at_epoch > now
+        });
+        if !controller_claim_current {
+            return Err(CliError::data(
+                "claim-not-active",
+                "Main Agent claim is no longer exact, active, and unexpired at the worker authority seal",
+                None,
+            ));
+        }
+        ensure_group_cleanup_quiescence(
+            &self.locked.registry,
+            std::slice::from_ref(&self.worker),
+            true,
+        )?;
+        seal_coordination_sessions(
+            &mut self.locked,
+            context,
+            std::slice::from_ref(&self.worker),
+        )
+    }
+}
+
 impl GroupCleanupQuiescenceGuard {
     /// Revoke the exact worker incarnations while the coordination registry is
     /// still locked. Once this commits, a racing worker cannot acquire a new
     /// claim or operation before orchestration terminalizes its assignment.
     pub(crate) fn seal(mut self, context: &CliContext) -> Result<(), CliError> {
-        let now = now_epoch();
-        for (session_id, incarnation) in &self.sessions {
-            if let Some(broker) = self.locked.registry.brokers.get_mut(session_id)
-                && broker.incarnation == *incarnation
-            {
-                broker.state = "stopped".to_string();
-                broker.heartbeat_at = timestamp(now);
-                broker.heartbeat_epoch = now;
-                broker.capability_digest.clear();
-            }
-            for claim in &mut self.locked.registry.claims {
-                if claim.session_id == *session_id
-                    && claim.session_incarnation == *incarnation
-                    && claim.state == "active"
-                {
-                    claim.state = "released".to_string();
-                    claim.revision = claim.revision.saturating_add(1);
-                    claim.updated_at = timestamp(now);
-                    claim.terminal_at_epoch = Some(now);
-                }
-            }
-            let _ = fs::remove_file(capability_path(context, session_id, incarnation));
-        }
-        self.locked.save()
+        seal_coordination_sessions(&mut self.locked, context, &self.sessions)
     }
+}
+
+fn seal_coordination_sessions(
+    locked: &mut LockedRegistry,
+    context: &CliContext,
+    sessions: &[(String, String)],
+) -> Result<(), CliError> {
+    let now = now_epoch();
+    for (session_id, incarnation) in sessions {
+        if let Some(broker) = locked.registry.brokers.get_mut(session_id)
+            && broker.incarnation == *incarnation
+        {
+            broker.state = "stopped".to_string();
+            broker.heartbeat_at = timestamp(now);
+            broker.heartbeat_epoch = now;
+            broker.capability_digest.clear();
+        }
+        for claim in &mut locked.registry.claims {
+            if claim.session_id == *session_id
+                && claim.session_incarnation == *incarnation
+                && claim.state == "active"
+            {
+                claim.state = "released".to_string();
+                claim.revision = claim.revision.saturating_add(1);
+                claim.updated_at = timestamp(now);
+                claim.terminal_at_epoch = Some(now);
+            }
+        }
+        let _ = fs::remove_file(capability_path(context, session_id, incarnation));
+    }
+    locked.save()?;
+    Ok(())
 }
 
 fn ensure_group_cleanup_quiescence(
@@ -399,6 +465,73 @@ pub(crate) fn lock_group_cleanup_quiescence(
     Ok(GroupCleanupQuiescenceGuard {
         locked,
         sessions: sessions.to_vec(),
+    })
+}
+
+pub(crate) fn lock_stopped_worker_terminalization(
+    context: &CliContext,
+    worker_session_id: &str,
+    worker_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+) -> Result<StoppedWorkerTerminalizationGuard, CliError> {
+    // Destructive authority sealing must observe the controller claim exactly
+    // as persisted. The normal registry lock opportunistically renews claims
+    // for healthy brokers, which would turn a claim that expired between the
+    // two durable stages back into valid sealing authority.
+    let locked = lock_registry_observational(context)?;
+    ensure_group_cleanup_quiescence(
+        &locked.registry,
+        &[(
+            worker_session_id.to_string(),
+            worker_incarnation.to_string(),
+        )],
+        true,
+    )?;
+    let now = now_epoch();
+    let controller_claim = locked
+        .registry
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.session_id == controller_session_id
+                && claim.session_incarnation == controller_incarnation
+                && claim.claim_id == authorized_controller_claim.claim_id
+                && claim.revision == authorized_controller_claim.revision
+                && claim.expires_at_epoch == authorized_controller_claim.expires_at_epoch
+                && claim.state == "active"
+                && claim.expires_at_epoch > now
+        })
+        .ok_or_else(|| {
+            CliError::data(
+                "claim-not-active",
+                "Main Agent claim must be exact, active, and unexpired for stopped-worker terminalization",
+                None,
+            )
+        })?;
+    let worker_claim_observed = locked.registry.claims.iter().any(|claim| {
+        claim.session_id == worker_session_id
+            && claim.session_incarnation == worker_incarnation
+            && claim.state == "active"
+    });
+    let controller_claim = ControllerClaimTuple {
+        claim_id: controller_claim.claim_id.clone(),
+        revision: controller_claim.revision,
+        expires_at_epoch: controller_claim.expires_at_epoch,
+    };
+    Ok(StoppedWorkerTerminalizationGuard {
+        locked,
+        worker: (
+            worker_session_id.to_string(),
+            worker_incarnation.to_string(),
+        ),
+        controller: (
+            controller_session_id.to_string(),
+            controller_incarnation.to_string(),
+        ),
+        controller_claim,
+        worker_claim_observed,
     })
 }
 
@@ -730,6 +863,38 @@ pub(crate) fn authenticate_any_from_file(
     context: &CliContext,
     capability_file: Option<&Path>,
 ) -> Result<(SessionRecord, String), CliError> {
+    let (record, incarnation, _) = authenticate_any_from_file_with_maintenance(
+        context,
+        capability_file,
+        RegistryMaintenance::Full,
+        false,
+    )?;
+    Ok((record, incarnation))
+}
+
+pub(crate) fn authenticate_any_from_file_with_active_claim_observational(
+    context: &CliContext,
+    capability_file: Option<&Path>,
+) -> Result<(SessionRecord, String, ControllerClaimTuple), CliError> {
+    let (record, incarnation, claim) = authenticate_any_from_file_with_maintenance(
+        context,
+        capability_file,
+        RegistryMaintenance::Observational,
+        true,
+    )?;
+    Ok((
+        record,
+        incarnation,
+        claim.expect("active claim was required by authentication"),
+    ))
+}
+
+fn authenticate_any_from_file_with_maintenance(
+    context: &CliContext,
+    capability_file: Option<&Path>,
+    maintenance: RegistryMaintenance,
+    require_active_claim: bool,
+) -> Result<(SessionRecord, String, Option<ControllerClaimTuple>), CliError> {
     let path = capability_file
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(CAPABILITY_ENV).map(PathBuf::from))
@@ -741,7 +906,7 @@ pub(crate) fn authenticate_any_from_file(
         return Err(unauthorized());
     }
     let digest = digest_bytes(token.as_bytes());
-    let locked = lock_registry(context)?;
+    let locked = lock_registry_with_maintenance(context, maintenance)?;
     let mut matches = locked.registry.brokers.values().filter(|broker| {
         broker.state == "ready"
             && digest_eq(&broker.capability_digest, &digest)
@@ -762,12 +927,41 @@ pub(crate) fn authenticate_any_from_file(
     if matches.next().is_some() {
         return Err(unauthorized());
     }
+    let claim = if require_active_claim {
+        let now = now_epoch();
+        Some(
+            locked
+                .registry
+                .claims
+                .iter()
+                .find(|claim| {
+                    claim.session_id == broker.session_id
+                        && claim.session_incarnation == broker.incarnation
+                        && claim.state == "active"
+                        && claim.expires_at_epoch > now
+                })
+                .map(|claim| ControllerClaimTuple {
+                    claim_id: claim.claim_id.clone(),
+                    revision: claim.revision,
+                    expires_at_epoch: claim.expires_at_epoch,
+                })
+                .ok_or_else(|| {
+                    CliError::data(
+                        "claim-not-active",
+                        "Main Agent claim must be active and unexpired",
+                        None,
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     drop(locked);
     let record = load_session_record(context, &broker.session_id).map_err(|_| unauthorized())?;
     if incarnation(&record)? != broker.incarnation {
         return Err(unauthorized());
     }
-    Ok((record, broker.incarnation))
+    Ok((record, broker.incarnation, claim))
 }
 
 pub(crate) fn authenticate_token(
@@ -939,7 +1133,24 @@ pub(crate) fn incarnation(record: &SessionRecord) -> Result<String, CliError> {
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryMaintenance {
+    Full,
+    Observational,
+}
+
 pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliError> {
+    lock_registry_with_maintenance(context, RegistryMaintenance::Full)
+}
+
+fn lock_registry_observational(context: &CliContext) -> Result<LockedRegistry, CliError> {
+    lock_registry_with_maintenance(context, RegistryMaintenance::Observational)
+}
+
+fn lock_registry_with_maintenance(
+    context: &CliContext,
+    maintenance: RegistryMaintenance,
+) -> Result<LockedRegistry, CliError> {
     let root = coordination_root(context)?;
     let lock_path = root.join(REGISTRY_LOCK);
     let lock = OpenOptions::new()
@@ -999,90 +1210,110 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
         Err(_) => return Err(store_unavailable()),
     };
     let now = now_epoch();
-    let mut renewed = notification::normalize_registry(&mut registry, now);
-    for claim in &mut registry.claims {
-        if claim.state != "active" || claim.expires_at_epoch > now.saturating_add(15 * 60) {
-            continue;
-        }
-        let Some(broker) = registry.brokers.get(&claim.session_id) else {
-            continue;
-        };
-        if broker.incarnation == claim.session_incarnation
-            && broker.state == "ready"
-            && broker::capability_available(
-                context,
-                &claim.session_id,
-                &claim.session_incarnation,
-                &broker.capability_digest,
-            )
-            && broker::heartbeat_fresh(
-                context,
-                &claim.session_id,
-                &claim.session_incarnation,
-                broker.heartbeat_epoch,
-            )
-        {
-            claim.expires_at_epoch = now.saturating_add(30 * 60);
-            claim.expires_at = timestamp(claim.expires_at_epoch);
-            renewed = true;
+    let mut renewed = if maintenance == RegistryMaintenance::Full {
+        notification::normalize_registry(&mut registry, now)
+    } else {
+        false
+    };
+    if maintenance == RegistryMaintenance::Full {
+        for claim in &mut registry.claims {
+            if claim.state != "active" || claim.expires_at_epoch > now.saturating_add(15 * 60) {
+                continue;
+            }
+            let Some(broker) = registry.brokers.get(&claim.session_id) else {
+                continue;
+            };
+            if broker.incarnation == claim.session_incarnation
+                && broker.state == "ready"
+                && broker::capability_available(
+                    context,
+                    &claim.session_id,
+                    &claim.session_incarnation,
+                    &broker.capability_digest,
+                )
+                && broker::heartbeat_fresh(
+                    context,
+                    &claim.session_id,
+                    &claim.session_incarnation,
+                    broker.heartbeat_epoch,
+                )
+            {
+                claim.expires_at_epoch = now.saturating_add(30 * 60);
+                claim.expires_at = timestamp(claim.expires_at_epoch);
+                renewed = true;
+            }
         }
     }
-    let operation_snapshots: Vec<_> = registry
-        .operations
-        .iter()
-        .enumerate()
-        .filter(|(_, lease)| {
-            matches!(
-                lease.state.as_str(),
-                "active" | "completing" | "reconcile_pending"
-            ) && lease.expires_at_epoch <= now.saturating_add(15 * 60)
-        })
-        .map(|(index, lease)| (index, lease.clone()))
-        .collect();
-    for (index, lease) in operation_snapshots {
-        let Some(broker) = registry.brokers.get(&lease.session_id) else {
-            continue;
-        };
-        if broker.incarnation != lease.session_incarnation
-            || broker.state != "ready"
-            || !broker::capability_available(
-                context,
-                &lease.session_id,
-                &lease.session_incarnation,
-                &broker.capability_digest,
-            )
-            || !broker::heartbeat_fresh(
-                context,
-                &lease.session_id,
-                &lease.session_incarnation,
-                broker.heartbeat_epoch,
-            )
-        {
-            continue;
-        }
-        let Ok(record) = load_session_record(context, &lease.session_id) else {
-            continue;
-        };
-        let runtime_matches = crate::coordination_runtime_evidence(&record).is_ok_and(|runtime| {
-            runtime.status == crate::CoordinationRuntimeStatus::Running
-                && runtime.identity_digest == lease.runtime_identity_digest
-        });
-        let activity_matches =
-            crate::activity::state_for_view(context, &record).is_some_and(|activity| {
-                activity.phase == crate::activity::TurnPhase::Working
-                    && claims::activity_identity_digest(&activity) == lease.activity_identity_digest
-            });
-        let descendant_matches = lease
-            .descendant
-            .as_ref()
-            .is_some_and(claims::descendant_is_live);
-        if runtime_matches && (activity_matches || descendant_matches) {
-            let current = &mut registry.operations[index];
-            current.state = "active".to_string();
-            current.reconcile_observed_at_epoch = None;
-            current.expires_at_epoch = now.saturating_add(30 * 60);
-            current.expires_at = timestamp(current.expires_at_epoch);
-            renewed = true;
+    if maintenance == RegistryMaintenance::Full {
+        let operation_snapshots: Vec<_> = registry
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, lease)| {
+                matches!(
+                    lease.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                ) && lease.expires_at_epoch <= now.saturating_add(15 * 60)
+            })
+            .map(|(index, lease)| (index, lease.clone()))
+            .collect();
+        for (index, lease) in operation_snapshots {
+            #[cfg(debug_assertions)]
+            if let Some(path) =
+                std::env::var_os("NILS_AGENT_SESSION_TEST_COORDINATION_OPERATION_PROBE_LOG")
+            {
+                use std::io::Write;
+
+                if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(log, "{}", lease.lease_id);
+                }
+            }
+            let Some(broker) = registry.brokers.get(&lease.session_id) else {
+                continue;
+            };
+            if broker.incarnation != lease.session_incarnation
+                || broker.state != "ready"
+                || !broker::capability_available(
+                    context,
+                    &lease.session_id,
+                    &lease.session_incarnation,
+                    &broker.capability_digest,
+                )
+                || !broker::heartbeat_fresh(
+                    context,
+                    &lease.session_id,
+                    &lease.session_incarnation,
+                    broker.heartbeat_epoch,
+                )
+            {
+                continue;
+            }
+            let Ok(record) = load_session_record(context, &lease.session_id) else {
+                continue;
+            };
+            let runtime_matches =
+                crate::coordination_runtime_evidence(&record).is_ok_and(|runtime| {
+                    runtime.status == crate::CoordinationRuntimeStatus::Running
+                        && runtime.identity_digest == lease.runtime_identity_digest
+                });
+            let activity_matches =
+                crate::activity::state_for_view(context, &record).is_some_and(|activity| {
+                    activity.phase == crate::activity::TurnPhase::Working
+                        && claims::activity_identity_digest(&activity)
+                            == lease.activity_identity_digest
+                });
+            let descendant_matches = lease
+                .descendant
+                .as_ref()
+                .is_some_and(claims::descendant_is_live);
+            if runtime_matches && (activity_matches || descendant_matches) {
+                let current = &mut registry.operations[index];
+                current.state = "active".to_string();
+                current.reconcile_observed_at_epoch = None;
+                current.expires_at_epoch = now.saturating_add(30 * 60);
+                current.expires_at = timestamp(current.expires_at_epoch);
+                renewed = true;
+            }
         }
     }
     if renewed {
