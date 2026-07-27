@@ -68,6 +68,35 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
     false
 }
 
+/// Wait until the detached background refresh has *finished*, not merely written
+/// the cache.
+///
+/// The refresh child's last filesystem write is releasing its
+/// `<key>.refresh.lock` directory (`RefreshLock::drop`), which happens after
+/// both the cache kv and the `<key>.refresh.at` marker. Returning as soon as the
+/// kv lands leaves the child still writing into a tree the fixture is about to
+/// remove, and those later writes recreate the directory *after* cleanup — one
+/// leaked temp directory under `$TMPDIR` per such test, invisible because the
+/// test itself passes.
+fn wait_for_background_refresh_settled(kv_path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    if !wait_for_file_contains(kv_path, needle, timeout) {
+        return false;
+    }
+
+    // `alpha.kv` -> `alpha.refresh.lock`, matching `lock_dir_for_cache_file`.
+    // Observing the kv proves the child already held the lock, so an absent lock
+    // dir here means released rather than not-yet-acquired.
+    let lock_dir = kv_path.with_extension("refresh.lock");
+    while lock_dir.exists() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
 fn wait_for_file_exists(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -248,7 +277,11 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
     // worst-case scheduling jitter and remains far under the integration-test
     // timeout.
     assert!(
-        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(30)),
+        wait_for_background_refresh_settled(
+            &kv_path,
+            "weekly_remaining=88",
+            Duration::from_secs(30)
+        ),
         "expected background refresh to update cache kv"
     );
 }

@@ -92,6 +92,35 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
     false
 }
 
+/// Wait until the detached background refresh has *finished*, not merely written
+/// the cache.
+///
+/// The refresh child's last filesystem write is releasing its
+/// `<key>.refresh.lock` directory (`RefreshLock::drop`), which happens after
+/// both the cache kv and the `<key>.refresh.at` marker. Returning as soon as the
+/// kv lands leaves the child still writing into a tree the fixture is about to
+/// remove, and those later writes recreate the directory *after* cleanup — one
+/// leaked temp directory under `$TMPDIR` per such test, invisible because the
+/// test itself passes.
+fn wait_for_background_refresh_settled(kv_path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    if !wait_for_file_contains(kv_path, needle, timeout) {
+        return false;
+    }
+
+    // `alpha.kv` -> `alpha.refresh.lock`, matching `lock_dir_for_cache_file`.
+    // Observing the kv proves the child already held the lock, so an absent lock
+    // dir here means released rather than not-yet-acquired.
+    let lock_dir = kv_path.with_extension("refresh.lock");
+    while lock_dir.exists() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+    }
+    true
+}
+
 fn collect_requests_for(server: &TestServer, timeout: Duration) -> Vec<RecordedRequest> {
     let deadline = Instant::now() + timeout;
     let mut requests = Vec::new();
@@ -308,8 +337,75 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
 
     let kv_path = cache_file(&cache_root, "alpha");
     assert!(
-        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
+        wait_for_background_refresh_settled(
+            &kv_path,
+            "weekly_remaining=88",
+            Duration::from_secs(3)
+        ),
         "expected background refresh to update cache kv"
+    );
+}
+
+/// Pins the wait predicate that keeps a fixture teardown safe.
+///
+/// The detached refresh child releases its `<key>.refresh.lock` directory as its
+/// last filesystem write, after both the cache kv and the `.refresh.at` marker.
+/// A wait that returns once the kv lands therefore hands control back while the
+/// child still has writes pending; those writes recreate the fixture directory
+/// after it is removed, leaking a temp directory while the test still passes.
+///
+/// Asserted against a synthetic cache rather than a real refresh: the real race
+/// only loses under parallel load, so a test that waits for the leak to appear
+/// passes for the wrong reason. This drives the predicate directly instead.
+#[test]
+fn settled_wait_blocks_until_the_refresh_lock_is_released() {
+    const LOCK_HELD_FOR: Duration = Duration::from_millis(200);
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let kv_path = dir.path().join("alpha.kv");
+    fs::write(&kv_path, "weekly_remaining=88\n").expect("write kv");
+    let lock_dir = dir.path().join("alpha.refresh.lock");
+    fs::create_dir(&lock_dir).expect("create lock dir");
+
+    let releaser = {
+        let lock_dir = lock_dir.clone();
+        thread::spawn(move || {
+            thread::sleep(LOCK_HELD_FOR);
+            fs::remove_dir_all(&lock_dir).expect("release lock dir");
+        })
+    };
+
+    let started = Instant::now();
+    let settled = wait_for_background_refresh_settled(
+        &kv_path,
+        "weekly_remaining=88",
+        Duration::from_secs(5),
+    );
+    let waited = started.elapsed();
+    releaser.join().expect("releaser thread");
+
+    assert!(settled, "the lock was released, so the wait must succeed");
+    assert!(
+        waited >= LOCK_HELD_FOR / 2,
+        "the wait must outlast the held lock rather than return on the kv alone; waited {waited:?}"
+    );
+    assert!(!lock_dir.exists(), "the lock dir must be gone on return");
+}
+
+#[test]
+fn settled_wait_times_out_when_the_refresh_lock_is_never_released() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let kv_path = dir.path().join("alpha.kv");
+    fs::write(&kv_path, "weekly_remaining=88\n").expect("write kv");
+    fs::create_dir(dir.path().join("alpha.refresh.lock")).expect("create lock dir");
+
+    assert!(
+        !wait_for_background_refresh_settled(
+            &kv_path,
+            "weekly_remaining=88",
+            Duration::from_millis(300)
+        ),
+        "a lock that is never released must surface as a failed wait, not a silent pass"
     );
 }
 
@@ -361,7 +457,11 @@ fn prompt_segment_expired_cache_refreshes_in_background_before_next_render() {
     assert_exit(&first, 0);
     assert!(stdout(&first).trim().is_empty());
     assert!(
-        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
+        wait_for_background_refresh_settled(
+            &kv_path,
+            "weekly_remaining=88",
+            Duration::from_secs(3)
+        ),
         "expected background refresh to replace expired cache"
     );
 
@@ -440,7 +540,11 @@ kill -HUP 0
 
     let kv_path = cache_file(&cache_root, "alpha");
     assert!(
-        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
+        wait_for_background_refresh_settled(
+            &kv_path,
+            "weekly_remaining=88",
+            Duration::from_secs(3)
+        ),
         "expected detached background refresh to survive prompt shell HUP and update cache kv"
     );
 }
@@ -521,7 +625,11 @@ printf '%s\n' "$REMOTE_AUTH_PAYLOAD"
     );
 
     let kv_path = cache_file(&cache_root, "alpha");
-    let refreshed = wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3));
+    let refreshed = wait_for_background_refresh_settled(
+        &kv_path,
+        "weekly_remaining=88",
+        Duration::from_secs(3),
+    );
     let requests = server.take_requests();
     let captured_args =
         fs::read_to_string(&args_file).unwrap_or_else(|err| format!("<missing: {err}>"));
