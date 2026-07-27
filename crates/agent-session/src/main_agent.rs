@@ -5538,14 +5538,17 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         .is_some_and(|summary| summary.starts_with("[pre-claim:"));
     let terminal_recovery_reconciled =
         terminal_recovery_recorded && worker_status == "stopped" && assignment.worker.is_some();
-    let failed_preclaim = !claim_active
-        && active_operations == 0
-        && uncertain_operations == 0
-        && matches!(assignment.state.as_str(), "starting" | "blocked")
-        && (preclaim_blocker
-            || (assignment.state == "starting" && provider_terminated)
-            || (assignment.state == "starting" && assignment.worker.is_none())
-            || terminal_recovery_reconciled);
+    let failed_preclaim = worker_failed_preclaim(PreClaimEvidence {
+        assignment_state: &assignment.state,
+        claim_active,
+        operations_quiescent: active_operations == 0 && uncertain_operations == 0,
+        worker_bound: assignment.worker.is_some(),
+        worker_status: &worker_status,
+        preclaim_blocker,
+        provider_terminated,
+        terminal_recovery_reconciled,
+    });
+    let starting_provider_terminated = assignment.state == "starting" && provider_terminated;
     let terminal_quiescent = matches!(assignment.state.as_str(), "cancelled" | "released")
         && !claim_active
         && active_operations == 0
@@ -5606,8 +5609,12 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         provider_activity_stale,
         unread_guidance: guidance.unread_count > 0,
         preclaim_blocker,
+        runtime_gone_preclaim: failed_preclaim
+            && !preclaim_blocker
+            && !terminal_recovery_reconciled
+            && !starting_provider_terminated,
         terminal_recovery_reconciled,
-        starting_provider_terminated: assignment.state == "starting" && provider_terminated,
+        starting_provider_terminated,
         terminal_quiescent,
         submitted: assignment.state == "submitted",
         reassignment_safe: new_assignment_safe,
@@ -5925,6 +5932,12 @@ struct WorkerDiagnosisFacts {
     provider_activity_stale: bool,
     unread_guidance: bool,
     preclaim_blocker: bool,
+    /// A pre-claim failure that no other fact represents: the worker runtime is
+    /// durably gone and there is no turn evidence to derive termination from.
+    /// Cases already carried by `preclaim_blocker`,
+    /// `terminal_recovery_reconciled`, or `starting_provider_terminated` are
+    /// excluded so this never displaces their classifications.
+    runtime_gone_preclaim: bool,
     terminal_recovery_reconciled: bool,
     starting_provider_terminated: bool,
     terminal_quiescent: bool,
@@ -6009,7 +6022,10 @@ fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'st
             },
             false,
         )
-    } else if facts.preclaim_blocker || facts.terminal_recovery_reconciled {
+    } else if facts.preclaim_blocker
+        || facts.terminal_recovery_reconciled
+        || facts.runtime_gone_preclaim
+    {
         (
             "pre_claim_failure",
             if facts.reassignment_safe {
@@ -6104,6 +6120,46 @@ fn account_handoff_facts(
         capability_gap: actionable && !controls_supported,
         required: actionable && controls_supported,
     }
+}
+
+/// Evidence that decides whether an assignment failed before its worker
+/// acquired the assignment-derived claim.
+#[derive(Clone, Copy, Debug)]
+struct PreClaimEvidence<'a> {
+    assignment_state: &'a str,
+    claim_active: bool,
+    operations_quiescent: bool,
+    worker_bound: bool,
+    worker_status: &'a str,
+    preclaim_blocker: bool,
+    provider_terminated: bool,
+    terminal_recovery_reconciled: bool,
+}
+
+/// Decide whether an assignment failed before its worker acquired the
+/// assignment-derived claim. Only from this state are `worker cancel` and
+/// `worker reassign` safe: no claim is held, no operation is in flight, and the
+/// assignment never advanced past `starting`/`blocked` into a `working`
+/// checkpoint.
+fn worker_failed_preclaim(evidence: PreClaimEvidence<'_>) -> bool {
+    if evidence.claim_active || !evidence.operations_quiescent {
+        return false;
+    }
+    if !matches!(evidence.assignment_state, "starting" | "blocked") {
+        return false;
+    }
+    let starting = evidence.assignment_state == "starting";
+    evidence.preclaim_blocker
+        || evidence.terminal_recovery_reconciled
+        // A `starting` assignment never recorded the `working` checkpoint that
+        // bootstrap writes, so any of these means the worker is gone before it
+        // could hold a claim. `worker_status == "stopped"` is the case
+        // `provider_terminated` cannot see: a runtime that dies during startup
+        // never begins the turn that activity evidence is derived from.
+        || (starting
+            && (evidence.provider_terminated
+                || !evidence.worker_bound
+                || evidence.worker_status == "stopped"))
 }
 
 fn worker_claim_renewal_required(
@@ -7265,15 +7321,25 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
     pause_cancel_after_admission_for_test(&assignment)?;
     let terminal_recovery_reconciled = has_terminal_reconciled_recovery(&assignment, run)
         && diagnosis["worker"]["status"] == "stopped";
+    // A worker whose runtime died before bootstrap never opened a broker, so
+    // demanding authoritative broker evidence would leave it permanently
+    // uncancellable. It earns the same waiver as a reconciled recovery by
+    // proving the same stopped runtime below; the quiescence checks after that
+    // still fence any claim or active/uncertain operation.
+    let preclaim_runtime_gone = !terminal_recovery_reconciled
+        && assignment.state == "starting"
+        && assignment.worker.is_some()
+        && diagnosis["worker"]["status"] == "stopped";
+    let broker_evidence_waived = terminal_recovery_reconciled || preclaim_runtime_gone;
     // Reconciliation committed this same stopped-runtime proof under the
     // record -> coordination -> orchestration lock order. Reacquire the
     // lifecycle boundary before relying on a stopped or absent broker so the
     // exact incarnation cannot be replaced while cancellation commits.
-    let _worker_lifecycle = if terminal_recovery_reconciled {
+    let _worker_lifecycle = if broker_evidence_waived {
         let worker = assignment.worker.as_ref().ok_or_else(|| {
             CliError::data(
                 "worker-incarnation-changed",
-                "reconciled worker identity is unavailable",
+                "worker identity is unavailable at the cancellation boundary",
                 None,
             )
         })?;
@@ -7297,7 +7363,7 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
         {
             return Err(CliError::data(
                 "worker-runtime-still-live",
-                "reconciled cancellation requires the exact worker runtime to remain stopped",
+                "cancellation on waived broker evidence requires the exact worker runtime to remain stopped",
                 Some(json!({ "assignment_id": args.assignment_id })),
             ));
         }
@@ -7315,7 +7381,7 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
     } else {
         crate::coordination::lock_session_quiescence(context, &main.id, &main_incarnation)?
     };
-    if worker_bound && !quiescence.broker_present && !terminal_recovery_reconciled {
+    if worker_bound && !quiescence.broker_present && !broker_evidence_waived {
         return Err(CliError::runtime(
             "coordination-broker-unavailable",
             "worker cancel requires authoritative coordination broker evidence",
@@ -7329,7 +7395,7 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
             Some(json!({ "assignment_id": args.assignment_id })),
         ));
     }
-    if worker_bound && !quiescence.broker_authoritative && !terminal_recovery_reconciled {
+    if worker_bound && !quiescence.broker_authoritative && !broker_evidence_waived {
         return Err(CliError::runtime(
             "coordination-broker-unavailable",
             "worker cancel requires a ready, fresh, capability-backed coordination broker",
@@ -18597,24 +18663,7 @@ mod tests {
         );
         let classification = classify_worker_diagnosis(WorkerDiagnosisFacts {
             evidence_unavailable: rewritten["available"] != true,
-            worker_unreachable: false,
-            active_or_uncertain_operation: false,
-            coordination_broker_stale: false,
-            edit_authority_stale: false,
-            claim_renewal_required: false,
-            orphan_guidance_quarantine_required: false,
-            guidance_continuity_required: false,
-            startup_dialog: false,
-            account_handoff_capability_gap: false,
-            account_handoff_required: false,
-            provider_activity_stale: false,
-            unread_guidance: false,
-            preclaim_blocker: false,
-            terminal_recovery_reconciled: false,
-            starting_provider_terminated: false,
-            terminal_quiescent: false,
-            submitted: false,
-            reassignment_safe: false,
+            ..base_diagnosis_facts()
         })
         .0;
         assert_eq!(
@@ -19435,9 +19484,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn worker_supervision_classifications_have_deterministic_precedence() {
-        let base = WorkerDiagnosisFacts {
+    /// Neutral supervision facts: every signal absent, so a single flipped
+    /// field isolates exactly one classification.
+    fn base_diagnosis_facts() -> WorkerDiagnosisFacts {
+        WorkerDiagnosisFacts {
             evidence_unavailable: false,
             worker_unreachable: false,
             active_or_uncertain_operation: false,
@@ -19452,12 +19502,105 @@ mod tests {
             provider_activity_stale: false,
             unread_guidance: false,
             preclaim_blocker: false,
+            runtime_gone_preclaim: false,
             terminal_recovery_reconciled: false,
             starting_provider_terminated: false,
             terminal_quiescent: false,
             submitted: false,
             reassignment_safe: false,
+        }
+    }
+
+    /// A worker whose provider runtime exits during startup never reaches
+    /// `main-agent bootstrap`, so it records no turn and holds no claim. It must
+    /// still be recognised as a pre-claim failure: otherwise supervision reports
+    /// `claim_renewal_required` and asks the dead worker to renew a claim it
+    /// never held, which leaves `worker cancel` and `worker reassign` refusing
+    /// the assignment and whole-run force cleanup as the only recovery.
+    #[test]
+    fn stopped_worker_on_a_starting_assignment_is_a_preclaim_failure() {
+        let startup_exited = PreClaimEvidence {
+            assignment_state: "starting",
+            claim_active: false,
+            operations_quiescent: true,
+            worker_bound: true,
+            worker_status: "stopped",
+            // The provider died before its first turn, so activity-derived
+            // termination is not observable.
+            provider_terminated: false,
+            preclaim_blocker: false,
+            terminal_recovery_reconciled: false,
         };
+        assert!(
+            worker_failed_preclaim(startup_exited),
+            "a bound worker whose runtime is gone while the assignment is still `starting` never acquired a claim"
+        );
+
+        // The verdict must reach the classifier, not just the safety fields.
+        // Without this the supervisor reports `healthy_progress` and tells the
+        // Main Agent that a dead worker needs no intervention.
+        let classified = classify_worker_diagnosis(WorkerDiagnosisFacts {
+            runtime_gone_preclaim: true,
+            reassignment_safe: true,
+            ..base_diagnosis_facts()
+        });
+        assert_eq!(
+            classified.0, "pre_claim_failure",
+            "a pre-claim failure must never be reported as healthy progress"
+        );
+        assert!(
+            classified.1.contains("reassign"),
+            "the next action must route to reassign/cancel, got: {}",
+            classified.1
+        );
+        assert!(classified.2, "cancel and reassign are safe from this state");
+
+        // An authoritative terminal turn keeps its own classification: it has
+        // turn evidence, so it is not the blind runtime-gone case.
+        assert_eq!(
+            classify_worker_diagnosis(WorkerDiagnosisFacts {
+                starting_provider_terminated: true,
+                reassignment_safe: true,
+                ..base_diagnosis_facts()
+            })
+            .0,
+            "submitted_or_waiting_without_checkpoint",
+            "provider-turn evidence must not be reclassified as a blind runtime-gone failure"
+        );
+
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                worker_status: "running",
+                ..startup_exited
+            }),
+            "a live worker that has simply not checkpointed yet is not a pre-claim failure"
+        );
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "working",
+                ..startup_exited
+            }),
+            "a `working` assignment already proved bootstrap and its claim"
+        );
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                claim_active: true,
+                ..startup_exited
+            }),
+            "an active claim must never be cancelled as a pre-claim failure"
+        );
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                operations_quiescent: false,
+                ..startup_exited
+            }),
+            "an in-flight or uncertain operation must dominate pre-claim cancellation"
+        );
+    }
+
+    #[test]
+    fn worker_supervision_classifications_have_deterministic_precedence() {
+        let base = base_diagnosis_facts();
         assert_eq!(classify_worker_diagnosis(base).0, "healthy_progress");
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
