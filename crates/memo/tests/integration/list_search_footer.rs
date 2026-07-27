@@ -1,6 +1,6 @@
 use pretty_assertions::assert_eq;
 
-use crate::support::{parse_json_stdout, run_memo, test_db_path};
+use crate::support::{parse_json_stdout, run_memo, test_db};
 
 fn add_items(db_path: &std::path::Path, count: usize, prefix: &str) {
     for idx in 0..count {
@@ -11,7 +11,7 @@ fn add_items(db_path: &std::path::Path, count: usize, prefix: &str) {
 
 #[test]
 fn list_text_footer_appears_only_when_limit_is_reached() {
-    let db_path = test_db_path("list_text_footer");
+    let (_db_dir, db_path) = test_db("list_text_footer");
     add_items(&db_path, 3, "visible");
 
     let truncated = run_memo(&db_path, &["list", "--limit", "2"], None);
@@ -32,7 +32,7 @@ fn list_text_footer_appears_only_when_limit_is_reached() {
 
 #[test]
 fn list_json_reports_truncation_state() {
-    let db_path = test_db_path("list_json_truncated");
+    let (_db_dir, db_path) = test_db("list_json_truncated");
     add_items(&db_path, 3, "json");
 
     let truncated = run_memo(&db_path, &["--json", "list", "--limit", "2"], None);
@@ -53,7 +53,7 @@ fn list_json_reports_truncation_state() {
 
 #[test]
 fn search_text_footer_appears_only_when_limit_is_reached() {
-    let db_path = test_db_path("search_text_footer");
+    let (_db_dir, db_path) = test_db("search_text_footer");
     add_items(&db_path, 3, "needle");
 
     let truncated = run_memo(&db_path, &["search", "needle", "--limit", "2"], None);
@@ -79,7 +79,7 @@ fn search_text_footer_appears_only_when_limit_is_reached() {
 
 #[test]
 fn search_json_reports_truncation_state() {
-    let db_path = test_db_path("search_json_truncated");
+    let (_db_dir, db_path) = test_db("search_json_truncated");
     add_items(&db_path, 3, "target");
 
     let truncated = run_memo(

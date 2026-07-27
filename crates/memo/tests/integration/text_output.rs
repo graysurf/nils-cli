@@ -2,11 +2,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{run_memo, run_memo_with_env, test_db_path};
+use support::{run_memo, run_memo_with_env, test_db};
 
 #[test]
 fn text_output_respects_no_color() {
-    let db_path = test_db_path("text_output_no_color");
+    let (_db_dir, db_path) = test_db("text_output_no_color");
     let add_one = run_memo(&db_path, &["add", "buy 1tb ssd for mom"], None);
     assert_eq!(add_one.code, 0, "add one failed: {}", add_one.stderr_text());
 
@@ -42,7 +42,7 @@ fn text_output_respects_no_color() {
 
 #[test]
 fn text_output_routes_warnings_to_stderr() {
-    let db_path = test_db_path("text_output_warning_stderr");
+    let (_db_dir, db_path) = test_db("text_output_warning_stderr");
     let add_output = run_memo(&db_path, &["add", "renew passport in april"], None);
     assert_eq!(
         add_output.code,

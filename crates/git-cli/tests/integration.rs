@@ -21,6 +21,8 @@ mod dispatcher;
 mod open;
 #[path = "integration/reset.rs"]
 mod reset;
+#[path = "integration/trusted_binary_cache.rs"]
+mod trusted_binary_cache;
 #[path = "integration/utils.rs"]
 pub mod utils;
 #[path = "integration/worktree.rs"]

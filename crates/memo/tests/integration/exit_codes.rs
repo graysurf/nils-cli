@@ -2,11 +2,11 @@ use nils_common::cli_contract::exit;
 use pretty_assertions::assert_eq;
 
 use crate::support;
-use support::{run_memo, test_db_path};
+use support::{run_memo, test_db};
 
 #[test]
 fn exit_code_success() {
-    let db_path = test_db_path("exit_code_success");
+    let (_db_dir, db_path) = test_db("exit_code_success");
     let output = run_memo(&db_path, &["add", "exit-code-success"], None);
     assert_eq!(
         output.code,
@@ -18,7 +18,7 @@ fn exit_code_success() {
 
 #[test]
 fn exit_code_usage_for_invalid_arg() {
-    let db_path = test_db_path("exit_code_usage_invalid_arg");
+    let (_db_dir, db_path) = test_db("exit_code_usage_invalid_arg");
     // `--limit 0` is rejected by the runtime usage guard.
     let output = run_memo(&db_path, &["fetch", "--limit", "0"], None);
     assert_eq!(
@@ -31,7 +31,7 @@ fn exit_code_usage_for_invalid_arg() {
 
 #[test]
 fn exit_code_usage_for_unknown_subcommand() {
-    let db_path = test_db_path("exit_code_usage_unknown_subcmd");
+    let (_db_dir, db_path) = test_db("exit_code_usage_unknown_subcmd");
     let output = run_memo(&db_path, &["bogus-subcommand"], None);
     assert_eq!(
         output.code,
@@ -43,7 +43,7 @@ fn exit_code_usage_for_unknown_subcommand() {
 
 #[test]
 fn exit_code_data_for_malformed_apply_payload() {
-    let db_path = test_db_path("exit_code_data_malformed_apply");
+    let (_db_dir, db_path) = test_db("exit_code_data_malformed_apply");
     let output = run_memo(&db_path, &["apply", "--stdin"], Some("{}"));
     assert_eq!(
         output.code,

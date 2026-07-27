@@ -3,11 +3,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn update_and_delete_keep_layers_consistent() {
-    let db_path = test_db_path("update_and_delete_keep_layers_consistent");
+    let (_db_dir, db_path) = test_db("update_and_delete_keep_layers_consistent");
 
     let add_output = run_memo(&db_path, &["--json", "add", "buy 1tb ssd for mom"], None);
     assert_eq!(

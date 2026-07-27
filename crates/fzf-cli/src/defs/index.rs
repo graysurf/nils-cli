@@ -201,6 +201,7 @@ fn scan_zsh_dir(
         if !entry.file_type().is_file() || !is_zsh_file(entry.path()) {
             continue;
         }
+        // tempdir-leak-audit: allow — walkdir::DirEntry::into_path, not a temp-dir handle.
         let path = entry.into_path();
         let canonical = canonical_or_original(path.clone());
         if is_below_git_dir(&canonical) {

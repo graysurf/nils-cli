@@ -1,7 +1,13 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
+
+/// How long an abandoned per-process state dir may linger before a later run
+/// sweeps it.
+const STALE_STATE_DIR_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Hermetic per-process `$PLAN_ISSUE_HOME` for every baseline invocation.
 ///
@@ -11,12 +17,46 @@ use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 /// empty stderr (issue: plan-tracking-testbed#61). nextest runs one process
 /// per test, so a process-wide dir isolates each test while multi-invocation
 /// tests keep state continuity within their own process.
-static HERMETIC_STATE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
-    tempfile::Builder::new()
-        .prefix("plan-issue-state-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("create hermetic plan-issue state dir")
+///
+/// This deliberately is not a `TempDir`: the handle is owned by a `static`, and
+/// Rust never drops statics, so its destructor could never run. Holding one
+/// here accumulated a directory per test process inside the build tree. A
+/// process-named directory plus a sweep of stale siblings gives the same
+/// isolation with cleanup that actually happens.
+static HERMETIC_STATE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("plan-issue-state");
+    fs::create_dir_all(&root).expect("create hermetic plan-issue state root");
+    sweep_stale_state_dirs(&root);
+
+    let dir = root.join(format!("pid-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create hermetic plan-issue state dir");
+    dir
 });
+
+/// Remove state dirs abandoned by earlier test processes.
+fn sweep_stale_state_dirs(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified
+            .elapsed()
+            .is_ok_and(|age| age >= STALE_STATE_DIR_AFTER)
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 /// Build a deterministic baseline for plan-issue integration tests.
 /// Tests can compose env/path overrides via `CmdOptions` instead of ad-hoc
@@ -32,7 +72,6 @@ pub fn plan_issue_cmd_options() -> CmdOptions {
         .with_env(
             "PLAN_ISSUE_HOME",
             HERMETIC_STATE_DIR
-                .path()
                 .to_str()
                 .expect("hermetic state dir path is utf-8"),
         )

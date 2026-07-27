@@ -77,14 +77,18 @@ pub(crate) mod tests {
 
     use super::Storage;
 
-    fn test_db_path(name: &str) -> PathBuf {
+    /// Returns the temp dir alongside the path: the caller must hold it for the
+    /// duration of the test. Disarming cleanup with `keep()` leaked one
+    /// directory per test process under `cargo nextest`.
+    fn test_db(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        dir.keep().join(format!("{name}.db"))
+        let path = dir.path().join(format!("{name}.db"));
+        (dir, path)
     }
 
     #[test]
     fn init_db() {
-        let db_path = test_db_path("init_db");
+        let (_db_dir, db_path) = test_db("init_db");
         let storage = Storage::new(db_path);
         storage.init().expect("storage init should succeed");
 
@@ -104,7 +108,7 @@ pub(crate) mod tests {
 
     #[test]
     fn migration_idempotent() {
-        let db_path = test_db_path("migration_idempotent");
+        let (_db_dir, db_path) = test_db("migration_idempotent");
         let storage = Storage::new(db_path);
         storage.init().expect("first init should succeed");
         storage.init().expect("second init should succeed");

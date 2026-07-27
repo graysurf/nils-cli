@@ -2,11 +2,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{fixture_json, parse_json_stdout, run_memo, test_db_path};
+use support::{fixture_json, parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn agent_roundtrip_empty_dataset_fetch_is_stable() {
-    let db_path = test_db_path("agent_roundtrip_empty_dataset_fetch_is_stable");
+    let (_db_dir, db_path) = test_db("agent_roundtrip_empty_dataset_fetch_is_stable");
 
     let fetch_output = run_memo(&db_path, &["--json", "fetch", "--limit", "20"], None);
     assert_eq!(
@@ -26,7 +26,8 @@ fn agent_roundtrip_empty_dataset_fetch_is_stable() {
 
 #[test]
 fn agent_roundtrip_malformed_apply_payload_returns_contract_error() {
-    let db_path = test_db_path("agent_roundtrip_malformed_apply_payload_returns_contract_error");
+    let (_db_dir, db_path) =
+        test_db("agent_roundtrip_malformed_apply_payload_returns_contract_error");
     let fixture = fixture_json("memo_seed.json");
     let malformed_payload = fixture["malformed_apply_payload"].clone();
 
@@ -49,7 +50,7 @@ fn agent_roundtrip_malformed_apply_payload_returns_contract_error() {
 
 #[test]
 fn agent_roundtrip_duplicate_apply_is_idempotent() {
-    let db_path = test_db_path("agent_roundtrip_duplicate_apply_is_idempotent");
+    let (_db_dir, db_path) = test_db("agent_roundtrip_duplicate_apply_is_idempotent");
 
     let add_output = run_memo(
         &db_path,

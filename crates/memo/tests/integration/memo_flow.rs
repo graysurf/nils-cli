@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::support;
-use support::{fixture_json, parse_json_stdout, run_memo, test_db_path};
+use support::{fixture_json, parse_json_stdout, run_memo, test_db};
 
 #[derive(Debug, Deserialize)]
 struct MemoSeedFixture {
@@ -44,7 +44,7 @@ fn load_fixture() -> MemoSeedFixture {
 #[test]
 fn memo_flow_capture_fetch_apply_search_report() {
     let fixture = load_fixture();
-    let db_path = test_db_path("memo_flow_capture_fetch_apply_search_report");
+    let (_db_dir, db_path) = test_db("memo_flow_capture_fetch_apply_search_report");
 
     for capture in &fixture.captures {
         let add_output = run_memo(

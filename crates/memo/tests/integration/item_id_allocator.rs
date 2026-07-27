@@ -2,11 +2,11 @@ use memo::output::parse_item_id;
 use pretty_assertions::assert_eq;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn hard_delete_does_not_reuse_item_ids() {
-    let db_path = test_db_path("hard_delete_does_not_reuse_item_ids");
+    let (_db_dir, db_path) = test_db("hard_delete_does_not_reuse_item_ids");
 
     let first_add = run_memo(&db_path, &["--json", "add", "first item"], None);
     assert_eq!(
@@ -54,7 +54,7 @@ fn hard_delete_does_not_reuse_item_ids() {
 
 #[test]
 fn allocator_row_backfills_from_existing_max_item_id() {
-    let db_path = test_db_path("allocator_row_backfills_from_existing_max_item_id");
+    let (_db_dir, db_path) = test_db("allocator_row_backfills_from_existing_max_item_id");
 
     let first_add = run_memo(&db_path, &["--json", "add", "seed one"], None);
     assert_eq!(

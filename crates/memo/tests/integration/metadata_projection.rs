@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::support;
-use support::{fixture_json, parse_json_stdout, run_memo, test_db_path};
+use support::{fixture_json, parse_json_stdout, run_memo, test_db};
 
 #[derive(Debug, Deserialize)]
 struct FormatCase {
@@ -26,7 +26,7 @@ fn load_fixture() -> Fixture {
 
 #[test]
 fn metadata_projection_search() {
-    let db_path = test_db_path("metadata_projection_search");
+    let (_db_dir, db_path) = test_db("metadata_projection_search");
 
     let add_output = run_memo(&db_path, &["--json", "add", "{\"task\":}"], None);
     assert_eq!(
@@ -83,7 +83,7 @@ fn metadata_projection_search() {
 
 #[test]
 fn metadata_projection_report() {
-    let db_path = test_db_path("metadata_projection_report");
+    let (_db_dir, db_path) = test_db("metadata_projection_report");
     let fixture = load_fixture();
 
     for case in &fixture.format_cases {

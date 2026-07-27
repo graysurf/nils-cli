@@ -5,14 +5,18 @@ use memo::storage::Storage;
 use memo::storage::repository::{self, QueryState};
 use pretty_assertions::assert_eq;
 
-fn test_db_path(name: &str) -> PathBuf {
+/// Returns the temp dir alongside the path: the caller must hold it for the
+/// duration of the test. Disarming cleanup with `keep()` leaked one directory
+/// per test process under `cargo nextest`.
+fn test_db(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir should be created");
-    dir.keep().join(format!("{name}.db"))
+    let path = dir.path().join(format!("{name}.db"));
+    (dir, path)
 }
 
 #[test]
 fn add_and_list() {
-    let db_path = test_db_path("add_and_list");
+    let (_db_dir, db_path) = test_db("add_and_list");
     let storage = Storage::new(db_path);
     storage
         .with_transaction(|tx| {
@@ -33,7 +37,7 @@ fn add_and_list() {
 
 #[test]
 fn add_and_list_json() {
-    let db_path = test_db_path("add_and_list_json");
+    let (_db_dir, db_path) = test_db("add_and_list_json");
     let db = db_path.display().to_string();
 
     let add_rc = app::run_with_args([
@@ -52,7 +56,7 @@ fn add_and_list_json() {
 
 #[test]
 fn add_with_at() {
-    let db_path = test_db_path("add_with_at");
+    let (_db_dir, db_path) = test_db("add_with_at");
     let db = db_path.display().to_string();
 
     let add_rc = app::run_with_args([
@@ -77,7 +81,7 @@ fn add_with_at() {
 
 #[test]
 fn add_rejects_invalid_at() {
-    let db_path = test_db_path("add_rejects_invalid_at");
+    let (_db_dir, db_path) = test_db("add_rejects_invalid_at");
     let db = db_path.display().to_string();
 
     let add_rc = app::run_with_args([

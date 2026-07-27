@@ -2,11 +2,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn json_contract() {
-    let db_path = test_db_path("json_contract");
+    let (_db_dir, db_path) = test_db("json_contract");
 
     let add_output = run_memo(&db_path, &["--json", "add", "buy 1tb ssd for mom"], None);
     assert_eq!(
@@ -167,7 +167,7 @@ fn json_contract() {
 
 #[test]
 fn json_no_secret_leak() {
-    let db_path = test_db_path("json_no_secret_leak");
+    let (_db_dir, db_path) = test_db("json_no_secret_leak");
     let secret = "SECRET_TOKEN_SHOULD_NOT_LEAK";
 
     let add_output = run_memo(

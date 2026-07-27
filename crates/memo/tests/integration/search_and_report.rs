@@ -5,14 +5,18 @@ use memo::storage::repository::{self, QueryState};
 use memo::storage::search::{self, ReportPeriod};
 use pretty_assertions::assert_eq;
 
-fn test_db_path(name: &str) -> PathBuf {
+/// Returns the temp dir alongside the path: the caller must hold it for the
+/// duration of the test. Disarming cleanup with `keep()` leaked one directory
+/// per test process under `cargo nextest`.
+fn test_db(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir should be created");
-    dir.keep().join(format!("{name}.db"))
+    let path = dir.path().join(format!("{name}.db"));
+    (dir, path)
 }
 
 #[test]
 fn search_and_report() {
-    let db_path = test_db_path("search_and_report");
+    let (_db_dir, db_path) = test_db("search_and_report");
     let storage = Storage::new(db_path);
 
     storage
@@ -116,7 +120,7 @@ fn search_and_report() {
 
 #[test]
 fn search_supports_field_filters() {
-    let db_path = test_db_path("search_supports_field_filters");
+    let (_db_dir, db_path) = test_db("search_supports_field_filters");
     let storage = Storage::new(db_path);
 
     let (raw_item_id, tagged_item_id) = storage
@@ -234,7 +238,7 @@ fn search_supports_field_filters() {
 
 #[test]
 fn search_match_modes_support_prefix_and_contains() {
-    let db_path = test_db_path("search_match_modes_support_prefix_and_contains");
+    let (_db_dir, db_path) = test_db("search_match_modes_support_prefix_and_contains");
     let storage = Storage::new(db_path);
 
     let item_id = storage

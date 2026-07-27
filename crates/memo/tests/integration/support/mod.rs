@@ -2,10 +2,14 @@ use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Returns the temp dir alongside the path: the caller must hold it for the
+/// duration of the test. Disarming cleanup with `keep()` leaked one directory
+/// per test process under `cargo nextest`.
 #[allow(dead_code)]
-pub fn test_db_path(name: &str) -> PathBuf {
+pub fn test_db(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir should be created");
-    dir.keep().join(format!("{name}.db"))
+    let path = dir.path().join(format!("{name}.db"));
+    (dir, path)
 }
 
 #[allow(dead_code)]

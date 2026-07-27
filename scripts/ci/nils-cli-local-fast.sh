@@ -446,6 +446,12 @@ for shell_file in "${shell_files[@]}"; do
   run bash -n "$shell_file"
 done
 
+# tempdir-leak-audit scans crates/ for temp-directory handles whose cleanup can
+# never run (a TempDir owned by a static, `keep()`, `into_path()`,
+# `mem::forget`). Any Rust change can introduce one, so run it unconditionally.
+require_cmd rg
+run bash scripts/ci/tempdir-leak-audit.sh
+
 if [[ "$third_party_artifacts" -eq 1 ]]; then
   run bash scripts/ci/third-party-artifacts-audit.sh --strict
 fi

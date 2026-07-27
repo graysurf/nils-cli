@@ -36,12 +36,7 @@ fn same_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-struct TrustedGitCliBinary {
-    _root: TempDir,
-    path: PathBuf,
-}
-
-fn copy_trusted_git_cli_binary(source_path: &Path, destination_dir: &Path) -> io::Result<PathBuf> {
+fn copy_trusted_git_cli_binary(source_path: &Path, destination_path: &Path) -> io::Result<PathBuf> {
     let source = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -55,13 +50,12 @@ fn copy_trusted_git_cli_binary(source_path: &Path, destination_dir: &Path) -> io
         return Err(invalid_binary("Cargo-resolved git-cli source is untrusted"));
     }
 
-    let destination_path = destination_dir.join("git-cli");
     let mut destination = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o700)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&destination_path)?;
+        .open(destination_path)?;
     io::copy(&mut &source, &mut destination)?;
     destination.sync_all()?;
     destination.set_permissions(std::fs::Permissions::from_mode(0o500))?;
@@ -76,7 +70,7 @@ fn copy_trusted_git_cli_binary(source_path: &Path, destination_dir: &Path) -> io
         ));
     }
     let destination_metadata = destination.metadata()?;
-    let destination_path_metadata = std::fs::metadata(&destination_path)?;
+    let destination_path_metadata = std::fs::metadata(destination_path)?;
     if !destination_metadata.file_type().is_file()
         || destination_metadata.uid() != euid
         || destination_metadata.permissions().mode() & 0o111 == 0
@@ -85,19 +79,169 @@ fn copy_trusted_git_cli_binary(source_path: &Path, destination_dir: &Path) -> io
     {
         return Err(invalid_binary("private git-cli test binary is untrusted"));
     }
-    Ok(destination_path)
+    Ok(destination_path.to_path_buf())
 }
 
-fn trusted_git_cli_binary() -> PathBuf {
-    static BINARY: OnceLock<TrustedGitCliBinary> = OnceLock::new();
+/// Deterministic home for the trusted `git-cli` copy shared by every test
+/// process.
+///
+/// This lives under `CARGO_TARGET_TMPDIR` — inside the build tree — so
+/// `cargo clean` reclaims it and no copy can outlive the binary it mirrors.
+/// The previous implementation put the copy in a `TempDir` owned by a `static`.
+/// Statics are never dropped, so that directory was never removed; under
+/// `cargo nextest`, which runs one process per test, it leaked a ~19 MB copy
+/// per test rather than per test binary.
+fn trusted_binary_cache_dir() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("trusted-git-cli")
+}
+
+/// Cache key over the source binary's identity. Any rebuild changes its size or
+/// mtime, so a rebuilt `git-cli` is never served from a stale copy.
+fn trusted_binary_cache_key(metadata: &std::fs::Metadata) -> String {
+    format!(
+        "{:016x}-{:016x}-{:08x}",
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec()
+    )
+}
+
+/// Re-check the trust contract against an already-cached copy, so a tampered or
+/// truncated entry is replaced instead of executed.
+fn cached_binary_is_trusted(path: &Path, expected_size: u64) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    let mode = metadata.permissions().mode();
+    metadata.file_type().is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.size() == expected_size
+        && mode & 0o111 != 0
+        && mode & 0o022 == 0
+}
+
+/// How long a superseded cache entry, or a staging file abandoned by a process
+/// that died mid-install, may linger before a later run sweeps it. Comfortably
+/// longer than any test run, so a live entry is never a candidate.
+const STALE_CACHE_ENTRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn is_stale(metadata: &std::fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= STALE_CACHE_ENTRY_AFTER)
+}
+
+/// Sweep cache entries for superseded builds plus staging files abandoned by a
+/// process that died mid-install.
+///
+/// A rebuilt `git-cli` gets a new cache key, so without this the cache would
+/// grow by one ~19 MB copy per rebuild. `current_key` is never swept, and
+/// neither is anything younger than [`STALE_CACHE_ENTRY_AFTER`], so a
+/// concurrent test run cannot have its binary removed from under it.
+fn sweep_stale_cache_entries(cache_root: &Path, current_key: &str) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let is_current = entry.file_name().to_string_lossy() == current_key;
+
+        if !is_current && is_stale(&metadata) {
+            if metadata.is_dir() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
+
+        if metadata.is_dir() {
+            sweep_stale_staging_files(&entry.path());
+        }
+    }
+}
+
+fn sweep_stale_staging_files(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_name().to_string_lossy().starts_with(".staging-") {
+            continue;
+        }
+        if entry.metadata().is_ok_and(|metadata| is_stale(&metadata)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Install, or reuse, the private trusted `git-cli` copy shared by every test
+/// process.
+pub fn install_trusted_git_cli_binary() -> io::Result<PathBuf> {
+    let source_path = resolve("git-cli");
+    let source_metadata = std::fs::metadata(&source_path)?;
+    let cache_root = trusted_binary_cache_dir();
+    std::fs::create_dir_all(&cache_root)?;
+    std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700))?;
+
+    // The cache key goes in the directory name, never the file name: the binary
+    // reports its own `argv[0]` in usage output and checks
+    // `current_exe().file_name() == "git-cli"` when deciding whether to trust
+    // itself, so the executable must keep its real name.
+    let cache_key = trusted_binary_cache_key(&source_metadata);
+    sweep_stale_cache_entries(&cache_root, &cache_key);
+
+    let cache_dir = cache_root.join(&cache_key);
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let cached_path = cache_dir.join("git-cli");
+    if cached_binary_is_trusted(&cached_path, source_metadata.size()) {
+        return Ok(cached_path);
+    }
+
+    // Stage under a process-unique name in the same directory, then rename into
+    // place. Writing the final path directly would race a concurrent test
+    // process executing it (ETXTBSY); rename swaps the directory entry
+    // atomically while any in-flight exec keeps the inode it already opened.
+    let staging_path = cache_dir.join(format!(".staging-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging_path);
+    if let Err(err) = copy_trusted_git_cli_binary(&source_path, &staging_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&staging_path, &cached_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(err);
+    }
+
+    // A concurrent installer may have renamed its own byte-identical copy over
+    // ours; re-validate so the losing racer still returns a trusted path.
+    if !cached_binary_is_trusted(&cached_path, source_metadata.size()) {
+        return Err(invalid_binary(
+            "cached private git-cli test binary is untrusted",
+        ));
+    }
+    Ok(cached_path)
+}
+
+pub fn trusted_git_cli_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY
         .get_or_init(|| {
-            let root = TempDir::new().expect("private git-cli binary root");
-            let path = copy_trusted_git_cli_binary(&resolve("git-cli"), root.path())
-                .expect("install private trusted git-cli test binary");
-            TrustedGitCliBinary { _root: root, path }
+            install_trusted_git_cli_binary().expect("install private trusted git-cli test binary")
         })
-        .path
         .clone()
 }
 
@@ -261,7 +405,8 @@ mod tests {
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o777))
             .expect("make source fixture writable");
 
-        let validated = copy_trusted_git_cli_binary(&source, destination_root.path())
+        let destination = destination_root.path().join("git-cli");
+        let validated = copy_trusted_git_cli_binary(&source, &destination)
             .expect("install private executable copy");
         assert_ne!(
             std::fs::canonicalize(&validated).expect("canonical validated fixture"),

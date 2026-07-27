@@ -11,6 +11,7 @@ pub mod git;
 pub mod help;
 pub mod http;
 pub mod stubs;
+pub mod tempdir;
 
 static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 

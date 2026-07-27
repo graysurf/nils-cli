@@ -2,11 +2,11 @@ use memo::output::parse_item_id;
 use pretty_assertions::assert_eq;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn hard_delete_cleans_anchor_and_typed_workflow_rows() {
-    let db_path = test_db_path("hard_delete_cleans_anchor_and_typed_workflow_rows");
+    let (_db_dir, db_path) = test_db("hard_delete_cleans_anchor_and_typed_workflow_rows");
 
     let add_output = run_memo(
         &db_path,

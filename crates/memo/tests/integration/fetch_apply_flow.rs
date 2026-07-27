@@ -3,11 +3,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn fetch_apply_flow() {
-    let db_path = test_db_path("fetch_apply_flow");
+    let (_db_dir, db_path) = test_db("fetch_apply_flow");
 
     let add_first = run_memo(
         &db_path,
@@ -93,7 +93,7 @@ fn fetch_apply_flow() {
 
 #[test]
 fn apply_idempotency() {
-    let db_path = test_db_path("apply_idempotency");
+    let (_db_dir, db_path) = test_db("apply_idempotency");
 
     let add_output = run_memo(
         &db_path,
@@ -203,7 +203,7 @@ fn apply_idempotency() {
 
 #[test]
 fn apply_dry_run_reports_change_preview() {
-    let db_path = test_db_path("apply_dry_run_reports_change_preview");
+    let (_db_dir, db_path) = test_db("apply_dry_run_reports_change_preview");
 
     let add_output = run_memo(
         &db_path,

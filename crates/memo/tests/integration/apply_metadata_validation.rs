@@ -2,11 +2,11 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn apply_metadata_validation() {
-    let db_path = test_db_path("apply_metadata_validation");
+    let (_db_dir, db_path) = test_db("apply_metadata_validation");
 
     let add_output = run_memo(
         &db_path,

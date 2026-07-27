@@ -1,11 +1,11 @@
 use pretty_assertions::assert_eq;
 
 use crate::support;
-use support::{parse_json_stdout, run_memo, test_db_path};
+use support::{parse_json_stdout, run_memo, test_db};
 
 #[test]
 fn report_custom_window() {
-    let db_path = test_db_path("report_custom_window");
+    let (_db_dir, db_path) = test_db("report_custom_window");
 
     let add_first = run_memo(
         &db_path,
@@ -64,7 +64,7 @@ fn report_custom_window() {
 
 #[test]
 fn report_timezone() {
-    let db_path = test_db_path("report_timezone");
+    let (_db_dir, db_path) = test_db("report_timezone");
 
     let add = run_memo(
         &db_path,
@@ -86,7 +86,7 @@ fn report_timezone() {
 
 #[test]
 fn report_rejects_invalid_custom_range() {
-    let db_path = test_db_path("report_rejects_invalid_custom_range");
+    let (_db_dir, db_path) = test_db("report_rejects_invalid_custom_range");
 
     let report = run_memo(
         &db_path,

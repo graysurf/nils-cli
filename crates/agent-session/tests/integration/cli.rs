@@ -30,6 +30,34 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("chmod executable");
 }
 
+/// Restores a directory's mode when the enclosing scope ends.
+///
+/// Fixtures that drive `AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION` ask the
+/// binary under test to chmod a state directory read-only. Restoring the mode
+/// after the assertions meant a failing assertion skipped the restore, leaving
+/// a directory `remove_dir_all` cannot empty — and `TempDir`'s `Drop` discards
+/// that error, so the entire fixture leaked silently under /tmp. Declare this
+/// after the fixture's `TempDir` so it restores before cleanup runs.
+struct RestoredPermissions {
+    path: PathBuf,
+    mode: u32,
+}
+
+impl RestoredPermissions {
+    fn new(path: &Path, mode: u32) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            mode,
+        }
+    }
+}
+
+impl Drop for RestoredPermissions {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
 fn sha256_hex(value: &str) -> String {
     Sha256::digest(value.as_bytes())
         .iter()
@@ -7525,6 +7553,7 @@ fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
     let codex_bin = fake_agent(tmp.path(), "codex");
     let codex_session = codex_home.join("sessions/2026/07/05/session.jsonl");
     let chmod_dir = state_dir.join("sessions/write-fail");
+    let _restore_chmod_dir = RestoredPermissions::new(&chmod_dir, 0o700);
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let cwd_arg = cwd.to_string_lossy().to_string();
@@ -7568,7 +7597,8 @@ fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let value = output.stdout_json();
     assert_eq!(value["error"]["code"], "file-write-failed");
-    let _ = fs::set_permissions(&chmod_dir, fs::Permissions::from_mode(0o700));
+    // `_restore_chmod_dir` restores the mode even when an assertion above fails.
+    fs::set_permissions(&chmod_dir, fs::Permissions::from_mode(0o700)).expect("restore mode");
     let record_path = chmod_dir.join("session.json");
     let record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
@@ -8611,6 +8641,7 @@ fn resume_retains_new_generation_when_identity_persistence_and_shutdown_fail() {
         ],
         Some(&codex_bin),
     );
+    let _restore_session_mode = RestoredPermissions::new(&session, 0o700);
     let record_path = session.join("session.json");
     let before: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     let state_arg = state_dir.to_string_lossy().to_string();
@@ -8640,7 +8671,8 @@ fn resume_retains_new_generation_when_identity_persistence_and_shutdown_fail() {
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let error = output.stdout_json();
     assert_eq!(error["error"]["code"], "file-write-failed");
-    let _ = fs::set_permissions(&session, fs::Permissions::from_mode(0o700));
+    // `_restore_session_mode` restores the mode even when an assertion above fails.
+    fs::set_permissions(&session, fs::Permissions::from_mode(0o700)).expect("restore mode");
     let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(retained["runtime"]["generation"], 2);
     assert_ne!(
