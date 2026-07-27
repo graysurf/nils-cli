@@ -128,6 +128,9 @@ This runs changed-scope validation against `origin/main` by default:
 - documentation-only changes use the docs-only lane
 - non-shared crate changes run package-scoped `fmt`, `clippy`, and tests
 - shared crates and workspace-level files escalate to the workspace Rust gate
+- the workspace lane runs its tests through `scripts/ci/tempdir-leak-probe.sh`,
+  which fails on temp directories the suite leaves behind; see
+  `docs/specs/test-temp-directory-policy.md`
 
 Override the base ref when needed:
 

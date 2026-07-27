@@ -451,6 +451,8 @@ done
 # `mem::forget`). Any Rust change can introduce one, so run it unconditionally.
 require_cmd rg
 run bash scripts/ci/tempdir-leak-audit.sh
+run bash scripts/ci/tests/tempdir-leak-audit.test.sh
+run bash scripts/ci/tests/tempdir-leak-probe.test.sh
 
 if [[ "$third_party_artifacts" -eq 1 ]]; then
   run bash scripts/ci/third-party-artifacts-audit.sh --strict
@@ -464,7 +466,16 @@ run cargo fmt --all -- --check
 if [[ "$mode" == "workspace" ]]; then
   run cargo clippy --all-targets --all-features -- -D warnings
   if [[ "$test_runner" == "nextest" ]]; then
-    run cargo nextest run --profile ci --workspace
+    # Build first so nothing compiles inside the probe's private TMPDIR, then run
+    # the suite through the probe: it is the only detector for temp-directory
+    # leaks whose cleanup *did* run (a late background write that re-creates the
+    # tree, or a lock placed beside the fixture instead of inside it).
+    run cargo nextest run --profile ci --workspace --no-run
+    # git-cli-test-worker.<euid> is a deliberate per-user cache of private worker
+    # binaries: a fixed name, contents keyed by source digest, reused across runs
+    # so concurrent readers see a stable inode. Bounded, so it is not a leak.
+    run bash scripts/ci/tempdir-leak-probe.sh --allow 'git-cli-test-worker.*' \
+      -- --profile ci --workspace
     run cargo test --workspace --doc
   else
     run cargo test --workspace

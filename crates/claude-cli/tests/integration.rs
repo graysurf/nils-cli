@@ -4,6 +4,7 @@ use nils_test_support::{bin, git as test_git};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,82 @@ fn write_cache(cache_dir: &Path, body: &str) -> PathBuf {
     let path = cache_dir.join("usage.json");
     std::fs::write(&path, body).expect("write cache");
     path
+}
+
+/// `<stem>.refresh.lock`, matching `prompt_segment::refresh::sibling_path`.
+fn refresh_lock_path(cache_file: &Path) -> PathBuf {
+    let stem = cache_file
+        .file_stem()
+        .expect("cache file stem")
+        .to_string_lossy()
+        .to_string();
+    cache_file.with_file_name(format!("{stem}.refresh.lock"))
+}
+
+/// Whether no process currently holds the refresh lock.
+///
+/// `flock` locks belong to the open file description, so a fresh `open` here
+/// contends with the detached child's descriptor even though both live on this
+/// host.
+fn refresh_lock_is_free(lock_file: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_file) else {
+        // No lock file means no refresh ever took it; nothing to wait for.
+        return true;
+    };
+    // SAFETY: `flock` observes the valid descriptor owned by `file`.
+    let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if acquired {
+        // SAFETY: same descriptor, still owned by `file` here.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    acquired
+}
+
+/// Waits for the detached refresh child to drop `<stem>.refresh.lock`.
+///
+/// `refresh_blocking` holds that lock across *every* write it makes, so a free
+/// lock means the child has no filesystem work left in the fixture. Callers must
+/// first observe something the child only does while holding the lock (its HTTP
+/// request, or the refreshed cache body); otherwise a free lock just means the
+/// child has not started yet.
+fn wait_for_refresh_lock_release(cache_file: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let lock_file = refresh_lock_path(cache_file);
+    while !refresh_lock_is_free(&lock_file) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
+/// Waits until the background refresh wrote `expected` *and* fully settled.
+///
+/// Returning as soon as the cache body lands is not enough: `refresh_blocking`
+/// still has to write the `<stem>.refresh.at` marker, and `write_atomic`
+/// re-creates the parent directory before writing. That marker write therefore
+/// resurrects the fixture directory *after* `TempDir` removed it, leaking one
+/// directory under `$TMPDIR` per run while the test still passes.
+fn wait_for_background_refresh_settled(
+    cache_file: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(cache_file).ok().as_deref() == Some(expected) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    wait_for_refresh_lock_release(
+        cache_file,
+        deadline.saturating_duration_since(Instant::now()),
+    )
 }
 
 fn make_old(path: &Path) {
@@ -677,6 +754,14 @@ fn prompt_segment_stale_cache_fallback_suppresses_fetch_errors() {
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "5h:75% W:50% 2026-01-03 (stale)\n");
     assert_eq!(stderr(&output), "");
+    // The stale render enqueues a detached refresh whose fetch fails. Its
+    // `.refresh.at` write lands after this test body returns unless we wait, and
+    // `write_atomic` re-creates `tmp` on the way.
+    assert_eq!(wait_for_requests(&server, 1).len(), 1);
+    assert!(
+        wait_for_refresh_lock_release(&cache_file, Duration::from_secs(4)),
+        "detached refresh still held the lock at teardown"
+    );
 }
 
 #[test]
@@ -724,6 +809,13 @@ fn prompt_segment_expired_cache_failed_refresh_observes_cooldown() {
     }
 
     assert_eq!(wait_for_requests(&server, 1).len(), 1);
+    // The observed request proves the detached child holds the refresh lock; it
+    // still writes the `.refresh.at` marker before releasing, which would
+    // re-create `tmp` after teardown.
+    assert!(
+        wait_for_refresh_lock_release(&cache_file, Duration::from_secs(4)),
+        "detached refresh still held the lock at teardown"
+    );
 }
 
 #[test]
@@ -787,6 +879,10 @@ fn prompt_segment_expired_cache_concurrent_refreshes_are_coalesced() {
             .lines()
             .count(),
         1
+    );
+    assert!(
+        wait_for_refresh_lock_release(&cache_file, Duration::from_secs(4)),
+        "coalesced refresh still held the lock at teardown"
     );
 }
 
@@ -2475,14 +2571,10 @@ fn prompt_segment_stale_cache_returns_immediately_and_refreshes_in_background() 
     );
     assert_eq!(stdout(&output), "5h:75% W:50% 2026-01-03 (stale)\n");
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < deadline {
-        if std::fs::read_to_string(&cache_file).ok().as_deref() == Some(refreshed_body.as_str()) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("background refresh did not update the cache");
+    assert!(
+        wait_for_background_refresh_settled(&cache_file, &refreshed_body, Duration::from_secs(4)),
+        "background refresh did not update the cache"
+    );
 }
 
 #[test]
@@ -2521,18 +2613,92 @@ fn prompt_segment_missing_cache_returns_immediately_then_renders_refreshed_cache
     assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "");
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < deadline {
-        if std::fs::read_to_string(&cache_file).ok().as_deref() == Some(refreshed_body.as_str()) {
-            let rendered = run(
-                &["prompt-segment", "--ttl", "1h", "--time-format", "%Y-%m-%d"],
-                &options,
-            );
-            assert_exit(&rendered, 0);
-            assert_eq!(stdout(&rendered), "5h:90% W:80% 2026-01-03\n");
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("missing-cache background refresh did not create the cache");
+    assert!(
+        wait_for_background_refresh_settled(&cache_file, &refreshed_body, Duration::from_secs(4)),
+        "missing-cache background refresh did not create the cache"
+    );
+    let rendered = run(
+        &["prompt-segment", "--ttl", "1h", "--time-format", "%Y-%m-%d"],
+        &options,
+    );
+    assert_exit(&rendered, 0);
+    assert_eq!(stdout(&rendered), "5h:90% W:80% 2026-01-03\n");
+}
+
+/// Pins the predicate that keeps the background-refresh fixtures leak-free.
+///
+/// Asserted against a synthetic lock rather than a real refresh: the real race
+/// is won by the child on an idle host, so a test that waits for an actual
+/// detached refresh passes with or without the fix and pins nothing.
+#[test]
+fn settled_wait_blocks_until_the_refresh_lock_is_released() {
+    const HOLD: Duration = Duration::from_millis(300);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), "settled-body");
+    let held = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(refresh_lock_path(&cache_file))
+        .expect("hold refresh lock");
+    // SAFETY: `flock` observes the valid descriptor owned by `held`.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test could not take the refresh lock"
+    );
+
+    // Measured *inside* the scope: `thread::scope` joins the releasing thread on
+    // the way out, so an elapsed time taken after the scope would satisfy this
+    // assertion even if the wait returned immediately.
+    let started = Instant::now();
+    let waited = thread::scope(|scope| {
+        let held = &held;
+        scope.spawn(move || {
+            thread::sleep(HOLD);
+            // SAFETY: `flock` observes the descriptor still owned by `held`.
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        });
+        assert!(
+            wait_for_background_refresh_settled(
+                &cache_file,
+                "settled-body",
+                Duration::from_secs(5)
+            ),
+            "settled wait gave up while the lock was still held"
+        );
+        started.elapsed()
+    });
+
+    assert!(
+        waited >= HOLD,
+        "settled wait returned after {waited:?}, before the lock was released"
+    );
+}
+
+/// A child that never releases must surface as a failure, not a silent pass.
+#[test]
+fn settled_wait_times_out_when_the_refresh_lock_is_never_released() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), "stuck-body");
+    let held = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(refresh_lock_path(&cache_file))
+        .expect("hold refresh lock");
+    // SAFETY: `flock` observes the valid descriptor owned by `held`.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test could not take the refresh lock"
+    );
+
+    assert!(
+        !wait_for_background_refresh_settled(&cache_file, "stuck-body", Duration::from_millis(200)),
+        "settled wait reported success while the lock was still held"
+    );
 }

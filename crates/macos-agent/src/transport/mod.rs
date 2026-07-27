@@ -1284,12 +1284,17 @@ mod tests {
     #[test]
     fn remote_session_storage_has_an_aggregate_root_bound() {
         let base = TempDir::new().expect("remote session base");
+        // The allocation lock is a *sibling* of the directory it guards, so the
+        // session roots need an owned parent inside the fixture. Handing
+        // `base.path()` itself to the allocator puts the lock next to the
+        // `TempDir` under `$TMPDIR`, where teardown never reaches it.
+        let roots = base.path().join("remote-sessions");
         let contenders = MAX_REMOTE_SESSION_ROOTS * 2;
         let barrier = Arc::new(Barrier::new(contenders));
         let attempts = (0..contenders)
             .map(|sequence| {
                 let barrier = Arc::clone(&barrier);
-                let root = base.path().join(format!("{sequence:032x}"));
+                let root = roots.join(format!("{sequence:032x}"));
                 std::thread::spawn(move || {
                     barrier.wait();
                     create_bounded_remote_session(&root)
@@ -1303,19 +1308,19 @@ mod tests {
             .count();
         assert_eq!(admitted, MAX_REMOTE_SESSION_ROOTS);
         assert_eq!(
-            fs::read_dir(base.path())
+            fs::read_dir(&roots)
                 .expect("session roots")
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
                 .count(),
             MAX_REMOTE_SESSION_ROOTS
         );
-        let overflow = base.path().join(format!("{:032x}", contenders));
+        let overflow = roots.join(format!("{:032x}", contenders));
         assert!(
             create_bounded_remote_session(&overflow).is_err(),
             "remote session roots exceeded their aggregate bound"
         );
-        let released = fs::read_dir(base.path())
+        let released = fs::read_dir(&roots)
             .expect("session roots")
             .filter_map(Result::ok)
             .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
@@ -1323,6 +1328,45 @@ mod tests {
             .path();
         remove_session(&released).expect("free one root");
         create_bounded_remote_session(&overflow).expect("released slot is reusable");
+        assert!(
+            base.path()
+                .join("remote-sessions.allocation.lock")
+                .is_file(),
+            "allocation lock escaped the fixture; teardown will not reach it"
+        );
+    }
+
+    /// Pins where the allocation lock lands, so the fixture stays self-cleaning.
+    ///
+    /// `RemoteSessionAllocationLock` names the lock after the guarded directory
+    /// and drops it alongside, not inside. A caller that guards a `TempDir` root
+    /// therefore writes `<tempdir>.allocation.lock` into `$TMPDIR`, which no
+    /// teardown owns — one leaked file per run, invisible because the test
+    /// itself passes.
+    #[test]
+    fn remote_session_allocation_lock_stays_inside_the_caller_owned_parent() {
+        let base = TempDir::new().expect("remote session base");
+        let roots = base.path().join("remote-sessions");
+        create_bounded_remote_session(&roots.join("0".repeat(32))).expect("first session");
+
+        assert!(
+            base.path()
+                .join("remote-sessions.allocation.lock")
+                .is_file(),
+            "allocation lock did not land beside the guarded directory"
+        );
+        let stray = base.path().parent().expect("fixture parent").join(format!(
+            "{}.allocation.lock",
+            base.path()
+                .file_name()
+                .expect("fixture name")
+                .to_string_lossy()
+        ));
+        assert!(
+            !stray.exists(),
+            "allocation lock escaped the fixture into {}",
+            stray.display()
+        );
     }
 
     #[test]

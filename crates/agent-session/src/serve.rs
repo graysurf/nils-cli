@@ -1403,6 +1403,10 @@ struct ActivityBroker {
     lifecycle: watch::Sender<ActivityBrokerLifecycle>,
     subscribers: Arc<Semaphore>,
     _watcher: Arc<StdMutex<Option<RecommendedWatcher>>>,
+    /// Handles for the change and heartbeat loops, retained only so a caller can
+    /// wait for them to stop. A served broker lives for the whole process and
+    /// never uses this; see [`ActivityBroker::shutdown`].
+    loops: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl ActivityBroker {
@@ -1454,6 +1458,7 @@ impl ActivityBroker {
             lifecycle,
             subscribers: Arc::new(Semaphore::new(ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)),
             _watcher: watcher.clone(),
+            loops: StdMutex::new(Vec::new()),
         });
         if ready {
             let rearm_watcher = watcher;
@@ -1474,7 +1479,7 @@ impl ActivityBroker {
                 *rearm_watcher.lock().expect("activity watcher lock") = Some(rearmed);
                 true
             });
-            tokio::spawn(activity_change_loop_inner(
+            let change_loop = tokio::spawn(activity_change_loop_inner(
                 broker.log.clone(),
                 broker.lifecycle.clone(),
                 session_collector,
@@ -1486,12 +1491,44 @@ impl ActivityBroker {
                     watch_rearm: Some(watch_rearm),
                 },
             ));
-            tokio::spawn(activity_heartbeat_loop(
+            let heartbeat_loop = tokio::spawn(activity_heartbeat_loop(
                 broker.log.clone(),
                 broker.lifecycle.clone(),
             ));
+            broker
+                .loops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend([change_loop, heartbeat_loop]);
         }
         broker
+    }
+
+    /// Stops the background loops and waits for them to actually be gone.
+    ///
+    /// The change loop owns a watch-rearm closure that calls `create_dir_all` on
+    /// the sessions root whenever the root disappears — correct for a served
+    /// broker, but fatal for a fixture: removing the `TempDir` *is* a root loss,
+    /// so a still-running loop re-creates the directory right after teardown and
+    /// leaks it. `abort()` alone does not close that window because it only
+    /// schedules cancellation; the `await` is what makes this a barrier.
+    #[cfg(test)]
+    async fn shutdown(&self) {
+        let handles: Vec<_> = self
+            .loops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        // Drop the watcher so no queued notification can re-arm it afterwards.
+        *self
+            ._watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     #[cfg(test)]
@@ -1510,6 +1547,7 @@ impl ActivityBroker {
             lifecycle,
             subscribers: Arc::new(Semaphore::new(subscriber_limit)),
             _watcher: Arc::new(StdMutex::new(Some(watcher))),
+            loops: StdMutex::new(Vec::new()),
         })
     }
 
@@ -1531,6 +1569,7 @@ impl ActivityBroker {
             lifecycle,
             subscribers: Arc::new(Semaphore::new(ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)),
             _watcher: Arc::new(StdMutex::new(Some(watcher))),
+            loops: StdMutex::new(Vec::new()),
         })
     }
 
@@ -12472,6 +12511,7 @@ esac
                 &broker.log,
                 &broker.lifecycle
             ));
+            broker.shutdown().await;
             return;
         }
 
@@ -12503,6 +12543,7 @@ esac
         .expect("re-armed root delivers later transition");
         assert_eq!(delivered.kind, "snapshot");
         assert_eq!(*broker.lifecycle.borrow(), ActivityBrokerLifecycle::Ready);
+        broker.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12596,6 +12637,7 @@ esac
         .await
         .expect("session removal transition");
         assert_eq!(deleted.kind, "snapshot");
+        broker.shutdown().await;
     }
 
     #[tokio::test]

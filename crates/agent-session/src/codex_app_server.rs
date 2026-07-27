@@ -4228,6 +4228,27 @@ mod tests {
         }
     }
 
+    /// Drains a projection's background work before its fixture is removed.
+    ///
+    /// `Drop for ProxyProjection` only calls `abort()`, which schedules
+    /// cancellation instead of waiting, and it does not touch the fail-close
+    /// task at all. Either one can still be inside a write when the test body
+    /// returns; because those writes run `create_dir_all` first, they re-create
+    /// the `TempDir` that teardown just removed — one leaked directory per run,
+    /// invisible because the test itself passes.
+    ///
+    /// This mirrors the shutdown a live proxy performs, so tests observe the
+    /// same ordering production does.
+    async fn settle_projection(projection: &mut ProxyProjection) {
+        projection.sender = None;
+        if let Some(task) = projection.task.take() {
+            let _ = task.await;
+        }
+        if projection.has_fail_close_task() {
+            projection.finish_fail_close().await;
+        }
+    }
+
     fn record_with_runtime(id: &str, socket: &Path) -> SessionRecord {
         SessionRecord {
             schema_version: crate::SESSION_DOCUMENT_VERSION.to_string(),
@@ -6814,16 +6835,22 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 }
             }
         }));
+        let mut failed_closed = false;
         for _ in 0..20 {
             let view = crate::auto_resume::view_for_record(&context, &record);
             if view.state == "terminal_failure" {
                 assert!(!view.enabled);
                 assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
-                return;
+                failed_closed = true;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("oversized selected unique observation did not fail closed");
+        assert!(
+            failed_closed,
+            "oversized selected unique observation did not fail closed"
+        );
+        settle_projection(&mut projection).await;
     }
 
     #[tokio::test]
@@ -6883,16 +6910,22 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 }
             }));
         }
+        let mut failed_closed = false;
         for _ in 0..20 {
             let view = crate::auto_resume::view_for_record(&context, &record);
             if view.state == "terminal_failure" {
                 assert!(!view.enabled);
                 assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
-                return;
+                failed_closed = true;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("unique projection overflow did not fail closed");
+        assert!(
+            failed_closed,
+            "unique projection overflow did not fail closed"
+        );
+        settle_projection(&mut projection).await;
     }
 
     #[tokio::test]
