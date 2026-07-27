@@ -21,6 +21,11 @@
 # Escape hatch: put `tempdir-leak-audit: allow` in a comment on the offending
 # line or the line directly above it, together with the reason.
 #
+# Scope limit: this only catches leaks where cleanup *never runs*. A leak where
+# cleanup runs and then a detached child process recreates the directory is not
+# detectable by inspection; that one is a test-authoring rule. See
+# docs/specs/test-temp-directory-policy.md for all three leak classes.
+#
 # Compatibility: must run on macOS (system bash 3.2) and Linux runners. Avoid
 # associative arrays, mapfile, and `${var,,}` lowercasing.
 
