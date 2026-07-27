@@ -548,6 +548,10 @@ pub struct BrokerRecoveryArgs {
     /// Managed session id whose broker is being recovered.
     #[arg(long)]
     pub session: String,
+    /// Exact incarnation-bound controller capability. Defaults to
+    /// AGENT_SESSION_CAPABILITY_FILE only inside the authenticated runtime.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub proof_file: PathBuf,
     #[arg(long)]

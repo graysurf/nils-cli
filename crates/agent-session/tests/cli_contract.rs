@@ -24,6 +24,8 @@ fn macro_first_worker_surface_is_discoverable() {
         "diagnose",
         "submit-recovery",
         "reconcile-recovery",
+        "account-handoff-cancel",
+        "request-changes",
         "cancel",
         "retire",
     ] {
@@ -33,12 +35,14 @@ fn macro_first_worker_surface_is_discoverable() {
         );
     }
 
-    let root = help(&["--help"]);
+    let root = help(&["--help"]).to_ascii_lowercase();
     for contract in [
-        "MACRO-FIRST RECOVERY",
+        "macro-first recovery",
         "last_proven_safe_state",
         "never resend a prompt",
-        "unbounded/manual Enter",
+        "unbounded/manual enter",
+        "current assignment revision",
+        "--authorize-account-change",
     ] {
         assert!(
             root.contains(contract),
@@ -68,14 +72,54 @@ fn recovery_primitives_publish_their_guards() {
     assert!(reassign.contains("distinct replacement assignment"));
     assert!(reassign.contains("clean worktree"));
     assert!(reassign.contains("without reusing its prompt or worktree"));
+
+    let request_changes = help(&["worker", "request-changes", "--help"]).to_ascii_lowercase();
+    assert!(request_changes.contains("return a submitted assignment"));
+    assert!(request_changes.contains("expected current assignment revision"));
+    assert!(request_changes.contains("bounded durable reason"));
 }
 
 #[test]
-fn worker_start_is_readiness_first_by_default_with_explicit_launch_only_opt_out() {
+fn worker_start_preserves_bounded_readiness_by_default_with_launch_only_opt_out() {
     let start = help(&["worker", "start", "--help"]).to_ascii_lowercase();
     assert!(start.contains("default: 5m"), "worker start help: {start}");
     assert!(
         start.contains("0 = launch-only"),
         "worker start help: {start}"
     );
+    for (name, docs) in [
+        ("README", include_str!("../README.md")),
+        (
+            "orchestration runbook",
+            include_str!("../docs/runbooks/main-agent-orchestration.md"),
+        ),
+    ] {
+        assert!(
+            docs.contains("defaults to waiting up to 5 minutes"),
+            "{name} must publish the same omitted readiness default as CLI help"
+        );
+        assert!(
+            docs.contains("`--await-ready 0`"),
+            "{name} must publish the explicit launch-only opt-out"
+        );
+    }
+}
+
+#[test]
+fn completions_publish_account_handoff_cancellation_guards() {
+    for shell in ["bash", "zsh"] {
+        let completion = help(&["completion", shell]);
+        for contract in [
+            "account-handoff-cancel",
+            "request-changes",
+            "--if-revision",
+            "--reason",
+            "--authorize-account-change",
+        ] {
+            assert!(
+                completion.contains(contract),
+                "{shell} completion omitted {contract}"
+            );
+        }
+    }
 }

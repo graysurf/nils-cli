@@ -93,13 +93,13 @@ pub(crate) struct SessionMaintenancePreview {
     session_id: String,
     operation: MaintenanceOperation,
     state: &'static str,
-    session_incarnation: Option<String>,
-    session_generation: Option<u64>,
+    pub(crate) session_incarnation: Option<String>,
+    pub(crate) session_generation: Option<u64>,
     issue: Option<MaintenanceIssue>,
     boundary: MaintenanceBoundary,
     preservation: MaintenancePreservation,
     actions: Vec<MaintenanceActionView>,
-    preview_digest: String,
+    pub(crate) preview_digest: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -579,6 +579,7 @@ fn execute_inner(
         request.action,
         MaintenanceActionId::RetryResume | MaintenanceActionId::TerminateRuntimeThenResume
     ) {
+        crate::orchestration::ensure_session_not_quarantined(context, &record)?;
         resume_guard(&record)?;
     }
 
@@ -803,6 +804,7 @@ fn sanitize_maintenance_error(
             | "maintenance-confirmation-required"
             | "session-maintenance-failed"
             | "agent-profile-unavailable"
+            | "worker-quarantined"
     ) {
         return error;
     }

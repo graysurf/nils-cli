@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use nils_common::execution_effect::digest_parts;
-use nils_common::local_default_receipt::{
-    LocalDefaultCompletion, LocalDefaultData, LocalDefaultReceipt, LocalDefaultRemote,
-    SCHEMA_VERSION as LOCAL_DEFAULT_SCHEMA,
+use nils_common::default_branch_receipt::{
+    DefaultBranchCompletion, DefaultBranchData, DefaultBranchReceipt, DefaultBranchRemote,
+    SCHEMA_VERSION as DEFAULT_BRANCH_SCHEMA,
 };
+use nils_common::execution_effect::digest_parts;
 use pretty_assertions::assert_eq;
 
 use super::support::{StubEnv, parse_envelope, run_forge_cli_in};
@@ -249,7 +249,8 @@ esac
 #[derive(Clone, Copy)]
 enum ReceiptMutation {
     None,
-    Schema,
+    OldSchema,
+    Preview,
     Branch,
     Head,
     Base,
@@ -258,18 +259,18 @@ enum ReceiptMutation {
     RemoteGap,
 }
 
-fn run_with_local_default_receipt(dry_run: bool) -> (StubEnv, super::support::CmdOutput) {
-    run_with_local_default_receipt_location(dry_run, ReceiptMutation::None, false)
+fn run_with_default_branch_receipt(dry_run: bool) -> (StubEnv, super::support::CmdOutput) {
+    run_with_default_branch_receipt_location(dry_run, ReceiptMutation::None, false)
 }
 
-fn run_with_local_default_receipt_mutation(
+fn run_with_default_branch_receipt_mutation(
     dry_run: bool,
     mutation: ReceiptMutation,
 ) -> (StubEnv, super::support::CmdOutput) {
-    run_with_local_default_receipt_location(dry_run, mutation, false)
+    run_with_default_branch_receipt_location(dry_run, mutation, false)
 }
 
-fn run_with_local_default_receipt_location(
+fn run_with_default_branch_receipt_location(
     dry_run: bool,
     mutation: ReceiptMutation,
     from_subdirectory: bool,
@@ -280,7 +281,7 @@ fn run_with_local_default_receipt_location(
     };
     let stub = StubEnv::new().gh_stub(&gh_stub());
     let reason = stub.tempdir.path().join("reason.md");
-    let receipt_path = stub.tempdir.path().join("local-default.json");
+    let receipt_path = stub.tempdir.path().join("default-branch.json");
     let state = stub.tempdir.path().join("pushed");
     let log = stub.tempdir.path().join("git.log");
     fs::write(&reason, "Freshly authorized receipt adoption.").expect("reason");
@@ -291,40 +292,43 @@ fn run_with_local_default_receipt_location(
         canonical_common.as_os_str().as_encoded_bytes(),
         b"sha1".as_slice(),
     ]);
-    let mut receipt = LocalDefaultReceipt {
-        schema_version: LOCAL_DEFAULT_SCHEMA.to_string(),
+    let mut receipt = DefaultBranchReceipt {
+        schema_version: DEFAULT_BRANCH_SCHEMA.to_string(),
         ok: true,
-        data: LocalDefaultData {
-            mode: "local-default".to_string(),
+        data: DefaultBranchData {
+            mode: "default-branch".to_string(),
             repository_fingerprint: fingerprint,
-            branch: "main".to_string(),
+            default_branch: "main".to_string(),
             old_head: BASE.to_string(),
             new_head: HEAD.to_string(),
             parent_sha: BASE.to_string(),
             tree_sha: OTHER.to_string(),
             signature: "verified-good".to_string(),
             staged_file_count: 1,
-            remote: LocalDefaultRemote {
+            remote: DefaultBranchRemote {
                 configured_count: 1,
-                mode: "local-only".to_string(),
+                mode: "cached-upstream".to_string(),
                 network_observed: false,
                 provider_mutated: false,
                 upstream: Some("origin/main".to_string()),
                 cached_relation_before: "aligned".to_string(),
                 cached_relation_after: "ahead-by-one".to_string(),
             },
-            completion: LocalDefaultCompletion {
-                local_default_committed: true,
+            completion: DefaultBranchCompletion {
+                default_branch_committed: true,
+                provider_delivery_attempted: false,
                 provider_delivered: false,
-                provider_reconciliation_required: true,
             },
             delivery_waiver: None,
         },
     };
     match mutation {
         ReceiptMutation::None => {}
-        ReceiptMutation::Schema => receipt.schema_version = "unsupported.v1".to_string(),
-        ReceiptMutation::Branch => receipt.data.branch = "trunk".to_string(),
+        ReceiptMutation::OldSchema => {
+            receipt.schema_version = "cli.semantic-commit.local-default.v1".to_string();
+        }
+        ReceiptMutation::Preview => {}
+        ReceiptMutation::Branch => receipt.data.default_branch = "trunk".to_string(),
         ReceiptMutation::Head => receipt.data.new_head = OTHER.to_string(),
         ReceiptMutation::Base => {
             receipt.data.old_head = OTHER.to_string();
@@ -339,11 +343,26 @@ fn run_with_local_default_receipt_location(
             receipt.data.remote.cached_relation_after = "ahead-by-2".to_string();
         }
     }
-    fs::write(
-        &receipt_path,
-        serde_json::to_vec(&receipt).expect("receipt json"),
-    )
-    .expect("receipt");
+    let receipt_bytes = if matches!(mutation, ReceiptMutation::Preview) {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "cli.semantic-commit.default-branch.preview.v1",
+            "ok": true,
+            "data": {
+                "mode": "default-branch",
+                "default_branch": "main",
+                "head": BASE,
+                "completion": {
+                    "default_branch_committed": false,
+                    "provider_delivery_attempted": false,
+                    "provider_delivered": false
+                }
+            }
+        }))
+        .expect("preview JSON")
+    } else {
+        serde_json::to_vec(&receipt).expect("receipt JSON")
+    };
+    fs::write(&receipt_path, receipt_bytes).expect("receipt");
     fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
         .expect("make receipt private");
     let git_body = git_stub(&state.to_string_lossy(), &log.to_string_lossy(), scenario);
@@ -365,7 +384,7 @@ fn run_with_local_default_receipt_location(
         BASE,
         "--reason-file",
         &reason,
-        "--local-default-receipt",
+        "--default-branch-receipt",
         &receipt_path,
     ];
     if dry_run {
@@ -705,8 +724,8 @@ fn push_default_dry_run_preflights_without_pushing() {
 }
 
 #[test]
-fn push_default_adopts_valid_local_default_receipt_on_checked_default_branch() {
-    let (stub, out) = run_with_local_default_receipt(true);
+fn push_default_adopts_valid_default_branch_receipt_on_checked_default_branch() {
+    let (stub, out) = run_with_default_branch_receipt(true);
     assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
     let envelope = parse_envelope(&out.stdout);
     assert_eq!(envelope["data"]["authoring_branch"], "main");
@@ -718,8 +737,8 @@ fn push_default_adopts_valid_local_default_receipt_on_checked_default_branch() {
 }
 
 #[test]
-fn push_default_adopts_local_default_receipt_from_primary_checkout_subdirectory() {
-    let (_, out) = run_with_local_default_receipt_location(true, ReceiptMutation::None, true);
+fn push_default_adopts_default_branch_receipt_from_primary_checkout_subdirectory() {
+    let (_, out) = run_with_default_branch_receipt_location(true, ReceiptMutation::None, true);
     assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
     let envelope = parse_envelope(&out.stdout);
     assert_eq!(envelope["data"]["authoring_branch"], "main");
@@ -727,29 +746,59 @@ fn push_default_adopts_local_default_receipt_from_primary_checkout_subdirectory(
 }
 
 #[test]
-fn push_default_revalidates_local_default_receipt_bindings() {
-    for (mutation, expected_code) in [
-        (ReceiptMutation::Schema, "local_default_receipt_invalid"),
+fn push_default_revalidates_default_branch_receipt_bindings() {
+    for (mutation, expected_code, rejects_before_git) in [
+        (
+            ReceiptMutation::OldSchema,
+            "default_branch_receipt_invalid",
+            true,
+        ),
+        (
+            ReceiptMutation::Preview,
+            "default_branch_receipt_invalid",
+            true,
+        ),
         (
             ReceiptMutation::Branch,
-            "local_default_receipt_branch_mismatch",
+            "default_branch_receipt_branch_mismatch",
+            false,
         ),
-        (ReceiptMutation::Head, "local_default_receipt_head_mismatch"),
-        (ReceiptMutation::Base, "local_default_receipt_base_mismatch"),
-        (ReceiptMutation::Tree, "local_default_receipt_tree_mismatch"),
+        (
+            ReceiptMutation::Head,
+            "default_branch_receipt_head_mismatch",
+            false,
+        ),
+        (
+            ReceiptMutation::Base,
+            "default_branch_receipt_base_mismatch",
+            false,
+        ),
+        (
+            ReceiptMutation::Tree,
+            "default_branch_receipt_tree_mismatch",
+            false,
+        ),
         (
             ReceiptMutation::Repository,
-            "local_default_receipt_repository_mismatch",
+            "default_branch_receipt_repository_mismatch",
+            false,
         ),
         (
             ReceiptMutation::RemoteGap,
-            "local_default_receipt_remote_gap_invalid",
+            "default_branch_receipt_invalid",
+            true,
         ),
     ] {
-        let (_, out) = run_with_local_default_receipt_mutation(true, mutation);
+        let (stub, out) = run_with_default_branch_receipt_mutation(true, mutation);
         assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
         let envelope = parse_envelope(&out.stdout);
         assert_eq!(envelope["error"]["code"], expected_code);
+        if rejects_before_git {
+            assert!(
+                !stub.tempdir.path().join("git.log").exists(),
+                "invalid receipt reached Git/provider preflight"
+            );
+        }
     }
 }
 

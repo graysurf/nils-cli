@@ -104,6 +104,22 @@ struct ReconcileProof {
 }
 
 pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<Value, CliError> {
+    claim_impl(context, args, None)
+}
+
+pub(crate) fn claim_resumed_worker(
+    context: &CliContext,
+    args: WorkContextClaimArgs,
+    previous_incarnation: &str,
+) -> Result<Value, CliError> {
+    claim_impl(context, args, Some(previous_incarnation))
+}
+
+fn claim_impl(
+    context: &CliContext,
+    args: WorkContextClaimArgs,
+    resume_from_incarnation: Option<&str>,
+) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     let candidate: WorkContextInput =
@@ -111,6 +127,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     let mut candidate = candidate.validate_and_canonicalize()?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_quarantined(context, &record)?;
     ensure_fingerprint_key(&mut locked.registry);
     let record_cwd = std::path::Path::new(&record.cwd);
     let checkout = checkout_root(record_cwd).unwrap_or_else(|_| record_cwd.to_path_buf());
@@ -131,6 +148,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         &json!({
             "candidate": candidate,
             "if_revision": args.if_revision,
+            "resume_from_incarnation": resume_from_incarnation,
         }),
     );
     clean_expired(&mut locked.registry, now);
@@ -144,6 +162,40 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         &digest,
     )? {
         return Ok(replay);
+    }
+    if let Some(previous_incarnation) = resume_from_incarnation {
+        if previous_incarnation == incarnation {
+            return Err(CliError::data(
+                "worker-resume-claim-conflict",
+                "resumed worker claim must name a distinct prior incarnation",
+                None,
+            ));
+        }
+        let stale_claim_ids = locked
+            .registry
+            .claims
+            .iter()
+            .filter(|claim| {
+                claim.session_id == record.id
+                    && claim.session_incarnation == previous_incarnation
+                    && claim.state == "active"
+            })
+            .map(|claim| claim.claim_id.clone())
+            .collect::<Vec<_>>();
+        if stale_claim_ids
+            .iter()
+            .any(|claim_id| has_nonterminal_operation(&locked.registry, claim_id))
+        {
+            return Err(operation_in_progress());
+        }
+        for claim in &mut locked.registry.claims {
+            if stale_claim_ids.contains(&claim.claim_id) {
+                claim.state = "released".to_string();
+                claim.revision = claim.revision.saturating_add(1);
+                claim.updated_at = timestamp(now);
+                claim.terminal_at_epoch = Some(now);
+            }
+        }
     }
     if let Some(existing_index) = locked.registry.claims.iter().position(|claim| {
         claim.session_id == record.id
@@ -1094,6 +1146,18 @@ pub(crate) fn ensure_current_broker(
         return Err(CliError::runtime(
             "coordination-broker-lost",
             "coordination broker is not ready",
+            None,
+        ));
+    }
+    if !super::broker::capability_available(
+        context,
+        session_id,
+        incarnation,
+        &broker.capability_digest,
+    ) {
+        return Err(CliError::runtime(
+            "coordination-broker-lost",
+            "coordination broker capability is unavailable",
             None,
         ));
     }

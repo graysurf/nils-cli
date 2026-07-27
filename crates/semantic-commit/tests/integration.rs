@@ -9,9 +9,11 @@ mod commit;
 pub mod common;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/default_branch.rs"]
+mod default_branch;
+#[path = "integration/default_branch_contract.rs"]
+mod default_branch_contract;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
-#[path = "integration/local_default.rs"]
-mod local_default;
 #[path = "integration/staged_context.rs"]
 mod staged_context;

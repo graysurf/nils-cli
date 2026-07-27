@@ -486,6 +486,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (adopt)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Managed session id whose broker is being recovered]:SESSION:_default' \
+'--capability-file=[Exact incarnation-bound controller capability. Defaults to AGENT_SESSION_CAPABILITY_FILE only inside the authenticated runtime]:PATH:_files' \
 '--proof-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
 '--operation=[]:OPERATION:_default' \
@@ -502,6 +503,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (reconcile)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Managed session id whose broker is being recovered]:SESSION:_default' \
+'--capability-file=[Exact incarnation-bound controller capability. Defaults to AGENT_SESSION_CAPABILITY_FILE only inside the authenticated runtime]:PATH:_files' \
 '--proof-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
 '--operation=[]:OPERATION:_default' \

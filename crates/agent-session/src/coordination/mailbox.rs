@@ -54,6 +54,10 @@ pub(crate) struct StoredMessage {
     pub expires_at_epoch: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at_epoch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from_incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_at_epoch: Option<i64>,
     pub body_bytes: usize,
     pub body: String,
 }
@@ -161,11 +165,12 @@ pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Valu
             None,
         ));
     }
-    if args
-        .state
-        .as_deref()
-        .is_some_and(|state| !matches!(state, "unread" | "read" | "acknowledged" | "expired"))
-    {
+    if args.state.as_deref().is_some_and(|state| {
+        !matches!(
+            state,
+            "unread" | "read" | "acknowledged" | "quarantined" | "expired"
+        )
+    }) {
         return Err(CliError::usage(
             "cursor-invalid",
             "inbox state filter is invalid",
@@ -842,6 +847,8 @@ where
         expires_at: timestamp(now.saturating_add(expiry_secs)),
         expires_at_epoch: now.saturating_add(expiry_secs),
         terminal_at_epoch: None,
+        forwarded_from_incarnation: None,
+        forwarded_at_epoch: None,
         body_bytes: body.len(),
         body,
     };
@@ -869,6 +876,145 @@ where
     )?;
     locked.save()?;
     Ok(outcome)
+}
+
+pub(crate) fn carry_forward_unread_controller_guidance_with_authorization<G, F>(
+    context: &CliContext,
+    recipient_session_id: &str,
+    previous_incarnation: &str,
+    current_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorize: F,
+) -> Result<usize, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    let broker = locked
+        .registry
+        .brokers
+        .get(recipient_session_id)
+        .filter(|broker| {
+            broker.incarnation == current_incarnation
+                && broker.state == "ready"
+                && super::broker::capability_available(
+                    context,
+                    recipient_session_id,
+                    current_incarnation,
+                    &broker.capability_digest,
+                )
+                && super::broker::heartbeat_fresh(
+                    context,
+                    recipient_session_id,
+                    current_incarnation,
+                    broker.heartbeat_epoch,
+                )
+        })
+        .ok_or_else(|| {
+            CliError::runtime(
+                "resume-guidance-recipient-unavailable",
+                "the resumed worker coordination identity is not authoritative",
+                None,
+            )
+        })?;
+    let _ = broker;
+    let _authorization_guard = authorize()?;
+
+    let mut carried = 0usize;
+    for message in &mut locked.registry.messages {
+        if message.recipient_session_id == recipient_session_id
+            && message.recipient_incarnation == previous_incarnation
+            && message.sender_session_id == controller_session_id
+            && message.sender_incarnation == controller_incarnation
+            && message.state == "unread"
+            && message.expires_at_epoch > now
+        {
+            message.recipient_incarnation = current_incarnation.to_string();
+            message.revision = message.revision.saturating_add(1);
+            message.forwarded_from_incarnation = Some(previous_incarnation.to_string());
+            message.forwarded_at_epoch = Some(now);
+            carried = carried.saturating_add(1);
+        }
+    }
+    if carried > 0 {
+        let _ = super::notification::schedule(
+            &mut locked.registry,
+            recipient_session_id,
+            current_incarnation,
+            now,
+        );
+        locked.save()?;
+    }
+    Ok(carried)
+}
+
+pub(crate) fn quarantine_orphaned_controller_guidance_with_authorization<G, F>(
+    context: &CliContext,
+    recipient_session_id: &str,
+    current_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorize: F,
+) -> Result<usize, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    locked
+        .registry
+        .brokers
+        .get(recipient_session_id)
+        .filter(|broker| {
+            broker.incarnation == current_incarnation
+                && broker.state == "ready"
+                && super::broker::capability_available(
+                    context,
+                    recipient_session_id,
+                    current_incarnation,
+                    &broker.capability_digest,
+                )
+                && super::broker::heartbeat_fresh(
+                    context,
+                    recipient_session_id,
+                    current_incarnation,
+                    broker.heartbeat_epoch,
+                )
+        })
+        .ok_or_else(|| {
+            CliError::runtime(
+                "guidance-quarantine-recipient-unavailable",
+                "the current worker coordination identity is not authoritative",
+                None,
+            )
+        })?;
+    let _authorization_guard = authorize()?;
+
+    let mut changed = false;
+    let mut quarantined = 0usize;
+    for message in &mut locked.registry.messages {
+        if message.recipient_session_id == recipient_session_id
+            && message.recipient_incarnation != current_incarnation
+            && message.sender_session_id == controller_session_id
+            && message.sender_incarnation == controller_incarnation
+            && message.expires_at_epoch > now
+            && matches!(message.state.as_str(), "unread" | "quarantined")
+        {
+            if message.state == "unread" {
+                message.state = "quarantined".to_string();
+                message.revision = message.revision.saturating_add(1);
+                message.terminal_at_epoch = Some(now);
+                changed = true;
+            }
+            quarantined = quarantined.saturating_add(1);
+        }
+    }
+    if changed {
+        locked.save()?;
+    }
+    Ok(quarantined)
 }
 
 fn read_body(path: &Path) -> Result<String, CliError> {
@@ -1066,6 +1212,8 @@ mod tests {
             expires_at: "time".to_string(),
             expires_at_epoch: 1,
             terminal_at_epoch: None,
+            forwarded_from_incarnation: None,
+            forwarded_at_epoch: None,
             body_bytes: 6,
             body: "canary".to_string(),
         };

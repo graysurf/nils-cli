@@ -473,7 +473,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__broker__adopt)
-            opts="-h --session --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
+            opts="-h --session --capability-file --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -481,6 +481,21 @@ _agent-session() {
             case "${prev}" in
                 --session)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --capability-file)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 --proof-file)
@@ -589,7 +604,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__broker__reconcile)
-            opts="-h --session --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
+            opts="-h --session --capability-file --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -597,6 +612,21 @@ _agent-session() {
             case "${prev}" in
                 --session)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --capability-file)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 --proof-file)

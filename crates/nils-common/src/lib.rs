@@ -25,12 +25,12 @@
 pub mod cli_contract;
 pub mod clipboard;
 pub mod coordination_projection;
+pub mod default_branch_receipt;
 pub mod diag_output;
 pub mod env;
 pub mod execution_effect;
 pub mod fs;
 pub mod git;
-pub mod local_default_receipt;
 pub mod markdown;
 pub mod process;
 pub mod provider_payload;

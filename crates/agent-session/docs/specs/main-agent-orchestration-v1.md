@@ -22,9 +22,9 @@ modes fail closed, and registry replacement is atomic under a bounded lock.
 
 The supported schemas are:
 
-- `agent-session.orchestration-registry.v2`
+- `agent-session.orchestration-registry.v3`
 - `agent-session.orchestration-run.v1`
-- `agent-session.orchestration-assignment.v2`
+- `agent-session.orchestration-assignment.v3`
 - `agent-session.session-orchestration.v1`
 - `main-agent.objective-packet.v1`
 - `main-agent.assignment-input.v1`
@@ -35,10 +35,27 @@ therefore reject mutations. Every identity reference is fenced by public
 session ID, runtime incarnation, and original session `created_at`; `machine`
 is an advisory routing/display hint only.
 
-The current reader upgrades registry/assignment v1 state in memory and writes
-v2 on the next successful mutation. Version 2 makes the durable
-submit-recovery record explicit; older binaries fail closed on the registry
-version instead of misreading an additive v1 assignment field.
+`nils-agent-session` 1.25.11 is the minimum reader and writer for
+registry/assignment v3. It upgrades released v2 state in memory and,
+immediately before the first successful v3 mutation, atomically preserves the
+exact source bytes as the owner-only
+`orchestration/registry.v2.rollback.json`. Only after that snapshot is durable
+does it replace `registry.json` with v3. Version 3 owns the opaque
+account-handoff reservation identity and every other post-v2 assignment field;
+released v2 binaries fail closed on the new outer schema instead of receiving
+unknown fields under the old version spelling. Historical v1 input remains
+readable and preserves its exact source separately as
+`registry.v1.rollback.json`, but v2 is the supported release rollback boundary.
+
+Rollback is an explicit operator action: stop every orchestration writer,
+verify no v3-only mutation must be retained, replace `registry.json` with the
+preserved exact v2 rollback snapshot, and then start the released v2 reader.
+The snapshot is a one-time migration source, not a live mirror; rolling back
+after v3 mutations intentionally discards those newer mutations. A mismatched
+pre-existing snapshot makes migration fail closed. The compatibility suite
+uses a populated frozen v2 fixture and a deny-unknown-fields reader copied from
+the released v2 contract; it restores the exact snapshot after representative
+v3 mutations and never substitutes the current v3 decoder as rollback proof.
 
 ## Public projection and privacy
 
@@ -53,8 +70,10 @@ Current relationships retain their exact incarnation identity. A resumed
 worker with the same session ID and original `created_at` remains visible as
 `role: "worker"` with `relationship_state: "rebind_required"` until its
 authenticated, revision-fenced checkpoint updates the durable worker
-reference. This continuity projection is read-only metadata and grants no
-claim, operation, or repository authority.
+reference. The assignment then retains `previous_worker` as bounded continuity
+metadata for exact-controller guidance reconciliation. This continuity
+projection is read-only metadata and grants no claim, operation, or repository
+authority.
 
 An authenticated `main-agent self show` or `rehydrate` may resolve the caller's
 own private objective or assignment packet. A worker cannot resolve sibling
@@ -69,6 +88,7 @@ role environment variable is never authoritative.
 ```text
 main-agent init --packet-file FILE --if-absent [--if-revision N] --idempotency-key KEY --format json
 main-agent self show --format json
+main-agent self recover --idempotency-key KEY --format json
 main-agent rehydrate --format json|markdown
 main-agent status --format json
 main-agent checkpoint --file FILE --if-revision N --idempotency-key KEY --format json
@@ -78,6 +98,11 @@ main-agent worker start --batch DIR --idempotency-key KEY --format json
 main-agent worker list|show ...
 main-agent worker wait [ASSIGNMENT_ID | --any] --until submitted|blocked|terminal [--timeout D] --format json
 main-agent worker diagnose|supervise ASSIGNMENT_ID --format json
+main-agent worker guidance-reconcile ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
+main-agent worker guidance-quarantine ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
+main-agent worker account-handoff ASSIGNMENT_ID --account ACCOUNT --if-revision N --authorize-account-change --idempotency-key KEY --format json
+main-agent worker account-handoff-cancel ASSIGNMENT_ID --reservation-id RESERVATION_ID --account ACCOUNT [--intent-id INTENT_ID] --if-revision N --authorize-account-change --idempotency-key KEY --format json
+main-agent worker request-changes ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
@@ -121,20 +146,29 @@ as one call, fencing each lane independently so a failing lane isolates to its
 own typed result (`{assignment_file, ok, result | error}`) instead of aborting
 the batch; the command itself succeeds and the caller branches on each lane's
 `ok`. Batch launch is transport-only and rejects `--await-ready`, so its
-bounded lane count cannot multiply single-assignment readiness deadlines.
+bounded lane count cannot multiply single-assignment readiness deadlines. The
+parent idempotency key first commits an immutable sorted manifest of lane names
+and raw packet digests. Exact replay resumes incomplete manifest lanes;
+transient or ambiguous child failures remain incomplete and reconcile from the
+child receipt, while deterministic failures become terminal lane results.
+Membership, name, order, or raw-byte changes conflict before any new worker
+launch. The immutable parent manifest makes the historical
+`{parent}-{index}` child key unambiguous, so new and rolling-upgrade callers
+share one lane authority instead of splitting work across key schemes.
 `main-agent quick --assignment-file FILE` is the L0/L1 fast-path: it
 synthesizes an ephemeral run and work-context claim from the assignment (the
 packet MUST declare a `repository`), launches the single worker in one call, and
 marks the run ephemeral so it auto-closes once that worker is torn down — no
 explicit `close`. A session that already controls a run must use the granular
-`init` + `worker start` path instead. Bare `worker start` and `quick` run the
-same `--await-ready`
-readiness proof and runtime-owned single-Enter recovery described below, but
-default to `5m` instead of launch-only: the normal paths exist to hand back a
-working worker, so a dropped submit key must be the runtime's problem rather
-than something its caller has to notice and repair by hand. `--await-ready 0`
-selects the old launch-only result. A malformed duration is rejected before the
-ephemeral run is created.
+`init` + `worker start` path instead. `worker start` and `quick` use the same
+explicit `--await-ready` readiness proof and runtime-owned single-Enter
+recovery described below. Bare `worker start` and `quick` both preserve the
+released `5m` readiness default; callers opt out explicitly with
+`--await-ready 0`.
+A malformed duration is rejected before the ephemeral run is created.
+Quick parent idempotency binds the canonical readiness duration; changing that
+duration under the same key conflicts. Historical quick parent digests and
+`{parent}-worker` child keys remain replayable for rolling upgrades.
 
 `worker start --await-ready D` folds the readiness proof into launch: after the
 worker is bound it waits up to a bounded `D` (0-5m; `0` = launch-only) for the
@@ -144,6 +178,14 @@ advance the assignment past `starting`, then returns a typed `readiness`
 nonzero wait persists one fixed deadline and leased finalizer. Concurrent exact
 replays join the same readiness attempt, a superseded finalizer cannot overwrite
 its successor, and every replay converges on the same final receipt. The
+readiness-progress receipt persists the automatic recovery reservation and its
+reserved/sending/sent substage. The attempt reservation and `reserved`
+continuation are committed atomically while rechecking the current finalizer
+and its live lease. A successor after reservation continues that same
+reservation; a successor after Enter observes the persisted sent result; an
+ambiguous sending substage fails closed and never authorizes another Enter.
+The `sending` lease outlives the pane-input timeout, while recoverable substages
+retain the short takeover lease. The
 checkpoint advancing is the readiness + newer-turn + identity proof, so the Main
 Agent branches on one typed result instead of hand-running the verified-startup
 sequence. `readiness.delivery.state: confirmed` requires that checkpoint and
@@ -186,6 +228,10 @@ replacing the hand-run
 release -> delete -> confirm sequence. An accepted assignment is released first;
 an already-terminal one goes straight to delete. Per-step idempotency keys are
 derived from the retire key so a retry converges through each step's receipt.
+Every single-worker start result also includes additive `polling` evidence. The
+explicit launch-only mode reports zero readiness-registry reads and writes. A
+bounded wait reports its timeout plus conservative read/write upper bounds
+derived from the 250 ms readiness poll and five-second finalizer renewal.
 Prompt load-buffer, paste-buffer, and Enter effects occur exactly once for a
 completed worker-start stage. A retry may remove and relaunch only an exact
 matching worker record that durably proves tmux never launched; it never treats
@@ -246,12 +292,20 @@ worker may atomically rebind the assignment to its new incarnation only when
 the session ID and original `created_at` still match and the prior incarnation
 is no longer live. A worker checkpoint cannot regress a `submitted`,
 `accepted`, `released`, or `cancelled` assignment to a pre-terminal worker
-state. Accept/release are explicit Main Agent transitions. The ordinary
-successful path is `submitted -> accepted -> released`. Once an assignment is
-`accepted`, `released`, or `cancelled`, worker checkpoints are rejected before
-any result, checkpoint, worker binding, state, or revision mutation. The
-`worker cancel` command is the only public transition into `cancelled`. It may
-terminalize only the named
+state. `worker request-changes` is the manager-only revision-fenced exception:
+it permits exactly `submitted -> working`, preserves the bound worker and
+private packet, clears stale result and blocker summaries, and records a
+bounded review-revision checkpoint and reason atomically with the new
+assignment revision. Its idempotency receipt is scoped to the authenticated
+current Main Agent and exact logical request. Wrong roles, changed
+primary-manager ownership, stale revisions, and every non-submitted source
+state fail closed.
+
+Accept/release are explicit Main Agent transitions. The ordinary successful
+path is `submitted -> accepted -> released`. Once an assignment is `accepted`,
+`released`, or `cancelled`, worker checkpoints are rejected before any result,
+checkpoint, worker binding, state, or revision mutation. The `worker cancel`
+command is the only public transition into `cancelled`. It may terminalize only the named
 failed pre-claim assignment, with an exact revision, active Main Agent claim,
 no worker claim, and no active or uncertain worker operation. The coordination
 registry lock remains held across the orchestration transition so claim
@@ -273,6 +327,94 @@ worktree evidence is projected as `present`, `absent`, `unavailable`, or
 unreadable, or identity-mismatched required evidence is
 `evidence_unavailable`. Both classifications are non-retry-safe and forbid
 automatic input or mutation.
+
+The full supervision classification set additionally includes
+`coordination_broker_stale`, `edit_authority_stale`,
+`claim_renewal_required`, `guidance_continuity_required`,
+`orphan_guidance_quarantine_required`,
+`account_handoff_capability_gap`, `account_handoff_required`, and
+`stale_provider_activity`. Broker-heartbeat/edit-authority staleness is not
+claim-expiry evidence: only `claim_renewal_required` directs the exact worker to
+renew its own claim. `coordination_broker_stale` routes to exact-incarnation
+broker-owner recovery; `edit_authority_stale` requests a bounded recheck while
+no durable broker-lost timestamp exists.
+
+Worktree staleness uses a durable, privacy-safe material fingerprint scoped to
+the assignment and exact worker incarnation. The bounded input combines
+porcelain path state, staged and unstaged binary/full-index diffs, and
+untracked path/content bytes. Same-path and same-size continued edits,
+untracked content changes, and deletion-only changes produce new fingerprints.
+Oversize, timeout, non-regular, unreadable, or inconsistent enumeration is
+unavailable. An unchanged fingerprint retains its original `changed_at`; a new
+worker incarnation starts a new progress clock even when the material matches
+the prior incarnation.
+
+`self recover` is the only facade macro for controller broker recovery; there
+is no top-level alias. It requires the exact current Main Agent role and
+incarnation, unchanged running persisted runtime identity, matching broker
+generation and runtime digest, an active retained claim, and no active or
+uncertain operation. It delegates to the broker adopt primitive, treats an
+already-authoritative exact broker as an idempotent `healthy_noop`, and
+post-verifies the same run, claim revision, and broker identity. It never
+changes accounts, resumes/replaces providers, resends prompts, sends Enter, or
+clears operation fences.
+
+Authenticated resume bootstrap releases the immediately stale worker claim,
+acquires the assignment-derived claim for the current incarnation, and carries
+only unread, unexpired guidance from the exact current controller. Carried
+guidance retains message identity and unread state, advances revision once,
+and records bounded forwarding provenance. Unrelated-controller, expired,
+read, and acknowledged messages remain on their original incarnation.
+`worker guidance-reconcile` is the revision-fenced, idempotent controller
+action for a retained `previous_worker`; it revalidates exact manager and
+worker identities across coordination-to-orchestration locking, never exposes
+message bodies, and never records worker consumption.
+When stale exact-controller guidance has no retained `previous_worker`,
+supervision instead prescribes `worker guidance-quarantine`. That action
+revalidates the current manager, assignment revision, worker, and absence of a
+prior identity under the same lock order, then marks only unread/unexpired
+non-current-incarnation records from that controller as `quarantined`.
+Current-incarnation and unrelated-controller messages are preserved.
+
+`worker account-handoff` is available only when the exact incumbent Codex
+worker exposes both managed app-server account control and structured
+auto-resume control. Explicit `--authorize-account-change`, current assignment
+revision, exact Main Agent authority, authoritative worker broker, active
+worker claim, operation quiescence, and a `starting|working|blocked` assignment
+are mandatory. Account input is validated before reservation, and an account
+handoff reservation is mutually exclusive with submit recovery. The macro queues or joins
+the typed next-account transition, waits for the same worker incarnation,
+verifies the allowlisted durable binding, and re-arms a structured quota
+continuation when eligible. `/logout`, raw terminal input, prompt resend, and
+worker/session replacement are forbidden. Raw workers advertise no restart
+flag and fail closed without account/runtime mutation. A bounded raw
+rate-limit probe is eligible only after both provider and material progress are
+stale, no structured quota evidence exists, managed controls are absent, and
+an exact durable selected-account provenance exists; ambient authentication is
+never account provenance.
+
+Failed, superseded, and queued timed-out reservations are recoverable through
+`worker account-handoff-cancel`. The typed action requires explicit
+authorization and revalidates exact manager, revision, reservation, worker,
+broker, claim, and operation quiescence. It atomically compare-and-clears the
+observed queued/failed pending account and revision plus the matching
+reservation while preserving the selected account and leaving auto-resume
+disabled. If a newer pending intent superseded the reservation, cancellation
+succeeds by clearing only the stale assignment reservation and reports the
+newer intent as preserved; no cancellation retry is needed because the stale
+reservation is gone. It refuses an actively applying owned intent and
+directs an already-applied intent back to exact replay of the original
+handoff.
+
+The cancellation selectors come from the durable reservation returned by the
+failed handoff or a private authenticated assignment view:
+`reservation_id` supplies `--reservation-id`, `account` supplies `--account`,
+and `account_intent_id` supplies `--intent-id`. Current v3 reservations require
+all three identities. A frozen released-v1 reservation predates the stored
+opaque reservation field and provider-side intent identity; its authenticated
+view derives the stable reservation selector from the request digest and may
+omit only `--intent-id`. The exact reservation and account selectors remain
+mandatory at the CLI boundary.
 
 `worker submit-recovery` is eligible only for an incarnation-matched
 assignment in the initial provider startup state, with no dialog, claim,
@@ -303,11 +445,21 @@ reserved-worker checkpoint or definitive failure resolves the attempt.
 `worker reconcile-recovery` is eligible only for an unknown `attempting`
 reservation bound to the current run, controller, assignment, and exact worker
 incarnation. It acquires the exact session-record lock, proves the tmux/runtime
-is stopped, then retains the worker coordination-quiescence guard while proving
+is stopped by combining all persisted cgroup, process-session, and process-group
+sources, then retains the worker coordination-quiescence guard while proving
 the worker claim absent and active/uncertain operations quiescent. Under the
 established coordination-to-orchestration lock order it revalidates current
 Main Agent authority and the unchanged revision before terminalizing the record
-as `reconciled`. The result records stopped/quiescent proof and
+as `reconciled`. Live evidence dominates, unavailable evidence remains unknown,
+and stopped requires every available identity source to prove absence.
+Platforms that cannot enumerate descendants treat process-group disappearance
+as unknown rather than stopped. Before the `reconciled` transition, a
+session-owned marker is atomically persisted with the exact-worker quarantine;
+the registry transition follows only after that durable fence exists. An exact
+retry adopts a matching marker if execution stopped between those commits. Resume,
+maintenance resume, claim, bootstrap, checkpoint, and equivalent execution
+authority restoration reject that retained worker until guarded terminal
+cleanup makes execution impossible. The result records stopped/quiescent proof and
 `input_sent:false`. No path through this command loads, pastes, sends Enter, or
 clears a fence while the reserved incarnation might still execute. Cancellation
 of this absorbing record reacquires the exact session-record boundary, reproves
@@ -370,13 +522,24 @@ requires force, and a digest over the complete plan. Collaborators, borrowers,
 workers handed off to another primary manager, and assignments from another
 run are outside the plan.
 
+A single plan is capped at 64 primary assignments. This bound keeps the
+resumable per-worker result/fence checkpoints, serialized receipts, and
+exclusive worker-authority lock set within a fixed worst case; preview fails
+with `group-cleanup-batch-too-large` before worker locks are acquired when the
+run exceeds it. Split a larger objective into smaller runs before cleanup.
+
 `POST` accepts only
 `agent-session.main-agent-group-cleanup-request.v1` with the previewed Main
 Agent incarnation, run revision, plan digest, `safe` or `force` mode, and an
 idempotency key. Any identity, revision, or plan drift fails before cleanup.
 Safe mode rejects a plan containing nonterminal assignments. Force mode
 terminalizes exactly those assignments as `cancelled`; accepted assignments
-advance to `released`.
+advance to `released`. Before any transition becomes durable, cleanup locks
+the coordination registry for every exact worker. Active or uncertain
+operation leases reject both modes. Safe mode also rejects an active claim;
+force may revoke that claim only after proving operation quiescence, and seals
+the broker/capability boundary before releasing the lock so no new lease can
+race deletion.
 
 Execution is deliberately ordered: delete or confirm absence of every planned
 worker, close the run, then delete the Main Agent. Worker identity is checked
@@ -384,8 +547,59 @@ again before deletion. A worker failure returns a typed
 `agent-session.main-agent-group-cleanup-result.v1` partial result and preserves
 both the active run and Main Agent. A failure after worker deletion but before
 or during Main deletion still reports `main_deleted: false`; clients reconcile
-the per-worker outcomes and keep the Main Agent available for recovery. Exact
-idempotent replay returns the original result.
+the per-worker outcomes and keep the Main Agent available for recovery. An
+incomplete result is a provisional durable checkpoint: an exact retry resumes
+after the last committed stage and may converge to success without repeating
+completed deletions. Once `completed: true` is stored, exact replay is stable
+and returns that terminal result byte-for-byte at the value boundary.
+
+Incomplete checkpoints use the private
+`agent-session.main-agent-group-cleanup-receipt.v2` schema. The receipt stores
+the exact original `requested_session_id` beside the canonical
+`principal_session_id`; post-delete recovery requires exact selector equality,
+the canonical identity from the embedded plan, and its matching pending
+registry fence. The v1 receipt remains readable only when the requested
+selector exactly equals its stored principal and the same plan/fence checks
+succeed. The same schema-specific selector check applies while the canonical
+session is still live: a retry through another alias cannot adopt or rewrite
+the original selector mapping. Prefix, abbreviation, and unique-scan inference
+are never ownership evidence. Completed alias cleanup persists an exact
+alias-keyed terminal receipt alongside the canonical receipt, but only the
+receipt keyed by the current exact selector is replayable.
+
+Progress-capacity reclamation treats unreadable, malformed, changing, or
+uncertain-principal records as live. A classified stale record is never
+removed by a verify-then-pathname-unlink sequence. Reclamation instead uses one
+private bounded recycle slot and an atomic exchange: the replacement identity
+is verified on both paths, a file-count reclamation installs the complete
+incoming checkpoint by atomic rename, and byte-only reclamation installs a
+valid compact retired receipt. Before exchange, a durable journal binds the
+source key and optional destination key to both descriptors' device, inode,
+length, modification time, and content digest. Recovery uses that exact
+mapping to roll back a stranded replacement or finish an already-installed
+checkpoint; unknown identities fail closed unless the exact stale source
+remains in the slot and the unrelated progress-path replacement can therefore
+be preserved without ambiguity. The recycle and progress directories are both
+pinned by validated descriptors. Exchange, final rename, rollback, and
+recovery use those authorities, and both changed directory namespaces are
+synced before the durable journal may transition to idle. Canonical
+directory-identity drift aborts before exchange. If a pathname replacement
+races an exchange, both resulting identities are checked and the displaced
+replacement is exchanged back before the transaction is retired. A replacement
+after exchange is likewise retained when the exact stale source remains in the
+slot. Final installation records a durable `installed` journal phase only after
+the prepared destination identity and changed progress namespace are synced.
+An unproven destination identity is atomically moved back to the source key and
+verified before the transaction retires; after the installed phase is durable,
+destination replacement or removal is retained as the later state and recovery
+can retire the exact stale slot without ambiguity. Reclaimable bytes are
+classified and summed before any sync-heavy compaction begins, and active
+residue is recovered before the capacity snapshot, so an admission that is
+provably impossible does not mutate stale receipts and a recovered size change
+cannot invalidate its projection. A matching canonical pending fence keeps
+released-v1 alias progress live even if the alias now resolves to another session. A
+crash therefore cannot create unbounded residue or permanently disable
+admission.
 
 ## Recovery and failure semantics
 

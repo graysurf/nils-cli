@@ -2,6 +2,8 @@ use clap::{Arg, ArgAction, Command, ValueHint};
 use clap_complete::{Shell, generate};
 use std::io::{self, Write};
 
+use crate::default_branch::clap_command as default_branch_completion_command;
+
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None => {
@@ -263,7 +265,7 @@ fn build_completion_command() -> Command {
                         .action(ArgAction::SetTrue),
                 ),
         )
-        .subcommand(local_default_completion_command())
+        .subcommand(default_branch_completion_command())
         .subcommand(cleanup_completion_command(
             "fixup",
             "Create a fixup! commit for staged changes",
@@ -283,109 +285,6 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(Command::new("help").about("Display help message"))
-}
-
-fn local_default_completion_command() -> Command {
-    Command::new("local-default")
-        .about("Create one governed signed commit on the primary local default branch")
-        .arg(
-            Arg::new("message")
-                .short('m')
-                .long("message")
-                .value_name("text"),
-        )
-        .arg(
-            Arg::new("message-file")
-                .short('F')
-                .long("message-file")
-                .value_name("path")
-                .value_hint(ValueHint::FilePath),
-        )
-        .arg(
-            Arg::new("expected-branch")
-                .long("expected-branch")
-                .value_name("name")
-                .required(true),
-        )
-        .arg(
-            Arg::new("expect-head")
-                .long("expect-head")
-                .value_name("full-sha")
-                .required(true),
-        )
-        .arg(
-            Arg::new("receipt-out")
-                .long("receipt-out")
-                .value_name("path")
-                .value_hint(ValueHint::FilePath)
-                .required(true),
-        )
-        .arg(
-            Arg::new("remote-mode")
-                .long("remote-mode")
-                .value_name("local-only")
-                .value_parser(["local-only"]),
-        )
-        .arg(
-            Arg::new("repo")
-                .long("repo")
-                .value_name("path")
-                .value_hint(ValueHint::DirPath),
-        )
-        .arg(
-            Arg::new("format")
-                .long("format")
-                .value_name("text|json")
-                .value_parser(["text", "json"]),
-        )
-        .arg(Arg::new("json").long("json").action(ArgAction::SetTrue))
-        .arg(
-            Arg::new("dry-run")
-                .long("dry-run")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("validate-only")
-                .long("validate-only")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("automation")
-                .long("automation")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(Arg::new("type").long("type").value_name("type"))
-        .arg(Arg::new("scope").long("scope").value_name("scope"))
-        .arg(Arg::new("subject").long("subject").value_name("subject"))
-        .arg(
-            Arg::new("body-bullet")
-                .long("body-bullet")
-                .alias("bullet")
-                .value_name("text")
-                .action(ArgAction::Append),
-        )
-        .arg(
-            Arg::new("signoff")
-                .long("signoff")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("trailer")
-                .long("trailer")
-                .value_name("token: value")
-                .action(ArgAction::Append),
-        )
-        .arg(
-            Arg::new("auto-fix")
-                .long("auto-fix")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-progress")
-                .long("no-progress")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(Arg::new("quiet").long("quiet").action(ArgAction::SetTrue))
 }
 
 fn cleanup_completion_command(name: &'static str, about: &'static str) -> Command {
@@ -472,4 +371,88 @@ fn cleanup_completion_command(name: &'static str, about: &'static str) -> Comman
                 .help("Reduce non-error output")
                 .action(ArgAction::SetTrue),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use clap::ArgAction;
+    use pretty_assertions::assert_eq;
+
+    use crate::default_branch::{OptionArity, OptionKind, option_contract};
+
+    use super::default_branch_completion_command;
+
+    #[test]
+    fn default_branch_completion_is_derived_from_the_public_parser_contract() {
+        let command = default_branch_completion_command();
+        let long_options = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect::<BTreeSet<_>>();
+        let expected_long_options = option_contract()
+            .iter()
+            .map(|option| option.long)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(long_options, expected_long_options);
+
+        let short_options = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_short())
+            .collect::<BTreeSet<_>>();
+        let expected_short_options = option_contract()
+            .iter()
+            .filter_map(|option| option.short)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(short_options, expected_short_options);
+
+        let visible_aliases = command
+            .get_arguments()
+            .filter_map(|argument| {
+                argument
+                    .get_visible_aliases()
+                    .map(|aliases| (argument.get_id().as_str(), aliases))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected_visible_aliases = option_contract()
+            .iter()
+            .filter(|option| !option.visible_aliases.is_empty())
+            .map(|option| (option.long, option.visible_aliases.to_vec()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(visible_aliases, expected_visible_aliases);
+
+        for option in option_contract() {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_long() == Some(option.long))
+                .expect("contract option should be present");
+            let action_matches = match (option.kind, option.arity, option.repeatable) {
+                (OptionKind::Help, _, _) => {
+                    matches!(argument.get_action(), ArgAction::HelpLong)
+                }
+                (_, OptionArity::Flag, _) => {
+                    matches!(argument.get_action(), ArgAction::SetTrue)
+                }
+                (_, OptionArity::Value, true) => {
+                    matches!(argument.get_action(), ArgAction::Append)
+                }
+                (_, OptionArity::Value, false) => {
+                    matches!(argument.get_action(), ArgAction::Set)
+                }
+            };
+            assert!(
+                action_matches,
+                "--{} value arity has action {:?}",
+                option.long,
+                argument.get_action()
+            );
+            assert_eq!(
+                argument.is_required_set(),
+                option.required,
+                "--{} required state",
+                option.long
+            );
+        }
+    }
 }

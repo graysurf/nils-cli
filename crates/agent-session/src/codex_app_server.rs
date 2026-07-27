@@ -35,6 +35,10 @@ use crate::{
     write_session_record,
 };
 
+pub(crate) const MANAGED_ACCOUNT_HANDOFF_CAPABILITY: &str =
+    "agent-session.codex-managed-account-handoff.v1";
+const MANAGED_ACCOUNT_HANDOFF_CAPABILITY_KEY: &str = "managed_account_handoff_capability";
+
 pub(crate) const RUNTIME_KIND: &str = "codex_app_server";
 pub(crate) const PROTOCOL_KEY: &str = "codex_app_server_protocol";
 pub(crate) const PROTOCOL_VERSION: &str = "v2";
@@ -176,13 +180,14 @@ pub(crate) fn configure_runtime(
         }
         return Ok(());
     }
-    configure_runtime_with_capabilities(context, record, forced, capabilities)
+    configure_runtime_with_capabilities(context, record, forced, managed, capabilities)
 }
 
 fn configure_runtime_with_capabilities(
     context: &CliContext,
     record: &mut SessionRecord,
     forced: bool,
+    managed: bool,
     capabilities: AppServerCapabilities,
 ) -> Result<(), CliError> {
     let socket = match allocate_socket_path(context, record) {
@@ -226,7 +231,26 @@ fn configure_runtime_with_capabilities(
         THREAD_ATTACHED_KEY.to_string(),
         json!(display_path(&socket.with_extension("attached"))),
     );
+    if managed {
+        runtime.extra.insert(
+            MANAGED_ACCOUNT_HANDOFF_CAPABILITY_KEY.to_string(),
+            json!(MANAGED_ACCOUNT_HANDOFF_CAPABILITY),
+        );
+    } else {
+        runtime.extra.remove(MANAGED_ACCOUNT_HANDOFF_CAPABILITY_KEY);
+    }
     write_session_record(context, record)
+}
+
+pub(crate) fn managed_account_handoff_supported(record: &SessionRecord) -> bool {
+    record.runtime.as_ref().is_some_and(|runtime| {
+        runtime.kind == RUNTIME_KIND
+            && runtime
+                .extra
+                .get(MANAGED_ACCOUNT_HANDOFF_CAPABILITY_KEY)
+                .and_then(Value::as_str)
+                == Some(MANAGED_ACCOUNT_HANDOFF_CAPABILITY)
+    })
 }
 
 #[cfg(test)]
@@ -1921,11 +1945,14 @@ async fn apply_pending_next_account(
     })
     .await
     .ok()?;
-    let (account, revision) = match queued {
-        Ok(Some(pair)) => pair,
+    let next = match queued {
+        Ok(Some(next)) => next,
         Ok(None) => return None,
         Err(_) => return None, // malformed intent stays fenced for explicit repair
     };
+    let intent_id = next.intent_id?;
+    let account = next.account;
+    let revision = next.revision;
 
     let outcome = drive_external_auth_login(websocket, request_id, &account).await;
     let succeeded = outcome.is_ok();
@@ -1940,6 +1967,7 @@ async fn apply_pending_next_account(
             &finish_launch,
             &finish_account,
             revision,
+            &intent_id,
             outcome,
         )
     })
@@ -4550,6 +4578,11 @@ mod tests {
         configure_runtime(&context, &agent, &mut record, true).unwrap();
         assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
         assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_HOOK);
+        assert!(managed_account_handoff_supported(&record));
+        assert_eq!(
+            record.runtime.as_ref().unwrap().extra[MANAGED_ACCOUNT_HANDOFF_CAPABILITY_KEY],
+            MANAGED_ACCOUNT_HANDOFF_CAPABILITY
+        );
         assert_eq!(
             record
                 .runtime
@@ -4644,6 +4677,7 @@ mod tests {
         configure_runtime_with_capabilities(
             &context,
             &mut record,
+            true,
             true,
             AppServerCapabilities {
                 transport: true,
@@ -7499,13 +7533,16 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
     }
 
     #[tokio::test]
-    async fn apply_next_drains_a_queued_account_at_the_idle_boundary() {
+    async fn managed_handoff_boundary_preserves_thread_and_arms_one_continuation() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let broker = tmp.path().join("broker");
+        let broker_calls = tmp.path().join("broker-calls");
         fs::write(
             &broker,
             r#"#!/bin/sh
+calls=$1
+shift
 account=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -7522,6 +7559,7 @@ case "$account" in
   gamania|sym) ;;
   *) exit 2 ;;
 esac
+printf '%s\n' "$account" >> "$calls"
 printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"account\":\"$account\",\"access_token\":\"token-$account\",\"chatgpt_account_id\":\"workspace-$account\",\"plan\":\"team\"}"
 "#,
         )
@@ -7530,7 +7568,11 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let _broker = EnvGuard::set(
             &lock,
             "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
-            &serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap(),
+            &serde_json::to_string(&vec![
+                broker.to_string_lossy().into_owned(),
+                broker_calls.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
         );
         let socket_path = tmp.path().join("apply-next.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -7543,6 +7585,8 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
         crate::write_session_record(&context, &record).unwrap();
         crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
         let turn_started = serde_json::from_value(json!({
             "schema_version": crate::activity::TURN_EVENT_VERSION,
             "event_id": "apply-next-turn-start",
@@ -7628,6 +7672,45 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let view = crate::codex_account::view_for_record(&persisted);
         assert_eq!(view.selected_account.as_deref(), Some("sym"));
         assert!(view.next.is_none());
+        assert_eq!(
+            persisted
+                .provider_resume
+                .as_ref()
+                .map(|resume| resume.session_id.as_str()),
+            Some("raw-thread-apply-next"),
+            "managed account binding must retain the exact provider thread"
+        );
+        assert!(
+            crate::auto_resume::arm_usage_exhaustion(
+                &context,
+                &record.id,
+                "turn-apply-next".to_string(),
+                2,
+                "2030-01-01T00:00:01Z",
+            )
+            .unwrap(),
+            "the handoff boundary arms one continuation"
+        );
+        assert!(
+            !crate::auto_resume::arm_usage_exhaustion(
+                &context,
+                &record.id,
+                "turn-apply-next".to_string(),
+                2,
+                "2030-01-01T00:00:02Z",
+            )
+            .unwrap(),
+            "an exact replay cannot arm a duplicate continuation"
+        );
+        assert_eq!(
+            crate::auto_resume::view_for_record(&context, &persisted).state,
+            "armed"
+        );
+        assert_eq!(
+            fs::read_to_string(&broker_calls).unwrap(),
+            "gamania\nsym\n",
+            "the real fake broker resolves exactly the initial and requested account once"
+        );
         drop(handle);
         control.abort();
         let _ = control.await;

@@ -16,9 +16,10 @@ use crate::cli::{BrokerHeartbeatArgs, BrokerRecoveryArgs, BrokerStatusArgs, Brok
 use crate::{CliContext, CliError, SessionRecord};
 
 use super::{
-    BrokerRecord, authenticate_from_file, capability_path, clean_expired, coordination_dir,
-    digest_bytes, ensure_fingerprint_key, idempotency_replay, incarnation, json_value,
-    lock_registry, now_epoch, read_bounded_json, request_digest, store_receipt, timestamp,
+    BrokerRecord, authenticate_from_file, authenticate_recovery_from_file, capability_path,
+    clean_expired, coordination_dir, digest_bytes, ensure_fingerprint_key, idempotency_replay,
+    incarnation, json_value, lock_registry, now_epoch, read_bounded_json, request_digest,
+    store_receipt, timestamp,
 };
 
 pub(crate) const BROKER_VERSION: &str = "agent-session.coordination-broker.v1";
@@ -82,6 +83,7 @@ pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<()
 }
 
 pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<PathBuf, CliError> {
+    crate::orchestration::ensure_session_not_quarantined(context, record)?;
     prepare(context, record)?;
     let incarnation = incarnation(record)?;
     let runtime = crate::coordination_runtime_evidence(record).ok();
@@ -463,6 +465,8 @@ pub(crate) fn recover(
     args: BrokerRecoveryArgs,
     reconcile: bool,
 ) -> Result<Value, CliError> {
+    let (authenticated_record, authenticated_incarnation) =
+        authenticate_recovery_from_file(context, &args.session, args.capability_file.as_deref())?;
     let proof: RecoveryProof =
         read_bounded_json(&args.proof_file, 8 * 1024, "invalid-recovery-proof")?;
     if proof.schema_version != "agent-session.coordination-recovery-proof.v1" {
@@ -474,7 +478,15 @@ pub(crate) fn recover(
     }
     let _session_lock = crate::acquire_session_record_lock(context, &args.session)?;
     let record = crate::load_session_record(context, &args.session)?;
+    crate::ensure_same_session_identity(&authenticated_record, &record)?;
     let record_incarnation = incarnation(&record)?;
+    if record_incarnation != authenticated_incarnation {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "the authenticated recovery capability no longer matches the current runtime",
+            None,
+        ));
+    }
     let record_generation = record
         .runtime
         .as_ref()

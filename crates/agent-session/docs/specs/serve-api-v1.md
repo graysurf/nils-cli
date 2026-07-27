@@ -25,7 +25,9 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `GET /sessions/{id}/work-context/v1` | Bearer | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/work-context/check/v1` and `POST /coordination/work-context/check/v1` | Bearer; session capability optional where supported | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/work-context/{claim,renew,release,admit,complete,reconcile}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
-| `GET /sessions/{id}/broker/v1` and `POST /sessions/{id}/broker/{adopt,reconcile}/v1` | Bearer; recovery proof is in the request body | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET /sessions/{id}/broker/v1` | Bearer | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/broker/{adopt,reconcile}/v2` | Bearer + capability; recovery proof is in the request body | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/broker/{adopt,reconcile}/v1` | Bearer + capability; retained transition alias for the v2 authorization contract | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `GET and POST /sessions/{id}/messages/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `GET /sessions/{id}/messages/{message_id}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/messages/{message_id}/{ack,reply}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
@@ -57,6 +59,14 @@ is no second state model.
   `data.capabilities.managed_resume_command` remains false until an unqualified
   CLI resume can revalidate the daemon's active profile registry and readiness
   contract; consumers must copy the provider session ID during that skew.
+  `data.capabilities.managed_account_handoff` advertises that this daemon
+  understands the managed-handoff protocol; it does not make every session
+  eligible. A session-level `capabilities` array contains
+  `agent-session.codex-managed-account-handoff.v1` only for a live Codex
+  app-server runtime whose launch-bound capability probe succeeded. Raw Codex
+  tmux sessions and all Claude sessions omit that session capability. Consumers
+  must require both the global protocol advertisement and the per-session
+  capability before presenting managed handoff controls.
   Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New interactive records also expose optional

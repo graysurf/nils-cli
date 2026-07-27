@@ -82,6 +82,17 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(recover)
+_arguments "${_arguments_options[@]}" : \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -200,6 +211,79 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (message)
 _arguments "${_arguments_options[@]}" : \
 '--body-file=[Private message body file]:PATH:_files' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(guidance-reconcile)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(guidance-quarantine)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(account-handoff)
+_arguments "${_arguments_options[@]}" : \
+'--account=[Explicit allowlisted account nickname to apply]:ACCOUNT:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--timeout=[Bound for managed account application and verification (1-60s)]:TIMEOUT:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'--authorize-account-change[Required acknowledgement that this operation may change the selected account for the exact worker]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(account-handoff-cancel)
+_arguments "${_arguments_options[@]}" : \
+'--reservation-id=[Exact opaque reservation identity returned by the reservation record]:RESERVATION_ID:_default' \
+'--account=[Exact account nickname named by the reservation]:ACCOUNT:_default' \
+'--intent-id=[Exact managed account intent identity. Omit only for a historical v1 reservation that never owned a provider-side intent identity]:INTENT_ID:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'--authorize-account-change[Required acknowledgement that this operation cancels the pending account intent for the exact worker without changing its bound account]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(request-changes)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--reason=[Bounded durable reason recorded for the exact worker'\''s next revision]:REASON:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -417,7 +501,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
 '--tier=[Work tier for the synthesized ephemeral run (L0/L1 delegate-all)]:TIER:_default' \
-'--await-ready=[Bounded wait for the worker'\''s authenticated checkpoint, with the same runtime-owned single-Enter recovery \`worker start --await-ready\` performs. Unlike \`worker start\` this defaults to waiting\: the fast path exists to hand back a working worker, and a launch-only result would leave a dropped submit key for the caller to notice and hand-repair. Pass 0 for the old launch-only behavior. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
+'--await-ready=[Bounded wait for the worker'\''s authenticated checkpoint, with the same runtime-owned single-Enter recovery \`worker start --await-ready\` performs. Both commands default to waiting because a launch-only result can leave a dropped submit key for the caller to notice and hand-repair. Pass 0 for launch-only behavior. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
 '--idempotency-key=[Optional for the fast-path\: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -542,8 +626,14 @@ _main-agent__subcmd__rehydrate_commands() {
 _main-agent__subcmd__self_commands() {
     local commands; commands=(
 'show:Show this authenticated session'\''s private run or assignment identity' \
+'recover:Recover this exact Main Agent controller'\''s stale coordination heartbeat' \
     )
     _describe -t commands 'main-agent self commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__self__subcmd__recover_commands] )) ||
+_main-agent__subcmd__self__subcmd__recover_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent self recover commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__self__subcmd__show_commands] )) ||
 _main-agent__subcmd__self__subcmd__show_commands() {
@@ -563,6 +653,11 @@ _main-agent__subcmd__worker_commands() {
 'show:Show one assignment, including its private packet' \
 'wait:Bounded long-poll until an assignment reaches a target state' \
 'message:Send a private mailbox message to an assignment'\''s worker' \
+'guidance-reconcile:Carry this controller'\''s unread guidance from the immediately stale worker incarnation into the exact current incarnation' \
+'guidance-quarantine:Quarantine this controller'\''s unread guidance for unretained stale worker incarnations without forwarding or marking it consumed' \
+'account-handoff:Apply an explicitly authorized account handoff to the exact worker' \
+'account-handoff-cancel:Safely cancel a failed, superseded, or queued account-handoff reservation without changing the bound account' \
+'request-changes:Return a submitted assignment to its exact worker for bounded revisions' \
 'accept:Accept a submitted worker result after Main Agent review' \
 'release:Mark an accepted assignment terminal before worker deletion' \
 'delete:Delete a released worker through guarded agent-session cleanup' \
@@ -581,6 +676,16 @@ _main-agent__subcmd__worker__subcmd__accept_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker accept commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__worker__subcmd__account-handoff_commands] )) ||
+_main-agent__subcmd__worker__subcmd__account-handoff_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker account-handoff commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__account-handoff-cancel_commands] )) ||
+_main-agent__subcmd__worker__subcmd__account-handoff-cancel_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker account-handoff-cancel commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__worker__subcmd__cancel_commands] )) ||
 _main-agent__subcmd__worker__subcmd__cancel_commands() {
     local commands; commands=()
@@ -595,6 +700,16 @@ _main-agent__subcmd__worker__subcmd__delete_commands() {
 _main-agent__subcmd__worker__subcmd__diagnose_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker diagnose commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__guidance-quarantine_commands] )) ||
+_main-agent__subcmd__worker__subcmd__guidance-quarantine_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker guidance-quarantine commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__guidance-reconcile_commands] )) ||
+_main-agent__subcmd__worker__subcmd__guidance-reconcile_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker guidance-reconcile commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__list_commands] )) ||
 _main-agent__subcmd__worker__subcmd__list_commands() {
@@ -620,6 +735,11 @@ _main-agent__subcmd__worker__subcmd__reconcile-recovery_commands() {
 _main-agent__subcmd__worker__subcmd__release_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker release commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__request-changes_commands] )) ||
+_main-agent__subcmd__worker__subcmd__request-changes_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker request-changes commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__retire_commands] )) ||
 _main-agent__subcmd__worker__subcmd__retire_commands() {

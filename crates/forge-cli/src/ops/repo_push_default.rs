@@ -15,8 +15,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
+use nils_common::default_branch_receipt::{DefaultBranchReceipt, read_strict};
 use nils_common::execution_effect::digest_parts;
-use nils_common::local_default_receipt::{LocalDefaultReceipt, read_strict};
 use serde::Serialize;
 
 use crate::backend::{
@@ -209,15 +209,15 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
 ) -> Result<i32, ForgeError> {
     let expected_base = validate_object_id(&args.expected_base)?;
     let reason = read_reason(&args.reason_file)?;
-    let local_default_receipt = args
-        .local_default_receipt
+    let default_branch_receipt = args
+        .default_branch_receipt
         .as_deref()
-        .map(read_local_default_receipt)
+        .map(read_default_branch_receipt)
         .transpose()?;
-    if local_default_receipt.is_some() && args.head != "HEAD" {
+    if default_branch_receipt.is_some() && args.head != "HEAD" {
         return Err(validation(
-            "local_default_receipt_head_invalid",
-            "--local-default-receipt requires the default --head HEAD binding",
+            "default_branch_receipt_head_invalid",
+            "--default-branch-receipt requires the default --head HEAD binding",
             None,
         ));
     }
@@ -323,7 +323,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             None,
         ));
     }
-    if branch == repo.default_branch && local_default_receipt.is_none() {
+    if branch == repo.default_branch && default_branch_receipt.is_none() {
         return Err(validation(
             "default_branch_checkout",
             format!(
@@ -333,10 +333,10 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             Some("create a managed worktree from the remote default branch".into()),
         ));
     }
-    if branch != repo.default_branch && local_default_receipt.is_some() {
+    if branch != repo.default_branch && default_branch_receipt.is_some() {
         return Err(validation(
-            "local_default_receipt_branch_invalid",
-            "--local-default-receipt may be adopted only from the checked-out provider default branch",
+            "default_branch_receipt_branch_invalid",
+            "--default-branch-receipt may be adopted only from the checked-out provider default branch",
             None,
         ));
     }
@@ -371,8 +371,8 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         ));
     }
 
-    if let Some(receipt) = local_default_receipt.as_ref() {
-        validate_local_default_adoption(
+    if let Some(receipt) = default_branch_receipt.as_ref() {
+        validate_default_branch_adoption(
             git,
             workdir,
             receipt,
@@ -460,7 +460,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             Some("commit through semantic-commit with signing enabled".into()),
         ));
     }
-    if local_default_receipt.is_some() {
+    if default_branch_receipt.is_some() {
         let verified = git.run(workdir, &os_args(&["verify-commit", &head_sha]))?;
         if !verified.success {
             return Err(validation(
@@ -553,44 +553,44 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
     Ok(emit_success(schema_success(), payload, format, render_text))
 }
 
-fn read_local_default_receipt(path: &Path) -> Result<LocalDefaultReceipt, ForgeError> {
+fn read_default_branch_receipt(path: &Path) -> Result<DefaultBranchReceipt, ForgeError> {
     read_strict(path).map_err(|message| {
         validation(
-            "local_default_receipt_invalid",
-            "--local-default-receipt is not a valid governed local receipt",
+            "default_branch_receipt_invalid",
+            "--default-branch-receipt is not a valid governed final receipt",
             Some(message),
         )
     })
 }
 
-fn validate_local_default_adoption<G: GitRunner>(
+fn validate_default_branch_adoption<G: GitRunner>(
     git: &G,
     workdir: &Path,
-    receipt: &LocalDefaultReceipt,
+    receipt: &DefaultBranchReceipt,
     default_branch: &str,
     branch: &str,
     head_sha: &str,
     expected_base: &str,
 ) -> Result<(), ForgeError> {
     let data = &receipt.data;
-    if data.branch != default_branch || data.branch != branch {
+    if data.default_branch != default_branch || data.default_branch != branch {
         return Err(validation(
-            "local_default_receipt_branch_mismatch",
-            "local-default receipt branch does not match the checked-out provider default branch",
+            "default_branch_receipt_branch_mismatch",
+            "default-branch receipt does not match the checked-out provider default branch",
             None,
         ));
     }
     if data.new_head != head_sha {
         return Err(validation(
-            "local_default_receipt_head_mismatch",
-            "local-default receipt does not describe the checked-out HEAD",
+            "default_branch_receipt_head_mismatch",
+            "default-branch receipt does not describe the checked-out HEAD",
             None,
         ));
     }
     if data.old_head != expected_base || data.parent_sha != expected_base {
         return Err(validation(
-            "local_default_receipt_base_mismatch",
-            "local-default receipt base does not match --expected-base",
+            "default_branch_receipt_base_mismatch",
+            "default-branch receipt base does not match --expected-base",
             None,
         ));
     }
@@ -598,8 +598,8 @@ fn validate_local_default_adoption<G: GitRunner>(
         || data.remote.cached_relation_after != "ahead-by-one"
     {
         return Err(validation(
-            "local_default_receipt_remote_gap_invalid",
-            "local-default receipt adoption requires an aligned-to-ahead-by-one cached upstream transition",
+            "default_branch_receipt_remote_gap_invalid",
+            "default-branch receipt adoption requires an aligned-to-ahead-by-one cached upstream transition",
             None,
         ));
     }
@@ -634,7 +634,7 @@ fn validate_local_default_adoption<G: GitRunner>(
         .find_map(|line| line.strip_prefix("worktree "))
         .ok_or_else(|| {
             validation(
-                "local_default_receipt_worktree_invalid",
+                "default_branch_receipt_worktree_invalid",
                 "failed to resolve the repository primary worktree",
                 None,
             )
@@ -648,7 +648,7 @@ fn validate_local_default_adoption<G: GitRunner>(
     })?;
     if repository_root != primary {
         return Err(validation(
-            "local_default_receipt_worktree_invalid",
+            "default_branch_receipt_worktree_invalid",
             "receipt adoption requires the repository primary worktree",
             None,
         ));
@@ -685,8 +685,8 @@ fn validate_local_default_adoption<G: GitRunner>(
     ]);
     if data.repository_fingerprint != fingerprint {
         return Err(validation(
-            "local_default_receipt_repository_mismatch",
-            "local-default receipt belongs to a different repository",
+            "default_branch_receipt_repository_mismatch",
+            "default-branch receipt belongs to a different repository",
             None,
         ));
     }
@@ -699,8 +699,8 @@ fn validate_local_default_adoption<G: GitRunner>(
     )?;
     if parent.trim() != data.parent_sha {
         return Err(validation(
-            "local_default_receipt_parent_mismatch",
-            "checked-out commit parent does not match the local-default receipt",
+            "default_branch_receipt_parent_mismatch",
+            "checked-out commit parent does not match the default-branch receipt",
             None,
         ));
     }
@@ -712,8 +712,8 @@ fn validate_local_default_adoption<G: GitRunner>(
     )?;
     if tree.trim() != data.tree_sha {
         return Err(validation(
-            "local_default_receipt_tree_mismatch",
-            "checked-out commit tree does not match the local-default receipt",
+            "default_branch_receipt_tree_mismatch",
+            "checked-out commit tree does not match the default-branch receipt",
             None,
         ));
     }

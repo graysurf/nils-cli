@@ -134,23 +134,37 @@ pub fn heartbeat_fresh(
     incarnation: &str,
     now_epoch: i64,
 ) -> bool {
+    heartbeat_age_seconds(state_dir, session_id, incarnation, now_epoch)
+        .is_some_and(|age| age <= HEARTBEAT_FRESH_SECONDS)
+}
+
+/// Return the privacy-safe age of the exact broker heartbeat sidecar.
+///
+/// The sidecar body and path remain private. Consumers can compare this age
+/// with their own operation horizon instead of retaining a freshness boolean
+/// that may expire before the guarded operation starts.
+pub fn heartbeat_age_seconds(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+    now_epoch: i64,
+) -> Option<i64> {
     let path = heartbeat_path(state_dir, session_id);
     let Ok(bytes) = read_private(&path, MAX_HEARTBEAT_BYTES) else {
-        return false;
+        return None;
     };
     let Ok(value) = std::str::from_utf8(&bytes) else {
-        return false;
+        return None;
     };
-    let Some((observed_incarnation, observed_epoch)) = value.trim().rsplit_once(':') else {
-        return false;
-    };
+    let (observed_incarnation, observed_epoch) = value.trim().rsplit_once(':')?;
     if observed_incarnation != incarnation {
-        return false;
+        return None;
     }
     let Ok(observed_epoch) = observed_epoch.parse::<i64>() else {
-        return false;
+        return None;
     };
-    (0..=HEARTBEAT_FRESH_SECONDS).contains(&now_epoch.saturating_sub(observed_epoch))
+    let age = now_epoch.saturating_sub(observed_epoch);
+    (age >= 0).then_some(age)
 }
 
 pub fn session_coordination_mode(
@@ -263,4 +277,45 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_age_is_exact_incarnation_private_and_preserves_hard_freshness() {
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let heartbeat = heartbeat_path(temporary.path(), "worker");
+        fs::create_dir_all(heartbeat.parent().expect("heartbeat parent"))
+            .expect("create heartbeat directory");
+        fs::write(&heartbeat, b"worker-inc:100\n").expect("write heartbeat");
+        fs::set_permissions(&heartbeat, fs::Permissions::from_mode(0o600))
+            .expect("secure heartbeat");
+
+        assert_eq!(
+            heartbeat_age_seconds(temporary.path(), "worker", "worker-inc", 129),
+            Some(29)
+        );
+        assert!(heartbeat_fresh(
+            temporary.path(),
+            "worker",
+            "worker-inc",
+            130
+        ));
+        assert!(!heartbeat_fresh(
+            temporary.path(),
+            "worker",
+            "worker-inc",
+            131
+        ));
+        assert_eq!(
+            heartbeat_age_seconds(temporary.path(), "worker", "other-inc", 101),
+            None
+        );
+        assert_eq!(
+            heartbeat_age_seconds(temporary.path(), "worker", "worker-inc", 99),
+            None
+        );
+    }
 }

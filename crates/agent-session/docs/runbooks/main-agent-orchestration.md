@@ -29,6 +29,19 @@ Pass `--state-dir PATH` when the process cannot discover the intended
 `agent-session` state directory. Use the same directory for `agent-session` and
 `main-agent` throughout one workflow.
 
+### Durable registry compatibility
+
+The current orchestration registry and assignment outer schemas are v3, with
+`nils-agent-session` 1.25.11 as their minimum reader and writer. The first v3
+mutation of released v2 state preserves the exact pre-migration bytes at
+`orchestration/registry.v2.rollback.json`.
+
+Rollback requires every orchestration writer to be stopped. Restore that exact
+snapshot as `orchestration/registry.json` before starting a released v2 binary.
+The snapshot is not a live mirror: restoring it intentionally discards later
+v3-only mutations. Never rewrite the schema spelling or use the current v3
+decoder as evidence that a released v2 binary can read the restored bytes.
+
 ## Minimal input packets
 
 The examples below are valid minimal packets. Replace summaries and paths with
@@ -136,6 +149,23 @@ main-agent rehydrate --format markdown
 caller's private objective or assignment packet and separates durable data from
 clock-dependent observations.
 
+If the exact Main Agent controller remains live but its coordination heartbeat
+owner is durably stale, use the ownership-qualified macro:
+
+```bash
+main-agent self recover \
+  --idempotency-key controller-recover-001 \
+  --format json
+```
+
+The macro requires the current exact Main Agent incarnation, unchanged running
+runtime identity, matching broker generation, active claim, and no active or
+uncertain operation. It adopts the existing broker recovery primitive and
+returns `healthy_noop` when the broker is already authoritative. There is no
+top-level `recover` alias. The macro never changes an account, resumes or
+replaces a provider, resends a prompt, sends Enter, or clears an operation
+fence.
+
 ### 2. Start an interactive worker
 
 Use the latest run revision returned by `init`, `status`, or `rehydrate`:
@@ -148,12 +178,26 @@ main-agent worker start \
   --format json
 ```
 
-A bare single-assignment start waits up to five minutes for readiness. Use
-`--await-ready 0` only when a launch-only result is intentional. Batch launch
-is transport-only and does not accept `--await-ready`, preventing its bounded
-lane count from multiplying readiness deadlines. For a nonzero wait, the
+A bare single-assignment start defaults to waiting up to 5 minutes for
+readiness folded into the result. Select explicit `--await-ready 0` for
+launch-only behavior. Batch launch is transport-only and does not accept
+`--await-ready`, preventing its bounded
+lane count from multiplying readiness deadlines. Before any lane launch, batch
+start persists an immutable parent manifest of sorted lane names and raw packet
+digests. Exact replay resumes incomplete lanes; added, removed, renamed,
+reordered, or byte-edited packets fail with `idempotency-conflict` before a
+new side effect. A transient or ambiguous child failure remains incomplete and
+is reconciled through that lane's durable receipt; only deterministic failures
+become terminal lane results. For a nonzero wait, the
 runtime persists one fixed deadline and leased finalizer; concurrent exact
 replays join the same readiness attempt and return the same final receipt.
+Automatic recovery reservation and reserved/sending/sent substages live in
+that receipt. Reservation and the `reserved` continuation commit together
+under the current finalizer fence, so an expired predecessor cannot reserve
+after takeover. A successor finalizer continues the same attempt after either
+reservation or Enter without reserving or sending again. The `sending` substage
+holds a lease longer than the pane-input timeout; other substages retain the
+short takeover lease.
 
 A mutating worker must use its own managed worktree. Its assignment `scopes`
 must be narrow enough not to overlap the Main Agent claim or another live
@@ -194,12 +238,16 @@ remain the launch-only result when `--await-ready 0` is selected. Launch
 transport alone is not worker readiness, task completion, or Main Agent
 acceptance.
 
-`main-agent quick` performs the same readiness proof and the same
-runtime-owned single-Enter recovery, and defaults to `--await-ready 5m` rather
-than launch-only. Do not hand-drive a `quick` worker that stays `starting`:
+`worker start` and `main-agent quick` perform the same readiness proof and the
+same runtime-owned single-Enter recovery, and both default to
+`--await-ready 5m`. Do not hand-drive a worker that stays `starting`:
 read its typed `readiness` result instead. If that result is
 `readiness_failed`, the recovery is already exhausted, so treat it as a
 transport defect to report rather than a prompt to resend.
+The quick parent receipt binds the canonical readiness duration. Reusing one
+key with a different duration conflicts before a second launch, while
+historical quick parent receipts and `{parent}-worker` child receipts remain
+replayable during rolling upgrades.
 
 Before accepting any result, verify all of these conditions:
 
@@ -293,6 +341,14 @@ progress. Branch on `classification`, never on prose:
 | `worker_unreachable` | Preserve the assignment and investigate the missing bound worker. Do not infer safe reassignment from absence alone. |
 | `pre_claim_failure` | When `reassignment_safe:true`, cancel/retire or use `worker reassign`; otherwise preserve the worker. |
 | `uncertain_mutation` | Preserve the exact worker and reconcile the operation. Do not cancel, retire, or reassign. |
+| `coordination_broker_stale` | Route to the exact worker's authenticated broker owner. Do not copy its capability or renew its claim as a substitute. |
+| `edit_authority_stale` | Preserve the exact worker and perform a bounded supervision recheck; route only durable broker-lost evidence to broker recovery. |
+| `claim_renewal_required` | Ask the exact worker to renew its own current claim and revision using its own capability file. |
+| `guidance_continuity_required` | Run revision-fenced `worker guidance-reconcile`; retain message identity and unread state. |
+| `orphan_guidance_quarantine_required` | Run revision-fenced `worker guidance-quarantine`; quarantine only exact-controller stale-incarnation records when no `previous_worker` exists. |
+| `account_handoff_capability_gap` | Preserve the worker. No public raw restart flag exists; retry only with a daemon-launched managed worker advertising `agent-session.codex-managed-account-handoff.v1`. |
+| `account_handoff_required` | Run explicitly authorized `worker account-handoff` for a managed worker and allowlisted account. |
+| `stale_provider_activity` | Continue bounded supervision or queue typed guidance at a turn boundary; never send raw terminal input. |
 | `submitted_or_waiting_without_checkpoint` | Do not resend the prompt or inject Enter. Reassign only when the returned safety evidence permits it. |
 | `safe_reassignment` | Start only a distinct assignment/session and clean worktree. Never reuse the old prompt. |
 
@@ -309,6 +365,114 @@ absence. A missing exact bound worker is `worker_unreachable`; corrupt,
 unreadable, or identity-mismatched required evidence is
 `evidence_unavailable`. Both are non-retry-safe and forbid automatic recovery
 input or mutation.
+
+Worktree progress is not porcelain status alone. Diagnosis persists a bounded,
+privacy-safe material fingerprint over porcelain path state, staged and
+unstaged binary/full-index diffs, and bounded untracked path/content material.
+Continued same-path edits, same-size edits, untracked content changes, and
+deletion-only changes reset progress age. Oversized, timed-out, or unsupported
+material is unavailable. A prior-incarnation snapshot is valid history but
+starts a new progress clock after authenticated worker rebind.
+
+Broker heartbeat freshness and claim expiry are distinct evidence.
+`owner-stale-dirty`-style edit refusal is broker/edit-authority staleness, not
+proof that the claim's `updated_at` is old. Do not prescribe
+`work-context renew` unless diagnosis returns `claim_renewal_required`.
+
+When a resumed worker retains unread guidance on its immediately prior
+incarnation, the current primary controller can reconcile it without exposing
+or consuming the body:
+
+```bash
+main-agent worker guidance-reconcile ASSIGNMENT_ID \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key guidance-reconcile-001 \
+  --format json
+```
+
+Only unread, unexpired messages from that exact controller move to the current
+worker incarnation. The message ID is retained, revision advances once,
+forwarding provenance is bounded, and unrelated, expired, read, or
+acknowledged messages do not move. Exact replay returns the same receipt.
+
+If stale unread guidance exists but the assignment retains no
+`previous_worker`, supervision returns
+`orphan_guidance_quarantine_required` instead of prescribing the impossible
+reconcile action. Quarantine those orphan records with:
+
+```bash
+main-agent worker guidance-quarantine ASSIGNMENT_ID \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key guidance-quarantine-001 \
+  --format json
+```
+
+The action is manager-, revision-, worker-, and incarnation-qualified. It
+marks only this exact controller's unread, unexpired messages addressed to
+non-current incarnations as `quarantined`; current-incarnation and unrelated
+controller messages remain unchanged. Exact replay returns the same receipt,
+and repeated supervision no longer prescribes guidance reconciliation.
+
+For a Codex worker launched through the managed app-server protocol with typed
+account and auto-resume controls, quota or authentication recovery uses:
+
+```bash
+main-agent worker account-handoff ASSIGNMENT_ID \
+  --account ALLOWLISTED_ACCOUNT \
+  --if-revision ASSIGNMENT_REVISION \
+  --authorize-account-change \
+  --idempotency-key account-handoff-001 \
+  --format json
+```
+
+The macro preserves the exact incumbent worker and provider conversation,
+queues the typed next-account transition, waits for that exact incarnation to
+apply it, verifies the durable binding, and re-arms structured continuation
+when a quota turn supports it. Only `starting`, `working`, or `blocked`
+assignments are eligible; submit recovery and account handoff reservations are
+mutually exclusive. Invalid account nicknames fail before a reservation is
+written. `/logout`, raw prompt/Enter input, worker
+replacement, and ambient account inference are forbidden. Raw workers expose
+no `--allow-raw-restart` flag; the action fails closed without changing account
+or runtime. Only after true provider and material staleness may diagnosis run a
+bounded selected-account rate-limit probe, and only an exact durable selected
+account is valid provenance.
+
+An account-handoff reservation remains a mutation fence until the apply and
+auto-resume receipt commits. If an apply fails, is superseded, or times out
+while its durable intent is still queued or failed, cancel it without changing
+the bound account:
+
+```bash
+main-agent worker account-handoff-cancel ASSIGNMENT_ID \
+  --reservation-id RESERVATION_ID \
+  --account ACCOUNT \
+  --intent-id INTENT_ID \
+  --if-revision ASSIGNMENT_REVISION \
+  --authorize-account-change \
+  --idempotency-key account-handoff-cancel-001 \
+  --format json
+```
+
+Cancellation requires the same exact manager, assignment revision, worker
+incarnation, authoritative broker, active claim, and operation quiescence. It
+uses the reservation's private authenticated `reservation_id`, `account`, and
+`account_intent_id` fields as the three selectors above; never infer them from
+ambient provider state or public projections. A frozen released-v1 reservation
+has no stored opaque reservation or provider-side intent identity; its private
+authenticated view derives the stable reservation selector from the request
+digest, and it may omit only `--intent-id`. It still requires the exact
+reservation and account selectors.
+It
+captures the non-applying pending intent's account and revision, then clears
+that intent only if both still match under the session-record lock; a newer
+intent is preserved while cancellation succeeds and clears only the stale
+assignment reservation. No cancellation retry is needed because that
+reservation is gone. It
+does not apply an account, re-arm auto-resume, restart or replace the worker,
+send prompt/Enter input, or use `/logout`. An already-bound reserved account
+must converge by retrying the original handoff; an actively applying intent
+remains fenced until it becomes safely cancellable.
 
 If the typed evidence proves the provider is still in its initial startup
 state, with the exact incarnation, no dialog, no claim, no active/uncertain
@@ -356,9 +520,19 @@ main-agent worker reconcile-recovery ASSIGNMENT_ID \
 
 Reconciliation holds the exact session-record and coordination-quiescence
 guards while proving stopped tmux/runtime evidence, absent worker claim, no
-active or uncertain operation, and unchanged Main Agent authority. It then
-terminalizes the attempt as `reconciled` without loading, pasting, or sending
-input. A following `worker cancel` reacquires the exact stopped-runtime and
+active or uncertain operation, and unchanged Main Agent authority. Runtime
+proof combines every persisted cgroup, process-session, and process-group
+identity: a live source dominates, unavailable or unresolvable evidence stays
+unknown, and stopped requires every available source to prove absence. Before
+terminalizing the attempt as `reconciled`, the command atomically persists a
+session-owned incarnation-bound quarantine marker without loading, pasting, or
+sending input. That bounded marker rejects `agent-session resume`, maintenance
+resume, work-context claim, worker bootstrap, checkpoint, and equivalent
+authority restoration for the retained worker record without requiring
+unrelated sessions to load the orchestration registry. If the process stops
+before the registry commit, an exact retry adopts the matching marker and
+finishes reconciliation. A following `worker
+cancel` reacquires the exact stopped-runtime and
 quiescence guards; it does not require the stopped worker broker to remain
 ready or retain its capability. It still rejects a live runtime, a present
 incarnation-mismatched broker, non-quiescent coordination state, or a Main
@@ -428,8 +602,24 @@ main-agent worker show ASSIGNMENT_ID --format json
 ```
 
 Review the actual deliverables and validation independently. A submitted
-checkpoint is a worker report, not automatic acceptance. Only a `submitted`
-assignment can be accepted:
+checkpoint is a worker report, not automatic acceptance. If review requires
+another worker revision, return only that exact submitted assignment to its
+bound worker:
+
+```bash
+main-agent worker request-changes ASSIGNMENT_ID \
+  --if-revision ASSIGNMENT_REVISION \
+  --reason "Address the bounded review findings" \
+  --idempotency-key worker-request-changes-001 \
+  --format json
+```
+
+This manager-only transition is revision-fenced and idempotent. It preserves the
+bound worker and private packet, clears stale result and blocker summaries,
+records the review reason as the next action, and changes only `submitted` to
+`working`. The worker must later submit a new exact result.
+
+Only a `submitted` assignment can be accepted:
 
 ```bash
 main-agent worker accept ASSIGNMENT_ID \
@@ -506,7 +696,10 @@ by its active run through the daemon-owned group-cleanup route. Review the
 preview before confirming. If any assignment is nonterminal, the first
 confirmation is review-only and a second explicit force confirmation is
 required; forced cleanup records those assignments as cancelled and may discard
-unaccepted output.
+unaccepted output. Neither mode overrides an active, completing, or
+reconcile-pending operation lease. Safe mode also retains active worker claims;
+force may release them only after the daemon atomically proves operation
+quiescence and seals the exact worker coordination authority before deletion.
 
 The daemon deletes workers first and the Main Agent last. If any worker fails,
 the Main Agent remains available and the result identifies which workers were
@@ -514,6 +707,12 @@ deleted, absent, or failed. Resolve any reported maintenance cleanup before
 retrying. The separate **Main only** action intentionally bypasses this group
 cleanup and can orphan live workers; use it only when preserving those workers
 for later adoption is the desired recovery path.
+
+An incomplete cleanup response is provisional progress, not a stable terminal
+receipt. Retry the identical request and idempotency key: the daemon resumes
+after the last committed stage and may return success. After a
+`completed: true` result is stored, later exact replays return that same
+terminal value and never repeat a deletion.
 
 ## Revision and idempotency rules
 
@@ -597,8 +796,20 @@ For a resumed worker:
 
 1. Run `main-agent self show --format json` and verify the expected assignment.
 2. Confirm the old worker incarnation is no longer live.
-3. Submit a revision-fenced `main-agent checkpoint`. The successful checkpoint
-   atomically binds the assignment to the new incarnation.
+3. Run `main-agent bootstrap` with a fresh idempotency key. Bootstrap releases
+   the old incarnation's claim, acquires the assignment-derived claim for the
+   current incarnation, carries only exact-controller unread/unexpired
+   guidance, and records the revision-fenced `working` checkpoint that binds
+   the assignment to the new incarnation.
+4. Re-run `main-agent self show --format json`; require
+   `role:"worker"` and `rebind_required:false` before editing.
+
+The assignment projection retains `previous_worker` so the continuity repair
+is auditable. If bootstrap completed its claim transition but the checkpoint
+was interrupted, recover with the current claim plus a revision-fenced
+   checkpoint; `worker guidance-reconcile` is the idempotent controller action for
+   retained `previous_worker` guidance, while `worker guidance-quarantine`
+   handles exact-controller orphan guidance when no prior identity is retained.
 
 A deleted-and-recreated session with the same display ID but a different
 `created_at` is not continuity. Handoff or orphan adoption is the supported

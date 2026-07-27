@@ -143,7 +143,7 @@ fn repo_push_default_help_exposes_guarded_contract_inputs() {
         "--head",
         "--expected-base",
         "--reason-file",
-        "--local-default-receipt",
+        "--default-branch-receipt",
         "normal fast-forward push",
     ] {
         assert!(
@@ -152,6 +152,36 @@ fn repo_push_default_help_exposes_guarded_contract_inputs() {
             out.stdout
         );
     }
+    assert!(
+        !out.stdout.contains("--local-default-receipt"),
+        "removed receipt option remains in help: stdout={}",
+        out.stdout
+    );
+}
+
+#[test]
+fn repo_push_default_rejects_the_removed_receipt_option() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "repo",
+            "push-default",
+            "--expected-base",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--reason-file",
+            "reason.md",
+            "--local-default-receipt",
+            "receipt.json",
+        ],
+    );
+
+    assert_eq!(out.code, 64, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("--local-default-receipt"),
+        "stderr={}",
+        out.stderr
+    );
 }
 
 #[test]

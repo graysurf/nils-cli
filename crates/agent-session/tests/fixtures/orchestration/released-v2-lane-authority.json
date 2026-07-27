@@ -1,0 +1,70 @@
+{
+  "schema_version": "fixture.main-agent.released-v2-lane-authority.v1",
+  "source_commit": "89fae89403782b7caec965c614dd1516d903a1e0",
+  "principal": {
+    "session_id": "main-v2",
+    "session_incarnation": "main-v2-incarnation"
+  },
+  "quick": {
+    "parent_key": "quick-v2",
+    "child_key": "quick-v2-worker",
+    "completed_child": {
+      "schema_version": "main-agent.worker-start-result.v1",
+      "assignment": {
+        "assignment_id": "assignment-v2-quick",
+        "state": "working"
+      },
+      "worker": {
+        "session_id": "worker-v2-quick"
+      },
+      "acceptance": {
+        "state": "pending-worker-checkpoint",
+        "transport_only": true
+      }
+    }
+  },
+  "batch": {
+    "parent_key": "batch-v2",
+    "child_key": "batch-v2-0",
+    "manifest": [
+      {
+        "name": "lane-0.json",
+        "packet_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "changed_manifest": [
+      {
+        "name": "lane-0.json",
+        "packet_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ]
+  },
+  "cases": {
+    "completed": {
+      "schema_version": "main-agent.worker-start-result.v1",
+      "assignment": {
+        "assignment_id": "assignment-v2-completed",
+        "state": "working"
+      },
+      "worker": {
+        "session_id": "worker-v2-completed"
+      },
+      "acceptance": {
+        "state": "pending-worker-checkpoint",
+        "transport_only": true
+      }
+    },
+    "incomplete": null,
+    "transient": {
+      "error_code": "orchestration-store-busy",
+      "resumable": true
+    },
+    "ambiguous": {
+      "schema_version": "main-agent.worker-start-result.v1",
+      "assignment_id": "assignment-v2-ambiguous",
+      "worker_session_id": "worker-v2-ambiguous",
+      "state": "starting",
+      "acceptance": "pending"
+    }
+  }
+}

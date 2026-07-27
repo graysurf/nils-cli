@@ -509,6 +509,19 @@ coordination state before session removal is reported complete.
 The optional HTTP server is not the heartbeat owner and is not required for
 coordination after launch.
 
+Broker recovery is an authenticated owner mutation, not an operator-only
+repair. The canonical HTTP routes are
+`POST /sessions/{id}/broker/{adopt,reconcile}/v2`; they require both the server
+bearer and `X-Agent-Session-Capability` for the exact persisted session
+incarnation. The proof remains in the request body. The `/v1` POST routes are
+retained only as transition aliases for the same strong authorization contract;
+starting with 1.25.11, bearer-only callers fail with
+`coordination-unauthorized` before registry mutation. Callers migrate by
+supplying the capability header and selecting `/v2`; a copied capability from
+another session or a replaced incarnation is rejected. This security boundary
+does not require a fresh heartbeat, because stale or absent heartbeat evidence
+is the state recovery repairs.
+
 ## CLI contract
 
 All commands support the global `--state-dir` and command-local `--format
@@ -539,8 +552,8 @@ agent-session work-context complete --session ID --lease UUID --if-revision N --
 agent-session work-context reconcile --session ID --lease UUID --if-revision N --proof-file JSON --capability-file FILE --idempotency-key KEY
 
 agent-session broker status --session ID [--capability-file FILE]
-agent-session broker adopt --session ID --proof-file JSON --idempotency-key KEY
-agent-session broker reconcile --session ID --proof-file JSON --operation UUID --if-revision N --attest-inactive --idempotency-key KEY
+agent-session broker adopt --session ID --capability-file FILE --proof-file JSON --idempotency-key KEY
+agent-session broker reconcile --session ID --capability-file FILE --proof-file JSON --operation UUID --if-revision N --attest-inactive --idempotency-key KEY
 
 agent-session message send --from ID --to ID --body-file FILE [--capability-file FILE] --idempotency-key KEY [--reply-to UUID] [--expires-in DURATION]
 agent-session message inbox --session ID [--capability-file FILE] [--state unread] [--cursor CURSOR] [--limit N]
@@ -573,8 +586,10 @@ POST /sessions/{id}/work-context/admit/v1
 POST /sessions/{id}/work-context/complete/v1
 POST /sessions/{id}/work-context/reconcile/v1
 GET  /sessions/{id}/broker/v1
-POST /sessions/{id}/broker/adopt/v1
-POST /sessions/{id}/broker/reconcile/v1
+POST /sessions/{id}/broker/adopt/v2
+POST /sessions/{id}/broker/reconcile/v2
+POST /sessions/{id}/broker/adopt/v1       (transition alias)
+POST /sessions/{id}/broker/reconcile/v1   (transition alias)
 GET  /sessions/{id}/messages/v1
 POST /sessions/{id}/messages/v1
 GET  /sessions/{id}/messages/{message_id}/v1

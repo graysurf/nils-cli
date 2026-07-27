@@ -1,6 +1,6 @@
 [package]
 name = "nils-image-processing"
-version = "1.25.10"
+version = "1.25.11"
 edition.workspace = true
 license.workspace = true
 
@@ -14,19 +14,19 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.25.10", path = "../nils-build-info" }
+nils-build-info = { version = "1.25.11", path = "../nils-build-info" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-nils-common = { version = "1.25.10", path = "../nils-common", package = "nils-common" }
-nils-term = { version = "1.25.10", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "1.25.11", path = "../nils-common", package = "nils-common" }
+nils-term = { version = "1.25.11", path = "../nils-term", package = "nils-term" }
 resvg = "0.47"
 roxmltree = "0.21"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-nils-test-support = { version = "1.25.10", path = "../nils-test-support" }
+nils-test-support = { version = "1.25.11", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"

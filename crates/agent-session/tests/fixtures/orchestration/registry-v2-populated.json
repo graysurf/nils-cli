@@ -1,0 +1,116 @@
+{
+  "schema_version": "agent-session.orchestration-registry.v2",
+  "runs": {
+    "run-v2": {
+      "schema_version": "agent-session.orchestration-run.v1",
+      "run_id": "run-v2",
+      "revision": 8,
+      "state": "active",
+      "tier": "L2",
+      "objective_summary": "Exercise the released v2 rollback reader",
+      "objective_packet_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "controller": {
+        "machine": "fixture",
+        "session_id": "main-v2",
+        "session_incarnation": "main-v2-incarnation",
+        "session_created_at": "2030-01-01T00:00:00Z"
+      },
+      "durable_refs": [
+        "fixture://released-v2"
+      ],
+      "ephemeral": false,
+      "checkpoint": {
+        "revision": 8,
+        "summary": "Populated released-v2 run",
+        "next_action": "Restore with the pinned v2 reader",
+        "updated_at": "2030-01-01T00:00:08Z"
+      },
+      "created_at": "2030-01-01T00:00:00Z",
+      "updated_at": "2030-01-01T00:00:08Z"
+    }
+  },
+  "assignments": {
+    "assignment-v2": {
+      "schema_version": "agent-session.orchestration-assignment.v2",
+      "assignment_id": "assignment-v2",
+      "run_id": "run-v2",
+      "revision": 7,
+      "state": "working",
+      "task_summary": "Exercise populated released-v2 assignment state",
+      "private_packet_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "primary_manager": {
+        "machine": "fixture",
+        "session_id": "main-v2",
+        "session_incarnation": "main-v2-incarnation",
+        "session_created_at": "2030-01-01T00:00:00Z"
+      },
+      "worker": {
+        "machine": "fixture",
+        "session_id": "worker-v2",
+        "session_incarnation": "worker-v2-incarnation-2",
+        "session_created_at": "2030-01-01T00:00:01Z"
+      },
+      "collaborators": [],
+      "borrowed_by": [],
+      "repository": "example/repository",
+      "worktree": "/private/released-v2-worktree",
+      "base_ref": "main",
+      "scopes": [
+        "crates/agent-session"
+      ],
+      "durable_refs": [
+        "fixture://assignment-v2"
+      ],
+      "depends_on": [
+        "completed-dependency-v2"
+      ],
+      "checkpoint": {
+        "revision": 7,
+        "summary": "Populated released-v2 assignment",
+        "next_action": "Resume exact authority",
+        "updated_at": "2030-01-01T00:00:07Z"
+      },
+      "result_summary": null,
+      "blocker_summary": null,
+      "submit_recovery": {
+        "schema_version": "main-agent.submit-recovery.v1",
+        "attempt_id": "submit-recovery-v2",
+        "origin": "explicit",
+        "run_id": "run-v2",
+        "controller": {
+          "machine": "fixture",
+          "session_id": "main-v2",
+          "session_incarnation": "main-v2-incarnation",
+          "session_created_at": "2030-01-01T00:00:00Z"
+        },
+        "session_incarnation": "worker-v2-incarnation-2",
+        "reserved_revision": 6,
+        "state": "reconciled",
+        "attempt_count": 1,
+        "result": "runtime-stopped",
+        "attempted_at": "2030-01-01T00:00:05Z",
+        "updated_at": "2030-01-01T00:00:06Z"
+      },
+      "created_at": "2030-01-01T00:00:01Z",
+      "updated_at": "2030-01-01T00:00:07Z"
+    }
+  },
+  "receipts": {
+    "main-v2:main-v2-incarnation:receipt-v2": {
+      "principal_session_id": "main-v2",
+      "principal_incarnation": "main-v2-incarnation",
+      "operation": "worker-supervise",
+      "request_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "outcome": {
+        "schema_version": "fixture.released-v2-recovery-state.v1",
+        "guidance": {
+          "unread_count": 1,
+          "consumed_count": 2
+        },
+        "account_reservation": "intent-v2",
+        "cleanup_state": "quarantined"
+      },
+      "created_at_epoch": 1893456007
+    }
+  }
+}

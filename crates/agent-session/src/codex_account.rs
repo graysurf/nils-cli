@@ -74,6 +74,8 @@ struct DurableNextAccount {
     schema_version: String,
     account: String,
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent_id: Option<String>,
     state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     applying_runtime_id: Option<String>,
@@ -92,6 +94,13 @@ enum DecodedNext {
     Absent,
     Valid(DurableNextAccount),
     Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NextAccountIdentity {
+    pub(crate) account: String,
+    pub(crate) revision: u64,
+    pub(crate) intent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,6 +624,10 @@ fn decode_next(record: &SessionRecord) -> DecodedNext {
             if next.schema_version == NEXT_SCHEMA_VERSION
                 && validate_account(&next.account).is_ok()
                 && next.revision > 0
+                && next
+                    .intent_id
+                    .as_deref()
+                    .is_none_or(|intent_id| validate_intent_id(intent_id).is_ok())
                 && matches!(next.state.as_str(), "queued" | "applying" | "failed") =>
         {
             DecodedNext::Valid(next)
@@ -696,6 +709,20 @@ pub(crate) fn pending_next_apply(
     }
 }
 
+pub(crate) fn next_account_identity(
+    record: &SessionRecord,
+) -> Result<Option<NextAccountIdentity>, CliError> {
+    match decode_next(record) {
+        DecodedNext::Absent => Ok(None),
+        DecodedNext::Invalid => Err(invalid_next_error(record)),
+        DecodedNext::Valid(next) => Ok(Some(NextAccountIdentity {
+            account: next.account,
+            revision: next.revision,
+            intent_id: next.intent_id,
+        })),
+    }
+}
+
 /// Queue a durable next-account intent for an already-bound session.
 pub(crate) fn queue_next_account(
     context: &CliContext,
@@ -703,7 +730,7 @@ pub(crate) fn queue_next_account(
     expected_launch_id: &str,
     account: &str,
 ) -> Result<CodexAccountView, CliError> {
-    queue_next_account_inner(context, id, expected_launch_id, account, false)
+    queue_next_account_inner(context, id, expected_launch_id, account, false, None, None)
 }
 
 /// Queue a durable next-account intent while a turn is working. Selecting the
@@ -718,7 +745,27 @@ pub(crate) fn queue_next_account_with_unbound(
     expected_launch_id: &str,
     account: &str,
 ) -> Result<CodexAccountView, CliError> {
-    queue_next_account_inner(context, id, expected_launch_id, account, true)
+    queue_next_account_inner(context, id, expected_launch_id, account, true, None, None)
+}
+
+pub(crate) fn queue_next_account_if_unchanged(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    account: &str,
+    expected_next: Option<&NextAccountIdentity>,
+    reserved_intent_id: &str,
+) -> Result<CodexAccountView, CliError> {
+    validate_intent_id(reserved_intent_id)?;
+    queue_next_account_inner(
+        context,
+        id,
+        expected_launch_id,
+        account,
+        false,
+        Some(expected_next),
+        Some(reserved_intent_id),
+    )
 }
 
 fn queue_next_account_inner(
@@ -727,6 +774,8 @@ fn queue_next_account_inner(
     expected_launch_id: &str,
     account: &str,
     allow_unbound: bool,
+    expected_next: Option<Option<&NextAccountIdentity>>,
+    reserved_intent_id: Option<&str>,
 ) -> Result<CodexAccountView, CliError> {
     validate_account(account)?;
     let _lock = acquire_session_record_lock(context, id)?;
@@ -744,6 +793,16 @@ fn queue_next_account_inner(
             "Codex account switching is not configured for this daemon",
             Some(json!({ "id": id })),
         ));
+    }
+    if let Some(expected_next) = expected_next {
+        let current_next = next_account_identity(&record)?;
+        if current_next.as_ref() != expected_next {
+            return Err(CliError::runtime(
+                "codex-account-next-superseded",
+                "the queued Codex account changed before the intent could be reserved",
+                Some(json!({ "id": id })),
+            ));
+        }
     }
     let current = match decode_binding(&record) {
         DecodedBinding::Valid(binding) if binding.state == "bound" => Some(binding),
@@ -774,12 +833,16 @@ fn queue_next_account_inner(
         DecodedNext::Valid(prior) => prior.revision.saturating_add(1).max(1),
         DecodedNext::Absent | DecodedNext::Invalid => 1,
     };
+    let intent_id = reserved_intent_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     store_next(
         &mut record,
         &DurableNextAccount {
             schema_version: NEXT_SCHEMA_VERSION.to_string(),
             account: account.to_string(),
             revision,
+            intent_id: Some(intent_id),
             state: "queued".to_string(),
             applying_runtime_id: None,
             failure_reason: None,
@@ -791,6 +854,22 @@ fn queue_next_account_inner(
     Ok(view_for_record(&record))
 }
 
+fn validate_intent_id(intent_id: &str) -> Result<(), CliError> {
+    if intent_id.is_empty()
+        || intent_id.len() > 128
+        || !intent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(CliError::data(
+            "codex-account-intent-id-invalid",
+            "Codex account intent identity is invalid",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Explicitly cancel any queued next-account intent. Idempotent; the applied
 /// binding is never changed.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -798,6 +877,8 @@ pub(crate) fn cancel_next_account(
     context: &CliContext,
     id: &str,
     expected_launch_id: &str,
+    expected_account: Option<&str>,
+    expected_revision: Option<u64>,
 ) -> Result<CodexAccountView, CliError> {
     let _lock = acquire_session_record_lock(context, id)?;
     let mut record = load_session_record(context, id)?;
@@ -808,6 +889,58 @@ pub(crate) fn cancel_next_account(
             Some(json!({ "id": id, "expected_session_incarnation": expected_launch_id })),
         )
     })?;
+    match (
+        decode_next(&record),
+        expected_account.zip(expected_revision),
+    ) {
+        (DecodedNext::Absent, None) => {}
+        (DecodedNext::Valid(next), Some((account, revision)))
+            if next.account == account
+                && next.revision == revision
+                && matches!(next.state.as_str(), "queued" | "failed") => {}
+        (DecodedNext::Invalid, _) => return Err(invalid_next_error(&record)),
+        _ => {
+            return Err(CliError::runtime(
+                "codex-account-next-superseded",
+                "the queued Codex account changed before cancellation",
+                Some(json!({ "id": id })),
+            ));
+        }
+    }
+    clear_next(&mut record);
+    record.updated_at = jiff::Timestamp::now().to_string();
+    write_session_record(context, &record)?;
+    Ok(view_for_record(&record))
+}
+
+pub(crate) fn cancel_next_account_if_matches(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    expected_next: Option<&NextAccountIdentity>,
+) -> Result<CodexAccountView, CliError> {
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    ensure_runtime(&record, expected_launch_id).map_err(|_| {
+        CliError::data(
+            "codex-account-session-incarnation-conflict",
+            "session was replaced before its Codex account switch was applied",
+            Some(json!({ "id": id, "expected_session_incarnation": expected_launch_id })),
+        )
+    })?;
+    let current = next_account_identity(&record)?;
+    if current.as_ref() != expected_next
+        || matches!(
+            decode_next(&record),
+            DecodedNext::Valid(ref next) if !matches!(next.state.as_str(), "queued" | "failed")
+        )
+    {
+        return Err(CliError::runtime(
+            "codex-account-next-superseded",
+            "the queued Codex account changed before cancellation",
+            Some(json!({ "id": id })),
+        ));
+    }
     clear_next(&mut record);
     record.updated_at = jiff::Timestamp::now().to_string();
     write_session_record(context, &record)?;
@@ -821,7 +954,7 @@ pub(crate) fn begin_next_apply(
     context: &CliContext,
     id: &str,
     expected_launch_id: &str,
-) -> Result<Option<(String, u64)>, CliError> {
+) -> Result<Option<NextAccountIdentity>, CliError> {
     let _lock = acquire_session_record_lock(context, id)?;
     let mut record = load_session_record(context, id)?;
     ensure_runtime(&record, expected_launch_id)?;
@@ -834,11 +967,18 @@ pub(crate) fn begin_next_apply(
         DecodedNext::Valid(next) if next.state == "queued" => next,
         DecodedNext::Valid(_) => return Ok(None),
     };
+    if next.intent_id.is_none() {
+        next.intent_id = Some(uuid::Uuid::new_v4().simple().to_string());
+    }
     next.state = "applying".to_string();
     next.applying_runtime_id = Some(expected_launch_id.to_string());
     next.failure_reason = None;
     next.updated_at = jiff::Timestamp::now().to_string();
-    let outcome = (next.account.clone(), next.revision);
+    let outcome = NextAccountIdentity {
+        account: next.account.clone(),
+        revision: next.revision,
+        intent_id: next.intent_id.clone(),
+    };
     store_next(&mut record, &next)?;
     record.updated_at = jiff::Timestamp::now().to_string();
     write_session_record(context, &record)?;
@@ -856,8 +996,10 @@ pub(crate) fn finish_next_apply(
     expected_launch_id: &str,
     account: &str,
     revision: u64,
+    intent_id: &str,
     result: Result<(), &'static str>,
 ) -> Result<CodexAccountView, CliError> {
+    validate_intent_id(intent_id)?;
     let _lock = acquire_session_record_lock(context, id)?;
     let mut record = load_session_record(context, id)?;
     ensure_runtime(&record, expected_launch_id)?;
@@ -866,6 +1008,7 @@ pub(crate) fn finish_next_apply(
             if next.state == "applying"
                 && next.account == account
                 && next.revision == revision
+                && next.intent_id.as_deref() == Some(intent_id)
                 && next.applying_runtime_id.as_deref() == Some(expected_launch_id) =>
         {
             next
@@ -1088,7 +1231,7 @@ fn ensure_runtime(record: &SessionRecord, expected_launch_id: &str) -> Result<()
     ))
 }
 
-fn validate_account(account: &str) -> Result<(), CliError> {
+pub(crate) fn validate_account(account: &str) -> Result<(), CliError> {
     if account.is_empty()
         || account.len() > MAX_ACCOUNT_BYTES
         || !account
@@ -1821,16 +1964,19 @@ wait "$child"
         );
         assert_eq!(queued.next.as_ref().map(|next| next.state), Some("queued"));
 
-        assert_eq!(
-            begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap(),
-            Some(("poies".to_string(), 1))
-        );
+        let applying = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued account is drainable");
+        assert_eq!(applying.account, "poies");
+        assert_eq!(applying.revision, 1);
+        let intent_id = applying.intent_id.expect("intent identity");
         let bound = finish_next_apply(
             &context,
             &record.id,
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Ok(()),
         )
         .unwrap();
@@ -1881,13 +2027,17 @@ wait "$child"
 
         queue_next_account_with_unbound(&context, &record.id, "runtime-binding-fixture", "poies")
             .unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let applying = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued account is drainable");
+        let intent_id = applying.intent_id.expect("intent identity");
         let view = finish_next_apply(
             &context,
             &record.id,
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Err("refresh_failed"),
         )
         .unwrap();
@@ -1951,8 +2101,114 @@ wait "$child"
                 .code(),
             "codex-account-next-pending"
         );
-        cancel_next_account(&context, &record.id, "runtime-binding-fixture").unwrap();
+        cancel_next_account(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            Some("poies"),
+            Some(1),
+        )
+        .unwrap();
         assert!(ensure_input_allowed(&reload(&context, &record.id)).is_ok());
+    }
+
+    #[test]
+    fn cancel_next_account_rejects_a_newer_intent_without_clearing_it() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
+
+        let error = cancel_next_account(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            Some("poies"),
+            Some(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "codex-account-next-superseded");
+        let next = view_for_record(&reload(&context, &record.id))
+            .next
+            .expect("newer intent must remain");
+        assert_eq!(next.account.as_deref(), Some("sym"));
+        assert_eq!(next.revision, 2);
+
+        cancel_next_account(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            Some("sym"),
+            Some(2),
+        )
+        .unwrap();
+        assert!(
+            view_for_record(&reload(&context, &record.id))
+                .next
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn account_intent_cas_rejects_snapshot_overwrite_and_same_tuple_aba() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+
+        let absent = next_account_identity(&reload(&context, &record.id)).unwrap();
+        assert!(absent.is_none());
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
+        let overwrite = queue_next_account_if_unchanged(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            absent.as_ref(),
+            "reserved-account-intent-0001",
+        )
+        .unwrap_err();
+        assert_eq!(overwrite.code(), "codex-account-next-superseded");
+        let newer = next_account_identity(&reload(&context, &record.id))
+            .unwrap()
+            .expect("newer intent");
+        assert_eq!(newer.account, "sym");
+
+        cancel_next_account(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            Some("sym"),
+            Some(newer.revision),
+        )
+        .unwrap();
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
+        let replacement = next_account_identity(&reload(&context, &record.id))
+            .unwrap()
+            .expect("replacement intent");
+        assert_eq!(replacement.account, newer.account);
+        assert_eq!(replacement.revision, newer.revision);
+        assert_ne!(
+            replacement.intent_id, newer.intent_id,
+            "clearing and re-queueing the same account must create a new CAS identity"
+        );
+
+        let stale_cancel = cancel_next_account_if_matches(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            Some(&newer),
+        )
+        .unwrap_err();
+        assert_eq!(stale_cancel.code(), "codex-account-next-superseded");
+        assert_eq!(
+            next_account_identity(&reload(&context, &record.id))
+                .unwrap()
+                .expect("replacement survives"),
+            replacement
+        );
     }
 
     #[test]
@@ -1989,7 +2245,10 @@ wait "$child"
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
         let apply = begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
-        assert_eq!(apply, Some(("poies".to_string(), 1)));
+        let apply = apply.expect("queued apply");
+        assert_eq!(apply.account, "poies");
+        assert_eq!(apply.revision, 1);
+        let intent_id = apply.intent_id.expect("intent id");
         assert_eq!(
             ensure_input_allowed(&reload(&context, &record.id))
                 .unwrap_err()
@@ -2003,6 +2262,7 @@ wait "$child"
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Ok(()),
         )
         .unwrap();
@@ -2023,13 +2283,18 @@ wait "$child"
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let intent_id = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued apply")
+            .intent_id
+            .expect("intent id");
         let view = finish_next_apply(
             &context,
             &record.id,
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Err("refresh_failed"),
         )
         .unwrap();
@@ -2112,7 +2377,11 @@ wait "$child"
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let intent_id = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued apply")
+            .intent_id
+            .expect("intent id");
         mark_waiting(&context, &record);
 
         begin_switch_binding(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
@@ -2128,6 +2397,7 @@ wait "$child"
                 "runtime-binding-fixture",
                 "poies",
                 1,
+                &intent_id,
                 Ok(()),
             )
             .unwrap_err()
@@ -2143,13 +2413,18 @@ wait "$child"
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let intent_id = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued apply")
+            .intent_id
+            .expect("intent id");
         finish_next_apply(
             &context,
             &record.id,
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Err("refresh_failed"),
         )
         .unwrap();
@@ -2171,7 +2446,11 @@ wait "$child"
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let intent_id = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued apply")
+            .intent_id
+            .expect("intent id");
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
         let error = finish_next_apply(
             &context,
@@ -2179,6 +2458,7 @@ wait "$child"
             "runtime-binding-fixture",
             "poies",
             1,
+            &intent_id,
             Ok(()),
         )
         .unwrap_err();
@@ -2195,7 +2475,11 @@ wait "$child"
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = persisted_bound(&tmp);
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
-        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let stale_intent_id = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("queued apply")
+            .intent_id
+            .expect("intent id");
         // Cancel by selecting the current account, then re-queue the same one.
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
         queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
@@ -2205,6 +2489,7 @@ wait "$child"
             "runtime-binding-fixture",
             "poies",
             1,
+            &stale_intent_id,
             Ok(()),
         )
         .unwrap_err();
@@ -2212,6 +2497,108 @@ wait "$child"
             error.code(),
             "codex-account-next-superseded",
             "a stale worker cannot complete against a re-queued intent it does not own"
+        );
+    }
+
+    #[test]
+    fn stale_apply_completion_cannot_cross_same_account_revision_intent_aba() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        for stale_result in [Ok(()), Err("refresh_failed")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (context, record) = persisted_bound(&tmp);
+            queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+            let stale = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+                .unwrap()
+                .expect("stale apply");
+            let stale_intent_id = stale.intent_id.expect("stale intent id");
+
+            let mut current = reload(&context, &record.id);
+            store_next(
+                &mut current,
+                &DurableNextAccount {
+                    schema_version: NEXT_SCHEMA_VERSION.to_string(),
+                    account: "poies".to_string(),
+                    revision: 1,
+                    intent_id: Some("replacement-intent".to_string()),
+                    state: "applying".to_string(),
+                    applying_runtime_id: Some("runtime-binding-fixture".to_string()),
+                    failure_reason: None,
+                    updated_at: "2030-01-01T00:00:01Z".to_string(),
+                },
+            )
+            .unwrap();
+            write_session_record(&context, &current).unwrap();
+
+            let error = finish_next_apply(
+                &context,
+                &record.id,
+                "runtime-binding-fixture",
+                "poies",
+                1,
+                &stale_intent_id,
+                stale_result,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "codex-account-next-superseded");
+            assert_eq!(
+                next_account_identity(&reload(&context, &record.id))
+                    .unwrap()
+                    .expect("replacement")
+                    .intent_id
+                    .as_deref(),
+                Some("replacement-intent"),
+                "stale success and failure completion must preserve the replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_queued_intent_mints_identity_before_entering_applying() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        let mut current = reload(&context, &record.id);
+        store_next(
+            &mut current,
+            &DurableNextAccount {
+                schema_version: NEXT_SCHEMA_VERSION.to_string(),
+                account: "poies".to_string(),
+                revision: 1,
+                intent_id: None,
+                state: "queued".to_string(),
+                applying_runtime_id: None,
+                failure_reason: None,
+                updated_at: "2030-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &current).unwrap();
+
+        let apply = begin_next_apply(&context, &record.id, "runtime-binding-fixture")
+            .unwrap()
+            .expect("v1 compatibility apply");
+        let intent_id = apply.intent_id.expect("minted intent id");
+        let persisted = next_account_identity(&reload(&context, &record.id))
+            .unwrap()
+            .expect("persisted apply");
+        assert_eq!(persisted.intent_id.as_deref(), Some(intent_id.as_str()));
+        finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            &intent_id,
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            view_for_record(&reload(&context, &record.id))
+                .selected_account
+                .as_deref(),
+            Some("poies")
         );
     }
 

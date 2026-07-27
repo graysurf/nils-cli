@@ -271,6 +271,68 @@ pub(crate) fn set_enabled(
     Ok(view(&record, state))
 }
 
+/// Atomically re-enable and arm usage-exhaustion recovery for one exact
+/// runtime incarnation. The session-record lock fences both identity
+/// validation and the auto-resume write, so a replacement reusing the public
+/// session id cannot inherit an older handoff's mutation.
+pub(crate) fn rearm_usage_exhaustion_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    blocked_turn_id: String,
+    blocked_revision: u64,
+    now: &str,
+) -> Result<(), CliError> {
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _lock =
+        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
+    let record = load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, Some(expected_launch_id)) {
+        return Err(CliError::data(
+            "auto-resume-runtime-changed",
+            "auto-resume mutation refused a replacement runtime incarnation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    if crate::activity::runtime_is_unhealthy(context, &record) {
+        return Err(CliError::data(
+            "auto-resume-state-unavailable",
+            "auto-resume projection is unavailable until this session runtime is restarted",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    if !supported(&record) {
+        return Err(CliError::data(
+            "auto-resume-unsupported",
+            "this provider does not expose an authoritative structured usage-exhaustion signal",
+            Some(json!({ "id": record.id, "provider": record.agent })),
+        ));
+    }
+    let mut state = read_state(context, &record.id, now)?;
+    if projection_unavailable(&state) {
+        return Err(CliError::data(
+            "auto-resume-state-unavailable",
+            "auto-resume projection is unavailable until this session runtime is restarted",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    state.enabled = true;
+    state.state = "armed".to_string();
+    state.updated_at = now.to_string();
+    state.scheduled_at = None;
+    state.next_check_at = None;
+    state.failure_reason = None;
+    state.blocked_turn_id = Some(blocked_turn_id);
+    state.blocked_revision = Some(blocked_revision);
+    state.attempt = 0;
+    state.ever_scheduled = false;
+    state.fallback_schedules = 0;
+    write_state(context, &record.id, &state)?;
+    Ok(())
+}
+
 pub(crate) fn cancel(
     context: &CliContext,
     id: &str,
@@ -1048,6 +1110,37 @@ mod tests {
         );
 
         assert!(!supported(&record));
+    }
+
+    #[test]
+    fn account_handoff_rearm_refuses_replacement_incarnation_without_state_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, false, "2030-01-01T00:00:00Z")
+            .expect("seed disabled auto-resume state");
+        let auto_resume_path = path(&context, &record.id);
+        let before = fs::read(&auto_resume_path).expect("seeded auto-resume bytes");
+
+        record.runtime.as_mut().expect("runtime").launch_id = "runtime-2".to_string();
+        record.runtime.as_mut().expect("runtime").generation = 2;
+        record.updated_at = "2030-01-01T00:00:01Z".to_string();
+        crate::write_session_record(&context, &record).expect("replacement session record");
+
+        let error = rearm_usage_exhaustion_for_runtime(
+            &context,
+            &record.id,
+            "runtime-1",
+            "blocked-turn-old-runtime".to_string(),
+            7,
+            "2030-01-01T00:00:02Z",
+        )
+        .expect_err("replacement runtime must reject stale handoff rearm");
+        assert_eq!(error.code(), "auto-resume-runtime-changed");
+        assert_eq!(
+            fs::read(&auto_resume_path).expect("auto-resume after rejected rearm"),
+            before,
+            "replacement runtime must not inherit any stale handoff auto-resume mutation"
+        );
     }
 
     fn waiting_revision(context: &CliContext, record: &SessionRecord) -> u64 {

@@ -31,7 +31,7 @@ cargo run -p nils-forge-cli -- pr pending-review resume-submit 123 --review PRR_
 cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --expected-head <sha> --expected-commit <sha> --expected-body-file review.md --confirm-abandoned --dry-run --format json
 cargo run -p nils-forge-cli -- pr merge 123 --expected-head <reviewed-sha> --review-convergence --format json
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
-cargo run -p nils-forge-cli -- repo push-default --local-default-receipt receipt.json --expected-base <sha> --reason-file reason.md --dry-run --format json
+cargo run -p nils-forge-cli -- repo push-default --default-branch-receipt receipt.json --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
 
 `repo push-default` is a narrow, policy-driven exception to PR delivery. It
@@ -48,15 +48,21 @@ command exposes no caller-controlled force mode. Callers remain responsible for
 obtaining explicit user authorization and recording it in a regular
 `--reason-file`.
 
-`--local-default-receipt` adopts a prior governed local-default commit as the
-only checked-out-default exception. It strictly parses the local receipt and
+`--default-branch-receipt` adopts a prior governed default-branch commit as the
+only checked-out-default exception. It strictly parses the final receipt and
 revalidates the repository fingerprint, branch, exact head/parent/tree,
 signature, one-commit ancestry, live remote base, destination, compare-and-swap,
 and read-back. Receipt creation is not push authorization; provider delivery is
 a separate explicit action. Adoption is eligible only for an
-`aligned` to `ahead-by-one` receipt; a receipt created on top of an existing
-local-ahead chain remains valid local evidence but is rejected for provider
-delivery.
+`aligned` to `ahead-by-one` receipt. Preview output and removed receipt schemas
+are rejected before any provider or Git delivery operation.
+
+Version 1.25.11 is the coordinated local cutover boundary: it accepts only
+`--default-branch-receipt` and the matching final receipt schema. Version
+1.25.10 and earlier use `--local-default-receipt`. The removed option and
+receipt are intentionally not aliases, so `forge-cli` must be deployed with
+the matching 1.25.11 `semantic-commit` before any governed receipt is adopted.
+This source boundary does not itself publish or authorize a release.
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
 each. Use `pr review validate` for local schema/privacy checks, and add

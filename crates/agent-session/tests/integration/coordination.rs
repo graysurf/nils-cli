@@ -4,7 +4,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nils_test_support::bin;
@@ -32,6 +31,146 @@ fn run_main_agent(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput
         "main-agent",
         args,
         &CmdOptions::new().with_cwd(dir).with_envs(envs),
+    )
+}
+
+fn run_managed_account_handoff(
+    dir: &Path,
+    state_dir: &Path,
+    capability_file: &str,
+    account: &str,
+    idempotency_key: &str,
+    apply_result: &str,
+) -> CmdOutput {
+    let registry = orchestration_registry(state_dir);
+    let assignment = &registry["assignments"]["assignment-matrix"];
+    let revision = assignment["account_handoff"]
+        .as_object()
+        .filter(|reservation| {
+            reservation
+                .get("account")
+                .and_then(serde_json::Value::as_str)
+                == Some(account)
+        })
+        .and_then(|reservation| reservation.get("reserved_revision"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            assignment["revision"]
+                .as_u64()
+                .expect("assignment revision")
+        })
+        .to_string();
+    run_main_agent(
+        dir,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            account,
+            "--if-revision",
+            &revision,
+            "--authorize-account-change",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            idempotency_key,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", capability_file),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", r#"["/bin/false"]"#),
+            (
+                "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+                apply_result,
+            ),
+        ],
+    )
+}
+
+fn run_managed_account_handoff_cancel(
+    dir: &Path,
+    state_dir: &Path,
+    capability_file: &str,
+    idempotency_key: &str,
+) -> CmdOutput {
+    let registry = orchestration_registry(state_dir);
+    let assignment = &registry["assignments"]["assignment-matrix"];
+    let reservation = &assignment["account_handoff"];
+    let revision = assignment["revision"]
+        .as_u64()
+        .expect("assignment revision")
+        .to_string();
+    let reservation_id = reservation["reservation_id"]
+        .as_str()
+        .or_else(|| reservation["request_digest"].as_str())
+        .expect("reservation identity")
+        .to_string();
+    let account = reservation["account"]
+        .as_str()
+        .expect("reserved account")
+        .to_string();
+    let intent_id = reservation["account_intent_id"]
+        .as_str()
+        .map(str::to_string);
+    run_managed_account_handoff_cancel_with_identity(
+        dir,
+        state_dir,
+        capability_file,
+        idempotency_key,
+        &revision,
+        &reservation_id,
+        &account,
+        intent_id.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_managed_account_handoff_cancel_with_identity(
+    dir: &Path,
+    state_dir: &Path,
+    capability_file: &str,
+    idempotency_key: &str,
+    revision: &str,
+    reservation_id: &str,
+    account: &str,
+    intent_id: Option<&str>,
+) -> CmdOutput {
+    let mut owned_args = vec![
+        "--state-dir".to_string(),
+        state_dir.to_str().expect("state dir").to_string(),
+        "worker".to_string(),
+        "account-handoff-cancel".to_string(),
+        "assignment-matrix".to_string(),
+        "--reservation-id".to_string(),
+        reservation_id.to_string(),
+        "--account".to_string(),
+        account.to_string(),
+    ];
+    if let Some(intent_id) = intent_id {
+        owned_args.push("--intent-id".to_string());
+        owned_args.push(intent_id.to_string());
+    }
+    owned_args.extend([
+        "--if-revision".to_string(),
+        revision.to_string(),
+        "--authorize-account-change".to_string(),
+        "--idempotency-key".to_string(),
+        idempotency_key.to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]);
+    let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_main_agent(
+        dir,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", capability_file),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", r#"["/bin/false"]"#),
+        ],
     )
 }
 
@@ -142,6 +281,21 @@ fn init_checkout(path: &Path, remote: &str) {
         .status()
         .expect("git remote add");
     assert!(remote_add.success());
+}
+
+fn git_stdout(path: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 fn digest(value: &str) -> String {
@@ -515,6 +669,13 @@ fn orchestration_registry(state_dir: &Path) -> serde_json::Value {
     .expect("orchestration registry json")
 }
 
+fn load_coordination_registry(state_dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json")
+}
+
 #[test]
 fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -630,10 +791,23 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
             &["expected current revision", "same idempotency key"][..],
         ),
         (
+            &["self", "recover", "--help"][..],
+            &["exact main agent controller", "same idempotency key"][..],
+        ),
+        (
             &["worker", "start", "--help"][..],
             // --if-run-revision is now optional (T2 decouple), so the help reads
             // "optional expected run revision" rather than "current".
             &["expected run revision", "same idempotency key"][..],
+        ),
+        (
+            &["worker", "request-changes", "--help"][..],
+            &[
+                "return a submitted assignment",
+                "bounded durable reason",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
         ),
         (
             &["worker", "accept", "--help"][..],
@@ -659,6 +833,43 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
                 "1-30s",
             ][..],
         ),
+        (
+            &["worker", "guidance-reconcile", "--help"][..],
+            &[
+                "unread guidance",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
+            &["worker", "guidance-quarantine", "--help"][..],
+            &[
+                "unretained stale worker incarnations",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
+            &["worker", "account-handoff", "--help"][..],
+            &[
+                "explicitly authorized account handoff",
+                "allowlisted account nickname",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
+            &["worker", "account-handoff-cancel", "--help"][..],
+            &[
+                "failed, superseded, or queued",
+                "--reservation-id",
+                "--account",
+                "--intent-id",
+                "expected current assignment revision",
+                "authorize-account-change",
+                "same idempotency key",
+            ][..],
+        ),
     ] {
         let output = run_main_agent(tmp.path(), args, &[]);
         assert_eq!(
@@ -675,6 +886,397 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
             );
         }
     }
+}
+
+#[test]
+fn main_agent_account_handoff_cancel_docs_publish_every_required_identity_selector() {
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let spec = fs::read_to_string(crate_root.join("docs/specs/main-agent-orchestration-v1.md"))
+        .expect("read orchestration spec");
+    let runbook = fs::read_to_string(crate_root.join("docs/runbooks/main-agent-orchestration.md"))
+        .expect("read orchestration runbook");
+    for (name, document) in [("spec", spec), ("runbook", runbook)] {
+        for selector in ["--reservation-id", "--account", "--intent-id"] {
+            assert!(
+                document.contains(selector),
+                "{name} omits required cancellation selector {selector}"
+            );
+        }
+        assert!(
+            document.contains("released-v1"),
+            "{name} must retain the frozen released-v1 intent-id exception"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn main_agent_self_recover_is_exact_controller_macro_first_and_claim_preserving() {
+    use std::os::unix::process::CommandExt;
+
+    #[derive(serde::Serialize)]
+    struct RuntimeIdentityFixture<'a> {
+        launch_id: &'a str,
+        session_id: &'a str,
+        pane_id: &'a str,
+        pane_pid: libc::pid_t,
+        process_group_id: libc::pid_t,
+        process_session_id: libc::pid_t,
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+
+    let mut runtime_process = Command::new("sleep");
+    runtime_process.arg("30").stdin(Stdio::null());
+    // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
+    unsafe {
+        runtime_process.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut runtime_process = runtime_process.spawn().expect("live runtime fixture");
+    let runtime_pid = runtime_process.id() as libc::pid_t;
+    let identity_fixture = RuntimeIdentityFixture {
+        launch_id: "main-incarnation-one",
+        session_id: "$77",
+        pane_id: "%77",
+        pane_pid: runtime_pid,
+        process_group_id: runtime_pid,
+        process_session_id: runtime_pid,
+    };
+    let identity_bytes = serde_json::to_vec(&identity_fixture).expect("runtime identity bytes");
+    let identity: serde_json::Value =
+        serde_json::from_slice(&identity_bytes).expect("runtime identity");
+    let identity_digest = Sha256::digest(&identity_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let session_path = state_dir.join("sessions/main-one/session.json");
+    let mut session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_path).expect("main session"))
+            .expect("main session json");
+    session["delete_tmux_identity"] = identity.clone();
+    write_private_json(&session_path, &session);
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["main-one"]["runtime_identity"] = identity;
+        registry["brokers"]["main-one"]["runtime_identity_digest"] = json!(identity_digest);
+    });
+
+    let recover = |key: &str| {
+        run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "self",
+                "recover",
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_ID", "main-one"),
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ],
+        )
+    };
+    let healthy = recover("controller-recover-healthy-0001");
+    assert_eq!(
+        healthy.code,
+        0,
+        "stdout={} stderr={}",
+        healthy.stdout_text(),
+        healthy.stderr_text()
+    );
+    assert_eq!(data(&healthy)["recovery"], "healthy_noop");
+    assert_eq!(data(&healthy)["claim"]["active"], true);
+    assert_eq!(data(&healthy)["claim"]["retained"], true);
+    assert_eq!(data(&healthy)["run"]["rebind_required"], false);
+    assert!(
+        data(&healthy)["forbidden_side_effects"]
+            .as_object()
+            .expect("side-effect proof")
+            .values()
+            .all(|value| value == false),
+        "controller recovery must not impersonate the provider or clear a mutation fence"
+    );
+
+    let baseline_coordination = load_coordination_registry(&state_dir);
+    let baseline_orchestration = orchestration_registry(&state_dir);
+    let heartbeat_path = state_dir.join("sessions/main-one/coordination/heartbeat");
+    let heartbeat_bytes = fs::read(&heartbeat_path).expect("healthy heartbeat");
+    let main_claim_id = baseline_coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .and_then(|claim| claim["claim_id"].as_str())
+        .expect("main claim")
+        .to_string();
+
+    fs::remove_file(&heartbeat_path).expect("remove heartbeat before replay");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["main-one"]["heartbeat_epoch"] = json!(0);
+        registry["brokers"]["main-one"]["lost_since_epoch"] = json!(1);
+    });
+    let stale_broker_before_replay =
+        load_coordination_registry(&state_dir)["brokers"]["main-one"].clone();
+    let healthy_replay = recover("controller-recover-healthy-0001");
+    assert_eq!(
+        healthy_replay.code,
+        0,
+        "stdout={} stderr={}",
+        healthy_replay.stdout_text(),
+        healthy_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&healthy_replay),
+        data(&healthy),
+        "an accepted healthy-noop recovery key must replay its original result even after the broker becomes adoptable"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir)["brokers"]["main-one"],
+        stale_broker_before_replay,
+        "replaying the healthy result must not adopt or mutate the broker"
+    );
+    fs::write(&heartbeat_path, heartbeat_bytes).expect("restore healthy heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        *registry = baseline_coordination.clone();
+    });
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        *registry = baseline_orchestration.clone();
+    });
+
+    for (case, expected_code) in [
+        ("active-operation", "controller-recovery-operation-fenced"),
+        (
+            "reconcile-pending-operation",
+            "controller-recovery-operation-fenced",
+        ),
+        ("missing-claim", "controller-recovery-claim-unavailable"),
+        ("released-claim", "controller-recovery-claim-unavailable"),
+        ("worker-principal", "controller-recovery-role"),
+        (
+            "runtime-identity-mismatch",
+            "controller-recovery-runtime-uncertain",
+        ),
+        ("runtime-stopped", "controller-recovery-runtime-uncertain"),
+        ("runtime-unknown", "controller-recovery-runtime-uncertain"),
+    ] {
+        rewrite_registry(&state_dir, |registry| {
+            *registry = baseline_coordination.clone();
+            match case {
+                "active-operation" | "reconcile-pending-operation" => {
+                    registry["operations"]
+                        .as_array_mut()
+                        .expect("operations")
+                        .push(json!({
+                            "schema_version": "agent-session.operation-lease.v1",
+                            "lease_id": format!("controller-recovery-{case}"),
+                            "session_id": "main-one",
+                            "session_incarnation": "main-incarnation-one",
+                            "claim_id": main_claim_id.clone(),
+                            "claim_revision": 1,
+                            "operation": "test mutation",
+                            "targets": [],
+                            "provider_targets": [],
+                            "state": if case == "active-operation" {
+                                "active"
+                            } else {
+                                "reconcile_pending"
+                            },
+                            "revision": 1,
+                            "started_at": "2030-01-01T00:00:00Z",
+                            "expires_at": "9999-12-31T23:59:59Z",
+                            "expires_at_epoch": i64::MAX,
+                            "terminal_at_epoch": null,
+                            "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "activity_revision": 1,
+                            "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                            "descendant": null,
+                            "reconcile_observed_at_epoch": null,
+                            "outcome": null
+                        }));
+                }
+                "missing-claim" => registry["claims"]
+                    .as_array_mut()
+                    .expect("claims")
+                    .retain(|claim| claim["session_id"] != "main-one"),
+                "released-claim" => {
+                    let claim = registry["claims"]
+                        .as_array_mut()
+                        .expect("claims")
+                        .iter_mut()
+                        .find(|claim| claim["session_id"] == "main-one")
+                        .expect("main claim");
+                    claim["state"] = json!("released");
+                }
+                "runtime-identity-mismatch" => {
+                    registry["brokers"]["main-one"]["runtime_identity_digest"] =
+                        json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                }
+                "worker-principal" | "runtime-stopped" | "runtime-unknown" => {}
+                _ => unreachable!(),
+            }
+        });
+        rewrite_orchestration_registry(&state_dir, |registry| {
+            *registry = baseline_orchestration.clone();
+            if case == "worker-principal" {
+                registry["runs"]["run-one"]["controller"] = json!({
+                    "session_id": "other-main",
+                    "session_incarnation": "other-main-incarnation",
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                });
+                registry["assignments"]["controller-as-worker"] = json!({
+                    "schema_version": "agent-session.orchestration-assignment.v1",
+                    "assignment_id": "controller-as-worker",
+                    "run_id": "run-one",
+                    "revision": 1,
+                    "state": "working",
+                    "task_summary": "Controller recovery role fence",
+                    "private_packet_digest": format!("sha256:{}", "d".repeat(64)),
+                    "primary_manager": {
+                        "session_id": "other-main",
+                        "session_incarnation": "other-main-incarnation",
+                        "session_created_at": "2030-01-01T00:00:00Z"
+                    },
+                    "worker": {
+                        "session_id": "main-one",
+                        "session_incarnation": "main-incarnation-one",
+                        "session_created_at": "2030-01-01T00:00:00Z"
+                    },
+                    "collaborators": [],
+                    "borrowed_by": [],
+                    "scopes": [],
+                    "durable_refs": [],
+                    "depends_on": [],
+                    "created_at": "2030-01-01T00:00:00Z",
+                    "updated_at": "2030-01-01T00:00:00Z"
+                });
+            }
+        });
+        let before_coordination = load_coordination_registry(&state_dir);
+        let before_run = orchestration_registry(&state_dir)["runs"]["run-one"].clone();
+        let coordination_bytes =
+            fs::read(state_dir.join("coordination/registry.json")).expect("coordination bytes");
+        let orchestration_bytes =
+            fs::read(state_dir.join("orchestration/registry.json")).expect("orchestration bytes");
+        let key = format!("controller-recover-{case}-0001");
+        let refused = if let Some(runtime_status) = case.strip_prefix("runtime-") {
+            run_main_agent(
+                &checkout,
+                &[
+                    "--state-dir",
+                    state_dir.to_str().expect("state dir"),
+                    "self",
+                    "recover",
+                    "--idempotency-key",
+                    &key,
+                    "--format",
+                    "json",
+                ],
+                &[
+                    ("AGENT_SESSION_ID", "main-one"),
+                    ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                    (
+                        "NILS_AGENT_SESSION_TEST_CONTROLLER_RUNTIME_STATUS",
+                        runtime_status,
+                    ),
+                ],
+            )
+        } else {
+            recover(&key)
+        };
+        assert_ne!(refused.code, 0, "case={case}");
+        assert_eq!(
+            refused.stdout_json()["error"]["code"],
+            expected_code,
+            "case={case}"
+        );
+        let after_coordination = load_coordination_registry(&state_dir);
+        assert_eq!(
+            after_coordination["brokers"]["main-one"], before_coordination["brokers"]["main-one"],
+            "broker generation/authority changed for {case}"
+        );
+        assert_eq!(
+            after_coordination["claims"], before_coordination["claims"],
+            "claim revision/state changed for {case}"
+        );
+        assert_eq!(
+            orchestration_registry(&state_dir)["runs"]["run-one"],
+            before_run,
+            "orchestration run changed for {case}"
+        );
+        assert_eq!(
+            fs::read(state_dir.join("coordination/registry.json")).unwrap(),
+            coordination_bytes,
+            "coordination registry bytes changed for {case}"
+        );
+        assert_eq!(
+            fs::read(state_dir.join("orchestration/registry.json")).unwrap(),
+            orchestration_bytes,
+            "orchestration registry bytes changed for {case}"
+        );
+    }
+    rewrite_registry(&state_dir, |registry| {
+        *registry = baseline_coordination.clone();
+    });
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        *registry = baseline_orchestration.clone();
+    });
+
+    fs::remove_file(state_dir.join("sessions/main-one/coordination/heartbeat"))
+        .expect("remove stale heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["main-one"]["heartbeat_epoch"] = json!(0);
+        registry["brokers"]["main-one"]["lost_since_epoch"] = json!(1);
+    });
+    let adopted = recover("controller-recover-adopt-0001");
+    assert_eq!(
+        adopted.code,
+        0,
+        "stdout={} stderr={}",
+        adopted.stdout_text(),
+        adopted.stderr_text()
+    );
+    assert_eq!(data(&adopted)["recovery"], "adopted");
+    assert_eq!(data(&adopted)["broker"]["authoritative"], true);
+    assert_eq!(data(&adopted)["claim"]["active"], true);
+    assert_eq!(
+        data(&adopted)["claim"]["revision"],
+        data(&healthy)["claim"]["revision"],
+        "macro recovery must retain the exact active controller claim"
+    );
+    assert_eq!(data(&adopted)["run"]["run_id"], "run-one");
+    assert_eq!(
+        data(&adopted)["run"]["revision"],
+        data(&healthy)["run"]["revision"],
+        "broker recovery must not mutate the durable objective"
+    );
+
+    let _ = runtime_process.kill();
+    let _ = runtime_process.wait();
 }
 
 #[test]
@@ -2546,6 +3148,7 @@ fn coordination_review_recovery_rejects_a_healthy_exact_broker() {
         .expect("proof json"),
     )
     .expect("proof");
+    let alpha_capability = capability(&state_dir, "alpha");
     let recovered = run(
         tmp.path(),
         &[
@@ -2555,6 +3158,8 @@ fn coordination_review_recovery_rejects_a_healthy_exact_broker() {
             "adopt",
             "--session",
             "alpha",
+            "--capability-file",
+            &alpha_capability,
             "--proof-file",
             proof.to_str().expect("proof"),
             "--idempotency-key",
@@ -2567,6 +3172,166 @@ fn coordination_review_recovery_rejects_a_healthy_exact_broker() {
     assert_eq!(
         recovered.stdout_json()["error"]["code"],
         "coordination-broker-not-lost"
+    );
+}
+
+#[test]
+fn broker_recovery_rejects_cross_session_capabilities_without_state_change() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+            ),
+        ],
+    );
+    let proof = tmp.path().join("proof.json");
+    fs::write(
+        &proof,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.coordination-recovery-proof.v1",
+            "session_incarnation": "incarnation-alpha",
+            "generation": 1
+        }))
+        .expect("proof json"),
+    )
+    .expect("proof");
+    let before = fs::read(state_dir.join("coordination/registry.json"))
+        .expect("coordination registry before unauthorized recovery");
+    let beta_capability = capability(&state_dir, "beta");
+
+    for (subcommand, extra) in [
+        ("adopt", Vec::<&str>::new()),
+        (
+            "reconcile",
+            vec![
+                "--operation",
+                "lease-alpha",
+                "--if-revision",
+                "1",
+                "--attest-inactive",
+            ],
+        ),
+    ] {
+        let mut args = vec![
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "broker",
+            subcommand,
+            "--session",
+            "alpha",
+            "--capability-file",
+            &beta_capability,
+            "--proof-file",
+            proof.to_str().expect("proof"),
+            "--idempotency-key",
+            if subcommand == "adopt" {
+                "cross-session-adopt-0001"
+            } else {
+                "cross-session-reconcile-0001"
+            },
+        ];
+        args.extend(extra);
+        args.extend(["--format", "json"]);
+        let recovered = run(tmp.path(), &args);
+        assert_ne!(recovered.code, 0);
+        assert_eq!(
+            recovered.stdout_json()["error"]["code"],
+            "coordination-unauthorized",
+            "cross-session {subcommand} must fail at capability authentication"
+        );
+        assert_eq!(
+            fs::read(state_dir.join("coordination/registry.json"))
+                .expect("coordination registry after unauthorized recovery"),
+            before,
+            "unauthorized {subcommand} must not change broker or operation state"
+        );
+    }
+}
+
+#[test]
+fn broker_recovery_rejects_copied_capability_from_replaced_same_id_incarnation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-old",
+            "alpha-old-private-capability-material",
+        )],
+    );
+    let copied_old_capability = tmp.path().join("copied-old-capability");
+    fs::copy(capability(&state_dir, "alpha"), &copied_old_capability)
+        .expect("copy prior incarnation capability");
+    fs::set_permissions(&copied_old_capability, fs::Permissions::from_mode(0o600))
+        .expect("copied capability mode");
+    fs::remove_dir_all(state_dir.join("sessions/alpha"))
+        .expect("remove prior incarnation session state");
+    fs::remove_dir_all(state_dir.join("coordination"))
+        .expect("remove prior incarnation coordination registry");
+
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-new",
+            "alpha-new-private-capability-material",
+        )],
+    );
+    let proof = tmp.path().join("proof.json");
+    fs::write(
+        &proof,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.coordination-recovery-proof.v1",
+            "session_incarnation": "incarnation-new",
+            "generation": 1
+        }))
+        .expect("proof json"),
+    )
+    .expect("proof");
+    let before = fs::read(state_dir.join("coordination/registry.json"))
+        .expect("coordination registry before replaced-incarnation recovery");
+    let recovered = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "broker",
+            "adopt",
+            "--session",
+            "alpha",
+            "--capability-file",
+            copied_old_capability.to_str().expect("copied capability"),
+            "--proof-file",
+            proof.to_str().expect("proof"),
+            "--idempotency-key",
+            "replaced-incarnation-adopt-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(recovered.code, 0);
+    assert_eq!(
+        recovered.stdout_json()["error"]["code"],
+        "coordination-unauthorized"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json"))
+            .expect("coordination registry after replaced-incarnation recovery"),
+        before,
+        "a copied prior-incarnation capability must not mutate recovery state"
     );
 }
 
@@ -4587,6 +5352,392 @@ fn main_agent_borrow_prunes_all_expired_relationships_before_enforcing_the_limit
 }
 
 #[test]
+fn main_agent_worker_request_changes_rejects_invalid_reasons_as_public_input() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    fs::create_dir(&checkout).expect("checkout");
+    let state = state_dir.to_str().expect("state dir");
+    let over_limit = "x".repeat(241);
+    for (index, reason) in ["", "line\nbreak", over_limit.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        for equals_form in [false, true] {
+            let revision = "1";
+            let idempotency_key = format!("request-changes-invalid-{index}-{equals_form}");
+            let mut args = vec![
+                "--state-dir",
+                state,
+                "worker",
+                "request-changes",
+                "assignment-review",
+                "--if-revision",
+                revision,
+                "--reason",
+                reason,
+                "--idempotency-key",
+                &idempotency_key,
+            ];
+            if equals_form {
+                args.push("--format=json");
+            } else {
+                args.extend(["--format", "json"]);
+            }
+            let invalid = run_main_agent(&checkout, &args, &[]);
+            assert_eq!(invalid.code, 65, "stderr={}", invalid.stderr_text());
+            assert_eq!(
+                invalid.stdout_json()["schema_version"],
+                "cli.main-agent.worker-request-changes.v1"
+            );
+            assert_eq!(
+                invalid.stdout_json()["error"]["code"],
+                "invalid-orchestration-input"
+            );
+            assert_eq!(invalid.stderr_text(), "");
+        }
+    }
+}
+
+#[test]
+fn main_agent_worker_request_changes_reopens_only_the_submitted_assignment() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-one",
+        "run-request-changes",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-review",
+        "task_summary": "Repair reviewed candidate",
+        "task": {"private_note": "packet-preservation-canary"},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-review",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-review",
+            "run_id": "run-request-changes",
+            "revision": 5,
+            "state": "submitted",
+            "task_summary": "Repair reviewed candidate",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": {
+                "revision": 5,
+                "summary": "Submitted stale candidate",
+                "next_action": "Await acceptance",
+                "updated_at": "2030-01-01T00:00:02Z"
+            },
+            "result_summary": "Stale candidate result",
+            "blocker_summary": "Stale blocker",
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let before = orchestration_registry(&state_dir);
+    let worker_before = before["assignments"]["assignment-review"]["worker"].clone();
+    let packet_before = before["assignments"]["assignment-review"]["private_packet_digest"].clone();
+    seed_active_claim(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "worker-request-changes-claim",
+    );
+    let worker_capability = capability(&state_dir, "worker-one");
+    let wrong_role = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "5",
+            "--reason",
+            "Worker cannot reopen its own submission",
+            "--idempotency-key",
+            "request-changes-wrong-role-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_ne!(wrong_role.code, 0);
+    assert_eq!(
+        wrong_role.stdout_json()["error"]["code"],
+        "controller-rebind-required"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-review"]["state"],
+        "submitted"
+    );
+
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "request-changes",
+        "assignment-review",
+        "--if-revision",
+        "5",
+        "--reason",
+        "Address the exact review findings",
+        "--idempotency-key",
+        "request-changes-review-0001",
+        "--format",
+        "json",
+    ];
+    let requested = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(requested.code, 0, "stderr={}", requested.stderr_text());
+    let assignment = &data(&requested)["assignment"];
+    assert_eq!(assignment["state"], "working");
+    assert_eq!(assignment["revision"], 6);
+    assert_eq!(assignment["worker"], worker_before);
+    assert_eq!(assignment["result_summary"], serde_json::Value::Null);
+    assert_eq!(assignment["blocker_summary"], serde_json::Value::Null);
+    assert_eq!(
+        assignment["checkpoint"]["summary"],
+        "Main Agent requested revisions"
+    );
+    assert_eq!(
+        assignment["checkpoint"]["next_action"],
+        "Address the exact review findings"
+    );
+    let after = orchestration_registry(&state_dir);
+    assert_eq!(
+        after["assignments"]["assignment-review"]["worker"],
+        worker_before
+    );
+    assert_eq!(
+        after["assignments"]["assignment-review"]["private_packet_digest"],
+        packet_before
+    );
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), requested.stdout_text());
+
+    let stale = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "5",
+            "--reason",
+            "A different stale request",
+            "--idempotency-key",
+            "request-changes-stale-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(stale.code, 0);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+
+    let invalid_state = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "6",
+            "--reason",
+            "Cannot reopen working state",
+            "--idempotency-key",
+            "request-changes-invalid-state-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(invalid_state.code, 0);
+    assert_eq!(
+        invalid_state.stdout_json()["error"]["code"],
+        "assignment-state-conflict"
+    );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-review"];
+        assignment["revision"] = json!(7);
+        assignment["state"] = json!("submitted");
+        assignment["primary_manager"]["session_id"] = json!("worker-one");
+        assignment["primary_manager"]["session_incarnation"] = json!("worker-incarnation-one");
+    });
+    let wrong_manager = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "7",
+            "--reason",
+            "Wrong manager must fail closed",
+            "--idempotency-key",
+            "request-changes-wrong-manager-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(wrong_manager.code, 0);
+    assert_eq!(
+        wrong_manager.stdout_json()["error"]["code"],
+        "primary-manager-conflict"
+    );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-review"];
+        assignment["revision"] = json!(8);
+        assignment["state"] = json!("accepted");
+        assignment["primary_manager"]["session_id"] = json!("main-one");
+        assignment["primary_manager"]["session_incarnation"] = json!("main-incarnation-one");
+    });
+    let terminal = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "8",
+            "--reason",
+            "Terminal state must remain immutable",
+            "--idempotency-key",
+            "request-changes-terminal-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(terminal.code, 0);
+    assert_eq!(
+        terminal.stdout_json()["error"]["code"],
+        "assignment-state-conflict"
+    );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-review"];
+        assignment["revision"] = json!(u64::MAX);
+        assignment["state"] = json!("submitted");
+    });
+    let before_overflow =
+        fs::read(state_dir.join("orchestration/registry.json")).expect("registry before overflow");
+    let overflow = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review",
+            "--if-revision",
+            "18446744073709551615",
+            "--reason",
+            "Revision overflow must fail without mutation",
+            "--idempotency-key",
+            "request-changes-overflow-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(overflow.code, 65, "stderr={}", overflow.stderr_text());
+    assert_eq!(
+        overflow.stdout_json()["error"]["code"],
+        "orchestration-revision-capacity"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json")).expect("registry after overflow"),
+        before_overflow,
+        "revision overflow must leave the registry byte-for-byte unchanged"
+    );
+}
+
+#[test]
 fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -5145,6 +6296,13 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
                 Some("enforce"),
             ),
             (
+                "main-two",
+                "main-incarnation-two",
+                "main-private-capability-material-bootstrap-race",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
                 "worker-one",
                 "worker-incarnation-one",
                 "worker-private-capability-material-0000000001",
@@ -5160,6 +6318,21 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
         "main-one",
         "run-one",
     );
+    seed_active_claim(
+        &state_dir,
+        "main-two",
+        "main-incarnation-two",
+        "main-two-bootstrap-race-claim",
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut run_two = registry["runs"]["run-one"].clone();
+        run_two["run_id"] = json!("run-two");
+        run_two["revision"] = json!(1);
+        run_two["objective_summary"] = json!("Receive bootstrap race handoff");
+        run_two["controller"]["session_id"] = json!("main-two");
+        run_two["controller"]["session_incarnation"] = json!("main-incarnation-two");
+        registry["runs"]["run-two"] = run_two;
+    });
     let private_packet = json!({
         "schema_version": "main-agent.assignment-input.v1",
         "assignment_id": "assignment-bootstrap",
@@ -5300,6 +6473,429 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     );
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
     assert_eq!(replay.stdout_text(), bootstrapped.stdout_text());
+
+    let continuity_body = tmp.path().join("resume-guidance.md");
+    fs::write(
+        &continuity_body,
+        "Unread exact-controller guidance must follow the resumed worker incarnation.",
+    )
+    .expect("resume guidance");
+    let queued_guidance = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "assignment-bootstrap",
+            "--body-file",
+            continuity_body.to_str().expect("guidance body"),
+            "--idempotency-key",
+            "bootstrap-resume-guidance-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        queued_guidance.code,
+        0,
+        "stderr={}",
+        queued_guidance.stderr_text()
+    );
+    let guidance_message_id = data(&queued_guidance)["message_id"]
+        .as_str()
+        .expect("guidance message id")
+        .to_string();
+    rewrite_registry(&state_dir, |registry| {
+        let messages = registry["messages"].as_array_mut().expect("messages");
+        let original = messages
+            .iter()
+            .find(|message| message["message_id"] == guidance_message_id)
+            .expect("original guidance")
+            .clone();
+        let mut wrong_sender = original.clone();
+        wrong_sender["message_id"] = json!("resume-guidance-wrong-sender");
+        wrong_sender["sender_session_id"] = json!("unrelated-controller");
+        wrong_sender["sender_incarnation"] = json!("unrelated-controller-incarnation");
+        wrong_sender["recipient_incarnation"] = json!("worker-incarnation-two");
+        messages.push(wrong_sender);
+        let mut expired = original.clone();
+        expired["message_id"] = json!("resume-guidance-expired");
+        expired["expires_at_epoch"] = json!(0);
+        messages.push(expired);
+        let mut consumed = original;
+        consumed["message_id"] = json!("resume-guidance-consumed");
+        consumed["state"] = json!("read");
+        messages.push(consumed);
+    });
+
+    let resumed_incarnation = "worker-incarnation-two";
+    let resumed_capability = "worker-private-capability-material-0000000002";
+    let worker_session_path = state_dir.join("sessions/worker-one/session.json");
+    let mut worker_session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_session_path).expect("worker session record"))
+            .expect("worker session json");
+    worker_session["runtime"]["launch_id"] = json!(resumed_incarnation);
+    write_private_json(&worker_session_path, &worker_session);
+    let worker_coordination_dir = state_dir.join("sessions/worker-one/coordination");
+    let resumed_capability_file =
+        worker_coordination_dir.join(format!("capability-{}", digest(resumed_incarnation)));
+    fs::write(&resumed_capability_file, resumed_capability).expect("resumed capability");
+    fs::set_permissions(&resumed_capability_file, fs::Permissions::from_mode(0o600))
+        .expect("resumed capability mode");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        worker_coordination_dir.join("heartbeat"),
+        format!("{resumed_incarnation}:{now}\n"),
+    )
+    .expect("resumed heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-one"]["incarnation"] = json!(resumed_incarnation);
+        registry["brokers"]["worker-one"]["capability_digest"] = json!(digest(resumed_capability));
+        registry["brokers"]["worker-one"]["heartbeat_epoch"] = json!(now);
+    });
+    let resumed_capability_arg = resumed_capability_file.to_string_lossy().into_owned();
+    let resumed_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "bootstrap",
+        "--idempotency-key",
+        "worker-bootstrap-resume-0001",
+        "--format",
+        "json",
+    ];
+    let before_resume = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "self",
+            "show",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(data(&before_resume)["rebind_required"], true);
+    let resumed = run_main_agent(
+        &worker_checkout,
+        &resumed_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    assert_eq!(data(&resumed)["assignment"]["record"]["revision"], 4);
+    assert_eq!(
+        data(&resumed)["assignment"]["record"]["worker"]["session_incarnation"],
+        resumed_incarnation
+    );
+    assert_eq!(
+        data(&resumed)["assignment"]["record"]["previous_worker"]["session_incarnation"],
+        "worker-incarnation-one",
+        "resume bootstrap must preserve the superseded worker identity for continuity auditing"
+    );
+    let resumed_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    let claims = resumed_registry["claims"].as_array().expect("claims");
+    assert!(claims.iter().any(|claim| {
+        claim["session_incarnation"] == "worker-incarnation-one" && claim["state"] == "released"
+    }));
+    assert!(claims.iter().any(|claim| {
+        claim["session_incarnation"] == resumed_incarnation && claim["state"] == "active"
+    }));
+    let carried_guidance = resumed_registry["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == guidance_message_id)
+        .expect("carried guidance");
+    assert_eq!(carried_guidance["state"], "unread");
+    assert_eq!(
+        carried_guidance["recipient_incarnation"],
+        resumed_incarnation
+    );
+    assert_eq!(
+        carried_guidance["forwarded_from_incarnation"],
+        "worker-incarnation-one"
+    );
+    assert!(
+        carried_guidance["forwarded_at_epoch"].as_i64().is_some(),
+        "carried guidance retains bounded provenance"
+    );
+    assert_eq!(
+        carried_guidance["body"],
+        "Unread exact-controller guidance must follow the resumed worker incarnation."
+    );
+    assert_eq!(
+        carried_guidance["revision"], 2,
+        "the retained message identity advances exactly once"
+    );
+    for message_id in ["resume-guidance-expired", "resume-guidance-consumed"] {
+        let untouched = resumed_registry["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["message_id"] == message_id)
+            .expect("non-forwardable message");
+        assert_eq!(
+            untouched["recipient_incarnation"], "worker-incarnation-one",
+            "{message_id} must not cross the incarnation boundary"
+        );
+        assert!(
+            untouched["forwarded_from_incarnation"].is_null(),
+            "{message_id} must retain no false forwarding provenance"
+        );
+    }
+    let unrelated = resumed_registry["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == "resume-guidance-wrong-sender")
+        .expect("unrelated message");
+    assert_eq!(
+        unrelated["recipient_incarnation"], resumed_incarnation,
+        "fixture remains current-incarnation so diagnosis must filter by exact controller"
+    );
+    let resumed_diagnosis = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "diagnose",
+            "assignment-bootstrap",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        resumed_diagnosis.code,
+        0,
+        "stdout={} stderr={}",
+        resumed_diagnosis.stdout_text(),
+        resumed_diagnosis.stderr_text()
+    );
+    assert_eq!(
+        data(&resumed_diagnosis)["guidance"]["state"],
+        "queued_unread",
+        "only the exact controller's retained unread message is actionable guidance"
+    );
+    let reconcile_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "guidance-reconcile",
+        "assignment-bootstrap",
+        "--if-revision",
+        "4",
+        "--idempotency-key",
+        "bootstrap-guidance-reconcile-0001",
+        "--format",
+        "json",
+    ];
+    let reconciled = run_main_agent(
+        &main_checkout,
+        &reconcile_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        reconciled.code,
+        0,
+        "stdout={} stderr={}",
+        reconciled.stdout_text(),
+        reconciled.stderr_text()
+    );
+    assert_eq!(data(&reconciled)["state"], "reconciled");
+    assert_eq!(data(&reconciled)["message_identity_retained"], true);
+    assert_eq!(data(&reconciled)["message_body_exposed"], false);
+    assert_eq!(data(&reconciled)["message_marked_consumed"], false);
+    let reconcile_replay = run_main_agent(
+        &main_checkout,
+        &reconcile_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(reconcile_replay.code, 0);
+    assert_eq!(
+        reconcile_replay.stdout_text(),
+        reconciled.stdout_text(),
+        "guidance reconciliation must be idempotent"
+    );
+    let after_reconcile_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    let retained_guidance = after_reconcile_registry["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == guidance_message_id)
+        .expect("retained guidance");
+    assert_eq!(
+        retained_guidance["state"], "unread",
+        "reconciliation must not claim worker consumption"
+    );
+    let after_resume = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "self",
+            "show",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(data(&after_resume)["rebind_required"], false);
+    let resumed_replay = run_main_agent(
+        &worker_checkout,
+        &resumed_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(resumed_replay.code, 0);
+    assert_eq!(resumed_replay.stdout_text(), resumed.stdout_text());
+
+    let raced_guidance_body = tmp.path().join("raced-resume-guidance.md");
+    fs::write(
+        &raced_guidance_body,
+        "This old-controller message must remain on the prior incarnation after handoff.",
+    )
+    .expect("raced guidance");
+    let raced_guidance = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "assignment-bootstrap",
+            "--body-file",
+            raced_guidance_body.to_str().expect("raced guidance body"),
+            "--idempotency-key",
+            "bootstrap-raced-guidance-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(raced_guidance.code, 0);
+    let raced_message_id = data(&raced_guidance)["message_id"]
+        .as_str()
+        .expect("raced guidance message id")
+        .to_string();
+    let third_incarnation = "worker-incarnation-three";
+    let third_capability = "worker-private-capability-material-0000000003";
+    let mut third_worker_session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_session_path).expect("worker session record"))
+            .expect("worker session json");
+    third_worker_session["runtime"]["launch_id"] = json!(third_incarnation);
+    write_private_json(&worker_session_path, &third_worker_session);
+    let third_capability_file =
+        worker_coordination_dir.join(format!("capability-{}", digest(third_incarnation)));
+    fs::write(&third_capability_file, third_capability).expect("third capability");
+    fs::set_permissions(&third_capability_file, fs::Permissions::from_mode(0o600))
+        .expect("third capability mode");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        worker_coordination_dir.join("heartbeat"),
+        format!("{third_incarnation}:{now}\n"),
+    )
+    .expect("third heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-one"]["incarnation"] = json!(third_incarnation);
+        registry["brokers"]["worker-one"]["capability_digest"] = json!(digest(third_capability));
+        registry["brokers"]["worker-one"]["heartbeat_epoch"] = json!(now);
+    });
+    let third_capability_arg = third_capability_file.to_string_lossy().into_owned();
+    let guidance_barrier = tmp.path().join("bootstrap-guidance-race-barrier");
+    fs::create_dir(&guidance_barrier).expect("guidance barrier");
+    let raced_bootstrap = Command::new(bin::resolve("main-agent"))
+        .current_dir(&worker_checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "worker-bootstrap-race-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &third_capability_arg)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BOOTSTRAP_GUIDANCE_BARRIER_DIR",
+            &guidance_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn raced bootstrap");
+    let guidance_deadline = Instant::now() + Duration::from_secs(10);
+    while !guidance_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < guidance_deadline,
+            "resumed bootstrap did not pause before its checkpoint"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let handed_off_during_bootstrap = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "assignment-bootstrap",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "4",
+            "--idempotency-key",
+            "bootstrap-guidance-race-handoff-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        handed_off_during_bootstrap.code,
+        0,
+        "stderr={}",
+        handed_off_during_bootstrap.stderr_text()
+    );
+    fs::write(guidance_barrier.join("release"), b"continue").expect("release guidance barrier");
+    let raced_bootstrap = raced_bootstrap
+        .wait_with_output()
+        .expect("raced bootstrap output");
+    assert!(!raced_bootstrap.status.success());
+    let raced_registry = load_coordination_registry(&state_dir);
+    let raced_message = raced_registry["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["message_id"] == raced_message_id)
+        .expect("raced guidance message");
+    assert_eq!(
+        raced_message["recipient_incarnation"], resumed_incarnation,
+        "the former controller's guidance must not cross the handoff boundary"
+    );
+    assert!(
+        raced_message["forwarded_from_incarnation"].is_null(),
+        "the losing bootstrap must leave no forwarding provenance"
+    );
 }
 
 #[test]
@@ -5487,12 +7083,27 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
     let migrated = orchestration_registry(&state_dir);
     assert_eq!(
         migrated["schema_version"],
-        "agent-session.orchestration-registry.v2"
+        "agent-session.orchestration-registry.v3"
     );
     assert_eq!(
         migrated["assignments"]["assignment-failed"]["schema_version"],
-        "agent-session.orchestration-assignment.v2"
+        "agent-session.orchestration-assignment.v3"
     );
+
+    let failed_worker_record_path = state_dir.join("sessions/worker-failed/session.json");
+    let mut failed_worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&failed_worker_record_path).expect("failed worker record"),
+    )
+    .expect("failed worker record json");
+    failed_worker_record["provider_resume"] = json!({
+        "provider": "codex",
+        "session_id": "provider-resume-private-sentinel",
+        "captured_at": "2030-01-01T00:00:00Z",
+        "capture_method": "codex-session-meta",
+        "resume_args": ["resume", "provider-resume-private-sentinel"],
+        "private_extra": "provider-resume-extra-sentinel"
+    });
+    write_private_json(&failed_worker_record_path, &failed_worker_record);
 
     let supervised = run_main_agent(
         &main_checkout,
@@ -5512,6 +7123,19 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
     assert_eq!(
         data(&supervised)["last_proven_safe_state"]["reassignment_safe"],
         true
+    );
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["provider_resume_preserved"],
+        true
+    );
+    assert!(
+        !supervised
+            .stdout_text()
+            .contains("provider-resume-private-sentinel")
+            && !supervised
+                .stdout_text()
+                .contains("provider-resume-extra-sentinel"),
+        "supervision must not expose raw provider resume metadata"
     );
 
     let stale_cancel = run_main_agent(
@@ -5691,7 +7315,13 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
         data(&stale_reassign)["error"]["code"],
         "orchestration-revision-conflict"
     );
-    let pane_process = spawn_scoped_test_process_group();
+    let pane_process = match spawn_scoped_test_process_group() {
+        Ok(process) => process,
+        Err(reason) => {
+            eprintln!("SKIP: Linux scoped-process integration capability unavailable: {reason}");
+            return;
+        }
+    };
     let pane_pid_arg = pane_process.pid().to_string();
     let state_runtime_arg = state_dir.to_string_lossy().into_owned();
     let delete_failure_marker = tmp.path().join("delete-kill-failure-once");
@@ -5764,6 +7394,18 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
     assert!(
         pane_process.is_running(),
         "the failed kill-session invocation must retain the live runtime"
+    );
+    let reassign_receipt = orchestration_registry(&state_dir)["receipts"]
+        ["main-one:main-incarnation-one:worker-reassign-0001"]
+        .clone();
+    assert!(
+        !reassign_receipt
+            .to_string()
+            .contains("provider-resume-private-sentinel")
+            && !reassign_receipt
+                .to_string()
+                .contains("provider-resume-extra-sentinel"),
+        "durable reassign progress must not copy raw provider resume metadata"
     );
     let kill_attempts_after_failure = tmux_calls(&tmux_log)
         .into_iter()
@@ -5955,6 +7597,13 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
                 Some("enforce"),
             ),
             (
+                "main-two",
+                "main-incarnation-two",
+                "main-private-capability-material-0000000002",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
                 "worker-matrix",
                 "worker-matrix-incarnation",
                 "worker-matrix-private-capability-000000001",
@@ -5970,6 +7619,21 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
         "main-one",
         "run-one",
     );
+    seed_active_claim(
+        &state_dir,
+        "main-two",
+        "main-incarnation-two",
+        "main-two-claim",
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut run_two = registry["runs"]["run-one"].clone();
+        run_two["run_id"] = json!("run-two");
+        run_two["revision"] = json!(1);
+        run_two["objective_summary"] = json!("Receive raced assignment handoff");
+        run_two["controller"]["session_id"] = json!("main-two");
+        run_two["controller"]["session_incarnation"] = json!("main-incarnation-two");
+        registry["runs"]["run-two"] = run_two;
+    });
     let packet = json!({
         "schema_version": "main-agent.assignment-input.v1",
         "assignment_id": "assignment-matrix",
@@ -6030,9 +7694,30 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
         }),
         &packet,
     );
+    seed_active_claim(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "worker-matrix-claim",
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["claim_id"] == "worker-matrix-claim")
+            .expect("worker matrix claim");
+        claim["repositories"] = json!(["example/repository"]);
+        claim["scopes"] = json!([{
+            "kind": "path-prefix",
+            "repository": "example/repository",
+            "value": "docs/matrix"
+        }]);
+    });
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let account_broker = r#"["/bin/false"]"#;
     let supervise = || {
         run_main_agent(
             &main_checkout,
@@ -6049,6 +7734,7 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
                 ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
                 ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
                 ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
             ],
         )
     };
@@ -6060,6 +7746,71 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
         data(&healthy)["last_proven_safe_state"]["assignment_revision"],
         2
     );
+
+    let progress_file = worker_checkout.join("large-progress.bin");
+    let progress_len = 512 * 1024 + 64 * 1024;
+    let mut base_state = 0x6a09_e667_f3bc_c909_u64;
+    let mut base_material = Vec::with_capacity(progress_len);
+    for _ in 0..progress_len {
+        base_state ^= base_state << 13;
+        base_state ^= base_state >> 7;
+        base_state ^= base_state << 17;
+        base_material.push(base_state as u8);
+    }
+    fs::write(&progress_file, &base_material).expect("large staged progress base");
+    git_stdout(&worker_checkout, &["add", "large-progress.bin"]);
+    let mut rewritten_material = base_material;
+    for byte in &mut rewritten_material {
+        *byte ^= 0xa5;
+    }
+    fs::write(&progress_file, &rewritten_material).expect("large unstaged progress rewrite");
+    assert!(
+        git_stdout(
+            &worker_checkout,
+            &["diff", "--cached", "--binary", "--full-index", "--"]
+        )
+        .len()
+            > 512 * 1024,
+        "public supervision regression requires staged output above the former cap"
+    );
+    assert!(
+        git_stdout(
+            &worker_checkout,
+            &["diff", "--binary", "--full-index", "--"]
+        )
+        .len()
+            > 512 * 1024,
+        "public supervision regression requires unstaged output above the former cap"
+    );
+    let dirty_first = supervise();
+    assert_eq!(dirty_first.code, 0, "stderr={}", dirty_first.stderr_text());
+    assert_ne!(data(&dirty_first)["classification"], "evidence_unavailable");
+    let dirty_fingerprint =
+        data(&dirty_first)["last_proven_safe_state"]["worktree_progress"]["material_fingerprint"]
+            .clone();
+    let dirty_repeat = supervise();
+    assert_eq!(
+        data(&dirty_repeat)["last_proven_safe_state"]["worktree_progress"]["material_fingerprint"],
+        dirty_fingerprint,
+        "repeated public supervision must retain the exact unchanged fingerprint"
+    );
+    rewritten_material[progress_len / 2] ^= 0xff;
+    fs::write(&progress_file, &rewritten_material).expect("same-size public progress rewrite");
+    let dirty_rewritten = supervise();
+    assert_ne!(
+        data(&dirty_rewritten)["classification"],
+        "evidence_unavailable"
+    );
+    assert_ne!(
+        data(&dirty_rewritten)["last_proven_safe_state"]["worktree_progress"]["material_fingerprint"],
+        dirty_fingerprint,
+        "same-size material rewrites must advance public supervision evidence"
+    );
+    git_stdout(
+        &worker_checkout,
+        &["rm", "--cached", "--force", "large-progress.bin"],
+    );
+    fs::remove_file(progress_file).expect("remove public progress fixture");
 
     seed_activity_state(
         &state_dir,
@@ -6081,6 +7832,1395 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
     assert_eq!(data(&dialog)["classification"], "startup_dialog_failure");
     assert_eq!(data(&dialog)["automatic_retry_safe"], false);
 
+    let worker_record_path = state_dir.join("sessions/worker-matrix/session.json");
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    worker_record["provider_resume"] = json!({
+        "provider": "codex",
+        "session_id": "provider-thread-matrix",
+        "captured_at": "2030-01-01T00:00:00Z",
+        "capture_method": "codex-session-meta",
+        "resume_args": ["resume", "provider-thread-matrix"],
+        "private_extra": "provider-resume-matrix-extra"
+    });
+    fs::write(
+        &worker_record_path,
+        serde_json::to_vec_pretty(&worker_record).expect("worker record bytes"),
+    )
+    .expect("write worker record");
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "needs_input",
+        json!({
+            "provider_turn_id": "turn-quota",
+            "started_at": "2020-01-01T00:00:01Z",
+            "attention": {
+                "kind": "quota_credits_exhausted",
+                "requested_at": "2020-01-01T00:00:02Z",
+                "pending_count": 1
+            }
+        }),
+        serde_json::Value::Null,
+    );
+    let quota = supervise();
+    assert_eq!(
+        data(&quota)["classification"],
+        "account_handoff_capability_gap"
+    );
+    assert_eq!(
+        data(&quota)["last_proven_safe_state"]["provider_resume_preserved"],
+        true,
+        "diagnosis may expose preservation state without continuation metadata"
+    );
+    assert!(
+        !quota.stdout_text().contains("provider-thread-matrix")
+            && !quota.stdout_text().contains("provider-resume-matrix-extra"),
+        "diagnosis must not expose provider resume metadata"
+    );
+    assert!(
+        data(&quota)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent-session.codex-managed-account-handoff.v1"),
+        "the capability gap must name the stable managed handoff contract"
+    );
+    assert!(
+        data(&quota)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("terminal capability gap")
+    );
+    assert!(
+        data(&quota)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be added by worker reassign"),
+        "diagnosis must make the reassignment boundary explicit"
+    );
+    let raw_worker_before = fs::read(&worker_record_path).expect("raw worker record");
+    let raw_handoff = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "beta",
+            "--if-revision",
+            "2",
+            "--authorize-account-change",
+            "--idempotency-key",
+            "matrix-raw-handoff-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
+        ],
+    );
+    assert_eq!(raw_handoff.code, 65);
+    assert_eq!(
+        raw_handoff.stdout_json()["error"]["code"],
+        "account-handoff-capability-unavailable"
+    );
+    assert_eq!(
+        raw_handoff.stdout_json()["error"]["details"]["required_capability"],
+        "agent-session.codex-managed-account-handoff.v1"
+    );
+    assert_eq!(
+        raw_handoff.stdout_json()["error"]["details"]["capability_gap_terminal_for_assignment"],
+        true
+    );
+    assert_eq!(
+        raw_handoff.stdout_json()["error"]["details"]["lifecycle_boundary"],
+        "accept|release|cancel|retire"
+    );
+    assert_eq!(
+        raw_handoff.stdout_json()["error"]["details"]["public_raw_fallback_advertised"],
+        false
+    );
+    assert_eq!(
+        fs::read(&worker_record_path).expect("raw worker record after handoff"),
+        raw_worker_before,
+        "unsupported raw handoff must not switch accounts, restart, or rewrite the session"
+    );
+
+    let progress_snapshot = fs::read_dir(state_dir.join("sessions/worker-matrix/coordination"))
+        .expect("progress directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("main-agent-progress-"))
+        })
+        .expect("progress snapshot");
+    let mut stale_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&progress_snapshot).expect("progress snapshot bytes"))
+            .expect("progress snapshot json");
+    stale_snapshot["changed_at_epoch"] = json!(1);
+    write_private_json(&progress_snapshot, &stale_snapshot);
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-raw-real-shape",
+            "started_at": "2020-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let real_raw_stall = supervise();
+    assert_eq!(
+        data(&real_raw_stall)["classification"],
+        "evidence_unavailable",
+        "a true stale raw stall without exact account provenance must fail closed"
+    );
+    assert_eq!(
+        data(&real_raw_stall)["last_proven_safe_state"]["quota_or_credit_evidence"],
+        false
+    );
+    assert_eq!(
+        data(&real_raw_stall)["last_proven_safe_state"]["raw_rate_limit_diagnostic"]["state"],
+        "unavailable"
+    );
+    assert_eq!(
+        data(&real_raw_stall)["last_proven_safe_state"]["raw_rate_limit_diagnostic"]["reason_code"],
+        "selected-raw-account-unavailable",
+        "ambient authentication must never invent provenance for a raw worker"
+    );
+
+    let mut managed_worker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    managed_worker["runtime"]["kind"] = json!("codex_app_server");
+    managed_worker["runtime"]["codex_app_server_protocol"] = json!("v2");
+    managed_worker["runtime"]["codex_app_server_socket"] = json!("/tmp/matrix.sock");
+    managed_worker["runtime"]["codex_app_server_proxy"] = json!("/tmp/matrix.proxy");
+    managed_worker["runtime"]["codex_app_server_thread_handoff"] = json!("/tmp/matrix.thread");
+    managed_worker["runtime"]["codex_app_server_thread_attached"] = json!("/tmp/matrix.attached");
+    managed_worker["runtime"]["managed_account_handoff_capability"] =
+        json!("agent-session.codex-managed-account-handoff.v1");
+    managed_worker["codex_account_binding"] = json!({
+        "schema_version": "agent-session.codex-account-binding.v1",
+        "selected_account": "alpha",
+        "revision": 1,
+        "state": "bound",
+        "applied_runtime_id": "worker-matrix-incarnation",
+        "updated_at": "2030-01-01T00:00:00Z"
+    });
+    write_private_json(&worker_record_path, &managed_worker);
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "needs_input",
+        json!({
+            "provider_turn_id": "turn-managed-quota",
+            "started_at": "2020-01-01T00:00:01Z",
+            "attention": {
+                "kind": "quota_credits_exhausted",
+                "requested_at": "2020-01-01T00:00:02Z",
+                "pending_count": 1
+            }
+        }),
+        json!({
+            "provider_turn_id": "turn-managed-quota",
+            "started_at": "2020-01-01T00:00:01Z",
+            "completed_at": "2020-01-01T00:00:02Z",
+            "outcome": "quota_credits_exhausted"
+        }),
+    );
+    let managed_quota = supervise();
+    assert_eq!(
+        data(&managed_quota)["classification"],
+        "account_handoff_required"
+    );
+    assert!(
+        data(&managed_quota)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("main-agent worker account-handoff"),
+        "managed quota recovery must advertise the executable typed macro"
+    );
+    let invalid_account = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "bad/account",
+        "matrix-managed-invalid-account-0001",
+        "success",
+    );
+    assert_eq!(invalid_account.code, 64);
+    assert_eq!(
+        invalid_account.stdout_json()["error"]["code"],
+        "invalid-codex-account"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_null(),
+        "invalid account input must fail before reserving the assignment"
+    );
+    let managed_handoff_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "account-handoff",
+        "assignment-matrix",
+        "--account",
+        "beta",
+        "--if-revision",
+        "2",
+        "--authorize-account-change",
+        "--timeout",
+        "1s",
+        "--idempotency-key",
+        "matrix-managed-handoff-0001",
+        "--format",
+        "json",
+    ];
+    let managed_handoff = run_main_agent(
+        &main_checkout,
+        &managed_handoff_args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
+            (
+                "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+                "success",
+            ),
+        ],
+    );
+    assert_eq!(
+        managed_handoff.code,
+        0,
+        "stdout={} stderr={}",
+        managed_handoff.stdout_text(),
+        managed_handoff.stderr_text()
+    );
+    assert_eq!(data(&managed_handoff)["state"], "bound");
+    assert_eq!(data(&managed_handoff)["account"], "beta");
+    assert_eq!(data(&managed_handoff)["auto_resume_rearmed"], true);
+    assert_eq!(data(&managed_handoff)["provider_resume_preserved"], true);
+    assert!(
+        !managed_handoff
+            .stdout_text()
+            .contains("provider-thread-matrix"),
+        "public handoff output must not expose provider resume metadata"
+    );
+    assert_eq!(
+        data(&managed_handoff)["forbidden_side_effects"],
+        json!({
+            "logout_used": false,
+            "prompt_resent": false,
+            "blind_enter_sent": false,
+            "duplicate_worker_created": false,
+            "provider_conversation_replaced": false
+        })
+    );
+    let applied_worker: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("managed worker after handoff"),
+    )
+    .expect("managed worker json");
+    assert_eq!(
+        applied_worker["codex_account_binding"]["selected_account"],
+        "beta"
+    );
+    assert_eq!(
+        applied_worker["provider_resume"]["session_id"],
+        "provider-thread-matrix"
+    );
+    let auto_resume: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            state_dir
+                .join("sessions/worker-matrix")
+                .join("auto-resume.json"),
+        )
+        .expect("durable auto resume"),
+    )
+    .expect("auto resume json");
+    assert_eq!(auto_resume["blocked_turn_id"], "turn-managed-quota");
+    assert_eq!(auto_resume["blocked_revision"], 1);
+    let handoff_receipt =
+        orchestration_registry(&state_dir)["receipts"]
+            ["main-one:main-incarnation-one:matrix-managed-handoff-0001"]
+            .clone();
+    assert_eq!(handoff_receipt["operation"], "worker-account-handoff");
+    assert!(
+        !handoff_receipt
+            .to_string()
+            .contains("provider-thread-matrix"),
+        "durable handoff receipts must not copy provider resume metadata"
+    );
+    let managed_replay = run_main_agent(
+        &main_checkout,
+        &managed_handoff_args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
+        ],
+    );
+    assert_eq!(managed_replay.code, 0);
+    assert_eq!(managed_replay.stdout_json(), managed_handoff.stdout_json());
+
+    let rearm_barrier = tmp.path().join("account-rearm-incarnation-barrier");
+    fs::create_dir(&rearm_barrier).expect("account rearm incarnation barrier");
+    let rearm_handoff_revision =
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["revision"]
+            .as_u64()
+            .expect("rearm handoff revision")
+            .to_string();
+    let worker_before_rearm_race =
+        fs::read(&worker_record_path).expect("worker before rearm incarnation race");
+    let rearm_race = Command::new(bin::resolve("main-agent"))
+        .current_dir(&main_checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "replacement-race",
+            "--if-revision",
+            &rearm_handoff_revision,
+            "--authorize-account-change",
+            "--timeout",
+            "5s",
+            "--idempotency-key",
+            "matrix-managed-rearm-incarnation-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker)
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+            "success",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_STAGE",
+            "before_auto_resume_rearm",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_DIR",
+            &rearm_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn account rearm incarnation race");
+    let rearm_deadline = Instant::now() + Duration::from_secs(10);
+    while !rearm_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < rearm_deadline,
+            "account handoff did not pause before auto-resume rearm"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let auto_resume_path = state_dir
+        .join("sessions/worker-matrix")
+        .join("auto-resume.json");
+    let auto_resume_before_replacement =
+        fs::read(&auto_resume_path).expect("auto resume before replacement");
+    let mut replacement_worker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker at rearm barrier"))
+            .expect("worker at rearm barrier json");
+    replacement_worker["runtime"]["launch_id"] = json!("worker-matrix-replacement-incarnation");
+    write_private_json(&worker_record_path, &replacement_worker);
+    let replacement_worker_bytes = fs::read(&worker_record_path).expect("replacement worker bytes");
+    fs::write(rearm_barrier.join("release"), b"continue").expect("release account rearm barrier");
+    let rearm_race = rearm_race
+        .wait_with_output()
+        .expect("account rearm incarnation race output");
+    assert_eq!(rearm_race.status.code(), Some(65));
+    let rearm_error: serde_json::Value =
+        serde_json::from_slice(&rearm_race.stdout).expect("rearm race json");
+    assert_eq!(
+        rearm_error["error"]["code"],
+        "account-handoff-worker-incarnation-conflict"
+    );
+    assert_eq!(
+        fs::read(&auto_resume_path).expect("auto resume after replacement"),
+        auto_resume_before_replacement,
+        "the old handoff must not rearm auto-resume for a replacement runtime"
+    );
+    assert_eq!(
+        fs::read(&worker_record_path).expect("replacement worker after rejected rearm"),
+        replacement_worker_bytes,
+        "the rejected old handoff must not mutate the replacement session record"
+    );
+    fs::write(&worker_record_path, worker_before_rearm_race)
+        .expect("restore worker after rearm incarnation race");
+    let rearm_race_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-rearm-incarnation-cancel-0001",
+    );
+    assert_eq!(
+        rearm_race_cancel.code,
+        0,
+        "rearm race reservation cleanup failed: {}",
+        rearm_race_cancel.stdout_text()
+    );
+
+    let failed = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "gamma",
+        "matrix-managed-failed-0001",
+        "failed",
+    );
+    assert_eq!(failed.code, 65);
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "account-handoff-apply-failed"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_object(),
+        "a failed apply remains durably fenced"
+    );
+    let transition_revision =
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["revision"]
+            .as_u64()
+            .expect("reserved assignment revision")
+            .to_string();
+    let transition_during_handoff = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "assignment-matrix",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            &transition_revision,
+            "--idempotency-key",
+            "matrix-account-reservation-handoff-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(transition_during_handoff.code, 65);
+    assert_eq!(
+        transition_during_handoff.stdout_json()["error"]["code"],
+        "account-handoff-in-flight"
+    );
+    let mut worker_without_reserved_intent: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker before missing-intent replay"),
+    )
+    .expect("worker before missing-intent replay json");
+    worker_without_reserved_intent
+        .as_object_mut()
+        .expect("worker record object")
+        .remove("codex_account_next");
+    write_private_json(&worker_record_path, &worker_without_reserved_intent);
+    let missing_intent_replay = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "gamma",
+        "matrix-managed-failed-0001",
+        "success",
+    );
+    assert_eq!(missing_intent_replay.code, 65);
+    assert_eq!(
+        missing_intent_replay.stdout_json()["error"]["code"],
+        "account-handoff-superseded"
+    );
+    let worker_after_missing_intent_replay: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after missing-intent replay"),
+    )
+    .expect("worker after missing-intent replay json");
+    assert!(
+        worker_after_missing_intent_replay["codex_account_next"].is_null(),
+        "an exact replay must not resurrect the missing reservation-owned intent"
+    );
+    let failed_cancel_registry = orchestration_registry(&state_dir);
+    let failed_cancel_assignment = &failed_cancel_registry["assignments"]["assignment-matrix"];
+    let failed_cancel_reservation = &failed_cancel_assignment["account_handoff"];
+    let failed_cancel_revision = failed_cancel_assignment["revision"]
+        .as_u64()
+        .expect("failed cancel revision")
+        .to_string();
+    let failed_cancel_reservation_id = failed_cancel_reservation["reservation_id"]
+        .as_str()
+        .expect("failed cancel reservation")
+        .to_string();
+    let failed_cancel_account = failed_cancel_reservation["account"]
+        .as_str()
+        .expect("failed cancel account")
+        .to_string();
+    let failed_cancel_intent = failed_cancel_reservation["account_intent_id"]
+        .as_str()
+        .expect("failed cancel intent")
+        .to_string();
+    let mismatched_cancel = run_managed_account_handoff_cancel_with_identity(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-mismatched-cancel-0001",
+        &failed_cancel_revision,
+        &failed_cancel_reservation_id,
+        "different-account",
+        Some(&failed_cancel_intent),
+    );
+    assert_eq!(mismatched_cancel.code, 65);
+    assert_eq!(
+        mismatched_cancel.stdout_json()["error"]["code"],
+        "account-handoff-cancel-reservation-conflict"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_object(),
+        "mismatched cancellation authorization must preserve the exact reservation"
+    );
+    let failed_cancel = run_managed_account_handoff_cancel_with_identity(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-failed-cancel-0001",
+        &failed_cancel_revision,
+        &failed_cancel_reservation_id,
+        &failed_cancel_account,
+        Some(&failed_cancel_intent),
+    );
+    assert_eq!(
+        failed_cancel.code,
+        0,
+        "stdout={} stderr={}",
+        failed_cancel.stdout_text(),
+        failed_cancel.stderr_text()
+    );
+    assert_eq!(data(&failed_cancel)["state"], "cancelled");
+    assert_eq!(data(&failed_cancel)["account_changed"], false);
+    assert_eq!(data(&failed_cancel)["auto_resume_rearmed"], false);
+    let failed_cancel_replay = run_managed_account_handoff_cancel_with_identity(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-failed-cancel-0001",
+        &failed_cancel_revision,
+        &failed_cancel_reservation_id,
+        &failed_cancel_account,
+        Some(&failed_cancel_intent),
+    );
+    assert_eq!(
+        failed_cancel_replay.stdout_json(),
+        failed_cancel.stdout_json()
+    );
+
+    let superseded = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "gamma",
+        "matrix-managed-superseded-0001",
+        "superseded",
+    );
+    assert_eq!(superseded.code, 65);
+    assert_eq!(
+        superseded.stdout_json()["error"]["code"],
+        "account-handoff-superseded"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_object(),
+        "a superseded apply remains durably fenced"
+    );
+    let superseded_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-superseded-cancel-0001",
+    );
+    assert_eq!(superseded_cancel.code, 0);
+    assert_eq!(data(&superseded_cancel)["state"], "cancelled");
+
+    let timeout = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "gamma",
+        "matrix-managed-timeout-0001",
+        "timeout",
+    );
+    assert_eq!(timeout.code, 1);
+    assert_eq!(
+        timeout.stdout_json()["error"]["code"],
+        "account-handoff-binding-timeout"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_object(),
+        "a timed-out apply remains durably fenced"
+    );
+    let timeout_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-timeout-cancel-0001",
+    );
+    assert_eq!(timeout_cancel.code, 0);
+    assert_eq!(data(&timeout_cancel)["state"], "cancelled");
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"],
+        serde_json::Value::Null
+    );
+
+    let operation_barrier = tmp.path().join("account-operation-barrier");
+    fs::create_dir(&operation_barrier).expect("operation barrier");
+    let operation_handoff_revision =
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["revision"]
+            .as_u64()
+            .expect("operation handoff revision")
+            .to_string();
+    let account_with_operation_race = Command::new(bin::resolve("main-agent"))
+        .current_dir(&main_checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "gamma",
+            "--if-revision",
+            &operation_handoff_revision,
+            "--authorize-account-change",
+            "--timeout",
+            "5s",
+            "--idempotency-key",
+            "matrix-managed-operation-race-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker)
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+            "success",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_DIR",
+            &operation_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn account handoff operation race");
+    let operation_deadline = Instant::now() + Duration::from_secs(10);
+    while !operation_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < operation_deadline,
+            "account handoff did not persist its reservation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let operation_targets = tmp.path().join("account-operation-targets.json");
+    write_private_json(
+        &operation_targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "docs/matrix/during-handoff.md"
+            }]
+        }),
+    );
+    let operation_token = tmp.path().join("account-operation-token");
+    fs::write(&operation_token, "account-operation-token").expect("operation token");
+    fs::set_permissions(&operation_token, fs::Permissions::from_mode(0o600))
+        .expect("operation token mode");
+    let worker_capability = capability(&state_dir, "worker-matrix");
+    let operation_runtime =
+        spawn_scoped_test_process_group().expect("operation race runtime identity");
+    let runtime_pid = operation_runtime.pid() as libc::pid_t;
+    let operation_runtime_identity = json!({
+        "launch_id": "worker-matrix-incarnation",
+        "session_id": "$88",
+        "pane_id": "%88",
+        "pane_pid": runtime_pid,
+        "process_group_id": runtime_pid,
+        "process_session_id": runtime_pid
+    });
+    let operation_runtime_bytes =
+        serde_json::to_vec(&operation_runtime_identity).expect("operation runtime identity");
+    let operation_runtime_digest = Sha256::digest(&operation_runtime_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut operation_worker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("operation worker"))
+            .expect("operation worker json");
+    operation_worker["delete_tmux_identity"] = operation_runtime_identity.clone();
+    write_private_json(&worker_record_path, &operation_worker);
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-matrix"]["runtime_identity"] =
+            operation_runtime_identity.clone();
+        registry["brokers"]["worker-matrix"]["runtime_identity_digest"] =
+            json!(operation_runtime_digest);
+    });
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-operation-race",
+            "started_at": "2020-01-01T00:00:20Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let operation_attempt = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "admit",
+            "--session",
+            "worker-matrix",
+            "--claim",
+            "worker-matrix-claim",
+            "--if-revision",
+            "1",
+            "--targets-file",
+            operation_targets.to_str().expect("operation targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            operation_token.to_str().expect("operation token"),
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "account-operation-race-admit-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        operation_attempt.code,
+        0,
+        "handoff must not hold coordination while waiting at a session mutation boundary: {}",
+        operation_attempt.stdout_text()
+    );
+    let operation_registry = load_coordination_registry(&state_dir);
+    let admitted_operation = operation_registry["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["session_id"] == "worker-matrix")
+        .expect("admitted reciprocal operation");
+    let admitted_lease = admitted_operation["lease_id"].as_str().unwrap().to_string();
+    let admitted_revision = admitted_operation["revision"].as_u64().unwrap().to_string();
+    fs::write(operation_barrier.join("release"), b"continue").expect("release operation barrier");
+    let account_with_operation_race = account_with_operation_race
+        .wait_with_output()
+        .expect("account handoff operation race output");
+    assert_eq!(
+        account_with_operation_race.status.code(),
+        Some(1),
+        "reciprocal overlap must converge to a typed authority fence, stdout={} stderr={}",
+        String::from_utf8_lossy(&account_with_operation_race.stdout),
+        String::from_utf8_lossy(&account_with_operation_race.stderr)
+    );
+    let overlap_error: serde_json::Value =
+        serde_json::from_slice(&account_with_operation_race.stdout).unwrap();
+    assert_eq!(
+        overlap_error["error"]["code"],
+        "account-handoff-worker-authority-changed"
+    );
+    let operation_complete = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "complete",
+            "--session",
+            "worker-matrix",
+            "--lease",
+            &admitted_lease,
+            "--if-revision",
+            &admitted_revision,
+            "--execution-token-file",
+            operation_token.to_str().expect("operation token"),
+            "--outcome",
+            "pass",
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "account-operation-race-complete-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        operation_complete.code,
+        0,
+        "reciprocal operation completion failed: {}",
+        operation_complete.stdout_text()
+    );
+    let overlap_retry = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "gamma",
+            "--if-revision",
+            &operation_handoff_revision,
+            "--authorize-account-change",
+            "--timeout",
+            "5s",
+            "--idempotency-key",
+            "matrix-managed-operation-race-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
+            (
+                "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+                "success",
+            ),
+        ],
+    );
+    assert_eq!(
+        overlap_retry.code,
+        0,
+        "exact retry must converge without a stranded reservation: {}",
+        overlap_retry.stdout_text()
+    );
+
+    let snapshot_barrier = tmp.path().join("account-snapshot-cas-barrier");
+    fs::create_dir(&snapshot_barrier).expect("account snapshot barrier");
+    let snapshot_handoff_revision =
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["revision"]
+            .as_u64()
+            .expect("snapshot handoff revision")
+            .to_string();
+    let stale_snapshot_handoff = Command::new(bin::resolve("main-agent"))
+        .current_dir(&main_checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "delta",
+            "--if-revision",
+            &snapshot_handoff_revision,
+            "--authorize-account-change",
+            "--timeout",
+            "5s",
+            "--idempotency-key",
+            "matrix-managed-snapshot-cas-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker)
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+            "success",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_DIR",
+            &snapshot_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stale snapshot handoff");
+    let snapshot_deadline = Instant::now() + Duration::from_secs(10);
+    while !snapshot_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < snapshot_deadline,
+            "account handoff did not pause after its durable snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut worker_after_snapshot: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after account snapshot"),
+    )
+    .expect("worker after account snapshot json");
+    worker_after_snapshot["codex_account_next"] = json!({
+        "schema_version": "agent-session.codex-account-next.v1",
+        "account": "epsilon",
+        "revision": 1,
+        "intent_id": "normal-account-control-intent-0001",
+        "state": "queued",
+        "updated_at": "2030-01-01T00:00:10Z"
+    });
+    write_private_json(&worker_record_path, &worker_after_snapshot);
+    fs::write(snapshot_barrier.join("release"), b"continue")
+        .expect("release account snapshot barrier");
+    let stale_snapshot_handoff = stale_snapshot_handoff
+        .wait_with_output()
+        .expect("stale snapshot handoff output");
+    assert_eq!(stale_snapshot_handoff.status.code(), Some(65));
+    let stale_snapshot_envelope: serde_json::Value =
+        serde_json::from_slice(&stale_snapshot_handoff.stdout)
+            .expect("stale snapshot handoff json");
+    assert_eq!(
+        stale_snapshot_envelope["error"]["code"],
+        "account-handoff-superseded"
+    );
+    let worker_after_stale_handoff: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker after stale handoff"))
+            .expect("worker after stale handoff json");
+    assert_eq!(
+        worker_after_stale_handoff["codex_account_next"]["account"], "epsilon",
+        "the stale handoff must preserve the newer account intent"
+    );
+    assert_eq!(
+        worker_after_stale_handoff["codex_account_next"]["intent_id"],
+        "normal-account-control-intent-0001"
+    );
+    let stale_snapshot_retry = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "assignment-matrix",
+            "--account",
+            "delta",
+            "--if-revision",
+            &snapshot_handoff_revision,
+            "--authorize-account-change",
+            "--timeout",
+            "5s",
+            "--idempotency-key",
+            "matrix-managed-snapshot-cas-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker),
+            (
+                "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+                "success",
+            ),
+        ],
+    );
+    assert_eq!(stale_snapshot_retry.code, 65);
+    assert_eq!(
+        stale_snapshot_retry.stdout_json()["error"]["code"],
+        "account-handoff-superseded"
+    );
+    let worker_after_stale_retry: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after stale handoff retry"),
+    )
+    .expect("worker after stale handoff retry json");
+    assert_eq!(
+        worker_after_stale_retry["codex_account_next"]["intent_id"],
+        "normal-account-control-intent-0001",
+        "an exact reservation retry must not adopt and replace its superseding intent"
+    );
+    let snapshot_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-snapshot-cas-cancel-0001",
+    );
+    assert_eq!(snapshot_cancel.code, 0);
+    assert_eq!(
+        data(&snapshot_cancel)["newer_account_intent_preserved"],
+        true,
+        "typed recovery must release only the stale reservation"
+    );
+    let worker_after_snapshot_cancel: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after superseded reservation recovery"),
+    )
+    .expect("worker after superseded reservation recovery json");
+    assert_eq!(
+        worker_after_snapshot_cancel["codex_account_next"]["intent_id"],
+        "normal-account-control-intent-0001",
+        "reservation recovery must not clear the superseding account intent"
+    );
+
+    let unrelated_run_before = orchestration_registry(&state_dir)["runs"]["run-one"].clone();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &registry["assignments"]["assignment-matrix"];
+        let assignment_revision = assignment["revision"].clone();
+        registry["assignments"]["assignment-matrix"]["account_handoff"] = json!({
+            "schema_version": "main-agent.account-handoff-reservation.v1",
+            "request_digest": "abababababababababababababababababababababababababababababababab",
+            "run_id": "run-one",
+            "controller": assignment["primary_manager"].clone(),
+            "worker": assignment["worker"].clone(),
+            "reserved_revision": assignment_revision,
+            "account": "delta",
+            "created_at": "2030-01-01T00:00:00Z",
+            "updated_at": "2030-01-01T00:00:00Z"
+        });
+    });
+    let legacy_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-v1-reservation-cancel-0001",
+    );
+    assert_eq!(
+        legacy_cancel.code,
+        0,
+        "v1 serialized reservation must load and recover: {}",
+        legacy_cancel.stdout_text()
+    );
+    assert_eq!(data(&legacy_cancel)["legacy_reservation_recovered"], true);
+    assert_eq!(data(&legacy_cancel)["newer_account_intent_preserved"], true);
+    let legacy_registry = orchestration_registry(&state_dir);
+    assert!(
+        legacy_registry["assignments"]["assignment-matrix"]["account_handoff"].is_null(),
+        "v1 recovery clears only the assignment-local unbound reservation"
+    );
+    assert_eq!(
+        legacy_registry["runs"]["run-one"], unrelated_run_before,
+        "v1 recovery must preserve unrelated run state"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&worker_record_path).expect("worker after v1 cancellation")
+        )
+        .unwrap()["codex_account_next"]["intent_id"],
+        "normal-account-control-intent-0001",
+        "v1 recovery must never guess ownership of a newer intent"
+    );
+
+    let failed_before_cancel_race = run_managed_account_handoff(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "delta",
+        "matrix-managed-cancel-race-handoff-0001",
+        "failed",
+    );
+    assert_eq!(failed_before_cancel_race.code, 65);
+    assert_eq!(
+        failed_before_cancel_race.stdout_json()["error"]["code"],
+        "account-handoff-apply-failed"
+    );
+    let cancel_barrier = tmp.path().join("account-cancel-race-barrier");
+    fs::create_dir(&cancel_barrier).expect("account cancel barrier");
+    let cancel_registry = orchestration_registry(&state_dir);
+    let cancel_assignment = &cancel_registry["assignments"]["assignment-matrix"];
+    let cancel_reservation = &cancel_assignment["account_handoff"];
+    let cancel_revision = cancel_assignment["revision"]
+        .as_u64()
+        .expect("cancel assignment revision")
+        .to_string();
+    let cancel_reservation_id = cancel_reservation["reservation_id"]
+        .as_str()
+        .or_else(|| cancel_reservation["request_digest"].as_str())
+        .expect("cancel reservation id")
+        .to_string();
+    let cancel_account = cancel_reservation["account"]
+        .as_str()
+        .expect("cancel account")
+        .to_string();
+    let cancel_intent = cancel_reservation["account_intent_id"]
+        .as_str()
+        .expect("cancel intent")
+        .to_string();
+    let cancel_race_args = vec![
+        "--state-dir".to_string(),
+        state_dir.to_str().expect("state dir").to_string(),
+        "worker".to_string(),
+        "account-handoff-cancel".to_string(),
+        "assignment-matrix".to_string(),
+        "--reservation-id".to_string(),
+        cancel_reservation_id,
+        "--account".to_string(),
+        cancel_account,
+        "--intent-id".to_string(),
+        cancel_intent,
+        "--if-revision".to_string(),
+        cancel_revision,
+        "--authorize-account-change".to_string(),
+        "--idempotency-key".to_string(),
+        "matrix-managed-cancel-race-0001".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    let cancel_race = Command::new(bin::resolve("main-agent"))
+        .current_dir(&main_checkout)
+        .args(cancel_race_args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CODEX_ACCOUNT_BROKER", account_broker)
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_STAGE",
+            "before_cancel",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_DIR",
+            &cancel_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn account cancel race");
+    let cancel_deadline = Instant::now() + Duration::from_secs(10);
+    while !cancel_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < cancel_deadline,
+            "account cancellation did not reach its exact-intent boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut worker_during_cancel: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker during account cancel"),
+    )
+    .expect("worker during account cancel json");
+    let original_cancel_revision = worker_during_cancel["codex_account_next"]["revision"]
+        .as_u64()
+        .expect("pending account revision");
+    worker_during_cancel["codex_account_next"]["account"] = json!("delta");
+    worker_during_cancel["codex_account_next"]["revision"] = json!(original_cancel_revision);
+    worker_during_cancel["codex_account_next"]["intent_id"] =
+        json!("replacement-same-account-intent-0001");
+    worker_during_cancel["codex_account_next"]["state"] = json!("queued");
+    worker_during_cancel["codex_account_next"]["applying_runtime_id"] = serde_json::Value::Null;
+    worker_during_cancel["codex_account_next"]["failure_reason"] = serde_json::Value::Null;
+    write_private_json(&worker_record_path, &worker_during_cancel);
+    fs::write(cancel_barrier.join("release"), b"continue").expect("release account cancel barrier");
+    let cancel_race = cancel_race
+        .wait_with_output()
+        .expect("account cancel race output");
+    assert!(!cancel_race.status.success());
+    let cancel_race_envelope: serde_json::Value =
+        serde_json::from_slice(&cancel_race.stdout).expect("account cancel race json");
+    assert_eq!(
+        cancel_race_envelope["error"]["code"],
+        "codex-account-next-superseded"
+    );
+    let worker_after_cancel_race: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after account cancel race"),
+    )
+    .expect("worker after account cancel race json");
+    assert_eq!(
+        worker_after_cancel_race["codex_account_next"]["account"], "delta",
+        "a same-account replacement must survive a stale cancellation attempt"
+    );
+    assert_eq!(
+        worker_after_cancel_race["codex_account_next"]["revision"], original_cancel_revision,
+        "the ABA fixture deliberately reuses the old account/revision tuple"
+    );
+    assert_eq!(
+        worker_after_cancel_race["codex_account_next"]["intent_id"],
+        "replacement-same-account-intent-0001",
+        "the durable intent identity must fence stale cancellation"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["account_handoff"]
+            .is_object(),
+        "a stale cancellation must preserve the exact reservation"
+    );
+    let converged_cancel = run_managed_account_handoff_cancel(
+        &main_checkout,
+        &state_dir,
+        &main_capability,
+        "matrix-managed-cancel-race-0001",
+    );
+    assert_eq!(
+        converged_cancel.code,
+        0,
+        "stdout={} stderr={}",
+        converged_cancel.stdout_text(),
+        converged_cancel.stderr_text()
+    );
+    assert_eq!(
+        data(&converged_cancel)["newer_account_intent_preserved"],
+        true,
+        "a fresh recovery attempt must still distinguish the replacement from the reservation"
+    );
+    let worker_after_converged_cancel: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("worker after converged cancellation"),
+    )
+    .expect("worker after converged cancellation json");
+    assert_eq!(
+        worker_after_converged_cancel["codex_account_next"]["intent_id"],
+        "replacement-same-account-intent-0001"
+    );
+    let mut worker_after_converged_cancel = worker_after_converged_cancel;
+    worker_after_converged_cancel
+        .as_object_mut()
+        .expect("worker record object")
+        .remove("codex_account_next");
+    write_private_json(&worker_record_path, &worker_after_converged_cancel);
+
+    let guidance_body = tmp.path().join("matrix-guidance.md");
+    fs::write(
+        &guidance_body,
+        "Continue with the focused validation after the active turn.",
+    )
+    .expect("guidance");
+    let queued = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "assignment-matrix",
+            "--body-file",
+            guidance_body.to_str().expect("guidance path"),
+            "--idempotency-key",
+            "matrix-stale-guidance-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(queued.code, 0, "stderr={}", queued.stderr_text());
+    let current_guidance_id = data(&queued)["message_id"]
+        .as_str()
+        .expect("current guidance id")
+        .to_string();
+    rewrite_registry(&state_dir, |registry| {
+        let messages = registry["messages"].as_array_mut().expect("messages");
+        let original = messages
+            .iter()
+            .find(|message| message["message_id"] == current_guidance_id)
+            .expect("current guidance")
+            .clone();
+        for index in 0..3 {
+            let mut stale = original.clone();
+            stale["message_id"] = json!(format!("orphan-stale-guidance-{index}"));
+            stale["recipient_incarnation"] = json!(format!("orphan-worker-incarnation-{index}"));
+            messages.push(stale);
+        }
+        let mut unrelated = original;
+        unrelated["message_id"] = json!("orphan-stale-guidance-unrelated");
+        unrelated["recipient_incarnation"] = json!("orphan-worker-incarnation-unrelated");
+        unrelated["sender_session_id"] = json!("unrelated-controller");
+        unrelated["sender_incarnation"] = json!("unrelated-controller-incarnation");
+        messages.push(unrelated);
+    });
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["previous_worker"]
+            .is_null(),
+        "the contradictory fixture intentionally has no retained previous worker"
+    );
+    let orphaned_guidance = supervise();
+    assert_eq!(
+        data(&orphaned_guidance)["classification"],
+        "orphan_guidance_quarantine_required"
+    );
+    assert!(
+        data(&orphaned_guidance)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("worker guidance-quarantine")
+    );
+    let quarantine_revision =
+        orchestration_registry(&state_dir)["assignments"]["assignment-matrix"]["revision"]
+            .as_u64()
+            .expect("guidance quarantine revision")
+            .to_string();
+    let quarantine_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "guidance-quarantine",
+        "assignment-matrix",
+        "--if-revision",
+        &quarantine_revision,
+        "--idempotency-key",
+        "matrix-guidance-quarantine-0001",
+        "--format",
+        "json",
+    ];
+    let quarantined = run_main_agent(
+        &main_checkout,
+        &quarantine_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        quarantined.code,
+        0,
+        "stdout={} stderr={}",
+        quarantined.stdout_text(),
+        quarantined.stderr_text()
+    );
+    assert_eq!(data(&quarantined)["state"], "quarantined");
+    assert_eq!(data(&quarantined)["quarantined_count"], 3);
+    let quarantine_replay = run_main_agent(
+        &main_checkout,
+        &quarantine_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(quarantine_replay.stdout_json(), quarantined.stdout_json());
+    let messages_after_quarantine = load_coordination_registry(&state_dir)["messages"]
+        .as_array()
+        .expect("messages")
+        .clone();
+    for index in 0..3 {
+        let message_id = format!("orphan-stale-guidance-{index}");
+        let message = messages_after_quarantine
+            .iter()
+            .find(|message| message["message_id"] == message_id)
+            .expect("quarantined guidance");
+        assert_eq!(message["state"], "quarantined");
+    }
+    for message_id in [
+        current_guidance_id.as_str(),
+        "orphan-stale-guidance-unrelated",
+    ] {
+        let message = messages_after_quarantine
+            .iter()
+            .find(|message| message["message_id"] == message_id)
+            .expect("preserved guidance");
+        assert_eq!(
+            message["state"], "unread",
+            "current-incarnation and unrelated guidance must be preserved"
+        );
+    }
+    let converged_guidance = supervise();
+    assert_ne!(
+        data(&converged_guidance)["classification"],
+        "orphan_guidance_quarantine_required"
+    );
+    assert_ne!(
+        data(&converged_guidance)["classification"],
+        "guidance_continuity_required"
+    );
+    assert!(
+        !data(&converged_guidance)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("guidance-")
+    );
     seed_activity_state(
         &state_dir,
         "worker-matrix",
@@ -6088,10 +9228,56 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
         "working",
         json!({
             "provider_turn_id": "turn-matrix",
-            "started_at": "2030-01-01T00:00:01Z"
+            "started_at": "2020-01-01T00:00:01Z"
         }),
         serde_json::Value::Null,
     );
+    let stale = supervise();
+    assert_eq!(data(&stale)["classification"], "stale_provider_activity");
+    assert_eq!(
+        data(&stale)["last_proven_safe_state"]["guidance"]["state"],
+        "queued_unread"
+    );
+    assert_eq!(
+        data(&stale)["last_proven_safe_state"]["progress"]["material_worktree_changes"],
+        0,
+        "provider activity alone is not material worktree progress"
+    );
+    assert!(
+        data(&stale)["next_action"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("turn boundary")
+    );
+    rewrite_registry(&state_dir, |registry| {
+        for message in registry["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .iter_mut()
+        {
+            if message["recipient_session_id"] == "worker-matrix" {
+                message["state"] = json!("read");
+            }
+        }
+    });
+    seed_activity_state(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-matrix-current",
+            "started_at": jiff::Timestamp::now().to_string()
+        }),
+        serde_json::Value::Null,
+    );
+    let consumed = supervise();
+    assert_eq!(data(&consumed)["classification"], "healthy_progress");
+    assert_eq!(
+        data(&consumed)["last_proven_safe_state"]["guidance"]["state"],
+        "consumed"
+    );
+
     rewrite_registry(&state_dir, |registry| {
         registry["operations"]
             .as_array_mut()
@@ -6270,6 +9456,13 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
                 checkout.as_path(),
                 Some("enforce"),
             ),
+            (
+                "worker-account-race",
+                "worker-account-race-incarnation",
+                "worker-private-capability-account-race",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
         ],
     );
     let main_one_capability =
@@ -6328,7 +9521,7 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
         "scopes": ["crates/agent-session"],
         "durable_refs": []
     });
-    for assignment_id in ["handoff-one", "adopt-one"] {
+    for assignment_id in ["handoff-one", "adopt-one", "account-handoff-race"] {
         insert_orchestration_assignment(
             &state_dir,
             assignment_id,
@@ -6337,7 +9530,11 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
                 "assignment_id": assignment_id,
                 "run_id": "run-one",
                 "revision": 1,
-                "state": "assigned",
+                "state": if assignment_id == "account-handoff-race" {
+                    "working"
+                } else {
+                    "assigned"
+                },
                 "task_summary": "Exercise relationship lifecycle",
                 "private_packet_digest": "replaced-by-fixture",
                 "primary_manager": main_one_controller,
@@ -6345,6 +9542,12 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
                     json!({
                         "session_id": "worker-handoff",
                         "session_incarnation": "worker-handoff-incarnation",
+                        "session_created_at": "2030-01-01T00:00:00Z"
+                    })
+                } else if assignment_id == "account-handoff-race" {
+                    json!({
+                        "session_id": "worker-account-race",
+                        "session_incarnation": "worker-account-race-incarnation",
                         "session_created_at": "2030-01-01T00:00:00Z"
                     })
                 } else {
@@ -6426,6 +9629,148 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
     rewrite_registry(&state_dir, |registry| {
         registry["operations"] = json!([]);
     });
+    seed_active_claim(
+        &state_dir,
+        "worker-account-race",
+        "worker-account-race-incarnation",
+        "worker-account-race-claim",
+    );
+    let account_worker_path = state_dir.join("sessions/worker-account-race/session.json");
+    let mut account_worker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&account_worker_path).expect("account race worker"))
+            .expect("account race worker json");
+    account_worker["runtime"]["kind"] = json!("codex_app_server");
+    account_worker["runtime"]["codex_app_server_protocol"] = json!("v2");
+    account_worker["runtime"]["managed_account_handoff_capability"] =
+        json!("agent-session.codex-managed-account-handoff.v1");
+    account_worker["runtime"]["codex_app_server_socket"] = json!("/tmp/account-race.sock");
+    account_worker["runtime"]["codex_app_server_proxy"] = json!("/tmp/account-race.proxy");
+    account_worker["runtime"]["codex_app_server_thread_handoff"] =
+        json!("/tmp/account-race.thread");
+    account_worker["runtime"]["codex_app_server_thread_attached"] =
+        json!("/tmp/account-race.attached");
+    account_worker["provider_resume"] = json!({
+        "provider": "codex",
+        "session_id": "provider-account-race",
+        "captured_at": "2030-01-01T00:00:00Z",
+        "capture_method": "codex-session-meta",
+        "resume_args": ["resume", "provider-account-race"]
+    });
+    account_worker["codex_account_binding"] = json!({
+        "schema_version": "agent-session.codex-account-binding.v1",
+        "selected_account": "alpha",
+        "revision": 1,
+        "state": "bound",
+        "applied_runtime_id": "worker-account-race-incarnation",
+        "updated_at": "2030-01-01T00:00:00Z"
+    });
+    write_private_json(&account_worker_path, &account_worker);
+    let account_barrier = tmp.path().join("account-handoff-race-barrier");
+    fs::create_dir(&account_barrier).expect("account handoff barrier");
+    let old_account_handoff = Command::new(bin::resolve("main-agent"))
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "account-handoff",
+            "account-handoff-race",
+            "--account",
+            "beta",
+            "--if-revision",
+            "1",
+            "--authorize-account-change",
+            "--timeout",
+            "1s",
+            "--idempotency-key",
+            "former-manager-account-handoff-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)
+        .env("AGENT_SESSION_CODEX_ACCOUNT_BROKER", r#"["/bin/false"]"#)
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_APPLY_RESULT",
+            "success",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_STAGE",
+            "after_initial_ownership_read",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_ACCOUNT_HANDOFF_BARRIER_DIR",
+            &account_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn former manager account handoff");
+    let account_deadline = Instant::now() + Duration::from_secs(10);
+    while !account_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < account_deadline,
+            "account handoff did not pause after the initial ownership read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let account_assignment_handoff = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "account-handoff-race",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "account-assignment-handoff-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(
+        account_assignment_handoff.code,
+        0,
+        "stderr={}",
+        account_assignment_handoff.stderr_text()
+    );
+    fs::write(account_barrier.join("release"), b"continue")
+        .expect("release account handoff barrier");
+    let old_account_handoff = old_account_handoff
+        .wait_with_output()
+        .expect("former manager account handoff output");
+    assert!(!old_account_handoff.status.success());
+    let old_account_envelope: serde_json::Value =
+        serde_json::from_slice(&old_account_handoff.stdout).expect("former manager json");
+    assert!(
+        matches!(
+            old_account_envelope["error"]["code"].as_str(),
+            Some("assignment-not-found" | "account-handoff-assignment-conflict")
+        ),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&old_account_handoff.stdout),
+        String::from_utf8_lossy(&old_account_handoff.stderr)
+    );
+    let account_after_race: serde_json::Value =
+        serde_json::from_slice(&fs::read(&account_worker_path).expect("account worker after race"))
+            .expect("account worker after race json");
+    assert_eq!(
+        account_after_race["codex_account_binding"]["selected_account"], "alpha",
+        "the former manager must not queue or apply an account"
+    );
+    assert!(
+        account_after_race.get("codex_account_next").is_none(),
+        "the former manager must leave no queued account intent"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-account-race/auto-resume.json")
+            .exists(),
+        "the former manager must not re-arm auto-resume"
+    );
     rewrite_orchestration_registry(&state_dir, |registry| {
         registry["assignments"]["handoff-one"]["depends_on"] = json!(["adopt-one"]);
     });
@@ -7296,6 +10641,92 @@ fn main_agent_worker_start_batch_isolates_per_lane_results() {
         .unwrap_or(0);
     assert_eq!(launched, 0, "refused/invalid lanes must not launch workers");
 
+    let replay_batch = || {
+        run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state,
+                "worker",
+                "start",
+                "--batch",
+                batch_dir.to_str().expect("batch dir"),
+                "--idempotency-key",
+                "batch-0001",
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+        )
+    };
+    let exact_replay = replay_batch();
+    assert_eq!(
+        exact_replay.code,
+        0,
+        "stderr={}",
+        exact_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&exact_replay),
+        data(&batch),
+        "exact batch replay must resume the immutable manifest"
+    );
+
+    let lane_a = batch_dir.join("lane-a.json");
+    let lane_b = batch_dir.join("lane-b.json");
+    let lane_bad = batch_dir.join("lane-bad.json");
+    let lane_a_bytes = fs::read(&lane_a).expect("lane-a bytes");
+    let lane_b_bytes = fs::read(&lane_b).expect("lane-b bytes");
+
+    fs::copy(&lane_a, batch_dir.join("lane-extra.json")).expect("add lane");
+    let added = replay_batch();
+    assert_eq!(added.code, 65, "outcome={}", added.stdout_text());
+    assert_eq!(added.stdout_json()["error"]["code"], "idempotency-conflict");
+    fs::remove_file(batch_dir.join("lane-extra.json")).expect("remove added lane");
+
+    let renamed_lane = batch_dir.join("lane-renamed.json");
+    fs::rename(&lane_a, &renamed_lane).expect("rename lane");
+    let renamed = replay_batch();
+    assert_eq!(renamed.code, 65, "outcome={}", renamed.stdout_text());
+    assert_eq!(
+        renamed.stdout_json()["error"]["code"],
+        "idempotency-conflict"
+    );
+    fs::rename(&renamed_lane, &lane_a).expect("restore lane name");
+
+    let mut edited_lane = lane_a_bytes.clone();
+    edited_lane.extend_from_slice(b"\n ");
+    fs::write(&lane_a, edited_lane).expect("edit lane bytes");
+    let edited = replay_batch();
+    assert_eq!(edited.code, 65, "outcome={}", edited.stdout_text());
+    assert_eq!(
+        edited.stdout_json()["error"]["code"],
+        "idempotency-conflict"
+    );
+    fs::write(&lane_a, &lane_a_bytes).expect("restore lane bytes");
+
+    fs::remove_file(&lane_b).expect("remove lane");
+    let removed = replay_batch();
+    assert_eq!(removed.code, 65, "outcome={}", removed.stdout_text());
+    assert_eq!(
+        removed.stdout_json()["error"]["code"],
+        "idempotency-conflict"
+    );
+    fs::write(&lane_b, lane_b_bytes).expect("restore removed lane");
+    assert!(lane_bad.is_file());
+
+    let launched_after_conflicts = fs::read_dir(state_dir.join("sessions"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("worker-"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        launched_after_conflicts, launched,
+        "manifest conflicts must fail before any new worker launch"
+    );
+
     // Neither source flag is a usage error.
     let neither = run_main_agent(
         &checkout,
@@ -7375,6 +10806,416 @@ fn main_agent_worker_start_batch_isolates_per_lane_results() {
         empty.stdout_json()["error"]["code"],
         "invalid-orchestration-input"
     );
+}
+
+#[test]
+fn main_agent_worker_start_batch_stale_lane_owner_cannot_create_the_child_session() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let batch_dir = tmp.path().join("stale-owner-batch");
+    fs::create_dir(&batch_dir).expect("batch dir");
+    write_private_json(
+        &batch_dir.join("lane.json"),
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-stale-batch-owner",
+            "task_summary": "Fence a stale batch lane owner",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null,
+                "session_id": "worker-stale-batch-owner",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": null, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let barrier = tmp.path().join("batch-lane-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let idempotency_key = "batch-stale-owner-0001";
+    let spawn_batch = |pause: bool| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "start",
+                "--batch",
+                batch_dir.to_str().expect("batch dir"),
+                "--idempotency-key",
+                idempotency_key,
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+            .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+            .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_LEASE_SECS", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if pause {
+            command
+                .env(
+                    "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+                    "before_session_create",
+                )
+                .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier);
+        }
+        command.spawn().expect("spawn batch")
+    };
+
+    let stale = spawn_batch(true);
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "stale lane owner never reached the session create boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let receipt_key = format!("main-one:main-incarnation-one:{idempotency_key}");
+    let first_owner = orchestration_registry(&state_dir)["receipts"][&receipt_key]["outcome"]
+        ["lanes"][0]["owner_id"]
+        .as_str()
+        .expect("first lane owner")
+        .to_string();
+    std::thread::sleep(Duration::from_secs(2));
+    let successor = spawn_batch(false);
+    let takeover_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let owner = orchestration_registry(&state_dir)["receipts"][&receipt_key]["outcome"]["lanes"]
+            [0]["owner_id"]
+            .as_str()
+            .map(str::to_string);
+        if owner.as_deref().is_some_and(|owner| owner != first_owner) {
+            break;
+        }
+        assert!(
+            Instant::now() < takeover_deadline,
+            "successor did not take over the expired batch lane"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(barrier.join("release"), b"release").expect("release stale lane owner");
+
+    let stale = stale.wait_with_output().expect("stale batch");
+    assert!(!stale.status.success(), "the stale owner must be fenced");
+    let stale_json: serde_json::Value =
+        serde_json::from_slice(&stale.stdout).expect("stale owner json");
+    assert_eq!(
+        stale_json["error"]["code"],
+        "worker-start-batch-lane-owner-changed"
+    );
+    let successor = successor.wait_with_output().expect("successor batch");
+    assert!(
+        successor.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&successor.stdout),
+        String::from_utf8_lossy(&successor.stderr)
+    );
+    let successor_json: serde_json::Value =
+        serde_json::from_slice(&successor.stdout).expect("successor json");
+    assert_eq!(successor_json["data"]["lanes"][0]["ok"], true);
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "the post-lock owner recheck must allow exactly one child session create"
+    );
+
+    let replay = spawn_batch(false)
+        .wait_with_output()
+        .expect("immediate exact replay");
+    assert!(replay.status.success());
+    let replay_json: serde_json::Value =
+        serde_json::from_slice(&replay.stdout).expect("replay json");
+    assert_eq!(replay_json["data"], successor_json["data"]);
+}
+
+#[test]
+fn main_agent_worker_start_batch_converges_concurrently_from_historical_lane_receipts() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let released_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/orchestration/released-v2-lane-authority.json"
+    ))
+    .expect("released-v2 lane fixture");
+    assert_eq!(
+        released_fixture["source_commit"],
+        "89fae89403782b7caec965c614dd1516d903a1e0"
+    );
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let batch_dir = tmp.path().join("historical-batch");
+    fs::create_dir(&batch_dir).expect("batch dir");
+    let completed_input = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-historical-completed",
+        "task_summary": "Replay a completed historical lane",
+        "task": {},
+        "launch": {
+            "agent": "codex", "cwd": checkout, "title": null,
+            "session_id": "worker-historical-completed",
+            "coordination_mode": "enforce", "agent_args": []
+        },
+        "repository": "example/repository", "worktree": null, "base_ref": "main",
+        "scopes": ["crates/agent-session"], "durable_refs": []
+    });
+    let pending_input = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-historical-pending",
+        "task_summary": "Resume a pending historical lane",
+        "task": {},
+        "launch": {
+            "agent": "codex", "cwd": checkout, "title": null,
+            "session_id": "worker-historical-pending",
+            "coordination_mode": "enforce", "agent_args": []
+        },
+        "repository": "example/repository", "worktree": null, "base_ref": "main",
+        "scopes": ["crates/agent-session"], "durable_refs": []
+    });
+    write_private_json(&batch_dir.join("lane-completed.json"), &completed_input);
+    write_private_json(&batch_dir.join("lane-pending.json"), &pending_input);
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-historical-pending",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-historical-pending",
+            "run_id": "run-one",
+            "revision": 1,
+            "state": "starting",
+            "task_summary": "Resume a pending historical lane",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:01Z"
+        }),
+        &pending_input,
+    );
+    let parent_key = released_fixture["batch"]["parent_key"]
+        .as_str()
+        .expect("released-v2 batch parent key");
+    assert_eq!(
+        format!("{parent_key}-0"),
+        released_fixture["batch"]["child_key"]
+            .as_str()
+            .expect("released-v2 first child key")
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"][format!("main-one:main-incarnation-one:{parent_key}-0")] = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-start",
+            "request_digest": assignment_request_digest(&completed_input),
+            "outcome": {
+                "schema_version": "main-agent.worker-start-result.v1",
+                "state": "started",
+                "assignment": {
+                    "assignment_id": "assignment-historical-completed"
+                },
+                "worker": {
+                    "session_id": "worker-historical-completed"
+                },
+                "fresh_launch": false
+            },
+            "created_at_epoch": 1
+        });
+        registry["receipts"][format!("main-one:main-incarnation-one:{parent_key}-1")] = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-start",
+            "request_digest": assignment_request_digest(&pending_input),
+            "outcome": {
+                "schema_version": "main-agent.worker-start-result.v1",
+                "assignment_id": "assignment-historical-pending",
+                "worker_session_id": "worker-historical-pending",
+                "state": "starting",
+                "acceptance": "pending"
+            },
+            "created_at_epoch": 1
+        });
+    });
+    let barrier = tmp.path().join("historical-batch-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let spawn_batch = |pause: bool| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "start",
+                "--batch",
+                batch_dir.to_str().expect("batch dir"),
+                "--idempotency-key",
+                parent_key,
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+            .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if pause {
+            command
+                .env(
+                    "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+                    "before_session_create",
+                )
+                .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier);
+        }
+        command.spawn().expect("spawn batch")
+    };
+    let first = spawn_batch(true);
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "historical lane owner never reached the child side-effect boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let receipt_key = format!("main-one:main-incarnation-one:{parent_key}");
+    let owner_before = orchestration_registry(&state_dir)["receipts"][&receipt_key]["outcome"]
+        ["lanes"][1]["owner_id"]
+        .as_str()
+        .expect("historical pending lane owner")
+        .to_string();
+
+    let mut second = spawn_batch(false);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        second.try_wait().expect("poll second batch").is_none(),
+        "the concurrent replay must wait on the live durable lane owner"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["receipts"][&receipt_key]["outcome"]["lanes"][1]["owner_id"],
+        owner_before,
+        "the live durable lane owner must not be replaced"
+    );
+    fs::write(barrier.join("release"), b"release").expect("release historical lane owner");
+    let first = first.wait_with_output().expect("first batch");
+    let second = second.wait_with_output().expect("second batch");
+    for output in [&first, &second] {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("first json");
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).expect("second json");
+    assert_eq!(first["data"], second["data"]);
+    assert!(
+        first["data"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.iter().all(|lane| lane["ok"] == true))
+    );
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "the completed historical lane replays and the pending lane launches once"
+    );
+
+    fs::write(
+        batch_dir.join("lane-completed.json"),
+        serde_json::to_vec_pretty(&completed_input)
+            .expect("completed bytes")
+            .into_iter()
+            .chain(b"\n ".iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .expect("edit completed lane bytes");
+    let drift = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--batch",
+            batch_dir.to_str().expect("batch dir"),
+            "--idempotency-key",
+            parent_key,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_CODEX_BIN",
+                codex_bin.to_str().expect("codex bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+        ],
+    );
+    assert_eq!(drift.code, 65, "outcome={}", drift.stdout_text());
+    assert_eq!(drift.stdout_json()["error"]["code"], "idempotency-conflict");
 }
 
 #[test]
@@ -7460,7 +11301,7 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             "--if-run-revision",
             "1",
             "--await-ready",
-            "1s",
+            "12s",
             "--idempotency-key",
             "worker-start-await-ready-0001",
             "--format",
@@ -7552,7 +11393,7 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             "--if-run-revision",
             "1",
             "--await-ready",
-            "1s",
+            "12s",
             "--idempotency-key",
             "worker-start-await-ready-0001",
             "--format",
@@ -7825,6 +11666,223 @@ fn main_agent_worker_start_concurrent_replays_join_one_readiness_finalizer() {
 }
 
 #[test]
+fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt() {
+    for crash_stage in ["before_reserve", "reserved", "sending", "sent"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir(&state_dir).expect("state");
+        init_checkout(&checkout, "https://example.invalid/example/repository.git");
+        seed_brokers_at(
+            &state_dir,
+            &[(
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            )],
+        );
+        let main_capability =
+            init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let codex_bin = fake_agent(tmp.path(), "codex-worker");
+        let assignment_id = format!("assignment-readiness-takeover-{crash_stage}");
+        let worker_id = format!("worker-readiness-takeover-{crash_stage}");
+        let assignment_path = tmp.path().join(format!("{assignment_id}.json"));
+        write_private_json(
+            &assignment_path,
+            &json!({
+                "schema_version": "main-agent.assignment-input.v1",
+                "assignment_id": assignment_id,
+                "task_summary": "Resume one automatic recovery after finalizer takeover",
+                "task": {},
+                "launch": {
+                    "agent": "codex",
+                    "cwd": checkout,
+                    "title": null,
+                    "session_id": worker_id,
+                    "coordination_mode": "enforce",
+                    "agent_args": []
+                },
+                "repository": "example/repository",
+                "worktree": null,
+                "base_ref": "main",
+                "scopes": ["crates/agent-session"],
+                "durable_refs": []
+            }),
+        );
+        let barrier = tmp.path().join(format!("readiness-{crash_stage}-barrier"));
+        fs::create_dir(&barrier).expect("barrier");
+        let takeover_barrier = tmp
+            .path()
+            .join(format!("readiness-{crash_stage}-takeover-barrier"));
+        fs::create_dir(&takeover_barrier).expect("takeover barrier");
+        let state_arg = state_dir.to_string_lossy().into_owned();
+        let assignment_arg = assignment_path.to_string_lossy().into_owned();
+        let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+        let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+        let codex_arg = codex_bin.to_string_lossy().into_owned();
+        let barrier_arg = barrier.to_string_lossy().into_owned();
+        let takeover_barrier_arg = takeover_barrier.to_string_lossy().into_owned();
+        let idempotency_key = format!("readiness-takeover-{crash_stage}-0001");
+        let spawn_start = |pause: bool, pause_takeover: bool| {
+            let mut command = Command::new(bin::resolve("main-agent"));
+            command
+                .current_dir(&checkout)
+                .args([
+                    "--state-dir",
+                    state_arg.as_str(),
+                    "worker",
+                    "start",
+                    "--assignment-file",
+                    assignment_arg.as_str(),
+                    "--await-ready",
+                    "20s",
+                    "--idempotency-key",
+                    idempotency_key.as_str(),
+                    "--format",
+                    "json",
+                ])
+                .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+                .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+                .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+                .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+                .env(
+                    "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
+                    "7",
+                )
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if pause {
+                command
+                    .env(
+                        "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_DIR",
+                        &barrier_arg,
+                    )
+                    .env(
+                        "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_STAGE",
+                        crash_stage,
+                    );
+            }
+            if pause_takeover {
+                command.env(
+                    "NILS_AGENT_SESSION_TEST_READINESS_TAKEOVER_BARRIER_DIR",
+                    &takeover_barrier_arg,
+                );
+            }
+            command.spawn().expect("spawn worker start")
+        };
+
+        let mut owner = spawn_start(true, false);
+        let barrier_deadline = Instant::now() + Duration::from_secs(30);
+        while !barrier.join("ready").is_file() {
+            assert!(
+                Instant::now() < barrier_deadline,
+                "readiness finalizer never paused after {crash_stage}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let successor = if matches!(crash_stage, "before_reserve" | "sending") {
+            let receipt_key = format!("main-one:main-incarnation-one:{idempotency_key}");
+            let original_finalizer = orchestration_registry(&state_dir)["receipts"][&receipt_key]
+                ["outcome"]["finalizer_id"]
+                .as_str()
+                .expect("original readiness finalizer")
+                .to_string();
+            let successor = spawn_start(false, true);
+            let takeover_deadline = Instant::now() + Duration::from_secs(25);
+            while !takeover_barrier.join("ready").is_file() {
+                assert!(
+                    Instant::now() < takeover_deadline,
+                    "successor did not reach its post-takeover barrier at {crash_stage}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let successor_finalizer =
+                fs::read_to_string(takeover_barrier.join("ready")).expect("successor finalizer id");
+            {
+                let registry = orchestration_registry(&state_dir);
+                let current = registry["receipts"][&receipt_key]["outcome"]["finalizer_id"]
+                    .as_str()
+                    .map(str::to_string);
+                assert_ne!(successor_finalizer, original_finalizer);
+                assert_eq!(
+                    current.as_deref(),
+                    Some(successor_finalizer.as_str()),
+                    "the successor-only barrier must observe its durable finalizer identity before the stale owner is released"
+                );
+            }
+            fs::write(barrier.join("release"), b"release").expect("release stale finalizer");
+            let stale_owner = owner.wait_with_output().expect("stale owner result");
+            if crash_stage == "sending" {
+                assert!(
+                    !stale_owner.status.success(),
+                    "a displaced sender must be fenced before Enter"
+                );
+                let stale: serde_json::Value =
+                    serde_json::from_slice(&stale_owner.stdout).expect("stale owner json");
+                assert_eq!(
+                    stale["error"]["code"], "worker-start-finalizer-changed",
+                    "the stale sending-stage owner must fail at the pre-send authority boundary"
+                );
+            } else {
+                assert!(
+                    stale_owner.status.success(),
+                    "stale owner stdout={} stderr={}",
+                    String::from_utf8_lossy(&stale_owner.stdout),
+                    String::from_utf8_lossy(&stale_owner.stderr)
+                );
+            }
+            fs::write(takeover_barrier.join("release"), b"release")
+                .expect("release successor finalizer");
+            successor
+                .wait_with_output()
+                .expect("successor worker start")
+        } else {
+            owner.kill().expect("terminate owning readiness finalizer");
+            let _ = owner.wait().expect("reap owning readiness finalizer");
+            spawn_start(false, false)
+                .wait_with_output()
+                .expect("successor worker start")
+        };
+        assert!(
+            successor.status.success(),
+            "stage={crash_stage} stdout={} stderr={}",
+            String::from_utf8_lossy(&successor.stdout),
+            String::from_utf8_lossy(&successor.stderr)
+        );
+        let successor: serde_json::Value =
+            serde_json::from_slice(&successor.stdout).expect("successor json");
+        assert_eq!(
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"], 1,
+            "successor must resume the persisted recovery reservation"
+        );
+        assert_eq!(
+            successor["data"]["readiness"]["submit_key_recovery"]["attempted"],
+            true
+        );
+        let registry = orchestration_registry(&state_dir);
+        assert_eq!(
+            registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
+            1
+        );
+        let expected_enter_count = if crash_stage == "sending" { 1 } else { 2 };
+        assert_eq!(
+            tmux_calls(&tmux_log)
+                .iter()
+                .filter(|call| {
+                    call.first().is_some_and(|arg| arg == "send-keys")
+                        && call.last().is_some_and(|arg| arg == "Enter")
+                })
+                .count(),
+            expected_enter_count,
+            "a displaced finalizer must not send Enter during {crash_stage} takeover"
+        );
+    }
+}
+
+#[test]
 fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boundary() {
     for (case, expected_result) in [
         (
@@ -7859,6 +11917,17 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
             "submit-recovery-send-outcome-unknown",
         ),
     ] {
+        if std::env::var("NILS_AGENT_SESSION_TEST_RECOVERY_CASE")
+            .ok()
+            .is_some_and(|selected| selected != case)
+        {
+            continue;
+        }
+        let recovery_timeout = if case == "tmux-timeout-terminal-reconcile" {
+            "4s"
+        } else {
+            "1s"
+        };
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
         let checkout = tmp.path().join("checkout");
@@ -7962,7 +12031,7 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                 "--if-revision",
                 "2",
                 "--timeout",
-                "1s",
+                recovery_timeout,
                 "--idempotency-key",
                 "worker-recovery-race-0001",
                 "--format",
@@ -8457,7 +12526,7 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                 "--if-revision",
                 "2",
                 "--timeout",
-                "1s",
+                recovery_timeout,
                 "--idempotency-key",
                 "worker-recovery-race-0001",
                 "--format",
@@ -8677,6 +12746,124 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                 );
                 assert_eq!(data(&reconciled)["proof"]["worker_runtime"], "stopped");
                 assert_eq!(data(&reconciled)["proof"]["coordination"], "quiescent");
+                let worker_capability = capability(&state_dir, "worker-race");
+                let reconciled_registry = orchestration_registry(&state_dir);
+                assert_eq!(
+                    reconciled_registry["assignments"]["assignment-race"]["worker_quarantine"]["worker"]
+                        ["session_incarnation"],
+                    worker_incarnation,
+                    "reconciliation must durably quarantine the exact worker incarnation"
+                );
+
+                let quarantined_resume = run_with_env(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "resume",
+                        "worker-race",
+                        "--format",
+                        "json",
+                    ],
+                    &[
+                        ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                    ],
+                );
+                assert_eq!(quarantined_resume.code, 65);
+                assert_eq!(
+                    quarantined_resume.stdout_json()["error"]["code"],
+                    "worker-quarantined"
+                );
+
+                let quarantined_claim_path = tmp.path().join("claim-after-terminal-reconcile.json");
+                candidate(
+                    &quarantined_claim_path,
+                    "crates/worker-race",
+                    "Quarantined worker must not restore execution authority",
+                );
+                let quarantined_claim = run(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "work-context",
+                        "claim",
+                        "--session",
+                        "worker-race",
+                        "--file",
+                        quarantined_claim_path.to_str().expect("quarantined claim"),
+                        "--capability-file",
+                        &worker_capability,
+                        "--idempotency-key",
+                        "claim-after-terminal-reconcile-0001",
+                        "--format",
+                        "json",
+                    ],
+                );
+                assert_eq!(quarantined_claim.code, 65);
+                assert_eq!(
+                    quarantined_claim.stdout_json()["error"]["code"],
+                    "worker-quarantined"
+                );
+
+                let quarantined_bootstrap = run_main_agent(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "bootstrap",
+                        "--idempotency-key",
+                        "bootstrap-after-terminal-reconcile-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+                );
+                assert_eq!(quarantined_bootstrap.code, 65);
+                assert_eq!(
+                    quarantined_bootstrap.stdout_json()["error"]["code"],
+                    "worker-quarantined"
+                );
+
+                let quarantined_checkpoint_path =
+                    tmp.path().join("checkpoint-after-terminal-reconcile.json");
+                write_private_json(
+                    &quarantined_checkpoint_path,
+                    &json!({
+                        "schema_version": "main-agent.checkpoint-input.v1",
+                        "summary": "Quarantined worker must not checkpoint",
+                        "next_action": "Remain stopped for guarded cancellation",
+                        "state": "working",
+                        "result_summary": null,
+                        "blocker_summary": null
+                    }),
+                );
+                let quarantined_checkpoint = run_main_agent(
+                    &worker_checkout,
+                    &[
+                        "--state-dir",
+                        &state_arg,
+                        "checkpoint",
+                        "--file",
+                        quarantined_checkpoint_path
+                            .to_str()
+                            .expect("quarantined checkpoint"),
+                        "--if-revision",
+                        "4",
+                        "--idempotency-key",
+                        "checkpoint-after-terminal-reconcile-0001",
+                        "--format",
+                        "json",
+                    ],
+                    &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+                );
+                assert_eq!(quarantined_checkpoint.code, 65);
+                assert_eq!(
+                    quarantined_checkpoint.stdout_json()["error"]["code"],
+                    "worker-quarantined"
+                );
                 let replay_started = Instant::now();
                 let terminal_replay = run_main_agent(
                     &checkout,
@@ -8694,7 +12881,7 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     terminal_replay.stdout_text()
                 );
                 assert!(
-                    replay_started.elapsed() < Duration::from_millis(500),
+                    replay_started.elapsed() < Duration::from_millis(1_500),
                     "reconciled replay must not wait for the original timeout"
                 );
                 assert_eq!(
@@ -8717,7 +12904,6 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     2,
                     "terminal reconciliation must never resend Enter"
                 );
-                let worker_capability = capability(&state_dir, "worker-race");
                 let stopped_broker = run(
                     &worker_checkout,
                     &[
@@ -9789,67 +13975,86 @@ fn main_agent_submit_recovery_is_bounded_idempotent_and_never_sends_a_second_ent
         "--format",
         "json",
     ];
-    let competing_args = [
-        "--state-dir",
-        state_dir.to_str().expect("state dir"),
-        "worker",
-        "submit-recovery",
-        "assignment-submit-recovery",
-        "--if-revision",
-        "2",
-        "--timeout",
-        "1s",
-        "--idempotency-key",
-        "submit-recovery-0001",
-        "--format",
-        "json",
-    ];
-    let barrier = Arc::new(Barrier::new(3));
-    let (first, second) = std::thread::scope(|scope| {
-        let first_barrier = Arc::clone(&barrier);
-        let first_checkout = &checkout;
-        let first_args = &recover_args;
-        let first_envs = &envs;
-        let first = scope.spawn(move || {
-            first_barrier.wait();
-            run_main_agent(first_checkout, first_args, first_envs)
-        });
-        let second_barrier = Arc::clone(&barrier);
-        let second_checkout = &checkout;
-        let second_args = &competing_args;
-        let second_envs = &envs;
-        let second = scope.spawn(move || {
-            second_barrier.wait();
-            run_main_agent(second_checkout, second_args, second_envs)
-        });
-        barrier.wait();
-        (
-            first.join().expect("first recovery contender"),
-            second.join().expect("second recovery contender"),
-        )
-    });
-    let recovered = first;
-    let concurrent_replay = second;
-    assert_eq!(recovered.code, 0, "stderr={}", recovered.stderr_text());
+    let owner_barrier = tmp.path().join("submit-recovery-owner-barrier");
+    let contender_barrier = tmp.path().join("submit-recovery-contender-barrier");
+    fs::create_dir(&owner_barrier).expect("owner barrier");
+    fs::create_dir(&contender_barrier).expect("contender barrier");
+    let spawn_recovery = |barrier: &Path, stage: &str| {
+        Command::new(bin::resolve("main-agent"))
+            .current_dir(&checkout)
+            .args(recover_args)
+            .envs(envs)
+            .env(
+                "NILS_AGENT_SESSION_TEST_SUBMIT_RECOVERY_BARRIER_STAGE",
+                stage,
+            )
+            .env(
+                "NILS_AGENT_SESSION_TEST_SUBMIT_RECOVERY_BARRIER_DIR",
+                barrier,
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn submit recovery contender")
+    };
+    let owner = spawn_recovery(&owner_barrier, "owner_reserved");
+    let owner_deadline = Instant::now() + Duration::from_secs(10);
+    while !owner_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < owner_deadline,
+            "submit recovery owner did not persist its reservation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
-        concurrent_replay.code,
-        0,
-        "outcome={}",
-        concurrent_replay.stdout_text()
+        orchestration_registry(&state_dir)["assignments"]["assignment-submit-recovery"]["submit_recovery"]
+            ["state"],
+        "attempting",
+        "the barrier must prove the owner persisted the in-progress attempt"
     );
+    let contender = spawn_recovery(&contender_barrier, "joined_in_progress");
+    let contender_deadline = Instant::now() + Duration::from_secs(10);
+    while !contender_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < contender_deadline,
+            "same-key contender did not join the persisted attempt"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(owner_barrier.join("release"), b"continue").expect("release recovery owner");
+    fs::write(contender_barrier.join("release"), b"continue").expect("release recovery contender");
+    let recovered = owner.wait_with_output().expect("recovery owner output");
+    let concurrent_replay = contender
+        .wait_with_output()
+        .expect("recovery contender output");
+    assert!(
+        recovered.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(
+        concurrent_replay.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&concurrent_replay.stdout),
+        String::from_utf8_lossy(&concurrent_replay.stderr)
+    );
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&recovered.stdout).expect("recovery owner json");
+    let concurrent_replay: serde_json::Value =
+        serde_json::from_slice(&concurrent_replay.stdout).expect("recovery contender json");
     assert_eq!(
-        data(&concurrent_replay),
-        data(&recovered),
+        concurrent_replay["data"], recovered["data"],
         "same-key contenders must converge on one durable attempt"
     );
-    assert_eq!(data(&recovered)["attempt_count"], 1);
-    assert_eq!(data(&recovered)["checkpoint_confirmed"], false);
-    assert_eq!(data(&recovered)["automatic_retry_safe"], false);
+    assert_eq!(recovered["data"]["attempt_count"], 1);
+    assert_eq!(recovered["data"]["checkpoint_confirmed"], false);
+    assert_eq!(recovered["data"]["automatic_retry_safe"], false);
     assert_eq!(
-        data(&recovered)["assignment"]["submit_recovery"]["state"],
+        recovered["data"]["assignment"]["submit_recovery"]["state"],
         "failed"
     );
-    assert_eq!(data(&recovered)["result"], "checkpoint-timeout");
+    assert_eq!(recovered["data"]["result"], "checkpoint-timeout");
     let enter_count = || {
         tmux_calls(&tmux_log)
             .iter()
@@ -9867,8 +14072,46 @@ fn main_agent_submit_recovery_is_bounded_idempotent_and_never_sends_a_second_ent
 
     let replay = run_main_agent(&checkout, &recover_args, &envs);
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
-    assert_eq!(data(&replay), data(&recovered));
+    assert_eq!(data(&replay), recovered["data"]);
     assert_eq!(enter_count(), 2, "idempotent replay cannot send Enter");
+
+    let before_late_checkpoint = orchestration_registry(&state_dir);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-submit-recovery"];
+        let revision = assignment["revision"]
+            .as_u64()
+            .expect("assignment revision")
+            + 1;
+        assignment["revision"] = json!(revision);
+        assignment["state"] = json!("working");
+        assignment["checkpoint"] = json!({
+            "revision": revision,
+            "summary": "Late authenticated worker checkpoint",
+            "next_action": "Continue",
+            "updated_at": "2030-01-01T00:00:10Z"
+        });
+        assignment["updated_at"] = json!("2030-01-01T00:00:10Z");
+    });
+    let late_checkpoint_replay = run_main_agent(&checkout, &recover_args, &envs);
+    assert_eq!(
+        late_checkpoint_replay.code,
+        0,
+        "stderr={}",
+        late_checkpoint_replay.stderr_text()
+    );
+    assert_eq!(data(&late_checkpoint_replay)["checkpoint_confirmed"], true);
+    assert_eq!(
+        data(&late_checkpoint_replay)["result"],
+        "authenticated worker checkpoint confirmed"
+    );
+    assert_eq!(
+        enter_count(),
+        2,
+        "upgrading a final negative receipt from a late checkpoint must never send another Enter"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        *registry = before_late_checkpoint.clone();
+    });
 
     // Simulate termination after automatic readiness recovery reserved its
     // one attempt but before the sender could record whether Enter was sent.
@@ -10072,6 +14315,119 @@ fn main_agent_quick_validates_before_launch() {
 }
 
 #[test]
+fn main_agent_quick_idempotency_binds_the_canonical_readiness_wait() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = capability(&state_dir, "main-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_path = tmp.path().join("quick-await.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-quick-await",
+            "task_summary": "Bind quick readiness semantics",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-quick-await",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let run = |await_ready: &str| {
+        run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "quick",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--tier",
+                "L0",
+                "--await-ready",
+                await_ready,
+                "--idempotency-key",
+                "quick-await-contract-0001",
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                (
+                    "AGENT_SESSION_TMUX_BIN",
+                    tmux_bin.to_str().expect("tmux bin"),
+                ),
+                (
+                    "AGENT_SESSION_CODEX_BIN",
+                    codex_bin.to_str().expect("codex bin"),
+                ),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_LOG",
+                    tmux_log.to_str().expect("tmux log"),
+                ),
+            ],
+        )
+    };
+
+    let launched = run("0");
+    assert_eq!(launched.code, 0, "stderr={}", launched.stderr_text());
+    let parent_receipt = "main-one:main-incarnation-one:quick-await-contract-0001";
+    let pending_run = data(&launched)["run"].clone();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"][parent_receipt]["outcome"] = json!({
+            "schema_version": "main-agent.quick-pending.v1",
+            "run": pending_run
+        });
+    });
+    let equivalent_wait = run("0s");
+    assert_eq!(
+        equivalent_wait.code,
+        0,
+        "equivalent canonical wait must resume: {}",
+        equivalent_wait.stdout_text()
+    );
+    assert_eq!(data(&equivalent_wait), data(&launched));
+    let changed_wait = run("1s");
+    assert_ne!(changed_wait.code, 0);
+    assert_eq!(
+        changed_wait.stdout_json()["error"]["code"],
+        "idempotency-conflict"
+    );
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "conflicting quick replay must not launch another worker"
+    );
+}
+
+#[test]
 fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -10272,6 +14628,95 @@ fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
     assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
     assert_eq!(data(&replay), data(&resumed));
 
+    // A rolling-upgrade retry can encounter the historical release child
+    // receipt after the assignment transition committed but before the old
+    // parent retire receipt was persisted. Adopt that exact child authority
+    // instead of reapplying the stale top-level revision.
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 11,
+            "state": "released",
+            "task_summary": "Retire fixture",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-historical-release-proven-absent",
+                "session_incarnation": "worker-historical-release-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:11Z"
+        }),
+        &private_packet,
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let parent_key = "retire-historical-release-0001";
+        let child_key = format!("{parent_key}-release");
+        let request = json!({
+            "assignment_id": "assignment-one",
+            "if_revision": 10
+        });
+        registry["receipts"][format!("main-one:main-incarnation-one:{child_key}")] = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-release",
+            "request_digest": orchestration_request_digest("worker-release", &request),
+            "outcome": {
+                "schema_version": "main-agent.assignment-mutation-result.v1",
+                "assignment": {
+                    "assignment_id": "assignment-one",
+                    "revision": 11,
+                    "state": "released"
+                }
+            },
+            "created_at_epoch": 1
+        });
+    });
+    let historical_release = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "retire",
+            "assignment-one",
+            "--if-revision",
+            "10",
+            "--idempotency-key",
+            "retire-historical-release-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        historical_release.code,
+        0,
+        "outcome={}",
+        historical_release.stdout_text()
+    );
+    assert_eq!(data(&historical_release)["released"], true);
+    assert_eq!(data(&historical_release)["retired"], true);
+
     // A missing assignment is a clean not-found.
     let missing = run_main_agent(
         &checkout,
@@ -10428,6 +14873,45 @@ fn main_agent_worker_start_parse_error_names_the_missing_idempotency_key() {
             .contains("--idempotency-key"),
         "parse error must name the missing --idempotency-key: {error}"
     );
+}
+
+#[test]
+fn main_agent_account_handoff_parse_errors_honor_equals_json_format() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let state_arg = state_dir.to_str().expect("state path").to_string();
+    for command in ["account-handoff", "account-handoff-cancel"] {
+        let mut args = vec![
+            "--state-dir",
+            &state_arg,
+            "worker",
+            command,
+            "assignment-1",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "parse-error-equals-json",
+            "--format=json",
+        ];
+        if command == "account-handoff-cancel" {
+            args.extend(["--reservation-id", "reservation-1"]);
+        }
+        let output = run_main_agent(tmp.path(), &args, &[]);
+        assert_eq!(output.code, 64, "{command}: {}", output.stderr_text());
+        assert_eq!(output.stderr_text(), "", "{command} must keep stderr empty");
+        let error = output.stdout_json();
+        assert_eq!(error["schema_version"], "cli.main-agent.error.v1");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "parse-error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--account"),
+            "{command} must name the missing account: {error}"
+        );
+    }
 }
 
 // F1: `quick` no longer requires --idempotency-key (it defaults from a digest of

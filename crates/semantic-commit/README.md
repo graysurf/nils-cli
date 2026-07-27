@@ -19,7 +19,7 @@ Usage: semantic-commit [COMMAND]
 Commands:
   staged-context  Print staged change context for commit message generation
   commit          Commit staged changes with a prepared commit message
-  local-default   Create one governed signed commit on the primary local default branch
+  default-branch  Create one governed signed commit on the primary checkout's default branch
   fixup           Create a fixup! commit for staged changes
   squash          Create a squash! commit for staged changes
   completion      Export shell completion script
@@ -111,25 +111,52 @@ Message-construction options:
 - `--subject <subject>` - structured message subject
 - `--body-bullet <text>` - structured message body bullet; repeatable
 
-## `local-default`
+## `default-branch`
 
-Create exactly one signed, local-only commit in the primary checkout. The
-mutating form requires `--expect-head <full-sha>`, `--expected-branch <name>`,
-and a new `--receipt-out <outside-repository-path>`. If any remote is
-configured, it also requires `--remote-mode local-only`. The command never
-contacts a remote.
+Create exactly one governed signed commit on the primary checkout's default
+branch. The command never contacts or updates a remote.
 
-It requires staged changes with no unstaged or untracked paths, an attached
-matching branch, no in-progress Git operation, and a cached upstream that is
-aligned or strictly behind the local HEAD (ahead-only local state), or no
-upstream. Behind, diverged, and unresolved cached upstream state remains
-fail-closed. It verifies the created signature and parent/tree/clean-state
-postconditions, then atomically writes a
-`cli.semantic-commit.local-default.v1` receipt. A post-commit receipt failure
-is reported as partial success and never triggers an automatic reset.
+Version 1.25.11 is the coordinated local cutover boundary for this intentionally
+breaking replacement. Version 1.25.10 and earlier expose `local-default` and
+the old receipt family; 1.25.11 exposes only `default-branch`. There is no
+command, flag, or receipt alias. Deploy `semantic-commit` and the matching
+`forge-cli` together before changing installed policy consumers. This source
+cutover does not itself authorize a release, tag, package publication, or
+provider delivery.
 
-Add `--repo <path>` to bind a target outside the current directory, so a
-cross-repository completion never depends on the caller's shell position.
+The mutating form requires a full lowercase `--expect-head` and a new private
+`--receipt-out` path outside the repository:
+
+```text
+semantic-commit default-branch \
+  --expect-head <full-sha> \
+  --receipt-out <absolute-outside-repository-path> \
+  [--repo <absolute-repository-path>] \
+  <message-construction-options> \
+  [--format text|json]
+```
+
+Use `--dry-run` without `--receipt-out` for full preflight and message
+validation. Dry-run emits only
+`cli.semantic-commit.default-branch.preview.v1`; it never writes a receipt and
+cannot be adopted for provider delivery. Successful mutation writes the strict
+`cli.semantic-commit.default-branch.v1` receipt only after signature,
+single-parent, exact-head, tree, clean-state, branch, and cached-identity
+postconditions pass.
+
+For remote-backed repositories, the current branch, configured upstream, and
+the upstream remote's cached symbolic default branch must agree, and the cached
+upstream must be exactly aligned before mutation. Missing, ambiguous, behind,
+diverged, or already-ahead cached state fails closed. A primary repository with
+no remotes or upstream metadata may proceed as a remote-free local default.
+Every check is local and network-free.
+
+Add an absolute `--repo <path>` to bind a target outside the current directory,
+so cross-repository completion never depends on the caller's shell position.
+`--expected-branch`, `--remote-mode`, and `--validate-only` are not supported;
+message-only validation remains under `semantic-commit commit --validate-only`.
+The ordinary commit recovery/output controls `--message-out`, `--no-progress`,
+and `--quiet` are not part of the `default-branch` transaction.
 
 When `AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER` is set, its normalized reason is
 recorded in the receipt as `data.delivery_waiver`. Admission is the host guard's

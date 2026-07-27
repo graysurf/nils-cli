@@ -1390,6 +1390,8 @@ struct DurableResumeRecord {
 struct SessionView {
     id: String,
     agent: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_profile: Option<String>,
     #[serde(skip)]
@@ -1482,16 +1484,16 @@ struct DeleteResult {
     registry_fence: SessionRegistryFence,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SessionRegistryFence {
-    session_id: String,
+    pub(crate) session_id: String,
     tmux_session: String,
     runtime_launch_id: Option<String>,
     runtime_generation: Option<u64>,
 }
 
 impl SessionRegistryFence {
-    fn from_record(record: &SessionRecord) -> Self {
+    pub(crate) fn from_record(record: &SessionRecord) -> Self {
         Self {
             session_id: record.id.clone(),
             tmux_session: record.tmux_session.clone(),
@@ -1694,6 +1696,16 @@ fn start_session(
     failure_disposition: StartFailureDisposition,
     prompt_delivery: PromptDelivery,
 ) -> Result<StartView, CliError> {
+    start_session_with_create_guard(context, args, failure_disposition, prompt_delivery, None)
+}
+
+fn start_session_with_create_guard(
+    context: &CliContext,
+    args: cli::StartArgs,
+    failure_disposition: StartFailureDisposition,
+    prompt_delivery: PromptDelivery,
+    create_guard: Option<&mut dyn FnMut() -> Result<(), CliError>>,
+) -> Result<StartView, CliError> {
     validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
@@ -1701,21 +1713,24 @@ fn start_session(
     let launch_started_at = SystemTime::now();
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
-    let mut created = create_record(RecordRequest {
-        context,
-        agent: args.agent,
-        mode: "interactive",
-        coordination_mode: args.coordination_mode,
-        title: args.title.as_deref(),
-        title_state: args.initial_title_state,
-        explicit_id: args.id.as_deref(),
-        cwd: &cwd,
-        prompt: prompt.as_deref(),
-        log_file_name: None,
-        provider_resume: provider_plan.provider_resume.clone(),
-        agent_args: args.agent_args.clone(),
-        agent_bin: Some(display_path(&agent_bin)),
-    })?;
+    let mut created = create_record_with_guard(
+        RecordRequest {
+            context,
+            agent: args.agent,
+            mode: "interactive",
+            coordination_mode: args.coordination_mode,
+            title: args.title.as_deref(),
+            title_state: args.initial_title_state,
+            explicit_id: args.id.as_deref(),
+            cwd: &cwd,
+            prompt: prompt.as_deref(),
+            log_file_name: None,
+            provider_resume: provider_plan.provider_resume.clone(),
+            agent_args: args.agent_args.clone(),
+            agent_bin: Some(display_path(&agent_bin)),
+        },
+        create_guard,
+    )?;
     persist_initial_profile_context(
         context,
         &mut created,
@@ -2226,6 +2241,13 @@ struct RecordRequest<'a> {
 }
 
 fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> {
+    create_record_with_guard(request, None)
+}
+
+fn create_record_with_guard(
+    request: RecordRequest<'_>,
+    mut create_guard: Option<&mut dyn FnMut() -> Result<(), CliError>>,
+) -> Result<CreatedRecord, CliError> {
     let now = Zoned::now();
     let timestamp = now.strftime("%Y%m%d-%H%M%S").to_string();
     let iso = now.timestamp().to_string();
@@ -2248,6 +2270,16 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     let lifecycle_lock = acquire_session_record_lock(request.context, &id)?;
     let tmux_session = format!("hs-{}-{id}", request.agent.as_str());
     let session_dir = session_dir(request.context, &id);
+    if session_dir.exists() {
+        return Err(CliError::runtime(
+            "session-exists",
+            format!("session already exists: {id}"),
+            Some(json!({ "id": id })),
+        ));
+    }
+    if let Some(guard) = create_guard.as_mut() {
+        guard()?;
+    }
     private_dir(&session_dir)?;
 
     let prompt_file = match request.prompt {
@@ -4289,6 +4321,7 @@ fn resume_session_locked(
     mut record: SessionRecord,
     tmux_bin: &Path,
 ) -> Result<ResumeSessionOutcome, CliError> {
+    orchestration::ensure_session_not_quarantined(context, &record)?;
     match session_status(tmux_bin, &record).as_str() {
         "running" => {
             return Ok(ResumeSessionOutcome {
@@ -5689,6 +5722,35 @@ impl Drop for SessionRecordLock {
     }
 }
 
+pub(crate) struct LockedSessionAuthority {
+    _lock: SessionRecordLock,
+    pub(crate) record: SessionRecord,
+}
+
+pub(crate) fn lock_exact_session_authority(
+    context: &CliContext,
+    id: &str,
+) -> Result<Option<LockedSessionAuthority>, CliError> {
+    validate_id(id)?;
+    let lock = acquire_session_record_lock(context, id)?;
+    let directory = session_dir(context, id);
+    let record_path = directory.join("session.json");
+    match fs::symlink_metadata(&record_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(session_io_error("session-read-failed", &record_path, error));
+        }
+        Ok(_) => {}
+    }
+    let resolved = ensure_record_in_session_dir(context, &record_path, &directory, id)?;
+    let record = read_session_record(&resolved.record_path)?;
+    validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+    Ok(Some(LockedSessionAuthority {
+        _lock: lock,
+        record,
+    }))
+}
+
 fn acquire_session_record_lock(
     context: &CliContext,
     id: &str,
@@ -6008,7 +6070,14 @@ fn session_view_from_parts(
     status: String,
     last_terminal_activity_at: Option<String>,
 ) -> SessionView {
-    let profile_resume_context = if status == "stopped" && is_resumable(record) {
+    let resume_blocked_reason =
+        match orchestration::session_authority_is_quarantined(context, record) {
+            Ok(true) => Some("worker-quarantined".to_string()),
+            Ok(false) => None,
+            Err(_) => Some("worker-quarantine-unavailable".to_string()),
+        };
+    let resumable = is_resumable(record) && resume_blocked_reason.is_none();
+    let profile_resume_context = if status == "stopped" && resumable {
         durable_profile_resume_context(record)
     } else {
         Ok(None)
@@ -6016,6 +6085,13 @@ fn session_view_from_parts(
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
+        capabilities: if status == "running"
+            && codex_app_server::managed_account_handoff_supported(record)
+        {
+            vec![codex_app_server::MANAGED_ACCOUNT_HANDOFF_CAPABILITY]
+        } else {
+            Vec::new()
+        },
         agent_profile: session_agent_profile(record).map(str::to_string),
         profile_resume_context,
         mode: record.mode.clone(),
@@ -6032,8 +6108,8 @@ fn session_view_from_parts(
         cwd: record.cwd.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
-        resumable: is_resumable(record),
-        resume_blocked_reason: None,
+        resumable,
+        resume_blocked_reason,
         repo_name: repo_name_from_cwd(&record.cwd),
         provider_resume: record
             .provider_resume
@@ -7882,17 +7958,61 @@ fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn coordination_process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
-    #[cfg(target_os = "linux")]
-    if identity.control_group.is_some()
-        || (identity.process_session_id.is_some() && !identity.process_session_members.is_empty())
-    {
-        return process_runtime_status(identity);
+    let mut evidence = Vec::with_capacity(3);
+    if let Some(control_group) = identity.control_group.as_ref() {
+        let status = linux_control_group_runtime_status(identity, control_group);
+        if status == ProcessGroupStatus::Running {
+            return ProcessGroupStatus::Running;
+        }
+        evidence.push(status);
     }
+    if let Some(process_session_id) = identity.process_session_id {
+        let status = linux_process_runtime_status(identity, process_session_id);
+        if status == ProcessGroupStatus::Running {
+            return ProcessGroupStatus::Running;
+        }
+        evidence.push(status);
+    }
+    if let Some(process_group_id) = identity.process_group_id {
+        let status = process_group_status(process_group_id);
+        if status == ProcessGroupStatus::Running {
+            return ProcessGroupStatus::Running;
+        }
+        evidence.push(status);
+    }
+    combine_runtime_status_evidence(&evidence)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn coordination_process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
     identity
         .process_group_id
         .map(process_group_status)
+        .map(conservative_coordination_process_group_status)
         .unwrap_or(ProcessGroupStatus::Unknown)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn conservative_coordination_process_group_status(
+    status: ProcessGroupStatus,
+) -> ProcessGroupStatus {
+    match status {
+        ProcessGroupStatus::Running => ProcessGroupStatus::Running,
+        ProcessGroupStatus::Stopped | ProcessGroupStatus::Unknown => ProcessGroupStatus::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn combine_runtime_status_evidence(evidence: &[ProcessGroupStatus]) -> ProcessGroupStatus {
+    if evidence.contains(&ProcessGroupStatus::Running) {
+        ProcessGroupStatus::Running
+    } else if evidence.is_empty() || evidence.contains(&ProcessGroupStatus::Unknown) {
+        ProcessGroupStatus::Unknown
+    } else {
+        ProcessGroupStatus::Stopped
+    }
 }
 
 fn process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
@@ -8336,7 +8456,8 @@ fn linux_process_runtime_status(
     }
     match linux_process_session_members(process_session_id) {
         Ok(members) if members.is_empty() => ProcessGroupStatus::Stopped,
-        Ok(_) | Err(_) => ProcessGroupStatus::Unknown,
+        Ok(_) => ProcessGroupStatus::Running,
+        Err(_) => ProcessGroupStatus::Unknown,
     }
 }
 
@@ -10244,7 +10365,7 @@ mod tests {
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record, pane_drawn,
         parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
-        resolve_agent_session_executable_from, resolve_session_id, session_dir,
+        resolve_agent_session_executable_from, resolve_session_id, session_dir, session_view,
         strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
     };
@@ -10918,6 +11039,192 @@ exit 97
         .id
     }
 
+    #[test]
+    fn maintenance_resume_actions_reject_a_session_owned_worker_quarantine() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("maintenance-quarantined-worker"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let runtime_before = serde_json::to_value(&record.runtime).unwrap();
+        let quarantine = crate::orchestration::WorkerQuarantineRecord {
+            schema_version: crate::orchestration::WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: crate::orchestration::SessionRef {
+                machine: None,
+                session_id: record.id.clone(),
+                session_incarnation: "stopped-worker-incarnation".to_string(),
+                session_created_at: record.created_at.clone(),
+            },
+            reason: "stopped runtime reconciled without a worker checkpoint".to_string(),
+            runtime_identity_digest: format!("sha256:{}", "a".repeat(64)),
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        crate::orchestration::persist_session_authority_quarantine(
+            &context,
+            "assignment-maintenance-quarantine",
+            4,
+            &quarantine,
+        )
+        .unwrap();
+        let mut retry = quarantine;
+        retry.created_at = "2031-01-01T00:00:00Z".to_string();
+        let adopted = crate::orchestration::persist_session_authority_quarantine(
+            &context,
+            "assignment-maintenance-quarantine",
+            4,
+            &retry,
+        )
+        .unwrap();
+        assert_eq!(
+            adopted.created_at, "2030-01-01T00:00:00Z",
+            "retry must adopt the durable quarantine timestamp after a pre-commit crash"
+        );
+        let false_bin = super::binary_on_path("false").expect("false executable");
+        let view = session_view(
+            &context,
+            &record,
+            Some("stopped".to_string()),
+            Some(&false_bin),
+        );
+        assert!(!view.resumable);
+        assert_eq!(
+            view.resume_blocked_reason.as_deref(),
+            Some("worker-quarantined")
+        );
+        let preview = crate::maintenance::preview(
+            &context,
+            &id,
+            &false_bin,
+            crate::maintenance::MaintenanceOperation::Resume,
+        )
+        .unwrap();
+        for (action, confirmed) in [
+            (crate::maintenance::MaintenanceActionId::RetryResume, false),
+            (
+                crate::maintenance::MaintenanceActionId::TerminateRuntimeThenResume,
+                true,
+            ),
+        ] {
+            let error = crate::maintenance::execute_with_resume_guard(
+                &context,
+                &id,
+                &false_bin,
+                crate::maintenance::MaintenanceActionRequest {
+                    operation: crate::maintenance::MaintenanceOperation::Resume,
+                    action,
+                    expected_session_incarnation: preview.session_incarnation.clone(),
+                    expected_session_generation: preview.session_generation,
+                    expected_preview_digest: preview.preview_digest.clone(),
+                    confirmed,
+                },
+                |_| panic!("quarantine must reject before the caller resume guard"),
+            )
+            .expect_err("maintenance resume must remain quarantined");
+            assert_eq!(error.code(), "worker-quarantined");
+        }
+        assert_eq!(
+            serde_json::to_value(load_session_record(&context, &id).unwrap().runtime).unwrap(),
+            runtime_before,
+            "maintenance must not launch a new runtime generation"
+        );
+    }
+
+    #[test]
+    fn group_cleanup_session_fence_serializes_resume_and_blocks_broker_reprovision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("group-cleanup-fenced-worker"),
+        );
+        let mut record = load_session_record(&context, &id).unwrap();
+        record.runtime = Some(super::RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: record.tmux_session.clone(),
+            generation: 1,
+            started_at: "2030-01-01T00:00:00Z".to_string(),
+            launch_id: "worker-incarnation".to_string(),
+            extra: std::collections::BTreeMap::new(),
+        });
+        write_session_record(&context, &record).unwrap();
+        let worker = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: record.id.clone(),
+            session_incarnation: "worker-incarnation".to_string(),
+            session_created_at: record.created_at.clone(),
+        };
+        let main = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: "main-cleanup-owner".to_string(),
+            session_incarnation: "main-incarnation".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let locked = super::lock_exact_session_authority(&context, &id)
+            .unwrap()
+            .expect("worker record exists");
+
+        let resume_context = context.clone();
+        let resume_id = id.clone();
+        let false_bin = super::binary_on_path("false").expect("false executable");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let resume_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = super::resume_session_by_id(&resume_context, &resume_id, &false_bin);
+            done_tx.send(result).unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resume contender starts");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "resume must remain blocked while group cleanup owns the exact session record lock"
+        );
+
+        let first = crate::orchestration::persist_session_group_cleanup_fence(
+            &context,
+            &worker,
+            &main,
+            "run-cleanup",
+            &format!("sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let retry = crate::orchestration::persist_session_group_cleanup_fence(
+            &context,
+            &worker,
+            &main,
+            "run-cleanup",
+            &format!("sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        assert_eq!(
+            retry, first,
+            "an interrupted cleanup retry must adopt the durable fence"
+        );
+        drop(locked);
+
+        let resume_error = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resume unblocks after cleanup releases the record lock")
+            .expect_err("durable cleanup fence rejects resume");
+        assert_eq!(resume_error.code(), "worker-group-cleanup-fenced");
+        resume_thread.join().unwrap();
+        let broker_error = crate::coordination::broker::provision(&context, &record)
+            .expect_err("durable cleanup fence rejects direct broker reprovision");
+        assert_eq!(broker_error.code(), "worker-group-cleanup-fenced");
+        assert!(
+            !crate::coordination::capability_path(&context, &record.id, "worker-incarnation")
+                .exists(),
+            "fenced broker reprovision must not create credentials"
+        );
+    }
+
     struct TestProcessGroup {
         child: Option<Child>,
         process_group_id: libc::pid_t,
@@ -11068,6 +11375,15 @@ exit 97
             self.process_group_id as u32
         }
 
+        #[cfg(target_os = "linux")]
+        fn stop_session_leader_only(&self) {
+            // SAFETY: the helper is the leader of this test-owned process group.
+            // Its separately grouped descendant remains in the same POSIX session.
+            unsafe {
+                libc::kill(-self.process_group_id, libc::SIGKILL);
+            }
+        }
+
         fn stop(&mut self) {
             // SAFETY: the helper is the leader of a dedicated test-only process group.
             unsafe {
@@ -11086,6 +11402,97 @@ exit 97
         fn drop(&mut self) {
             self.stop();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coordination_runtime_keeps_a_late_same_session_descendant_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descendant_pid = tmp.path().join("descendant.pid");
+        let mut process = ReapedTestProcessGroup::spawn_tree(&descendant_pid);
+        let session_id = process.process_group_id;
+        let descendant_group = process
+            .descendant_process_group_id
+            .expect("descendant process group");
+        process.stop_session_leader_only();
+
+        let stopped_deadline = Instant::now() + Duration::from_secs(2);
+        while super::process_group_status(process.process_group_id)
+            != super::ProcessGroupStatus::Stopped
+        {
+            assert!(
+                Instant::now() < stopped_deadline,
+                "session leader process group did not stop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::getsid(descendant_group) },
+            session_id,
+            "late descendant must remain in the captured process session"
+        );
+
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("late-session-descendant".to_string()),
+            session_id: "$late".to_string(),
+            pane_id: "%late".to_string(),
+            pane_pid: process.process_group_id,
+            process_group_id: Some(process.process_group_id),
+            process_session_id: Some(session_id),
+            process_session_members: Vec::new(),
+            control_group: None,
+            control_group_members: Vec::new(),
+        };
+        assert_eq!(
+            super::coordination_process_runtime_status(&identity),
+            super::ProcessGroupStatus::Running,
+            "a live same-session descendant must dominate the stopped leader group"
+        );
+        process.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coordination_runtime_evidence_combination_is_fail_closed() {
+        use super::ProcessGroupStatus::{Running, Stopped, Unknown};
+
+        assert_eq!(
+            super::combine_runtime_status_evidence(&[Stopped, Running]),
+            Running,
+            "positive live evidence dominates a stale absence proof"
+        );
+        assert_eq!(
+            super::combine_runtime_status_evidence(&[Stopped, Unknown]),
+            Unknown,
+            "unavailable evidence prevents stopped reconciliation"
+        );
+        assert_eq!(
+            super::combine_runtime_status_evidence(&[Stopped, Stopped]),
+            Stopped
+        );
+        assert_eq!(
+            super::combine_runtime_status_evidence(&[]),
+            Unknown,
+            "no evidence is never proof of absence"
+        );
+    }
+
+    #[test]
+    fn an_unenumerated_process_group_absence_is_not_stopped_runtime_proof() {
+        use super::ProcessGroupStatus::{Running, Stopped, Unknown};
+
+        assert_eq!(
+            super::conservative_coordination_process_group_status(Running),
+            Running
+        );
+        assert_eq!(
+            super::conservative_coordination_process_group_status(Stopped),
+            Unknown
+        );
+        assert_eq!(
+            super::conservative_coordination_process_group_status(Unknown),
+            Unknown
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -11218,41 +11625,174 @@ exit 97
     }
 
     #[cfg(target_os = "linux")]
+    fn linux_scoped_process_test_capability(
+        runtime_dir: Option<&std::ffi::OsStr>,
+        systemd_run: Option<PathBuf>,
+        probe_manager: impl FnOnce(&Path) -> bool,
+    ) -> Result<PathBuf, &'static str> {
+        let runtime_dir = runtime_dir
+            .map(PathBuf::from)
+            .ok_or("XDG_RUNTIME_DIR is unavailable")?;
+        let systemd_run = systemd_run.ok_or("systemd-run is unavailable")?;
+        if !runtime_dir.join("systemd/private").exists() || !probe_manager(&systemd_run) {
+            return Err("the systemd user manager is unreachable");
+        }
+        Ok(systemd_run)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_systemd_user_scope(systemd_run: &Path) -> bool {
+        let Some(success) = super::binary_on_path("true") else {
+            return false;
+        };
+        let mut command = Command::new(systemd_run);
+        command
+            .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+            .arg(format!(
+                "nils-agent-session-cgroup-probe-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .arg("--")
+            .arg(success);
+        super::run_output_with_timeout_and_cap(command, Duration::from_secs(3), 4 * 1024)
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_cgroup_test_capability_or_skip(
+        capability: Result<PathBuf, &'static str>,
+        required: bool,
+        label: &str,
+    ) -> Option<PathBuf> {
+        match capability {
+            Ok(executable) => Some(executable),
+            Err(reason) if required => {
+                panic!("{label} is required but unavailable: {reason}");
+            }
+            Err(reason) => {
+                eprintln!("SKIP: {label} unavailable: {reason}");
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scoped_process_capability_is_explicitly_skippable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let systemd_dir = tmp.path().join("systemd");
+        fs::create_dir(&systemd_dir).unwrap();
+        fs::write(systemd_dir.join("private"), "").unwrap();
+        let executable = tmp.path().join("systemd-run");
+        fs::write(&executable, "").unwrap();
+
+        assert_eq!(
+            linux_scoped_process_test_capability(None, Some(executable.clone()), |_| true),
+            Err("XDG_RUNTIME_DIR is unavailable")
+        );
+        assert_eq!(
+            linux_scoped_process_test_capability(Some(tmp.path().as_os_str()), None, |_| true),
+            Err("systemd-run is unavailable")
+        );
+        assert_eq!(
+            linux_scoped_process_test_capability(
+                Some(tmp.path().as_os_str()),
+                Some(executable.clone()),
+                |_| false,
+            ),
+            Err("the systemd user manager is unreachable")
+        );
+        assert_eq!(
+            linux_scoped_process_test_capability(
+                Some(tmp.path().as_os_str()),
+                Some(executable.clone()),
+                |_| true,
+            ),
+            Ok(executable)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "required cgroup capability is required but unavailable")]
+    fn linux_scoped_process_capability_fails_closed_when_ci_requires_it() {
+        let _ = linux_cgroup_test_capability_or_skip(
+            Err("the systemd user manager is unreachable"),
+            true,
+            "required cgroup capability",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_systemd_scope_probe_executes_when_the_user_manager_is_available() {
+        let required = env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() == Ok("1");
+        let capability = linux_scoped_process_test_capability(
+            env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            super::binary_on_path("systemd-run"),
+            probe_systemd_user_scope,
+        );
+        let _ =
+            linux_cgroup_test_capability_or_skip(capability, required, "Linux systemd scope probe");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_systemd_scope_probe_kills_and_reaps_a_hung_helper() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let helper = tmp.path().join("systemd-run");
+        let pid_file = tmp.path().join("probe.pid");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > {}\nexec sleep 30\n",
+                shell_words::quote(&super::display_path(&pid_file)),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        assert!(!probe_systemd_user_scope(&helper));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the systemd capability probe must have a bounded deadline"
+        );
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the timed-out probe process must be killed and reaped"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn delete_kills_a_detached_descendant_inside_a_pinned_tmux_control_group() {
-        let require_cgroup = env::var_os("AGENT_SESSION_TEST_REQUIRE_CGROUP").is_some();
-        if !require_cgroup {
-            eprintln!(
-                "SKIP: the Linux cgroup integration test runs in its dedicated required CI step"
-            );
-            return;
-        }
         assert!(
             unsafe { libc::getsid(0) } > 1,
-            "required cgroup test must run in an isolated POSIX session; prefix the command with `setsid --wait`"
+            "cgroup test must run in an isolated POSIX session"
         );
-        let Some(tmux) = super::binary_on_path("tmux") else {
-            eprintln!("SKIP: tmux is unavailable for the Linux cgroup integration test");
-            assert!(!require_cgroup, "required cgroup test must provide tmux");
+        let required = env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() == Ok("1");
+        let Some(tmux) = linux_cgroup_test_capability_or_skip(
+            super::binary_on_path("tmux").ok_or("tmux is unavailable"),
+            required,
+            "Linux cgroup integration",
+        ) else {
             return;
         };
-        let Some(systemd_run) = super::binary_on_path("systemd-run") else {
-            eprintln!("SKIP: systemd-run is unavailable for the Linux cgroup integration test");
-            assert!(
-                !require_cgroup,
-                "required cgroup test must provide systemd-run"
-            );
-            return;
-        };
-        let user_manager_ready = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .is_some_and(|runtime_dir| runtime_dir.join("systemd/private").exists());
-        if !user_manager_ready {
-            eprintln!("SKIP: no reachable systemd user manager for the Linux cgroup test");
-            assert!(
-                !require_cgroup,
-                "required cgroup test must provide a reachable systemd user manager"
-            );
+        let Some(systemd_run) = linux_cgroup_test_capability_or_skip(
+            linux_scoped_process_test_capability(
+                env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                super::binary_on_path("systemd-run"),
+                probe_systemd_user_scope,
+            ),
+            required,
+            "Linux cgroup integration capability",
+        ) else {
             return;
         };
         let tmp = tempfile::TempDir::new().unwrap();

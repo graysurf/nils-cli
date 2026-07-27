@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::cli;
 use crate::{CliContext, CliError};
 
-use super::{authenticate_token, claims, mailbox};
+use super::{authenticate_recovery_token, authenticate_token, claims, mailbox};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -363,9 +363,11 @@ pub(crate) fn broker_status(context: &CliContext, id: &str) -> Result<Value, Cli
 pub(crate) fn broker_recover(
     context: &CliContext,
     id: &str,
+    token: &str,
     body: BrokerRecoveryBody,
     reconcile: bool,
 ) -> Result<Value, CliError> {
+    let server_capability = authorize_recovery(context, id, token)?;
     with_json(
         context,
         id,
@@ -376,6 +378,7 @@ pub(crate) fn broker_recover(
                 context,
                 cli::BrokerRecoveryArgs {
                     session: id.to_string(),
+                    capability_file: Some(server_capability.path.clone()),
                     proof_file,
                     idempotency_key: body.idempotency_key,
                     operation: body.operation,
@@ -531,6 +534,23 @@ impl Drop for ServerCapability {
 
 fn authorize(context: &CliContext, id: &str, token: &str) -> Result<ServerCapability, CliError> {
     authenticate_token(context, id, token)?;
+    stage_server_capability(context, id, token)
+}
+
+fn authorize_recovery(
+    context: &CliContext,
+    id: &str,
+    token: &str,
+) -> Result<ServerCapability, CliError> {
+    authenticate_recovery_token(context, id, token)?;
+    stage_server_capability(context, id, token)
+}
+
+fn stage_server_capability(
+    context: &CliContext,
+    id: &str,
+    token: &str,
+) -> Result<ServerCapability, CliError> {
     let directory = if id == "registry" {
         drop(super::lock_registry(context)?);
         context.state_dir.join("coordination")
@@ -556,19 +576,8 @@ fn authorize_any(
     token: &str,
 ) -> Result<(crate::SessionRecord, ServerCapability), CliError> {
     let (record, _) = super::authenticate_any_token(context, token)?;
-    let directory = super::coordination_dir(context, &record.id);
-    let path = directory.join(format!(
-        ".server-capability-{}.request",
-        uuid::Uuid::new_v4()
-    ));
-    write_atomic(&path, token.as_bytes(), SECRET_FILE_MODE).map_err(|_| {
-        CliError::runtime(
-            "coordination-unavailable",
-            "server capability staging failed",
-            None,
-        )
-    })?;
-    Ok((record, ServerCapability { path }))
+    let capability = stage_server_capability(context, &record.id, token)?;
+    Ok((record, capability))
 }
 
 fn with_json<T>(

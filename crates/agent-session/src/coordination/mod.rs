@@ -264,7 +264,14 @@ pub(crate) struct SessionQuiescenceGuard {
     pub broker_present: bool,
     pub broker_identity_matched: bool,
     pub broker_authoritative: bool,
+    pub broker_generation: Option<u64>,
+    pub broker_runtime_identity_digest: Option<String>,
+    pub broker_lost_since_epoch: Option<i64>,
     pub active_claim: bool,
+    pub claim_id: Option<String>,
+    pub claim_revision: Option<u64>,
+    pub claim_expires_at: Option<String>,
+    pub claim_expires_at_epoch: Option<i64>,
     pub active_operation: bool,
     pub uncertain_operation: bool,
 }
@@ -277,6 +284,122 @@ impl SessionQuiescenceGuard {
                 && claim.state == "active"
         })
     }
+
+    pub(crate) fn guidance_summary(
+        &self,
+        session_id: &str,
+        incarnation: &str,
+        controller_session_id: &str,
+        controller_incarnation: &str,
+    ) -> GuidanceSummary {
+        guidance_summary_from_registry(
+            &self._locked.registry,
+            session_id,
+            incarnation,
+            controller_session_id,
+            controller_incarnation,
+            now_epoch(),
+        )
+    }
+}
+
+pub(crate) struct GroupCleanupQuiescenceGuard {
+    locked: LockedRegistry,
+    sessions: Vec<(String, String)>,
+}
+
+impl GroupCleanupQuiescenceGuard {
+    /// Revoke the exact worker incarnations while the coordination registry is
+    /// still locked. Once this commits, a racing worker cannot acquire a new
+    /// claim or operation before orchestration terminalizes its assignment.
+    pub(crate) fn seal(mut self, context: &CliContext) -> Result<(), CliError> {
+        let now = now_epoch();
+        for (session_id, incarnation) in &self.sessions {
+            if let Some(broker) = self.locked.registry.brokers.get_mut(session_id)
+                && broker.incarnation == *incarnation
+            {
+                broker.state = "stopped".to_string();
+                broker.heartbeat_at = timestamp(now);
+                broker.heartbeat_epoch = now;
+                broker.capability_digest.clear();
+            }
+            for claim in &mut self.locked.registry.claims {
+                if claim.session_id == *session_id
+                    && claim.session_incarnation == *incarnation
+                    && claim.state == "active"
+                {
+                    claim.state = "released".to_string();
+                    claim.revision = claim.revision.saturating_add(1);
+                    claim.updated_at = timestamp(now);
+                    claim.terminal_at_epoch = Some(now);
+                }
+            }
+            let _ = fs::remove_file(capability_path(context, session_id, incarnation));
+        }
+        self.locked.save()
+    }
+}
+
+fn ensure_group_cleanup_quiescence(
+    registry: &Registry,
+    sessions: &[(String, String)],
+    allow_active_claims: bool,
+) -> Result<(), CliError> {
+    for (session_id, incarnation) in sessions {
+        if registry
+            .brokers
+            .get(session_id)
+            .is_some_and(|broker| broker.incarnation != *incarnation)
+        {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "worker coordination identity changed before group cleanup",
+                Some(serde_json::json!({ "session_id": session_id })),
+            ));
+        }
+        let active_claim = registry.claims.iter().any(|claim| {
+            claim.session_id == *session_id
+                && claim.session_incarnation == *incarnation
+                && claim.state == "active"
+        });
+        let operation_state = registry
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.session_id == *session_id
+                    && operation.session_incarnation == *incarnation
+                    && matches!(
+                        operation.state.as_str(),
+                        "active" | "completing" | "reconcile_pending"
+                    )
+            })
+            .map(|operation| operation.state.as_str());
+        if operation_state.is_some() || (active_claim && !allow_active_claims) {
+            return Err(CliError::data(
+                "worker-not-quiescent",
+                "group cleanup refuses worker authority with active or uncertain mutations",
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "active_claim": active_claim,
+                    "operation_state": operation_state
+                })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn lock_group_cleanup_quiescence(
+    context: &CliContext,
+    sessions: &[(String, String)],
+    allow_active_claims: bool,
+) -> Result<GroupCleanupQuiescenceGuard, CliError> {
+    let locked = lock_registry(context)?;
+    ensure_group_cleanup_quiescence(&locked.registry, sessions, allow_active_claims)?;
+    Ok(GroupCleanupQuiescenceGuard {
+        locked,
+        sessions: sessions.to_vec(),
+    })
 }
 
 pub(crate) fn lock_session_quiescence(
@@ -285,6 +408,7 @@ pub(crate) fn lock_session_quiescence(
     incarnation: &str,
 ) -> Result<SessionQuiescenceGuard, CliError> {
     let locked = lock_registry(context)?;
+    let now = now_epoch();
     let broker = locked.registry.brokers.get(session_id);
     let broker_present = broker.is_some();
     let broker_identity_matched = broker.is_some_and(|broker| broker.incarnation == incarnation);
@@ -299,11 +423,20 @@ pub(crate) fn lock_session_quiescence(
             )
             && broker::heartbeat_fresh(context, session_id, incarnation, broker.heartbeat_epoch)
     });
-    let active_claim = locked.registry.claims.iter().any(|claim| {
+    let broker_generation = broker.map(|broker| broker.generation);
+    let broker_runtime_identity_digest =
+        broker.map(|broker| broker.runtime_identity_digest.clone());
+    let broker_lost_since_epoch = broker.and_then(|broker| broker.lost_since_epoch);
+    let active_claim_record = locked.registry.claims.iter().find(|claim| {
         claim.session_id == session_id
             && claim.session_incarnation == incarnation
             && claim.state == "active"
     });
+    let active_claim = active_claim_record.is_some_and(|claim| claim.expires_at_epoch > now);
+    let claim_id = active_claim_record.map(|claim| claim.claim_id.clone());
+    let claim_revision = active_claim_record.map(|claim| claim.revision);
+    let claim_expires_at = active_claim_record.map(|claim| claim.expires_at.clone());
+    let claim_expires_at_epoch = active_claim_record.map(|claim| claim.expires_at_epoch);
     let active_operation = locked.registry.operations.iter().any(|operation| {
         operation.session_id == session_id
             && operation.session_incarnation == incarnation
@@ -319,7 +452,14 @@ pub(crate) fn lock_session_quiescence(
         broker_present,
         broker_identity_matched,
         broker_authoritative,
+        broker_generation,
+        broker_runtime_identity_digest,
+        broker_lost_since_epoch,
         active_claim,
+        claim_id,
+        claim_revision,
+        claim_expires_at,
+        claim_expires_at_epoch,
         active_operation,
         uncertain_operation,
     })
@@ -354,6 +494,90 @@ pub(crate) fn activate_ready(context: &CliContext, record: &SessionRecord) -> Re
 
 pub(crate) fn ensure_ready(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
     broker::ensure_ready(context, record)
+}
+
+pub(crate) fn ensure_recovery_registry_schema(context: &CliContext) -> Result<(), CliError> {
+    let path = coordination_root(context)?.join(REGISTRY_FILE);
+    let bytes = read_private_file(&path, MAX_REGISTRY_BYTES).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            store_unavailable()
+        } else {
+            store_corrupt()
+        }
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| store_corrupt())?;
+    let found = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if found != REGISTRY_VERSION {
+        return Err(CliError::data(
+            "coordination-facade-version-skew",
+            "the durable coordination registry requires a matching agent-session/main-agent facade",
+            Some(serde_json::json!({
+                "found_schema_version": found,
+                "supported_schema_version": REGISTRY_VERSION,
+                "required_action": "use the agent-session and main-agent binaries matching this durable registry; do not reinterpret the failure as an authorization problem"
+            })),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_recovery_capability(
+    context: &CliContext,
+    record: &SessionRecord,
+    capability_file: &Path,
+) -> Result<(), CliError> {
+    let expected_incarnation = incarnation(record)?;
+    let token = read_private_file(capability_file, 512).map_err(|_| {
+        CliError::runtime(
+            "controller-recovery-capability-unavailable",
+            "the exact controller recovery capability is unavailable",
+            None,
+        )
+    })?;
+    let token = String::from_utf8(token).map_err(|_| {
+        CliError::runtime(
+            "controller-recovery-capability-unavailable",
+            "the exact controller recovery capability is unavailable",
+            None,
+        )
+    })?;
+    let locked = lock_registry(context)?;
+    locked
+        .registry
+        .brokers
+        .get(&record.id)
+        .filter(|broker| {
+            broker.incarnation == expected_incarnation
+                && matches!(broker.state.as_str(), "ready" | "recovering")
+                && digest_eq(
+                    &broker.capability_digest,
+                    &digest_bytes(token.trim().as_bytes()),
+                )
+                && broker::capability_available(
+                    context,
+                    &record.id,
+                    &expected_incarnation,
+                    &broker.capability_digest,
+                )
+        })
+        .ok_or_else(|| {
+            CliError::runtime(
+                "controller-recovery-capability-unavailable",
+                "the exact controller recovery capability is unavailable",
+                None,
+            )
+        })?;
+    Ok(())
+}
+
+pub(crate) fn recover_broker(
+    context: &CliContext,
+    args: cli::BrokerRecoveryArgs,
+) -> Result<Value, CliError> {
+    broker::recover(context, args, false)
 }
 
 pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
@@ -479,13 +703,27 @@ fn authenticate_from_file(
     session_id: &str,
     capability_file: Option<&Path>,
 ) -> Result<(SessionRecord, String), CliError> {
+    let token = capability_token_from_file(capability_file)?;
+    authenticate_token(context, session_id, &token)
+}
+
+pub(crate) fn authenticate_recovery_from_file(
+    context: &CliContext,
+    session_id: &str,
+    capability_file: Option<&Path>,
+) -> Result<(SessionRecord, String), CliError> {
+    let token = capability_token_from_file(capability_file)?;
+    authenticate_recovery_token(context, session_id, &token)
+}
+
+fn capability_token_from_file(capability_file: Option<&Path>) -> Result<String, CliError> {
     let path = capability_file
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(CAPABILITY_ENV).map(PathBuf::from))
         .ok_or_else(unauthorized)?;
     let token = read_private_file(&path, 512).map_err(|_| unauthorized())?;
     let token = String::from_utf8(token).map_err(|_| unauthorized())?;
-    authenticate_token(context, session_id, token.trim())
+    Ok(token.trim().to_string())
 }
 
 pub(crate) fn authenticate_any_from_file(
@@ -566,6 +804,44 @@ pub(crate) fn authenticate_token(
             "coordination broker heartbeat is stale",
             None,
         ));
+    }
+    Ok((record, incarnation))
+}
+
+pub(crate) fn authenticate_recovery_token(
+    context: &CliContext,
+    session_id: &str,
+    token: &str,
+) -> Result<(SessionRecord, String), CliError> {
+    if token.len() < 32 || token.len() > 256 || !token.is_ascii() {
+        return Err(unauthorized());
+    }
+    let record = load_session_record(context, session_id).map_err(|_| unauthorized())?;
+    let incarnation = incarnation(&record)?;
+    let generation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.generation)
+        .unwrap_or_default();
+    let locked = lock_registry(context)?;
+    let broker = locked
+        .registry
+        .brokers
+        .get(&record.id)
+        .ok_or_else(unauthorized)?;
+    if !matches!(broker.state.as_str(), "ready" | "recovering")
+        || broker.session_id != record.id
+        || broker.incarnation != incarnation
+        || broker.generation != generation
+        || !digest_eq(&broker.capability_digest, &digest_bytes(token.as_bytes()))
+        || !broker::capability_available(
+            context,
+            &record.id,
+            &incarnation,
+            &broker.capability_digest,
+        )
+    {
+        return Err(unauthorized());
     }
     Ok((record, incarnation))
 }
@@ -1338,6 +1614,95 @@ pub(crate) struct CoordinationSummary {
     pub coordination_available: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct GuidanceSummary {
+    pub unread_count: usize,
+    pub consumed_count: usize,
+    pub stale_incarnation_unread_count: usize,
+}
+
+fn guidance_summary_from_registry(
+    registry: &Registry,
+    session_id: &str,
+    incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    now: i64,
+) -> GuidanceSummary {
+    let mut summary = GuidanceSummary::default();
+    for message in registry.messages.iter().filter(|message| {
+        message.recipient_session_id == session_id
+            && message.sender_session_id == controller_session_id
+            && message.sender_incarnation == controller_incarnation
+    }) {
+        if message.state == "unread"
+            && message.expires_at_epoch > now
+            && message.recipient_incarnation != incarnation
+        {
+            summary.stale_incarnation_unread_count =
+                summary.stale_incarnation_unread_count.saturating_add(1);
+            continue;
+        }
+        if message.recipient_incarnation != incarnation {
+            continue;
+        }
+        match message.state.as_str() {
+            "unread" if message.expires_at_epoch > now => {
+                summary.unread_count = summary.unread_count.saturating_add(1);
+            }
+            "read" | "acknowledged" => {
+                summary.consumed_count = summary.consumed_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    summary
+}
+
+pub(crate) fn carry_forward_unread_controller_guidance_with_authorization<G, F>(
+    context: &CliContext,
+    recipient_session_id: &str,
+    previous_incarnation: &str,
+    current_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorize: F,
+) -> Result<usize, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    mailbox::carry_forward_unread_controller_guidance_with_authorization(
+        context,
+        recipient_session_id,
+        previous_incarnation,
+        current_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorize,
+    )
+}
+
+pub(crate) fn quarantine_orphaned_controller_guidance_with_authorization<G, F>(
+    context: &CliContext,
+    recipient_session_id: &str,
+    current_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorize: F,
+) -> Result<usize, CliError>
+where
+    F: FnOnce() -> Result<G, CliError>,
+{
+    mailbox::quarantine_orphaned_controller_guidance_with_authorization(
+        context,
+        recipient_session_id,
+        current_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorize,
+    )
+}
+
 pub(crate) fn json_value<T: Serialize>(value: T) -> Result<Value, CliError> {
     serde_json::to_value(value).map_err(|_| {
         CliError::runtime(
@@ -1353,21 +1718,197 @@ pub(crate) fn read_bounded_json<T: for<'de> Deserialize<'de>>(
     max_bytes: u64,
     code: &'static str,
 ) -> Result<T, CliError> {
-    let metadata = fs::metadata(path)
+    let bytes = read_bounded_bytes(path, max_bytes, code)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| CliError::data(code, "coordination input is invalid", None))
+}
+
+pub(crate) fn read_bounded_bytes(
+    path: &Path,
+    max_bytes: u64,
+    code: &'static str,
+) -> Result<Vec<u8>, CliError> {
+    let mut file = File::open(path)
+        .map_err(|_| CliError::data(code, "coordination input could not be read", None))?;
+    let metadata = file
+        .metadata()
         .map_err(|_| CliError::data(code, "coordination input could not be read", None))?;
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(CliError::data(code, "coordination input is invalid", None));
     }
-    let bytes = fs::read(path)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|_| CliError::data(code, "coordination input could not be read", None))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| CliError::data(code, "coordination input is invalid", None))
+    if bytes.len() as u64 > max_bytes {
+        return Err(CliError::data(code, "coordination input is invalid", None));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bounded_reader_rejects_an_oversized_regular_file_before_allocating_its_length() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("oversized.json");
+        fs::write(&path, vec![b'x'; 65]).expect("fixture");
+
+        let error =
+            read_bounded_bytes(&path, 64, "oversized-input").expect_err("must reject oversized");
+        assert_eq!(error.code(), "oversized-input");
+    }
+
+    #[test]
+    fn group_cleanup_never_overrides_operations_and_force_only_overrides_claims() {
+        let sessions = vec![("worker".to_string(), "incarnation".to_string())];
+        let registry_with = |operation_state: Option<&str>| {
+            let operations = operation_state
+                .map(|state| {
+                    json!([{
+                        "schema_version": "agent-session.operation-lease.v1",
+                        "lease_id": "lease",
+                        "session_id": "worker",
+                        "session_incarnation": "incarnation",
+                        "claim_id": "claim",
+                        "claim_revision": 1,
+                        "operation": "edit",
+                        "targets": [],
+                        "state": state,
+                        "revision": 1,
+                        "started_at": "2030-01-01T00:00:00Z",
+                        "expires_at": "2030-01-01T00:10:00Z",
+                        "expires_at_epoch": i64::MAX,
+                        "terminal_at_epoch": null,
+                        "execution_token_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "activity_revision": 1,
+                        "activity_identity_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "runtime_identity_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        "outcome": null
+                    }])
+                })
+                .unwrap_or_else(|| json!([]));
+            serde_json::from_value::<Registry>(json!({
+                "claims": [{
+                    "schema_version": "agent-session.work-context.v1",
+                    "session_id": "worker",
+                    "session_incarnation": "incarnation",
+                    "claim_id": "claim",
+                    "revision": 1,
+                    "state": "active",
+                    "intent": "implementation",
+                    "tier": "L2",
+                    "repositories": ["example/repository"],
+                    "worktrees": [],
+                    "provider_refs": [],
+                    "plan_refs": [],
+                    "scopes": [],
+                    "summary": "fixture",
+                    "updated_at": "2030-01-01T00:00:00Z",
+                    "expires_at": "2030-01-01T00:10:00Z",
+                    "expires_at_epoch": i64::MAX
+                }],
+                "operations": operations
+            }))
+            .expect("registry")
+        };
+
+        let safe_claim = ensure_group_cleanup_quiescence(&registry_with(None), &sessions, false)
+            .expect_err("safe cleanup must retain an active claim");
+        assert_eq!(safe_claim.code(), "worker-not-quiescent");
+        ensure_group_cleanup_quiescence(&registry_with(None), &sessions, true)
+            .expect("force may revoke a claim after proving operation quiescence");
+        for state in ["active", "completing", "reconcile_pending"] {
+            let error =
+                ensure_group_cleanup_quiescence(&registry_with(Some(state)), &sessions, true)
+                    .expect_err("force must never override an operation");
+            assert_eq!(error.code(), "worker-not-quiescent", "state={state}");
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let mut registry = registry_with(None);
+        registry.brokers.insert(
+            "worker".to_string(),
+            BrokerRecord {
+                session_id: "worker".to_string(),
+                incarnation: "incarnation".to_string(),
+                coordination_mode: crate::cli::CoordinationMode::Enforce,
+                capability_digest:
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        .to_string(),
+                generation: 1,
+                state: "ready".to_string(),
+                heartbeat_at: "2030-01-01T00:00:00Z".to_string(),
+                heartbeat_epoch: i64::MAX,
+                runtime_identity: None,
+                runtime_identity_digest: String::new(),
+                lost_since_epoch: None,
+            },
+        );
+        {
+            let mut locked = lock_registry(&context).expect("lock");
+            locked.registry = registry;
+            locked.save().expect("seed registry");
+        }
+        let capability = capability_path(&context, "worker", "incarnation");
+        fs::create_dir_all(capability.parent().expect("capability parent"))
+            .expect("capability dir");
+        fs::write(&capability, b"private capability").expect("capability");
+        let guard = lock_group_cleanup_quiescence(&context, &sessions, true).expect("force guard");
+        let observer_context = context.clone();
+        let observer_capability = capability.clone();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let locked = lock_registry(&observer_context).expect("observer lock");
+            let broker_state = locked.registry.brokers["worker"].state.clone();
+            let active_claim = locked
+                .registry
+                .claims
+                .iter()
+                .any(|claim| claim.state == "active");
+            let authority = claims::ensure_current_broker(
+                &observer_context,
+                &locked.registry,
+                "worker",
+                "incarnation",
+            )
+            .map_err(|error| error.code().to_string());
+            observed_tx
+                .send((
+                    broker_state,
+                    active_claim,
+                    observer_capability.exists(),
+                    authority,
+                ))
+                .expect("observer result");
+        });
+        assert!(
+            observed_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a competing authority check must remain blocked before the seal"
+        );
+        guard.seal(&context).expect("seal");
+        let (broker_state, active_claim, capability_exists, authority) = observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("observer must complete without lock-order deadlock");
+        observer.join().expect("observer");
+        assert_eq!(broker_state, "stopped");
+        assert!(!active_claim);
+        assert!(!capability_exists);
+        assert_eq!(
+            authority.expect_err("pre-authenticated waiter must fail under the sealed snapshot"),
+            "coordination-broker-lost"
+        );
+    }
 
     #[test]
     fn digest_comparison_is_exact() {

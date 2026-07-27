@@ -232,15 +232,62 @@ pub fn run(args: &[String]) -> i32 {
     run_with_signing_policy(args, false)
 }
 
-pub(crate) fn run_forced_signing(args: &[String]) -> i32 {
-    run_with_signing_policy(args, true)
-}
-
 fn run_with_signing_policy(args: &[String], force_signing: bool) -> i32 {
-    let mut options = match parse_args(args) {
+    let options = match parse_args(args) {
         Ok(options) => options,
         Err(code) => return code,
     };
+    run_options(options, force_signing)
+}
+
+/// Typed commit configuration shared by the exceptional default-branch path.
+///
+/// The default-branch parser delegates every message-construction option to
+/// this type, so the ordinary and exceptional commands cannot drift through a
+/// manually synchronized option/value list.
+pub(crate) struct DefaultBranchCommitOptions {
+    options: CommitOptions,
+    max_header_width_from_flag: bool,
+}
+
+impl DefaultBranchCommitOptions {
+    pub(crate) fn new() -> Self {
+        Self {
+            options: CommitOptions::default(),
+            max_header_width_from_flag: false,
+        }
+    }
+
+    pub(crate) fn parse_message_argument(
+        &mut self,
+        args: &[String],
+        index: usize,
+    ) -> Result<Option<usize>, i32> {
+        parse_message_argument(
+            args,
+            index,
+            &mut self.options,
+            &mut self.max_header_width_from_flag,
+        )
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), i32> {
+        finish_message_options(&mut self.options, self.max_header_width_from_flag)
+    }
+
+    pub(crate) fn run(mut self, repo: PathBuf, expect_head: String, dry_run: bool) -> i32 {
+        self.options.summary_mode = SummaryMode::None;
+        self.options.no_progress = true;
+        self.options.quiet = true;
+        self.options.dry_run = dry_run;
+        self.options.require_clean = true;
+        self.options.expect_head = Some(expect_head);
+        self.options.repo = Some(repo);
+        run_options(self.options, true)
+    }
+}
+
+fn run_options(mut options: CommitOptions, force_signing: bool) -> i32 {
     let operation = commit_operation(&options);
 
     if !git::command_exists("git") {
@@ -542,52 +589,127 @@ fn run_cleanup(args: &[String], operation: CleanupOperation) -> i32 {
     print_summary(options.summary_mode, options.repo.as_deref())
 }
 
+fn parse_message_argument(
+    args: &[String],
+    index: usize,
+    options: &mut CommitOptions,
+    max_header_width_from_flag: &mut bool,
+) -> Result<Option<usize>, i32> {
+    let value = |label: &str| {
+        args.get(index + 1).cloned().ok_or_else(|| {
+            eprintln!("error: {label} requires a value");
+            EXIT_ERROR
+        })
+    };
+    let next = match args[index].as_str() {
+        "--message" | "-m" => {
+            options.message = Some(value(args[index].as_str())?);
+            index + 2
+        }
+        "--message-file" | "-F" => {
+            options.message_file = Some(args.get(index + 1).cloned().ok_or_else(|| {
+                eprintln!("error: {} requires a path", args[index]);
+                EXIT_ERROR
+            })?);
+            index + 2
+        }
+        "--message-out" => {
+            options.message_out = Some(PathBuf::from(value("--message-out")?));
+            index + 2
+        }
+        "--automation" | "--non-interactive" => {
+            options.automation = true;
+            index + 1
+        }
+        "--auto-fix" => {
+            options.auto_fix = true;
+            index + 1
+        }
+        "--signoff" => {
+            options.signoff = true;
+            index + 1
+        }
+        "--trailer" => {
+            options.trailers.push(value("--trailer")?);
+            index + 2
+        }
+        "--type" => {
+            options.structured.typ = Some(value("--type")?);
+            index + 2
+        }
+        "--scope" => {
+            options.structured.scope = Some(value("--scope")?);
+            index + 2
+        }
+        "--subject" => {
+            options.structured.subject = Some(value("--subject")?);
+            index + 2
+        }
+        "--body-bullet" | "--bullet" => {
+            options
+                .structured
+                .body_bullets
+                .push(value(args[index].as_str())?);
+            index + 2
+        }
+        "--max-header-width" => {
+            let width = value("--max-header-width")?;
+            options.max_header_width = parse_header_width_flag(&width)?;
+            *max_header_width_from_flag = true;
+            index + 2
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(next))
+}
+
+fn finish_message_options(
+    options: &mut CommitOptions,
+    max_header_width_from_flag: bool,
+) -> Result<(), i32> {
+    if options.message.is_some() && options.message_file.is_some() {
+        eprintln!("error: use only one of --message or --message-file");
+        return Err(EXIT_ERROR);
+    }
+    if options.structured.has_any() && (options.message.is_some() || options.message_file.is_some())
+    {
+        eprintln!(
+            "error: structured message fields cannot be combined with --message or --message-file"
+        );
+        return Err(EXIT_ERROR);
+    }
+    if options.structured.has_any()
+        && (options.structured.typ.is_none() || options.structured.subject.is_none())
+    {
+        eprintln!("error: structured message fields require --type and --subject");
+        return Err(EXIT_ERROR);
+    }
+    if let Err(message) = validate_trailers(&options.trailers) {
+        eprintln!("error: {message}");
+        return Err(EXIT_ERROR);
+    }
+    if !max_header_width_from_flag {
+        options.max_header_width = env_header_width()?;
+    }
+    Ok(())
+}
+
 fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
     let mut options = CommitOptions::default();
     let mut max_header_width_from_flag = false;
 
     let mut i = 0;
     while i < args.len() {
+        if let Some(next) =
+            parse_message_argument(args, i, &mut options, &mut max_header_width_from_flag)?
+        {
+            i = next;
+            continue;
+        }
         match args[i].as_str() {
             "-h" | "--help" => {
                 print_usage_stdout();
                 return Err(0);
-            }
-            "--message" | "-m" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: {} requires a value", args[i]);
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.message = Some(value);
-                i += 2;
-            }
-            "--message-file" | "-F" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: {} requires a path", args[i]);
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.message_file = Some(value);
-                i += 2;
-            }
-            "--message-out" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: --message-out requires a path");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.message_out = Some(PathBuf::from(value));
-                i += 2;
             }
             "--summary" => {
                 let value = match args.get(i + 1) {
@@ -643,20 +765,12 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
                 options.quiet = true;
                 i += 1;
             }
-            "--automation" | "--non-interactive" => {
-                options.automation = true;
-                i += 1;
-            }
             "--validate-only" => {
                 options.validate_only = true;
                 i += 1;
             }
             "--dry-run" => {
                 options.dry_run = true;
-                i += 1;
-            }
-            "--auto-fix" => {
-                options.auto_fix = true;
                 i += 1;
             }
             "--amend" => {
@@ -691,70 +805,6 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
                 options.expect_head = Some(value);
                 i += 2;
             }
-            "--signoff" => {
-                options.signoff = true;
-                i += 1;
-            }
-            "--trailer" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: --trailer requires a value");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.trailers.push(value);
-                i += 2;
-            }
-            "--type" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: --type requires a value");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.structured.typ = Some(value);
-                i += 2;
-            }
-            "--scope" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: --scope requires a value");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.structured.scope = Some(value);
-                i += 2;
-            }
-            "--subject" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: --subject requires a value");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.structured.subject = Some(value);
-                i += 2;
-            }
-            "--body-bullet" | "--bullet" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value.clone(),
-                    None => {
-                        eprintln!("error: {} requires a value", args[i]);
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.structured.body_bullets.push(value);
-                i += 2;
-            }
             "--repo" => {
                 let value = match args.get(i + 1) {
                     Some(value) => value.clone(),
@@ -767,19 +817,6 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
                 options.repo = Some(PathBuf::from(value));
                 i += 2;
             }
-            "--max-header-width" => {
-                let value = match args.get(i + 1) {
-                    Some(value) => value,
-                    None => {
-                        eprintln!("error: --max-header-width requires a value");
-                        print_usage_stderr();
-                        return Err(EXIT_ERROR);
-                    }
-                };
-                options.max_header_width = parse_header_width_flag(value)?;
-                max_header_width_from_flag = true;
-                i += 2;
-            }
             other => {
                 eprintln!("error: unknown argument: {other}");
                 print_usage_stderr();
@@ -788,10 +825,7 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
         }
     }
 
-    if options.message.is_some() && options.message_file.is_some() {
-        eprintln!("error: use only one of --message or --message-file");
-        return Err(EXIT_ERROR);
-    }
+    finish_message_options(&mut options, max_header_width_from_flag)?;
 
     if options.no_edit && !options.amend {
         eprintln!("error: --no-edit requires --amend");
@@ -816,30 +850,6 @@ fn parse_args(args: &[String]) -> Result<CommitOptions, i32> {
     {
         eprintln!("error: --no-edit cannot be combined with message input or --auto-fix");
         return Err(EXIT_ERROR);
-    }
-
-    if options.structured.has_any() && (options.message.is_some() || options.message_file.is_some())
-    {
-        eprintln!(
-            "error: structured message fields cannot be combined with --message or --message-file"
-        );
-        return Err(EXIT_ERROR);
-    }
-
-    if options.structured.has_any()
-        && (options.structured.typ.is_none() || options.structured.subject.is_none())
-    {
-        eprintln!("error: structured message fields require --type and --subject");
-        return Err(EXIT_ERROR);
-    }
-
-    if let Err(message) = validate_trailers(&options.trailers) {
-        eprintln!("error: {message}");
-        return Err(EXIT_ERROR);
-    }
-
-    if !max_header_width_from_flag {
-        options.max_header_width = env_header_width()?;
     }
 
     Ok(options)

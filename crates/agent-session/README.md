@@ -59,11 +59,14 @@ agent-session logs <id>
 agent-session delete <id>
 main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json
 main-agent self show --format json
+main-agent self recover --idempotency-key recover-controller-001 --format json
 main-agent rehydrate --format markdown
 main-agent status --format json
 main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json
 main-agent worker supervise ASSIGNMENT_ID --format json
 main-agent worker diagnose ASSIGNMENT_ID --format json
+main-agent worker guidance-reconcile ASSIGNMENT_ID --if-revision 3 --idempotency-key guidance-001 --format json
+main-agent worker account-handoff ASSIGNMENT_ID --account ACCOUNT --if-revision 3 --authorize-account-change --idempotency-key account-001 --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision 2 --timeout 5s --idempotency-key recover-001 --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision 3 --idempotency-key reconcile-001 --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key cancel-001 --format json
@@ -79,12 +82,22 @@ list/serve/activity projections expose bounded relationship metadata only.
 Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
 for packet examples, revision and retry rules, interactive worker acceptance,
 resume/rebind, relationship transfers, and terminal cleanup. In particular,
-Bare single-assignment `worker start` defaults to a bounded five-minute
-readiness wait, keeping startup inside one typed boundary; `--await-ready 0`
-is the explicit launch-only opt-out. Batch launch remains transport-only so
-its bounded lane count cannot multiply readiness deadlines. A nonzero wait
+bare single-assignment `worker start` defaults to waiting up to 5 minutes for
+the typed readiness proof; select explicit `--await-ready 0` for launch-only
+behavior. Batch launch remains transport-only so its bounded lane count cannot
+multiply readiness deadlines. Its parent
+idempotency receipt binds the sorted lane names and raw packet digests before
+any lane starts; exact replay resumes incomplete lanes, including transient or
+ambiguous child failures reconciled through the lane receipt, while membership,
+rename, order, or byte drift conflicts before launch. A nonzero wait
 persists one fixed readiness deadline and leased finalizer, so concurrent exact
-replays join the same attempt and return the same final receipt. A fresh
+replays join the same attempt and return the same final receipt. The receipt
+also persists the automatic recovery reservation and its reserved/sending/sent
+substage in the same locked commit that reserves the attempt, so a stale
+finalizer cannot reserve recovery after a successor takes over. Finalizer
+takeover continues the same attempt and never repeats an Enter with an
+ambiguous outcome. The short takeover lease is extended beyond
+the pane-input timeout only while `sending` is in flight. A fresh
 Codex or Claude worker that remains `starting` receives at most one
 runtime-owned recovery Enter; automatic and explicit recovery share one durable
 attempt reservation, and prompt load, paste, and Enter each occur at most once
@@ -105,7 +118,16 @@ may still act. `worker reconcile-recovery` is the explicit non-resend terminal
 escape: it succeeds only while holding the exact worker record and
 coordination-quiescence guards after proving the runtime/tmux command stopped,
 the worker claim absent, operations quiescent, and Main Agent authority still
-active. Guarded cancellation of that absorbing terminal record reacquires the
+active. Stopped proof combines every persisted cgroup, process-session, and
+process-group source: live evidence dominates, unavailable evidence fails
+closed, and `Stopped` requires every available source to prove absence. Before
+recording `reconciled`, the command atomically persists a session-owned
+exact-incarnation quarantine marker that rejects session resume, maintenance
+resume, work-context claim, bootstrap, checkpoint, and equivalent
+execution-authority restoration without coupling unrelated sessions to the
+orchestration registry. A retry after marker persistence adopts the matching
+durable marker before completing the registry transition. Guarded cancellation of that
+absorbing terminal record reacquires the
 same stopped-runtime and quiescence boundaries and therefore remains available
 after the exact worker broker has stopped and cleared its capability. Otherwise
 it fails closed. Cancellation also revalidates the exact Main Agent claim while
@@ -114,6 +136,9 @@ authenticated worker checkpoint can also resolve the attempt. Its provisional re
 resumable: an exact-key retry observes the same attempt without resending and
 may upgrade the receipt once that checkpoint or a definitive failure resolves
 the outcome.
+`main-agent quick` includes the canonical readiness wait in its parent
+idempotency contract while continuing to recognize historical parent and
+`{parent}-worker` child receipts during rolling upgrades.
 Readiness still requires the interactive worker to
 be visible, attachable, authenticated, and checkpointed after that reservation.
 An authoritative completed or failed provider turn ends the wait early when no
@@ -128,6 +153,44 @@ repeating it. If a macro stops, continue from `last_proven_safe_state` with
 `worker diagnose`, `submit-recovery`, `cancel`, or `retire`; never resend the
 prompt, inject a second Enter, or accept a trust, update, authentication,
 permission, or MCP dialog automatically.
+
+Supervision persists a privacy-safe, bounded material worktree fingerprint:
+porcelain status, staged and unstaged binary diffs, and bounded untracked
+path/content evidence. Continued edits to an already-modified file and
+deletion-only changes therefore reset progress age; unavailable, oversized, or
+non-regular material fails closed. Broker-heartbeat staleness is classified
+separately from work-context expiry. `coordination_broker_stale` routes recovery
+to the target session's exact authenticated broker owner;
+`edit_authority_stale` requests a bounded recheck; only
+`claim_renewal_required` asks the worker to renew its own claim.
+
+`main-agent self recover` is the ownership-qualified controller recovery macro.
+It proves the current caller is the exact Main Agent incarnation with an
+unchanged live runtime, active claim, matching broker identity, and no active or
+uncertain operation, then adopts the existing broker recovery primitive. A
+healthy broker is an idempotent no-op. There is no ambiguous top-level
+`recover`, and the command never changes accounts, resumes or replaces the
+provider, resends a prompt, sends Enter, or clears an operation fence.
+
+Resume bootstrap retains `previous_worker`, moves only unread/unexpired guidance
+from the exact current controller to the new worker incarnation, and preserves
+the message ID and unread state with bounded forwarding provenance.
+`worker guidance-reconcile` is the revision-fenced idempotent repair action when
+supervision still reports stale-incarnation guidance; it never exposes a body
+or marks worker consumption.
+
+For an app-server-managed Codex worker with typed account and auto-resume
+controls, `worker account-handoff` is the revision-fenced, explicitly authorized
+macro that queues the allowlisted account, waits for the exact incumbent
+incarnation to apply it, verifies the binding, and re-arms structured
+continuation. It never uses `/logout` or raw terminal input. A raw worker has no
+public restart flag: unsupported handoff fails closed and reports the stable
+`agent-session.codex-managed-account-handoff.v1` capability required from a
+daemon-launched managed worker, without changing the account or runtime. A
+bounded raw rate-limit diagnostic is attempted only after both provider and
+material progress are truly stale, and only for an exact durable
+selected-account provenance; ambient authentication is never treated as
+account identity.
 
 Handoff moves the assignment run and primary manager atomically under the
 source coordination guard. It refuses upstream or reverse dependency edges
@@ -145,7 +208,8 @@ remain usable from a phone.
 latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation,
 and the immutable tmux session/pane identity is persisted before a successful start or resume returns. Resume first
 proves the current and every retained prior launch identity stopped, so a surviving provider process cannot be hidden by
-a new runtime generation.
+a new runtime generation. A worker carrying a stopped-recovery quarantine
+cannot resume into a new runtime generation.
 An older stopped record without that proof returns the same non-retryable manual-verification action as deletion; only
 a generation durably marked as never launched can resume without a runtime identity. If tmux launch fails, the prior
 runtime and activity snapshot are restored only after any possibly launched replacement is verified stopped. An

@@ -410,17 +410,70 @@ pub(super) fn spawn_test_process_group() -> TestProcessGroup {
     spawn_test_process_group_command(command)
 }
 
-pub(super) fn spawn_scoped_test_process_group() -> TestProcessGroup {
+#[cfg(target_os = "linux")]
+fn binary_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn probe_systemd_user_scope(systemd_run: &Path) -> bool {
+    let Some(success) = binary_on_path("true") else {
+        return false;
+    };
+    let mut command = Command::new(systemd_run);
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+        .arg(format!(
+            "nils-agent-session-integration-probe-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .arg("--")
+        .arg(success)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < Duration::from_secs(3) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let pid = child.id() as libc::pid_t;
+                // SAFETY: the probe was launched as a dedicated process-group leader.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+pub(super) fn spawn_scoped_test_process_group() -> Result<TestProcessGroup, &'static str> {
     #[cfg(target_os = "linux")]
     let command = {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .expect("Linux scoped process test requires XDG_RUNTIME_DIR");
-        assert!(
-            runtime_dir.join("systemd/private").exists(),
-            "Linux scoped process test requires a reachable systemd user manager"
-        );
-        let mut command = Command::new("systemd-run");
+            .ok_or("XDG_RUNTIME_DIR is unavailable")?;
+        if !runtime_dir.join("systemd/private").exists() {
+            return Err("the systemd user manager socket is unavailable");
+        }
+        let systemd_run = binary_on_path("systemd-run").ok_or("systemd-run is unavailable")?;
+        if !probe_systemd_user_scope(&systemd_run) {
+            return Err("the systemd user manager is unreachable");
+        }
+        let mut command = Command::new(systemd_run);
         command
             .arg("--user")
             .arg("--scope")
@@ -458,7 +511,7 @@ pub(super) fn spawn_scoped_test_process_group() -> TestProcessGroup {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    process
+    Ok(process)
 }
 
 fn spawn_test_process_group_command(mut command: Command) -> TestProcessGroup {
@@ -6322,6 +6375,121 @@ fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
         );
     }
     assert!(standalone.get("orchestration").is_none());
+}
+
+#[test]
+fn list_json_projects_managed_handoff_capability_without_private_session_metadata() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let managed_dir = write_session_record(&state_dir, "managed", "codex", "hs-managed");
+    let raw_dir = write_session_record(&state_dir, "raw", "codex", "hs-raw");
+    let claude_dir = write_session_record(&state_dir, "claude", "claude", "hs-claude");
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &managed_dir,
+        "managed",
+        "codex",
+        "hs-managed",
+    );
+    attach_provider_runtime(tmp.path(), &state_dir, &raw_dir, "raw", "codex", "hs-raw");
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &claude_dir,
+        "claude",
+        "claude",
+        "hs-claude",
+    );
+    let managed_record_path = managed_dir.join("session.json");
+    let mut managed: Value =
+        serde_json::from_slice(&fs::read(&managed_record_path).expect("managed session record"))
+            .expect("managed session json");
+    managed["runtime"]["managed_account_handoff_capability"] =
+        json!("agent-session.codex-managed-account-handoff.v1");
+    managed["runtime"]["private_runtime_sentinel"] = json!("must-not-project");
+    managed["provider_resume"] = json!({
+        "provider": "codex",
+        "session_id": "public-resume-session",
+        "captured_at": "2030-01-01T00:00:00Z",
+        "capture_method": "test",
+        "resume_args": ["resume", "public-resume-session"],
+        "private_resume_sentinel": "private-resume-metadata"
+    });
+    managed["codex_account_binding"] = json!({
+        "schema_version": "agent-session.codex-account-binding.v1",
+        "selected_account": "alpha",
+        "revision": 1,
+        "state": "bound",
+        "applied_runtime_id": "launch-managed",
+        "updated_at": "2030-01-01T00:00:00Z",
+        "private_token": "private-token-sentinel"
+    });
+    fs::write(
+        &managed_record_path,
+        serde_json::to_vec_pretty(&managed).expect("managed session bytes"),
+    )
+    .expect("managed session record update");
+
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let output = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "1"),
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let sessions = data(&output.stdout_json())
+        .as_array()
+        .expect("list sessions")
+        .clone();
+    let by_id = |id: &str| {
+        sessions
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id} session"))
+    };
+    assert_eq!(
+        by_id("managed")["capabilities"],
+        json!(["agent-session.codex-managed-account-handoff.v1"])
+    );
+    assert_eq!(
+        by_id("managed")["codex_account"]["selected_account"],
+        "alpha"
+    );
+    assert_eq!(
+        by_id("managed")["provider_resume"]["session_id"],
+        "public-resume-session"
+    );
+    for id in ["raw", "claude"] {
+        assert!(
+            by_id(id)
+                .as_object()
+                .is_some_and(|session| !session.contains_key("capabilities")),
+            "{id} must not advertise managed Codex handoff"
+        );
+    }
+    let rendered = serde_json::to_string(&sessions).expect("render list projection");
+    for private in [
+        "private_runtime_sentinel",
+        "private-token-sentinel",
+        "private-resume-metadata",
+        "codex_account_binding",
+        "managed_account_handoff_capability",
+        "codex_app_server_socket",
+        "codex_app_server_thread_handoff",
+    ] {
+        assert!(
+            !rendered.contains(private),
+            "list JSON leaked private session metadata {private}: {rendered}"
+        );
+    }
 }
 
 fn write_session_record(dir: &Path, id: &str, agent: &str, tmux_session: &str) -> PathBuf {
