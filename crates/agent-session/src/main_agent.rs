@@ -2064,7 +2064,7 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
         .map_err(|_| invalid_input("stored assignment packet is invalid"))?;
     validate_assignment_input(&packet)?;
     if let Err(error) = validate_bootstrap_checkout_binding(&record, &assignment, &packet) {
-        if rebind_from.is_none() {
+        if rebind_from.is_none() && assignment.state == "starting" {
             record_preclaim_bootstrap_blocker(
                 context,
                 &record,
@@ -2110,7 +2110,7 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
         rebind_from.as_ref(),
         true,
     ) {
-        if rebind_from.is_none() {
+        if rebind_from.is_none() && assignment.state == "starting" {
             record_preclaim_bootstrap_blocker(
                 context,
                 &record,
@@ -2828,12 +2828,14 @@ fn run_worker_start_single_input(
         )
     })?;
     let prompt = worker_start_prompt(&assignment_id, &main_agent_bin);
+    let previous_prompt = previous_worker_start_prompt(&assignment_id, &main_agent_bin);
+    let replay_prompts = [prompt.as_str(), previous_prompt.as_str()];
     if let Some(batch_lane) = batch_lane {
         renew_worker_start_batch_lane(context, batch_lane)?;
     }
     let existing = match load_session_record(context, &worker_session_id) {
         Ok(worker) if runtime_is_proven_never_launched(&worker) => {
-            ensure_worker_launch_matches(context, &worker, &launch_input, &prompt)?;
+            ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
             delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
             None
         }
@@ -2844,7 +2846,7 @@ fn run_worker_start_single_input(
     let fresh_launch = existing.is_none();
     let mut worker_start_fence = None;
     let (worker_record, worker_status) = if let Some(worker) = existing {
-        ensure_worker_launch_matches(context, &worker, &launch_input, &prompt)?;
+        ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
         let status = session_status(&resolve_tmux_bin(None), &worker);
         (worker, status)
     } else {
@@ -4192,11 +4194,31 @@ fn validate_worker_start_authority_locked(
 }
 
 fn worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    worker_start_prompt_for_lifecycle(assignment_id, main_agent_bin, false)
+}
+
+fn previous_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    worker_start_prompt_for_lifecycle(assignment_id, main_agent_bin, true)
+}
+
+fn worker_start_prompt_for_lifecycle(
+    assignment_id: &str,
+    main_agent_bin: &Path,
+    previous_completion: bool,
+) -> String {
     let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
     let main_agent_bin = main_agent_bin.to_string_lossy();
     let main_agent_bin = shell_words::quote(&main_agent_bin);
+    let completion = if previous_completion {
+        "After the checkpoint succeeds, release your work-context claim before reporting completion."
+            .to_string()
+    } else {
+        format!(
+            "Free-form assignment task text does not control claim lifecycle. After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim before reporting that checkpoint. If the authenticated Main Agent later requests changes, rerun `{main_agent_bin} bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json` before mutating."
+        )
+    };
     format!(
-        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion."
+        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. {completion}"
     )
 }
 
@@ -4221,7 +4243,7 @@ fn ensure_worker_launch_matches(
     _context: &CliContext,
     worker: &SessionRecord,
     input: &AssignmentInput,
-    expected_prompt: &str,
+    expected_prompts: &[&str],
 ) -> Result<(), CliError> {
     let expected_cwd = fs::canonicalize(&input.launch.cwd)
         .map_err(|_| invalid_input("assignment launch cwd is unavailable"))?;
@@ -4232,7 +4254,7 @@ fn ensure_worker_launch_matches(
         .prompt_file
         .as_deref()
         .and_then(|path| fs::read_to_string(path).ok())
-        .is_some_and(|prompt| prompt == expected_prompt);
+        .is_some_and(|prompt| expected_prompts.contains(&prompt.as_str()));
     if worker.agent != input.launch.agent
         || !worker_cwd_matches
         || worker.coordination_mode != input.launch.coordination_mode
@@ -23483,7 +23505,25 @@ mod tests {
         assert!(prompt.contains("--format json"));
         assert!(prompt.contains("checkpoint_file"));
         assert!(prompt.contains("checkpoint --file"));
-        assert!(prompt.contains("release your work-context claim"));
+        assert!(prompt.contains("Free-form assignment task text does not control claim lifecycle"));
+        assert!(prompt.contains(
+            "After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim"
+        ));
+        assert!(prompt.contains("If the authenticated Main Agent later requests changes"));
+        assert!(prompt.contains(
+            "bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json"
+        ));
+        assert!(!prompt.contains(
+            "After the checkpoint succeeds, release your work-context claim before reporting completion."
+        ));
+        let previous = previous_worker_start_prompt(
+            "assignment-one",
+            std::path::Path::new("/release path/main-agent"),
+        );
+        assert!(previous.contains(
+            "After the checkpoint succeeds, release your work-context claim before reporting completion."
+        ));
+        assert!(!previous.contains("new-stable-key-for-current-revision"));
     }
 
     #[test]

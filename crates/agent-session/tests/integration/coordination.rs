@@ -7141,6 +7141,372 @@ fn main_agent_worker_request_changes_reopens_only_the_submitted_assignment() {
 }
 
 #[test]
+fn main_agent_request_changes_rebootstraps_after_worker_releases_its_claim() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-one",
+        "run-request-changes-rebootstrap",
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one")
+            .expect("Main Agent claim");
+        claim["repositories"] = json!([]);
+        claim["worktrees"] = json!([]);
+        claim["scopes"] = json!([]);
+    });
+    let worker_capability = capability(&state_dir, "worker-one");
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-review-rebootstrap",
+        "task_summary": "Exercise a released request-changes cycle",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": checkout,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-review-rebootstrap",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-review-rebootstrap",
+            "run_id": "run-request-changes-rebootstrap",
+            "revision": 5,
+            "state": "submitted",
+            "task_summary": "Exercise a released request-changes cycle",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": {
+                "revision": 5,
+                "summary": "Initial candidate submitted",
+                "next_action": "Await Main Agent review",
+                "updated_at": "2030-01-01T00:00:02Z"
+            },
+            "result_summary": "Initial candidate",
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    seed_active_claim(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "worker-initial-claim",
+    );
+    let released = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "release",
+            "--session",
+            "worker-one",
+            "--claim",
+            "worker-initial-claim",
+            "--if-revision",
+            "1",
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "request-changes-initial-release-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+
+    let requested = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review-rebootstrap",
+            "--if-revision",
+            "5",
+            "--reason",
+            "Exercise the authenticated revision cycle",
+            "--idempotency-key",
+            "request-changes-rebootstrap-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(requested.code, 0, "stderr={}", requested.stderr_text());
+    assert_eq!(data(&requested)["assignment"]["state"], "working");
+    assert_eq!(data(&requested)["assignment"]["revision"], 6);
+    let review_cycle =
+        orchestration_registry(&state_dir)["assignments"]["assignment-review-rebootstrap"].clone();
+
+    let mismatched_checkout = tmp.path().join("mismatched-checkout");
+    init_checkout(
+        &mismatched_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    let worker_record_path = state_dir.join("sessions/worker-one/session.json");
+    let worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    let mut mismatched_worker = worker_record.clone();
+    mismatched_worker["cwd"] = json!(mismatched_checkout);
+    write_private_json(&worker_record_path, &mismatched_worker);
+    let checkout_mismatch = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "request-changes-rebootstrap-mismatch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(checkout_mismatch.code, 65);
+    assert_eq!(
+        checkout_mismatch.stdout_json()["error"]["code"],
+        "worker-bootstrap-checkout-mismatch"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-review-rebootstrap"],
+        review_cycle,
+        "failed working-state checkout validation must preserve the review cycle"
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != "worker-one" || claim["state"] != "active"),
+        "failed working-state checkout validation must not grant worker authority"
+    );
+    write_private_json(&worker_record_path, &worker_record);
+
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one")
+            .expect("Main Agent claim");
+        claim["repositories"] = json!(["example/repository"]);
+        claim["scopes"] = json!([{
+            "kind": "path-prefix",
+            "repository": "example/repository",
+            "value": "crates/agent-session"
+        }]);
+    });
+    let claim_conflict = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "request-changes-rebootstrap-conflict-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(claim_conflict.code, 65);
+    assert_eq!(
+        claim_conflict.stdout_json()["error"]["code"],
+        "claim-conflict"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-review-rebootstrap"],
+        review_cycle,
+        "failed working-state claim acquisition must preserve the review cycle"
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != "worker-one" || claim["state"] != "active"),
+        "failed working-state claim acquisition must not grant worker authority"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one")
+            .expect("Main Agent claim");
+        claim["repositories"] = json!([]);
+        claim["scopes"] = json!([]);
+    });
+
+    let bootstrap = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "bootstrap",
+            "--idempotency-key",
+            "request-changes-rebootstrap-worker-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        bootstrap.code,
+        0,
+        "stdout={} stderr={}",
+        bootstrap.stdout_text(),
+        bootstrap.stderr_text()
+    );
+    assert_eq!(data(&bootstrap)["claim"], "active");
+    assert_eq!(data(&bootstrap)["assignment"]["record"]["state"], "working");
+    assert_eq!(data(&bootstrap)["assignment"]["record"]["revision"], 7);
+
+    let bootstrap_data = data(&bootstrap);
+    let checkpoint_file = bootstrap_data["checkpoint_file"]
+        .as_str()
+        .expect("checkpoint file")
+        .to_string();
+    write_private_json(
+        Path::new(&checkpoint_file),
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Requested revision complete",
+            "next_action": "Await Main Agent acceptance",
+            "state": "submitted",
+            "result_summary": "Revision cycle completed after rebootstrap"
+        }),
+    );
+    let submitted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "checkpoint",
+            "--file",
+            &checkpoint_file,
+            "--if-revision",
+            "7",
+            "--idempotency-key",
+            "request-changes-resubmit-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(submitted.code, 0, "stderr={}", submitted.stderr_text());
+    assert_eq!(data(&submitted)["assignment"]["state"], "submitted");
+    assert_eq!(data(&submitted)["assignment"]["revision"], 8);
+
+    let coordination = load_coordination_registry(&state_dir);
+    let claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "worker-one" && claim["state"] == "active")
+        .expect("rebootstrapped worker claim");
+    let claim_id = claim["claim_id"].as_str().expect("claim id");
+    let claim_revision = claim["revision"].as_u64().expect("claim revision");
+    let released_again = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "release",
+            "--session",
+            "worker-one",
+            "--claim",
+            claim_id,
+            "--if-revision",
+            &claim_revision.to_string(),
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "request-changes-final-release-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        released_again.code,
+        0,
+        "stderr={}",
+        released_again.stderr_text()
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != "worker-one" || claim["state"] != "active"),
+        "the bounded revision cycle must end without retained worker authority"
+    );
+}
+
+#[test]
 fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
