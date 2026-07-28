@@ -78,6 +78,8 @@ struct MainAgentCli {
 
 #[derive(Debug, Subcommand)]
 enum MainAgentCommand {
+    /// Report machine-readable facade capabilities for compatibility probes.
+    Capabilities(CapabilitiesArgs),
     /// Create or continuity-rebind this Main Agent's durable run.
     Init(InitArgs),
     /// Re-bind this Main Agent's durable run to the current session incarnation
@@ -144,8 +146,36 @@ struct SelfGroupArgs {
 enum SelfCommand {
     /// Show this authenticated session's private run or assignment identity.
     Show(ReadArgs),
+    /// Verify that this exact session incarnation has its runtime-issued
+    /// checkpoint environment and private file.
+    Readiness(ReadArgs),
     /// Recover this exact Main Agent controller's stale coordination heartbeat.
     Recover(ControllerRecoverArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum RuntimeHookProduct {
+    Codex,
+    Claude,
+}
+
+impl RuntimeHookProduct {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct CapabilitiesArgs {
+    /// Provider runtime whose deployed hook surface must admit checkpoint writes.
+    #[arg(long, value_enum)]
+    provider: RuntimeHookProduct,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -807,6 +837,13 @@ fn dispatch(cli: MainAgentCli) -> i32 {
     if let MainAgentCommand::Completion(args) = cli.command {
         return run_completion(args.shell);
     }
+    if let MainAgentCommand::Capabilities(args) = cli.command {
+        return render_success(
+            "capabilities",
+            args.format,
+            &main_agent_capabilities(args.provider),
+        );
+    }
     let format = command_output_format(&cli.command);
     let command = command_name(&cli.command);
     let context = match CliContext::resolve(cli.state_dir, cli.host) {
@@ -837,10 +874,12 @@ fn dispatch(cli: MainAgentCli) -> i32 {
 /// re-run converges through those rather than duplicating an effect.
 fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value, CliError> {
     match command {
+        MainAgentCommand::Capabilities(_) => unreachable!(),
         MainAgentCommand::Init(args) => run_init(context, args.clone()),
         MainAgentCommand::Rebind(args) => run_rebind(context, args.clone()),
         MainAgentCommand::SelfGroup(args) => match &args.command {
             SelfCommand::Show(args) => run_self_show(context, args.clone()),
+            SelfCommand::Readiness(_) => run_self_readiness(context),
             SelfCommand::Recover(args) => run_controller_recover(context, args.clone()),
         },
         MainAgentCommand::Rehydrate(args) => run_rehydrate(context, args.clone()),
@@ -857,6 +896,164 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
         MainAgentCommand::PacketSchema(_) => Ok(objective_packet_schema_example()),
         MainAgentCommand::Completion(_) => unreachable!(),
     }
+}
+
+fn main_agent_capabilities(provider: RuntimeHookProduct) -> Value {
+    let runtime_hook_checkpoint_write = runtime_hook_checkpoint_capability(provider);
+    json!({
+        "schema_version": "main-agent.capabilities.v1",
+        "provider": provider.as_str(),
+        "compatible": runtime_hook_checkpoint_write.is_some(),
+        "capabilities": {
+            "runtime_checkpoint_file": "main-agent.runtime-checkpoint-file.v1",
+            "runtime_hook_checkpoint_write": runtime_hook_checkpoint_write,
+        }
+    })
+}
+
+fn runtime_hook_checkpoint_capability(provider: RuntimeHookProduct) -> Option<&'static str> {
+    let executable = env::current_exe().ok()?;
+    let agent_hook = executable.parent()?.join("agent-hook");
+    let metadata = fs::metadata(&agent_hook).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut command = Command::new(&agent_hook);
+    command.args(["inventory", "--format", "json"]);
+    let output =
+        run_output_with_timeout_and_cap(command, Duration::from_secs(2), 256 * 1024).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let inventory: Value = serde_json::from_slice(&output.stdout).ok()?;
+    if !runtime_hook_supports_checkpoint(&inventory, provider)
+        || !runtime_hook_doctor_converged(&agent_hook, provider)
+        || !runtime_checkpoint_handler_supports_product(provider)
+    {
+        return None;
+    }
+    Some("runtime-kit.checkpoint-write-admission.v1")
+}
+
+fn runtime_hook_supports_checkpoint(inventory: &Value, provider: RuntimeHookProduct) -> bool {
+    if inventory["schema_version"] != "cli.agent-hook.inventory.v1"
+        || inventory["ok"] != true
+        || inventory["data"]["schema_version"] != "agent-hook.inventory.v1"
+        || !runtime_hook_bundle_supports_checkpoint(
+            inventory["data"]["bundle_version"]
+                .as_str()
+                .unwrap_or_default(),
+        )
+    {
+        return false;
+    }
+    let Some(rules) = inventory["data"]["rules"].as_array() else {
+        return false;
+    };
+    let product = provider.as_str();
+    let matchers = match provider {
+        RuntimeHookProduct::Codex => ["Bash", "Write|Edit|NotebookEdit|apply_patch"],
+        RuntimeHookProduct::Claude => ["Bash", "Write|Edit|NotebookEdit"],
+    };
+    matchers.into_iter().all(|matcher| {
+        rules.iter().any(|rule| {
+            rule["capability_id"] == "agent-session.coordination.v1"
+                && rule["override_class"] == "locked"
+                && rule["matcher"] == matcher
+                && rule["products"]
+                    .as_array()
+                    .is_some_and(|products| products.iter().any(|value| value == product))
+                && rule["events"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|value| value == "PreToolUse"))
+                && rule["effective_modes"][product] == "enforce"
+        })
+    })
+}
+
+fn runtime_hook_doctor_converged(agent_hook: &Path, provider: RuntimeHookProduct) -> bool {
+    let mut command = Command::new(agent_hook);
+    command.args(["doctor", "--format", "json"]);
+    let Ok(output) = run_output_with_timeout_and_cap(command, Duration::from_secs(2), 64 * 1024)
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(doctor) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return false;
+    };
+    if doctor["schema_version"] != "cli.agent-hook.doctor.v1" || doctor["ok"] != true {
+        return false;
+    }
+    let Some(records) = doctor["data"].as_array() else {
+        return false;
+    };
+    records.iter().any(|record| {
+        record["schema_version"] == "agent-hook.doctor.v1"
+            && record["product"] == provider.as_str()
+            && record["status"] == "converged"
+            && record["supported"] == true
+    })
+}
+
+fn runtime_checkpoint_handler_supports_product(provider: RuntimeHookProduct) -> bool {
+    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let home = PathBuf::from(home);
+    let codex_home = env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let handler = match provider {
+        RuntimeHookProduct::Codex => codex_home.join("hooks/session-coordination-guard.py"),
+        RuntimeHookProduct::Claude => home.join(".claude/hooks/session-coordination-guard.py"),
+    };
+    runtime_checkpoint_handler_supports_capability(&handler)
+}
+
+fn runtime_checkpoint_handler_supports_capability(handler: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(handler) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o100 == 0
+    {
+        return false;
+    }
+    let mut command = Command::new(handler);
+    command.args(["--capabilities", "--format", "json"]);
+    let Ok(output) = run_output_with_timeout_and_cap(command, Duration::from_secs(2), 16 * 1024)
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return false;
+    };
+    value["schema_version"] == "runtime-kit.handler-capabilities.v1"
+        && value["capabilities"]["runtime_checkpoint_write"]
+            == "runtime-kit.checkpoint-write-admission.v1"
+}
+
+fn runtime_hook_bundle_supports_checkpoint(version: &str) -> bool {
+    let Some(parts) = version
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()
+        .filter(|parts| parts.len() == 4)
+    else {
+        return false;
+    };
+    parts.as_slice() >= &[2026, 7, 28, 1]
 }
 
 // ---- T6: bounded auto-retry for transient orchestration-store conditions ----
@@ -954,6 +1151,7 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
     )?;
     validate_objective_packet(&packet)?;
     let (record, incarnation) = authenticated_self(context)?;
+    ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
     ensure_or_acquire_claim(
         context,
         &record,
@@ -1093,6 +1291,7 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
 fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
     let (record, incarnation) = authenticated_self(context)?;
+    ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
 
     // Recover the run's stored objective packet (read-only) so the work-context
     // claim can be re-acquired without the caller re-supplying the packet file.
@@ -1205,6 +1404,54 @@ fn run_self_show(context: &CliContext, _args: ReadArgs) -> Result<Value, CliErro
             "rebind_required": rebind_required
         })),
     }
+}
+
+fn run_self_readiness(context: &CliContext) -> Result<Value, CliError> {
+    let (record, incarnation) = authenticated_self(context)?;
+    let checkpoint_file = ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
+    Ok(json!({
+        "schema_version": "main-agent.runtime-readiness.v1",
+        "ready": true,
+        "session_id": record.id,
+        "session_incarnation": incarnation,
+        "checkpoint_file": crate::display_path(&checkpoint_file)
+    }))
+}
+
+fn ensure_runtime_checkpoint_ready(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+) -> Result<PathBuf, CliError> {
+    let expected =
+        crate::coordination::checkpoint_path_for_state(&context.state_dir, &record.id, incarnation);
+    let supplied = env::var_os(crate::coordination::CHECKPOINT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(runtime_checkpoint_unavailable)?;
+    if supplied != expected {
+        return Err(runtime_checkpoint_unavailable());
+    }
+    let metadata = fs::symlink_metadata(&expected).map_err(|_| runtime_checkpoint_unavailable())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != SECRET_FILE_MODE
+    {
+        return Err(runtime_checkpoint_unavailable());
+    }
+    Ok(expected)
+}
+
+fn runtime_checkpoint_unavailable() -> CliError {
+    CliError::data(
+        "runtime-checkpoint-unavailable",
+        "this session incarnation has no trusted runtime-issued checkpoint file; resume or restart the managed session after deploying compatible runtime surfaces",
+        Some(json!({
+            "required_action": "resume-or-restart-managed-session"
+        })),
+    )
 }
 
 fn run_rehydrate(context: &CliContext, _args: RehydrateArgs) -> Result<Value, CliError> {
@@ -1731,6 +1978,7 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
     validate_idempotency_key(&args.idempotency_key)?;
     let (record, incarnation) = authenticated_self(context)?;
     orchestration::ensure_session_not_quarantined(context, &record)?;
+    let checkpoint_file = ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
     let (assignment, tier, rebind_from) = {
         let registry = orchestration::load_registry_readonly(context)?;
         let principal = resolve_principal(&registry, &record, &incarnation)?;
@@ -1902,6 +2150,7 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
     Ok(json!({
         "schema_version": "main-agent.bootstrap-result.v1",
         "claim": "active",
+        "checkpoint_file": crate::display_path(&checkpoint_file),
         "assignment": private_assignment_view(context, &current)?
     }))
 }
@@ -3311,7 +3560,7 @@ fn worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
     let main_agent_bin = main_agent_bin.to_string_lossy();
     let main_agent_bin = shell_words::quote(&main_agent_bin);
     format!(
-        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task; do not mutate before bootstrap succeeds. After checkpointing the final result, release your work-context claim before reporting completion."
+        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion."
     )
 }
 
@@ -14168,10 +14417,12 @@ fn rebind_required() -> CliError {
 
 fn command_name(command: &MainAgentCommand) -> &'static str {
     match command {
+        MainAgentCommand::Capabilities(_) => "capabilities",
         MainAgentCommand::Init(_) => "init",
         MainAgentCommand::Rebind(_) => "rebind",
         MainAgentCommand::SelfGroup(args) => match &args.command {
             SelfCommand::Show(_) => "self-show",
+            SelfCommand::Readiness(_) => "self-readiness",
             SelfCommand::Recover(_) => "self-recover",
         },
         MainAgentCommand::Rehydrate(_) => "rehydrate",
@@ -14214,10 +14465,12 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
 
 fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
     match command {
+        MainAgentCommand::Capabilities(args) => args.format,
         MainAgentCommand::Init(args) => args.format,
         MainAgentCommand::Rebind(args) => args.format,
         MainAgentCommand::SelfGroup(args) => match &args.command {
             SelfCommand::Show(args) => args.format,
+            SelfCommand::Readiness(args) => args.format,
             SelfCommand::Recover(args) => args.format,
         },
         MainAgentCommand::Rehydrate(args) => match args.format {
@@ -21031,7 +21284,126 @@ mod tests {
         assert!(prompt.contains(" bootstrap "));
         assert!(prompt.contains("--idempotency-key bootstrap-"));
         assert!(prompt.contains("--format json"));
+        assert!(prompt.contains("checkpoint_file"));
+        assert!(prompt.contains("checkpoint --file"));
         assert!(prompt.contains("release your work-context claim"));
-        assert!(!prompt.contains("then checkpoint"));
+    }
+
+    #[test]
+    fn capabilities_advertise_runtime_checkpoint_file_support() {
+        let cli = MainAgentCli::try_parse_from([
+            "main-agent",
+            "capabilities",
+            "--provider",
+            "codex",
+            "--format",
+            "json",
+        ])
+        .expect("capabilities command parses");
+        let MainAgentCommand::Capabilities(args) = cli.command else {
+            panic!("expected capabilities");
+        };
+        assert_eq!(args.provider, RuntimeHookProduct::Codex);
+        assert_eq!(args.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn runtime_hook_checkpoint_capability_requires_the_paired_policy() {
+        let complete = json!({
+            "schema_version": "cli.agent-hook.inventory.v1",
+            "ok": true,
+            "data": {
+                "schema_version": "agent-hook.inventory.v1",
+                "bundle_version": "2026.07.28.1",
+                "rules": [
+                    {
+                        "products": ["codex"],
+                        "events": ["PreToolUse"],
+                        "matcher": "Bash",
+                        "effective_modes": {"codex": "enforce"},
+                        "override_class": "locked",
+                        "capability_id": "agent-session.coordination.v1"
+                    },
+                    {
+                        "products": ["codex"],
+                        "events": ["PreToolUse"],
+                        "matcher": "Write|Edit|NotebookEdit|apply_patch",
+                        "effective_modes": {"codex": "enforce"},
+                        "override_class": "locked",
+                        "capability_id": "agent-session.coordination.v1"
+                    },
+                    {
+                        "products": ["claude"],
+                        "events": ["PreToolUse"],
+                        "matcher": "Bash",
+                        "effective_modes": {"claude": "enforce"},
+                        "override_class": "locked",
+                        "capability_id": "agent-session.coordination.v1"
+                    },
+                    {
+                        "products": ["claude"],
+                        "events": ["PreToolUse"],
+                        "matcher": "Write|Edit|NotebookEdit",
+                        "effective_modes": {"claude": "enforce"},
+                        "override_class": "locked",
+                        "capability_id": "agent-session.coordination.v1"
+                    }
+                ]
+            }
+        });
+        assert!(runtime_hook_supports_checkpoint(
+            &complete,
+            RuntimeHookProduct::Codex
+        ));
+        assert!(runtime_hook_supports_checkpoint(
+            &complete,
+            RuntimeHookProduct::Claude
+        ));
+
+        let mut stale = complete.clone();
+        stale["data"]["bundle_version"] = json!("2026.07.25.3");
+        assert!(!runtime_hook_supports_checkpoint(
+            &stale,
+            RuntimeHookProduct::Codex
+        ));
+
+        let mut incomplete = complete;
+        incomplete["data"]["rules"][0]["override_class"] = json!("free");
+        assert!(!runtime_hook_supports_checkpoint(
+            &incomplete,
+            RuntimeHookProduct::Codex
+        ));
+        assert!(runtime_hook_supports_checkpoint(
+            &incomplete,
+            RuntimeHookProduct::Claude
+        ));
+    }
+
+    #[test]
+    fn runtime_checkpoint_handler_capability_is_explicit_and_trusted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let handler = tmp.path().join("session-coordination-guard.py");
+        fs::write(
+            &handler,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\n' ",
+                "'{\"schema_version\":\"runtime-kit.handler-capabilities.v1\",",
+                "\"capabilities\":{\"runtime_checkpoint_write\":",
+                "\"runtime-kit.checkpoint-write-admission.v1\"}}'\n"
+            ),
+        )
+        .expect("write handler");
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o700))
+            .expect("private executable");
+        assert!(runtime_checkpoint_handler_supports_capability(&handler));
+
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o722))
+            .expect("public write mode");
+        assert!(!runtime_checkpoint_handler_supports_capability(&handler));
+
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("restore mode");
+        fs::write(&handler, "#!/bin/sh\nexit 0\n").expect("stale handler");
+        assert!(!runtime_checkpoint_handler_supports_capability(&handler));
     }
 }

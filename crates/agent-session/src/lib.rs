@@ -4574,6 +4574,17 @@ fn resume_session_locked(
         }
         return Err(launch_err);
     }
+    if let (Ok(previous_incarnation), Ok(current_incarnation)) = (
+        coordination::incarnation(&previous_record),
+        coordination::incarnation(&record),
+    ) && previous_incarnation != current_incarnation
+    {
+        let _ = fs::remove_file(coordination::checkpoint_path_for_state(
+            &context.state_dir,
+            &previous_record.id,
+            &previous_incarnation,
+        ));
+    }
     reconcile_owned_startup_projection(context, &mut record, "running");
     startup_artifacts.discard();
     Ok(ResumeSessionOutcome {
@@ -4772,6 +4783,13 @@ fn add_runtime_tmux_environment(
             "{}={}",
             coordination::CAPABILITY_ENV,
             display_path(&coordination::capability_path_for_state(
+                state_dir, &record.id, runtime_id
+            ))
+        ),
+        format!(
+            "{}={}",
+            coordination::CHECKPOINT_ENV,
+            display_path(&coordination::checkpoint_path_for_state(
                 state_dir, &record.id, runtime_id
             ))
         ),

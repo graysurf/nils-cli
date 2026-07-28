@@ -30,6 +30,36 @@ fn run_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
 }
 
 fn run_main_agent(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
+    let mut options = CmdOptions::new().with_cwd(dir).with_envs(envs);
+    if !envs
+        .iter()
+        .any(|(key, _)| *key == "AGENT_SESSION_CHECKPOINT_FILE")
+        && let Some((_, capability_file)) = envs
+            .iter()
+            .find(|(key, value)| *key == "AGENT_SESSION_CAPABILITY_FILE" && !value.is_empty())
+    {
+        let capability_path = Path::new(capability_file);
+        if let Some(name) = capability_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+        {
+            let checkpoint_path =
+                capability_path.with_file_name(format!("main-agent-checkpoint-{name}.json"));
+            options = options.with_env(
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("checkpoint path"),
+            );
+        }
+    }
+    run_resolved("main-agent", args, &options)
+}
+
+fn run_main_agent_without_checkpoint(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> CmdOutput {
     run_resolved(
         "main-agent",
         args,
@@ -373,6 +403,13 @@ fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Optio
         fs::write(&capability_path, capability).expect("capability");
         fs::set_permissions(&capability_path, fs::Permissions::from_mode(0o600))
             .expect("capability mode");
+        let checkpoint_path = capability_dir.join(format!(
+            "main-agent-checkpoint-{}.json",
+            digest(incarnation)
+        ));
+        fs::write(&checkpoint_path, []).expect("checkpoint");
+        fs::set_permissions(&checkpoint_path, fs::Permissions::from_mode(0o600))
+            .expect("checkpoint mode");
         let heartbeat_path = capability_dir.join("heartbeat");
         fs::write(&heartbeat_path, format!("{incarnation}:{now}\n")).expect("heartbeat");
         fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
@@ -5184,6 +5221,13 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
     fs::write(&new_capability_file, new_capability).expect("new capability");
     fs::set_permissions(&new_capability_file, fs::Permissions::from_mode(0o600))
         .expect("new capability mode");
+    let new_checkpoint_file = coordination_dir.join(format!(
+        "main-agent-checkpoint-{}.json",
+        digest(new_incarnation)
+    ));
+    fs::write(&new_checkpoint_file, []).expect("new checkpoint");
+    fs::set_permissions(&new_checkpoint_file, fs::Permissions::from_mode(0o600))
+        .expect("new checkpoint mode");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -5309,7 +5353,7 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     fs::write(
         &worker_prompt,
         format!(
-            "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json`. Use the returned private assignment packet as your task; do not mutate before bootstrap succeeds. After checkpointing the final result, release your work-context claim before reporting completion.",
+            "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion.",
             &bootstrap_digest[..32]
         ),
     )
@@ -6681,6 +6725,13 @@ fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
     fs::write(&resumed_capability_file, resumed_capability).expect("resumed capability");
     fs::set_permissions(&resumed_capability_file, fs::Permissions::from_mode(0o600))
         .expect("resumed capability mode");
+    let resumed_checkpoint_file = worker_coordination_dir.join(format!(
+        "main-agent-checkpoint-{}.json",
+        digest(resumed_incarnation)
+    ));
+    fs::write(&resumed_checkpoint_file, []).expect("resumed checkpoint");
+    fs::set_permissions(&resumed_checkpoint_file, fs::Permissions::from_mode(0o600))
+        .expect("resumed checkpoint mode");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -7446,10 +7497,47 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
         "--format",
         "json",
     ];
-    let bootstrapped = run_main_agent(
+    let missing_checkpoint_env = run_main_agent_without_checkpoint(
         &worker_checkout,
         &args,
         &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_ne!(
+        missing_checkpoint_env.code,
+        0,
+        "a pre-B6 incarnation without its runtime-issued checkpoint environment must fail before bootstrap mutates: {}",
+        missing_checkpoint_env.stdout_text()
+    );
+    assert_eq!(
+        missing_checkpoint_env.stdout_json()["error"]["code"],
+        "runtime-checkpoint-unavailable"
+    );
+    let coordination_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    assert!(
+        coordination_registry["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != "worker-one" || claim["state"] != "active"),
+        "checkpoint readiness must fail before the worker acquires a claim"
+    );
+    let worker_checkpoint = state_dir.join(format!(
+        "sessions/worker-one/coordination/main-agent-checkpoint-{}.json",
+        digest("worker-incarnation-one")
+    ));
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &worker_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                worker_checkpoint.to_str().expect("checkpoint path"),
+            ),
+        ],
     );
     assert_eq!(
         bootstrapped.code,
@@ -7471,6 +7559,17 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
         data(&bootstrapped)["assignment"]["record"]["worktree"],
         worker_checkout.to_string_lossy().as_ref(),
         "the absolute managed-worktree path remains durable routing metadata"
+    );
+    assert_eq!(
+        data(&bootstrapped)["checkpoint_file"],
+        state_dir
+            .join(format!(
+                "sessions/worker-one/coordination/main-agent-checkpoint-{}.json",
+                digest("worker-incarnation-one")
+            ))
+            .to_string_lossy()
+            .as_ref(),
+        "bootstrap must return the runtime-issued checkpoint path for later authenticated checkpoints"
     );
     let coordination_registry: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
@@ -7616,6 +7715,13 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     fs::write(&resumed_capability_file, resumed_capability).expect("resumed capability");
     fs::set_permissions(&resumed_capability_file, fs::Permissions::from_mode(0o600))
         .expect("resumed capability mode");
+    let resumed_checkpoint_file = worker_coordination_dir.join(format!(
+        "main-agent-checkpoint-{}.json",
+        digest(resumed_incarnation)
+    ));
+    fs::write(&resumed_checkpoint_file, []).expect("resumed checkpoint");
+    fs::set_permissions(&resumed_checkpoint_file, fs::Permissions::from_mode(0o600))
+        .expect("resumed checkpoint mode");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -7656,7 +7762,13 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     let resumed = run_main_agent(
         &worker_checkout,
         &resumed_args,
-        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                resumed_checkpoint_file.to_str().expect("checkpoint path"),
+            ),
+        ],
     );
     assert_eq!(
         resumed.code,
@@ -7879,6 +7991,13 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
     fs::write(&third_capability_file, third_capability).expect("third capability");
     fs::set_permissions(&third_capability_file, fs::Permissions::from_mode(0o600))
         .expect("third capability mode");
+    let third_checkpoint_file = worker_coordination_dir.join(format!(
+        "main-agent-checkpoint-{}.json",
+        digest(third_incarnation)
+    ));
+    fs::write(&third_checkpoint_file, []).expect("third checkpoint");
+    fs::set_permissions(&third_checkpoint_file, fs::Permissions::from_mode(0o600))
+        .expect("third checkpoint mode");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -7908,6 +8027,7 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
             "json",
         ])
         .env("AGENT_SESSION_CAPABILITY_FILE", &third_capability_arg)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &third_checkpoint_file)
         .env(
             "NILS_AGENT_SESSION_TEST_BOOTSTRAP_GUIDANCE_BARRIER_DIR",
             &guidance_barrier,
@@ -16911,8 +17031,16 @@ for candidate in {state_dir}/sessions/{worker_id}/coordination/capability-*; do
   break
 done
 [ -n "$capability_file" ]
+checkpoint_file=""
+for candidate in {state_dir}/sessions/{worker_id}/coordination/main-agent-checkpoint-*; do
+  [ -f "$candidate" ] || continue
+  checkpoint_file="$candidate"
+  break
+done
+[ -n "$checkpoint_file" ]
 cd {worker_checkout}
 AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+AGENT_SESSION_CHECKPOINT_FILE="$checkpoint_file" \
   {main_agent} --state-dir {state_dir} bootstrap \
   --idempotency-key {bootstrap_key} --format json > {output}
 cat > {submitted_checkpoint} <<'JSON'
@@ -16920,6 +17048,7 @@ cat > {submitted_checkpoint} <<'JSON'
 JSON
 chmod 600 {submitted_checkpoint}
 AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+AGENT_SESSION_CHECKPOINT_FILE="$checkpoint_file" \
   {main_agent} --state-dir {state_dir} checkpoint \
   --file {submitted_checkpoint} --if-revision 4 \
   --idempotency-key checkpoint-after-recovery-0001 --format json > {checkpoint_output}
@@ -17175,9 +17304,17 @@ for candidate in {state_dir}/sessions/{worker_id}/coordination/capability-*; do
   break
 done
 [ -n "$capability_file" ]
+checkpoint_file=""
+for candidate in {state_dir}/sessions/{worker_id}/coordination/main-agent-checkpoint-*; do
+  [ -f "$candidate" ] || continue
+  checkpoint_file="$candidate"
+  break
+done
+[ -n "$checkpoint_file" ]
 cd {worker_checkout}
 set +e
 AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+AGENT_SESSION_CHECKPOINT_FILE="$checkpoint_file" \
   {main_agent} --state-dir {state_dir} bootstrap \
   --idempotency-key {bootstrap_key} --format json > {output}
 status=$?
@@ -18137,6 +18274,109 @@ fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
 // F4: the objective-packet schema is discoverable via `main-agent packet-schema`
 // (an example naming both nested schema_version constants), and a schema
 // mismatch names the expected version and points back at the printer.
+#[test]
+fn main_agent_capabilities_exposes_the_runtime_checkpoint_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let output = run_resolved(
+        "main-agent",
+        &["capabilities", "--provider", "codex", "--format", "json"],
+        &CmdOptions::new()
+            .with_cwd(tmp.path())
+            .with_env_remove_many(&[
+                "HOME",
+                "XDG_STATE_HOME",
+                "AGENT_SESSION_STATE_DIR",
+                "AGENT_SESSION_HOST",
+            ]),
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        data(&output)["schema_version"],
+        "main-agent.capabilities.v1"
+    );
+    assert_eq!(
+        data(&output)["capabilities"]["runtime_checkpoint_file"],
+        "main-agent.runtime-checkpoint-file.v1"
+    );
+}
+
+#[test]
+fn main_agent_self_readiness_is_bound_to_the_exact_runtime_checkpoint() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-ready",
+            "main-ready-incarnation",
+            "main-ready-private-capability-material-0001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = capability(&state_dir, "main-ready");
+    let checkpoint_file = state_dir.join(format!(
+        "sessions/main-ready/coordination/main-agent-checkpoint-{}.json",
+        digest("main-ready-incarnation")
+    ));
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state"),
+        "self",
+        "readiness",
+        "--format",
+        "json",
+    ];
+
+    let missing = run_main_agent_without_checkpoint(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        missing.stdout_json()["error"]["code"],
+        "runtime-checkpoint-unavailable"
+    );
+
+    let wrong_checkpoint = tmp.path().join("wrong-checkpoint.json");
+    let mismatched = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &capability_file),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                wrong_checkpoint.to_str().expect("wrong checkpoint"),
+            ),
+        ],
+    );
+    assert_eq!(
+        mismatched.stdout_json()["error"]["code"],
+        "runtime-checkpoint-unavailable"
+    );
+
+    let ready = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &capability_file),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_file.to_str().expect("checkpoint"),
+            ),
+        ],
+    );
+    assert_eq!(ready.code, 0, "stdout={}", ready.stdout_text());
+    assert_eq!(data(&ready)["ready"], true);
+    assert_eq!(
+        data(&ready)["checkpoint_file"],
+        checkpoint_file.to_string_lossy().as_ref()
+    );
+}
+
 #[test]
 fn main_agent_packet_schema_prints_the_example_packet() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

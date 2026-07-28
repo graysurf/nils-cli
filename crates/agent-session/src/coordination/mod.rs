@@ -42,6 +42,7 @@ const MAX_RECEIPTS_GLOBAL: usize = 32_768;
 const TERMINAL_RETENTION_SECS: i64 = 5 * 60;
 const ACKNOWLEDGED_MESSAGE_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub(crate) const CAPABILITY_ENV: &str = "AGENT_SESSION_CAPABILITY_FILE";
+pub(crate) const CHECKPOINT_ENV: &str = "AGENT_SESSION_CHECKPOINT_FILE";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -819,6 +820,21 @@ pub(crate) fn capability_path_for_state(
         .join("coordination")
         .join(format!(
             "capability-{}",
+            digest_bytes(incarnation.as_bytes())
+        ))
+}
+
+pub(crate) fn checkpoint_path_for_state(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(session_id)
+        .join("coordination")
+        .join(format!(
+            "main-agent-checkpoint-{}.json",
             digest_bytes(incarnation.as_bytes())
         ))
 }

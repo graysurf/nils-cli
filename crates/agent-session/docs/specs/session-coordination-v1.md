@@ -27,6 +27,12 @@ provider-backed dispatch workflow.
   examples use `--capability-file`; the managed runtime may instead provide the
   trusted `AGENT_SESSION_CAPABILITY_FILE` path. Secrets are never accepted as
   public identifiers or emitted in argv, JSON, errors, logs, or provider data.
+- Each broker incarnation also pre-creates one empty owner-only checkpoint file
+  below that session's `0700` coordination directory and projects its exact
+  path through `AGENT_SESSION_CHECKPOINT_FILE`. The filename binds the SHA-256
+  digest of `AGENT_SESSION_RUNTIME_ID`; replacement removes the prior
+  incarnation's file. This file is a private data-transfer boundary, not a
+  credential, and does not relax checkpoint authentication or revision fences.
 - Peer summaries and mailbox bodies are authenticated as peer-supplied data but
   remain untrusted. They cannot authorize commands, approvals, scope changes,
   credential access, or secret disclosure.
@@ -222,6 +228,17 @@ the checkout lease prevents simultaneous physical writers. A worker remains
 untrusted: its final diff must be checked against the assignment scopes, and
 an adversarial same-user process requires an OS security boundary outside this
 contract.
+
+The runtime-issued checkpoint file follows the same threat boundary. The broker
+pre-creates one exact owner-only regular file for the current incarnation, and
+the runtime hook admits only the bounded checkpoint operation targeting that
+path. An owner-controlled configured state-root symlink remains supported: the
+hook validates both the link owner and the resolved private directory, rejects
+symlinked descendants, and requires the issued path to resolve beneath that
+exact target. This is semantic coordination for an ordinary provider Write or
+shell redirection, not a race-free filesystem sandbox: preventing an
+adversarial same-user process from replacing a pathname between admission and
+provider open requires an OS isolation boundary outside this contract.
 
 Authenticated operation reconcile reads
 `agent-session.operation-reconcile-proof.v1` with exact fields

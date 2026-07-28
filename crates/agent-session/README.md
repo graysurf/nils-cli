@@ -57,6 +57,8 @@ agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
 agent-session delete <id>
+main-agent capabilities --provider codex --format json
+main-agent self readiness --format json
 main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json
 main-agent self show --format json
 main-agent self recover --idempotency-key recover-controller-001 --format json
@@ -79,6 +81,29 @@ main-agent checkpoint --file checkpoint.json --if-revision 2 --idempotency-key c
 managed-worker relationships. Private objective and assignment packets are
 read only through the current session capability; ordinary `agent-session`
 list/serve/activity projections expose bounded relationship metadata only.
+Compatibility-sensitive callers must require
+`main-agent.capabilities.v1` to advertise
+`main-agent.runtime-checkpoint-file.v1` and
+`runtime-kit.checkpoint-write-admission.v1`, with `compatible:true`. The second
+capability is derived for the requested Codex or Claude provider from the
+installed sibling `agent-hook` inventory's
+bundle version `2026.07.28.1` or newer and its locked
+`agent-session.coordination.v1` rules, so the probe rejects a mixed
+CLI/runtime-hook deployment. It additionally requires that provider's
+converged doctor record and executes its installed handler's versioned
+capability self-probe, so a new policy with stale or missing handler code also
+fails closed without requiring the other provider to be installed. The
+bundle-version boundary identifies the first policy whose paired handler admits
+the checkpoint write; the package version alone does not prove this API.
+Before `init` or any managed mutation, `main-agent self readiness` verifies the
+current incarnation's exact `AGENT_SESSION_CHECKPOINT_FILE` binding and trusted
+mode-0600 file. A pre-deployment incarnation fails closed with
+`runtime-checkpoint-unavailable` and must be resumed or restarted.
+Authenticated worker `bootstrap --format json` returns a private
+`checkpoint_file` bound to the current runtime incarnation. Write later
+checkpoint objects to that pre-created mode-0600 file and pass the same path to
+`main-agent checkpoint --file`; do not allocate a separate worker checkpoint
+path under a repository or project output tree.
 Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
 for packet examples, revision and retry rules, interactive worker acceptance,
 resume/rebind, relationship transfers, and terminal cleanup. In particular,

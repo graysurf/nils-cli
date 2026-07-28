@@ -29,6 +29,7 @@ The supported schemas are:
 - `main-agent.objective-packet.v1`
 - `main-agent.assignment-input.v1`
 - `main-agent.checkpoint-input.v1`
+- `main-agent.capabilities.v1`
 
 Unknown fields, schema versions, and lifecycle states reject registry reads and
 therefore reject mutations. Every identity reference is fenced by public
@@ -246,6 +247,40 @@ only the caller's bound assignment, reads that worker's private assignment
 packet, derives the coordination claim from the packet's
 repository/scopes plus the HMAC fingerprint derived from the authenticated
 worker session's canonical `cwd`, and records the initial `working` checkpoint.
+Its private `main-agent.bootstrap-result.v1` response also returns
+`checkpoint_file`, the exact runtime-issued
+`AGENT_SESSION_CHECKPOINT_FILE` for the authenticated session/incarnation.
+Workers MUST write later checkpoint JSON to that pre-created owner-only file
+before invoking `main-agent checkpoint --file` with the current revision and a
+stable idempotency key; the generated prompt states this complete sequence.
+An arbitrary project output path is not the managed-worker checkpoint-write
+boundary. Before worker launch, compatibility-sensitive callers MUST require
+`main-agent capabilities --provider <codex|claude> --format json` to return
+`main-agent.capabilities.v1` with
+`capabilities.runtime_checkpoint_file` exactly
+`main-agent.runtime-checkpoint-file.v1`,
+`capabilities.runtime_hook_checkpoint_write` exactly
+`runtime-kit.checkpoint-write-admission.v1`, and `compatible:true`. The hook
+capability is derived for that selected provider from the installed sibling
+`agent-hook` inventory's
+bundle version `2026.07.28.1` or newer and its locked
+`agent-session.coordination.v1` rules. That bundle version
+is the first policy whose paired handler admits the checkpoint write. The probe
+also requires the selected provider's converged doctor record and executes its
+installed handler's `runtime-kit.handler-capabilities.v1` self-probe, so new
+policy with stale or missing handler code is rejected without coupling a
+healthy installation to the other provider. Either mixed-deployment direction
+therefore fails before worker launch. The `1.25.11` registry floor alone does
+not prove this additive paired API.
+
+The current controller incarnation MUST also pass `main-agent self readiness
+--format json` before `init` or mutation. This authenticates the session and
+requires its exact runtime-derived `AGENT_SESSION_CHECKPOINT_FILE` path to
+refer to the expected owner-only regular file. `init`, `rebind`, and worker
+`bootstrap` independently enforce the same precondition before claim
+acquisition or orchestration mutation. A missing, mismatched, linked, or
+permission-drifted file returns `runtime-checkpoint-unavailable` with a typed
+resume-or-restart requirement.
 Before minting the private checkout-shell grant, bootstrap requires the
 packet's absolute `worktree`, `launch.cwd`, the durable assignment worktree,
 and the authenticated session `cwd` to resolve to the same canonical checkout

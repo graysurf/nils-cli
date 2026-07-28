@@ -25,6 +25,9 @@ _main-agent() {
             main__agent,borrow)
                 cmd="main__agent__borrow"
                 ;;
+            main__agent,capabilities)
+                cmd="main__agent__capabilities"
+                ;;
             main__agent,checkpoint)
                 cmd="main__agent__checkpoint"
                 ;;
@@ -63,6 +66,9 @@ _main-agent() {
                 ;;
             main__agent,worker)
                 cmd="main__agent__worker"
+                ;;
+            main__agent__self,readiness)
+                cmd="main__agent__self__readiness"
                 ;;
             main__agent__self,recover)
                 cmd="main__agent__self__recover"
@@ -140,7 +146,7 @@ _main-agent() {
 
     case "${cmd}" in
         main__agent)
-            opts="-h -V --state-dir --host --help --version init rebind self rehydrate status checkpoint bootstrap worker collaborate borrow handoff adopt close quick packet-schema completion"
+            opts="-h -V --state-dir --host --help --version capabilities init rebind self rehydrate status checkpoint bootstrap worker collaborate borrow handoff adopt close quick packet-schema completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -255,6 +261,39 @@ _main-agent() {
                     ;;
                 --idempotency-key)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        main__agent__capabilities)
+            opts="-h --provider --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --provider)
+                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
                     return 0
                     ;;
                 --format)
@@ -679,12 +718,41 @@ _main-agent() {
             return 0
             ;;
         main__agent__self)
-            opts="-h --state-dir --host --help show recover"
+            opts="-h --state-dir --host --help show readiness recover"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        main__agent__self__readiness)
+            opts="-h --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
                 --state-dir)
                     COMPREPLY=()
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then

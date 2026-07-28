@@ -1302,6 +1302,30 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
             .windows(2)
             .any(|pair| { pair == ["-e", &format!("AGENT_SESSION_RUNTIME_ID={runtime_id}")] })
     );
+    let checkpoint_path = session_dir.join(format!(
+        "coordination/main-agent-checkpoint-{}.json",
+        sha256_hex(runtime_id)
+    ));
+    assert!(
+        new_session.windows(2).any(|pair| {
+            pair == [
+                "-e",
+                &format!(
+                    "AGENT_SESSION_CHECKPOINT_FILE={}",
+                    checkpoint_path.display()
+                ),
+            ]
+        }),
+        "runtime launch must receive its exact private checkpoint path"
+    );
+    let checkpoint_metadata =
+        fs::symlink_metadata(&checkpoint_path).expect("runtime-issued checkpoint file");
+    assert!(checkpoint_metadata.file_type().is_file());
+    assert_eq!(
+        checkpoint_metadata.permissions().mode() & 0o777,
+        0o600,
+        "runtime-issued checkpoint file must be owner-only"
+    );
     assert!(
         new_session
             .windows(2)
@@ -3465,6 +3489,14 @@ fn start_creates_session_state_without_printing_prompt() {
     )
     .expect("session json");
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let checkpoint_file = state_dir.join("sessions").join(id).join(format!(
+        "coordination/main-agent-checkpoint-{}.json",
+        sha256_hex(runtime_id)
+    ));
+    let checkpoint_metadata =
+        fs::symlink_metadata(&checkpoint_file).expect("runtime checkpoint file");
+    assert!(checkpoint_metadata.is_file());
+    assert_eq!(checkpoint_metadata.permissions().mode() & 0o777, 0o600);
     let agent_session_bin = nils_test_support::bin::resolve("agent-session")
         .to_string_lossy()
         .to_string();
@@ -3502,6 +3534,18 @@ fn start_creates_session_state_without_printing_prompt() {
                     .join("sessions")
                     .join(id)
                     .join(format!("coordination/capability-{}", sha256_hex(runtime_id)))
+                    .display()
+            ),
+            "-e".to_string(),
+            format!(
+                "AGENT_SESSION_CHECKPOINT_FILE={}",
+                state_dir
+                    .join("sessions")
+                    .join(id)
+                    .join(format!(
+                        "coordination/main-agent-checkpoint-{}.json",
+                        sha256_hex(runtime_id)
+                    ))
                     .display()
             ),
             "-e".to_string(),
@@ -3676,6 +3720,15 @@ fn list_command_and_delete_manage_existing_session() {
     );
     assert_eq!(record["runtime"]["generation"], 1);
     assert!(record.get("agent_args").is_none());
+    let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let checkpoint_file = state_dir.join("sessions").join(&id).join(format!(
+        "coordination/main-agent-checkpoint-{}.json",
+        sha256_hex(runtime_id)
+    ));
+    assert!(
+        checkpoint_file.is_file(),
+        "checkpoint must exist before delete"
+    );
     let calls = tmux_calls(&tmux_log);
     let new_session = calls
         .iter()
@@ -3874,6 +3927,10 @@ fn list_command_and_delete_manage_existing_session() {
     let delete_json = delete.stdout_json();
     assert_eq!(delete_json["schema_version"], "cli.agent-session.delete.v1");
     assert_eq!(data(&delete_json)["deleted"], true);
+    assert!(
+        !checkpoint_file.exists(),
+        "delete must remove the runtime-bound checkpoint file"
+    );
     let delete_calls = tmux_calls(&tmux_log);
     assert!(
         delete_calls
@@ -8064,6 +8121,17 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     let record_path = session.join("session.json");
     let mut failed_record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    let previous_runtime_id = failed_record["runtime"]["launch_id"]
+        .as_str()
+        .expect("previous runtime id")
+        .to_string();
+    let previous_checkpoint = session.join(format!(
+        "coordination/main-agent-checkpoint-{}.json",
+        sha256_hex(&previous_runtime_id)
+    ));
+    fs::create_dir_all(previous_checkpoint.parent().expect("coordination dir")).unwrap();
+    fs::write(&previous_checkpoint, b"{\"state\":\"stale\"}\n").unwrap();
+    fs::set_permissions(&previous_checkpoint, fs::Permissions::from_mode(0o600)).unwrap();
     failed_record["startup"] = json!({
         "schema_version": "agent-session.startup.v1",
         "state": "failed",
@@ -8165,6 +8233,16 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
                     .display()
             ),
             "-e".to_string(),
+            format!(
+                "AGENT_SESSION_CHECKPOINT_FILE={}",
+                state_dir
+                    .join(format!(
+                        "sessions/recoverable/coordination/main-agent-checkpoint-{}.json",
+                        sha256_hex(runtime_id)
+                    ))
+                    .display()
+            ),
+            "-e".to_string(),
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
             "-e".to_string(),
             format!("PATH={inherited_path}"),
@@ -8208,6 +8286,26 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
 
     assert_eq!(record["id"], "recoverable");
     assert_eq!(record["runtime"]["generation"], 2);
+    let replacement_checkpoint = session.join(format!(
+        "coordination/main-agent-checkpoint-{}.json",
+        sha256_hex(runtime_id)
+    ));
+    assert!(
+        !previous_checkpoint.exists(),
+        "resume must remove the superseded incarnation checkpoint"
+    );
+    assert!(
+        replacement_checkpoint.is_file(),
+        "resume must create the replacement incarnation checkpoint"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&replacement_checkpoint)
+            .expect("replacement checkpoint metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
     assert_eq!(record["agent_bin"], codex_arg);
     assert_eq!(record["startup"]["state"], "ready");

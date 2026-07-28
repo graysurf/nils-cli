@@ -3,7 +3,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,12 +17,50 @@ use crate::{CliContext, CliError, SessionRecord};
 
 use super::{
     BrokerRecord, authenticate_from_file, authenticate_recovery_from_file, capability_path,
-    clean_expired, coordination_dir, digest_bytes, ensure_fingerprint_key, idempotency_replay,
-    incarnation, json_value, lock_registry, now_epoch, read_bounded_json, request_digest,
-    store_receipt, timestamp,
+    checkpoint_path_for_state, clean_expired, coordination_dir, digest_bytes,
+    ensure_fingerprint_key, idempotency_replay, incarnation, json_value, lock_registry, now_epoch,
+    read_bounded_json, request_digest, store_receipt, timestamp,
 };
 
 pub(crate) const BROKER_VERSION: &str = "agent-session.coordination-broker.v1";
+
+fn prepare_checkpoint_file(path: &Path) -> Result<bool, CliError> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SECRET_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => {
+            if file
+                .set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
+                .is_err()
+            {
+                let _ = fs::remove_file(path);
+                return Err(unavailable());
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.permissions().mode() & 0o777 != SECRET_FILE_MODE
+            {
+                return Err(CliError::runtime(
+                    "coordination-store-untrusted",
+                    "session checkpoint file is untrusted",
+                    None,
+                ));
+            }
+            Ok(false)
+        }
+        Err(_) => Err(unavailable()),
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 struct BrokerStatus {
@@ -195,7 +233,18 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     let previous_capability = previous_broker
         .as_ref()
         .map(|broker| capability_path(context, &record.id, &broker.incarnation));
+    let previous_checkpoint = previous_broker.as_ref().map(|broker| {
+        checkpoint_path_for_state(&context.state_dir, &record.id, &broker.incarnation)
+    });
     write_atomic(&path, token.as_bytes(), SECRET_FILE_MODE).map_err(|_| unavailable())?;
+    let checkpoint_path = checkpoint_path_for_state(&context.state_dir, &record.id, &incarnation);
+    let checkpoint_created = match prepare_checkpoint_file(&checkpoint_path) {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
     ensure_fingerprint_key(&mut locked.registry);
     clean_expired(&mut locked.registry, now);
     for claim in &mut locked.registry.claims {
@@ -243,9 +292,15 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     );
     if let Err(error) = locked.save() {
         let _ = fs::remove_file(&path);
+        if checkpoint_created {
+            let _ = fs::remove_file(&checkpoint_path);
+        }
         return Err(error);
     }
     if let Some(previous) = previous_capability {
+        let _ = fs::remove_file(previous);
+    }
+    if let Some(previous) = previous_checkpoint {
         let _ = fs::remove_file(previous);
     }
     Ok(path)
@@ -357,6 +412,11 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
     locked.save()?;
     if let Some(current) = current_incarnation.as_deref() {
         let _ = fs::remove_file(capability_path(context, &record.id, current));
+        let _ = fs::remove_file(checkpoint_path_for_state(
+            &context.state_dir,
+            &record.id,
+            current,
+        ));
     }
     Ok(())
 }
@@ -1032,6 +1092,61 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serde_json::json;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn checkpoint_file_is_private_and_reuses_only_a_trusted_inode() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("checkpoint.json");
+
+        assert!(prepare_checkpoint_file(&path).expect("create checkpoint"));
+        let metadata = fs::symlink_metadata(&path).expect("checkpoint metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.permissions().mode() & 0o777, SECRET_FILE_MODE);
+
+        fs::write(&path, b"{\"state\":\"working\"}\n").expect("seed checkpoint");
+        assert!(!prepare_checkpoint_file(&path).expect("reuse trusted checkpoint"));
+        assert_eq!(
+            fs::read(&path).expect("read checkpoint"),
+            b"{\"state\":\"working\"}\n"
+        );
+    }
+
+    #[test]
+    fn checkpoint_file_rejects_public_symlink_and_hardlink_targets() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let public = tmp.path().join("public.json");
+        fs::write(&public, b"public").expect("seed public");
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).expect("set public mode");
+        let error = prepare_checkpoint_file(&public).expect_err("public file rejected");
+        assert_eq!(error.code(), "coordination-store-untrusted");
+        assert_eq!(fs::read(&public).expect("public unchanged"), b"public");
+
+        let sentinel = tmp.path().join("sentinel");
+        fs::write(&sentinel, b"sentinel").expect("seed sentinel");
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .expect("set private mode");
+        let linked = tmp.path().join("linked.json");
+        fs::hard_link(&sentinel, &linked).expect("hard link");
+        let error = prepare_checkpoint_file(&linked).expect_err("hard link rejected");
+        assert_eq!(error.code(), "coordination-store-untrusted");
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel unchanged"),
+            b"sentinel"
+        );
+
+        let symbolic = tmp.path().join("symbolic.json");
+        symlink(&sentinel, &symbolic).expect("symlink");
+        let error = prepare_checkpoint_file(&symbolic).expect_err("symlink rejected");
+        assert_eq!(error.code(), "coordination-store-untrusted");
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel unchanged"),
+            b"sentinel"
+        );
+    }
 
     #[test]
     fn broker_projection_schema_is_stable() {

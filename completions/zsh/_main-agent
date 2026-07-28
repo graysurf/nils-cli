@@ -30,7 +30,18 @@ _main-agent() {
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:main-agent-command-$line[1]:"
         case $line[1] in
-            (init)
+            (capabilities)
+_arguments "${_arguments_options[@]}" : \
+'--provider=[Provider runtime whose deployed hook surface must admit checkpoint writes]:PROVIDER:(codex claude)' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(init)
 _arguments "${_arguments_options[@]}" : \
 '--packet-file=[Private objective packet JSON file]:PATH:_files' \
 '--if-revision=[Expected current run revision when continuity-rebinding a stopped prior incarnation]:IF_REVISION:_default' \
@@ -73,6 +84,16 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:main-agent-self-command-$line[1]:"
         case $line[1] in
             (show)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(readiness)
 _arguments "${_arguments_options[@]}" : \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -552,6 +573,7 @@ esac
 (( $+functions[_main-agent_commands] )) ||
 _main-agent_commands() {
     local commands; commands=(
+'capabilities:Report machine-readable facade capabilities for compatibility probes' \
 'init:Create or continuity-rebind this Main Agent'\''s durable run' \
 'rebind:Re-bind this Main Agent'\''s durable run to the current session incarnation after a resume, reusing the stored objective packet (no packet file)' \
 'self:Inspect the authenticated Main Agent or worker identity' \
@@ -585,6 +607,11 @@ _main-agent__subcmd__bootstrap_commands() {
 _main-agent__subcmd__borrow_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent borrow commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__capabilities_commands] )) ||
+_main-agent__subcmd__capabilities_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent capabilities commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__checkpoint_commands] )) ||
 _main-agent__subcmd__checkpoint_commands() {
@@ -640,9 +667,15 @@ _main-agent__subcmd__rehydrate_commands() {
 _main-agent__subcmd__self_commands() {
     local commands; commands=(
 'show:Show this authenticated session'\''s private run or assignment identity' \
+'readiness:Verify that this exact session incarnation has its runtime-issued checkpoint environment and private file' \
 'recover:Recover this exact Main Agent controller'\''s stale coordination heartbeat' \
     )
     _describe -t commands 'main-agent self commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__self__subcmd__readiness_commands] )) ||
+_main-agent__subcmd__self__subcmd__readiness_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent self readiness commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__self__subcmd__recover_commands] )) ||
 _main-agent__subcmd__self__subcmd__recover_commands() {
