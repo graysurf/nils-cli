@@ -211,6 +211,47 @@ worker. The Main Agent owns orchestration, review, and acceptance; it must not
 claim worker-owned implementation paths. An enforce-mode `claim-conflict`
 therefore means the ownership plan is wrong, not that prompt transport failed.
 
+Fresh launch is preflighted before any durable assignment or provider side
+effect. `assignment-launch-cwd-unavailable` means `launch.cwd` does not resolve
+to an existing directory; create the managed worktree, then retry the same
+request. For Codex, explicitly review and trust that exact canonical worktree
+in Codex before launch. `provider-trust-required` routes that decision to the
+user; do not accept the trust prompt on the user's behalf.
+`provider-trust-unverified` means the active Codex configuration could not be
+safely read or parsed; repair the provider configuration before retrying.
+The preflight canonicalizes the Codex configuration directory and accepts only
+a bounded regular `config.toml`; special files such as FIFOs fail without
+waiting for producer input. On success, that canonical directory is persisted
+with the pending start and session record, then passed to the provider process.
+Exact replay therefore uses the same configuration root even when an input
+symlink is retargeted or the controlling service has a different current
+environment.
+Trusting only a parent directory does not authorize a new managed worktree.
+These errors report `retryable: true`, but their recovery remains explicitly
+manual (`automatic: false`). In batch output they appear as isolated
+`resumable: true` lane failures; other lanes continue. After creating the cwd
+or repairing trust, replay the exact parent idempotency key and unchanged
+manifest to launch only the repaired lanes.
+
+Before creating the session record, the start path establishes a durable
+operation fence bound to the controller's active claim, then revalidates the
+exact current-run identity, unchanged starting assignment, pending idempotency
+receipt, and any batch-lane lease. Normal claim release and replacement remain
+blocked until the created worker is attached to the assignment and the fence is
+terminalized. Loss of controller authority before the fence leaves the durable
+pending start resumable and does not authorize a new child side effect. The
+fence identity binds the request digest, idempotency key, resolved assignment,
+and resolved worker session. An exact replay after controller process
+interruption renews and completes that retained fence instead of stacking
+another operation lease; a private acquisition token prevents a stale
+invocation from terminalizing a newer owner. A private, fixed 256-way sharded
+OS lock proves whether that owner is still live without unbounded lock-file
+growth: concurrent exact replay joins the durable receipt without rotating the
+token, while process death releases the lock so a replay can adopt the lease.
+Pending replay adopts the fence before attaching an existing child, and
+readiness or terminal receipt replay finishes any lease retained by a
+post-commit cleanup failure.
+
 A successful start creates an `agent-session.session.v1` record in
 `mode: "interactive"`, launches a real tmux-backed provider session, and
 returns the worker session ID and incarnation. With `--await-ready`, branch only

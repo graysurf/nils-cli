@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,6 +30,29 @@ fn run_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     )
 }
 
+fn write_trusted_codex_config(codex_home: &Path, projects: &[&Path]) {
+    let canonical_projects = projects
+        .iter()
+        .map(|project| fs::canonicalize(project).expect("canonical test checkout"))
+        .collect::<BTreeSet<_>>();
+    let mut config = String::new();
+    for project in canonical_projects {
+        let project_key = toml_edit::Value::from(
+            project
+                .to_str()
+                .expect("test checkout must have a UTF-8 path"),
+        );
+        config.push_str(&format!(
+            "[projects.{project_key}]\ntrust_level = \"trusted\"\n"
+        ));
+    }
+    fs::create_dir_all(codex_home).expect("test Codex home");
+    let config_path = codex_home.join("config.toml");
+    fs::write(&config_path, config).expect("test Codex config");
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+        .expect("test Codex config mode");
+}
+
 fn run_main_agent(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     let mut options = CmdOptions::new().with_cwd(dir).with_envs(envs);
     if !envs
@@ -53,6 +77,24 @@ fn run_main_agent(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput
         }
     }
     run_resolved("main-agent", args, &options)
+}
+
+fn run_main_agent_with_codex_trust(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    codex_home: &Path,
+    projects: &[&Path],
+) -> CmdOutput {
+    assert!(
+        !envs.iter().any(|(key, _)| *key == "CODEX_HOME"),
+        "explicit Codex trust helper owns CODEX_HOME"
+    );
+    write_trusted_codex_config(codex_home, projects);
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let mut trusted_envs = envs.to_vec();
+    trusted_envs.push(("CODEX_HOME", codex_home_arg.as_str()));
+    run_main_agent(dir, args, &trusted_envs)
 }
 
 fn run_main_agent_without_checkpoint(
@@ -1094,7 +1136,6 @@ fn main_agent_self_recover_is_exact_controller_macro_first_and_claim_preserving(
         )],
     );
     let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
-
     let mut runtime_process = Command::new("sleep");
     runtime_process.arg("30").stdin(Stdio::null());
     // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
@@ -5314,12 +5355,589 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
 }
 
 #[test]
-fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_launch() {
+fn main_agent_worker_start_rejects_untrusted_or_unverifiable_codex_checkout_before_durable_side_effects()
+ {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
     fs::create_dir(&state_dir).expect("state");
     init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[tmp.path()]);
+    let codex_config = codex_home.join("config.toml");
+
+    let assignment_path = tmp.path().join("assignment-untrusted-codex.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-untrusted-codex",
+            "task_summary": "Refuse an untrusted Codex checkout before launch",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-untrusted-codex",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-untrusted-codex-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(refused.code, 65, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "provider-trust-required"
+    );
+    assert_eq!(
+        refused.stdout_json()["error"]["details"]["next_action"],
+        "review-and-trust-project"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-untrusted-codex")
+            .is_none(),
+        "trust refusal must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-untrusted-codex").exists(),
+        "trust refusal must not create a worker session"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "trust refusal must happen before tmux launch"
+    );
+
+    fs::write(&codex_config, "[projects.").expect("malformed Codex config");
+    let unverifiable = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-untrusted-codex-0002",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        unverifiable.code,
+        65,
+        "outcome={}",
+        unverifiable.stdout_text()
+    );
+    assert_eq!(
+        unverifiable.stdout_json()["error"]["code"],
+        "provider-trust-unverified"
+    );
+    assert_eq!(
+        unverifiable.stdout_json()["error"]["details"]["next_action"],
+        "repair-provider-config"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-untrusted-codex")
+            .is_none(),
+        "unverifiable trust must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-untrusted-codex").exists(),
+        "unverifiable trust must not create a worker session"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "unverifiable trust must happen before tmux launch"
+    );
+
+    fs::write(&codex_config, format!("#{}\n", "x".repeat(1024 * 1024 + 1)))
+        .expect("oversized Codex config");
+    let oversized = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-untrusted-codex-0003",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(oversized.code, 65, "outcome={}", oversized.stdout_text());
+    assert_eq!(
+        oversized.stdout_json()["error"]["code"],
+        "provider-trust-unverified"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-untrusted-codex")
+            .is_none(),
+        "oversized trust config must not persist an assignment"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "oversized trust config must happen before tmux launch"
+    );
+
+    fs::remove_file(&codex_config).expect("remove oversized Codex config");
+    let fifo_path = std::ffi::CString::new(
+        codex_config
+            .to_str()
+            .expect("test Codex config path must be UTF-8"),
+    )
+    .expect("FIFO path");
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+        0,
+        "create Codex config FIFO"
+    );
+    let mut fifo_command = Command::new(bin::resolve("main-agent"));
+    fifo_command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-untrusted-codex-0004",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut fifo = fifo_command.spawn().expect("spawn FIFO preflight");
+    let fifo_deadline = Instant::now() + Duration::from_secs(3);
+    while fifo.try_wait().expect("poll FIFO preflight").is_none() {
+        if Instant::now() >= fifo_deadline {
+            fifo.kill().expect("kill blocked FIFO preflight");
+            let _ = fifo.wait();
+            panic!("Codex trust preflight blocked while opening a config.toml FIFO");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let fifo = fifo.wait_with_output().expect("FIFO preflight output");
+    assert_eq!(
+        fifo.status.code(),
+        Some(65),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&fifo.stdout),
+        String::from_utf8_lossy(&fifo.stderr)
+    );
+    let fifo_json: serde_json::Value =
+        serde_json::from_slice(&fifo.stdout).expect("FIFO error json");
+    assert_eq!(fifo_json["error"]["code"], "provider-trust-unverified");
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-untrusted-codex")
+            .is_none(),
+        "FIFO trust config must not persist an assignment"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "FIFO trust config must fail without blocking before tmux launch"
+    );
+    fs::remove_file(&codex_config).expect("remove Codex config FIFO");
+
+    let linked_config_home = tmp.path().join("linked-config-home");
+    write_trusted_codex_config(&linked_config_home, &[&checkout]);
+    std::os::unix::fs::symlink(linked_config_home.join("config.toml"), &codex_config)
+        .expect("linked Codex config");
+    let linked_config = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-untrusted-codex-0005",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        linked_config.code,
+        65,
+        "outcome={}",
+        linked_config.stdout_text()
+    );
+    assert_eq!(
+        linked_config.stdout_json()["error"]["code"],
+        "provider-trust-unverified"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-untrusted-codex")
+            .is_none()
+    );
+    assert!(tmux_calls(&tmux_log).is_empty());
+    fs::remove_file(&codex_config).expect("remove linked Codex config");
+
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let linked_checkout = tmp.path().join("linked-checkout");
+    std::os::unix::fs::symlink(&checkout, &linked_checkout).expect("linked checkout");
+    let trusted_assignment_path = tmp.path().join("assignment-trusted-symlink.json");
+    write_private_json(
+        &trusted_assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-trusted-symlink",
+            "task_summary": "Launch the exact canonical trusted checkout",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": linked_checkout,
+                "title": null,
+                "session_id": "worker-trusted-symlink",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": linked_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let trusted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            trusted_assignment_path
+                .to_str()
+                .expect("trusted assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-trusted-symlink-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(trusted.code, 0, "outcome={}", trusted.stdout_text());
+    let worker: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions/worker-trusted-symlink/session.json"))
+            .expect("trusted worker session"),
+    )
+    .expect("trusted worker session json");
+    assert_eq!(
+        worker["cwd"],
+        fs::canonicalize(&checkout)
+            .expect("canonical checkout")
+            .to_string_lossy()
+            .as_ref(),
+        "the launched session must retain the exact canonical path that passed trust preflight"
+    );
+    let canonical_codex_home = fs::canonicalize(&codex_home).expect("canonical Codex home");
+    assert_eq!(
+        worker["runtime"]["agent_profile_provider_config_dir"],
+        canonical_codex_home.to_string_lossy().as_ref(),
+        "the session record must retain the verified provider configuration root without requiring a named profile"
+    );
+    assert!(
+        tmux_calls(&tmux_log).iter().any(|call| {
+            call.iter()
+                .any(|arg| arg == &format!("CODEX_HOME={}", canonical_codex_home.to_string_lossy()))
+        }),
+        "the tmux child environment must receive the verified Codex configuration root"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_rejects_missing_cwd_before_durable_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let missing_checkout = tmp.path().join("missing-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    fs::create_dir(&codex_home).expect("Codex home");
+    fs::write(codex_home.join("config.toml"), "[projects.").expect("malformed Codex config");
+    let assignment_path = tmp.path().join("assignment-missing-cwd.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-missing-cwd",
+            "task_summary": "Refuse a missing launch cwd before persistence",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": missing_checkout,
+                "title": null,
+                "session_id": "worker-missing-cwd",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": missing_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-missing-cwd-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(refused.code, 65, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "assignment-launch-cwd-unavailable"
+    );
+    assert_eq!(
+        refused.stdout_json()["error"]["details"]["next_action"],
+        "create-managed-worktree"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-missing-cwd")
+            .is_none(),
+        "cwd refusal must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-missing-cwd").exists(),
+        "cwd refusal must not create a worker session"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "cwd refusal must happen before tmux launch"
+    );
+
+    let file_checkout = tmp.path().join("file-checkout");
+    fs::write(&file_checkout, "not a directory").expect("file checkout");
+    let file_assignment_path = tmp.path().join("assignment-file-cwd.json");
+    write_private_json(
+        &file_assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-file-cwd",
+            "task_summary": "Refuse a non-directory launch cwd before persistence",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": file_checkout,
+                "title": null,
+                "session_id": "worker-file-cwd",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": file_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let file_refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            file_assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-file-cwd-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        file_refused.code,
+        65,
+        "outcome={}",
+        file_refused.stdout_text()
+    );
+    assert_eq!(
+        file_refused.stdout_json()["error"]["code"],
+        "assignment-launch-cwd-unavailable"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-file-cwd")
+            .is_none(),
+        "non-directory cwd refusal must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-file-cwd").exists(),
+        "non-directory cwd refusal must not create a worker session"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "non-directory cwd refusal must happen before tmux launch"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_launch() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let replacement_checkout = tmp.path().join("replacement-checkout");
+    let linked_checkout = tmp.path().join("linked-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &replacement_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    std::os::unix::fs::symlink(&checkout, &linked_checkout).expect("linked checkout");
     let assignment_id = "assignment-auto-stable";
     let worker_id = "worker-assignment-auto-stable";
     seed_brokers_at(
@@ -5373,7 +5991,7 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
         "task": {},
         "launch": {
             "agent": "codex",
-            "cwd": checkout,
+            "cwd": linked_checkout,
             "title": null,
             "session_id": null,
             "coordination_mode": "enforce",
@@ -5419,6 +6037,7 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     );
     let idempotency_key = "worker-start-crash-0001";
     let request_digest = assignment_request_digest(&assignment_input);
+    let codex_home = tmp.path().join("codex-home");
     rewrite_orchestration_registry(&state_dir, |registry| {
         registry["receipts"][format!("main-one:main-incarnation-one:{idempotency_key}")] = json!({
             "principal_session_id": "main-one",
@@ -5428,6 +6047,10 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
             "outcome": {
                 "schema_version": "main-agent.worker-start-result.v1",
                 "assignment_id": assignment_id,
+                "worker_session_id": worker_id,
+                "canonical_launch_cwd": fs::canonicalize(&checkout)
+                    .expect("canonical checkout"),
+                "provider_config_dir": codex_home,
                 "state": "starting",
                 "acceptance": "pending"
             },
@@ -5436,6 +6059,12 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     });
     let assignment_path = tmp.path().join("assignment.json");
     write_private_json(&assignment_path, &assignment_input);
+    fs::remove_file(&linked_checkout).expect("remove original checkout link");
+    std::os::unix::fs::symlink(&replacement_checkout, &linked_checkout)
+        .expect("retarget checkout link");
+    fs::create_dir(&codex_home).expect("Codex home");
+    fs::write(codex_home.join("config.toml"), "[projects.").expect("malformed Codex config");
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
     let args = [
         "--state-dir",
         state_dir.to_str().expect("state dir"),
@@ -5455,12 +6084,24 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     let resumed = run_main_agent(
         &checkout,
         &args,
-        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("CODEX_HOME", &codex_home_arg),
+        ],
     );
     assert_eq!(resumed.code, 0, "stderr={}", resumed.stderr_text());
     assert_eq!(data(&resumed)["assignment"]["assignment_id"], assignment_id);
     assert_eq!(data(&resumed)["assignment"]["revision"], 2);
     assert_eq!(data(&resumed)["worker"]["session_id"], worker_id);
+    let resumed_worker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("resumed worker record"))
+            .expect("resumed worker record json");
+    assert_eq!(
+        fs::canonicalize(resumed_worker["cwd"].as_str().expect("worker cwd"))
+            .expect("canonical resumed worker cwd"),
+        fs::canonicalize(&checkout).expect("canonical original checkout"),
+        "pending replay must use the durably approved canonical path, not a retargeted packet symlink"
+    );
     assert_eq!(
         data(&resumed)["acceptance"]["state"],
         "pending-worker-checkpoint"
@@ -5469,7 +6110,10 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     let replay = run_main_agent(
         &checkout,
         &args,
-        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("CODEX_HOME", &codex_home_arg),
+        ],
     );
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
     assert_eq!(replay.stdout_text(), resumed.stdout_text());
@@ -5529,6 +6173,7 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             "durable_refs": []
         }),
     );
+    write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
@@ -5713,7 +6358,8 @@ fn main_agent_worker_start_binds_broker_to_same_release_agent_session_sibling() 
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let path_arg = joined_path.to_string_lossy().into_owned();
-    let started = run_main_agent(
+    let codex_home = tmp.path().join("codex-home");
+    let started = run_main_agent_with_codex_trust(
         &checkout,
         &[
             "--state-dir",
@@ -5738,6 +6384,8 @@ fn main_agent_worker_start_binds_broker_to_same_release_agent_session_sibling() 
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("PATH", &path_arg),
         ],
+        &codex_home,
+        &[&checkout],
     );
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
 
@@ -8466,11 +9114,15 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
         "--format",
         "json",
     ];
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&replacement_checkout]);
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
     let reassign_env = [
         ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
         ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("CODEX_HOME", codex_home_arg.as_str()),
     ];
     let stale_reassign = run_main_agent(
         &main_checkout,
@@ -8523,6 +9175,7 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
         ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("CODEX_HOME", codex_home_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
         (
             "AGENT_SESSION_FAKE_TMUX_FAIL_ONCE_DIR",
@@ -8616,6 +9269,7 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
         ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("CODEX_HOME", codex_home_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid_arg.as_str()),
         (
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
@@ -14118,6 +14772,188 @@ fn main_agent_worker_start_batch_isolates_per_lane_results() {
 }
 
 #[test]
+fn main_agent_worker_start_batch_replays_repaired_cwd_without_duplicate_lanes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let missing_checkout = tmp.path().join("missing-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let claude_bin = fake_agent(tmp.path(), "claude-worker");
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    fs::create_dir(&codex_home).expect("Codex home");
+    fs::write(codex_home.join("config.toml"), "[projects.").expect("malformed Codex config");
+    let batch_dir = tmp.path().join("repairable-batch");
+    fs::create_dir(&batch_dir).expect("batch dir");
+    for (name, assignment_id, worker_id, agent, cwd) in [
+        (
+            "a-missing.json",
+            "assignment-batch-missing",
+            "worker-batch-missing",
+            "codex",
+            missing_checkout.as_path(),
+        ),
+        (
+            "b-valid.json",
+            "assignment-batch-valid",
+            "worker-batch-valid",
+            "claude",
+            checkout.as_path(),
+        ),
+    ] {
+        write_private_json(
+            &batch_dir.join(name),
+            &json!({
+                "schema_version": "main-agent.assignment-input.v1",
+                "assignment_id": assignment_id,
+                "task_summary": "Resume a manually repaired batch lane",
+                "task": {},
+                "launch": {
+                    "agent": agent,
+                    "cwd": cwd,
+                    "title": null,
+                    "session_id": worker_id,
+                    "coordination_mode": "enforce",
+                    "agent_args": []
+                },
+                "repository": "example/repository",
+                "worktree": cwd,
+                "base_ref": "main",
+                "scopes": ["crates/agent-session"],
+                "durable_refs": []
+            }),
+        );
+    }
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let claude_arg = claude_bin.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "start",
+        "--batch",
+        batch_dir.to_str().expect("batch dir"),
+        "--idempotency-key",
+        "batch-repairable-cwd-0001",
+        "--format",
+        "json",
+    ];
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CLAUDE_BIN", claude_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("CODEX_HOME", codex_home_arg.as_str()),
+    ];
+    let blocked = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(blocked.code, 0, "outcome={}", blocked.stdout_text());
+    let blocked_data = data(&blocked);
+    let blocked_lanes = blocked_data["lanes"].as_array().expect("blocked lanes");
+    assert_eq!(
+        blocked_lanes[0]["error"]["code"],
+        "assignment-launch-cwd-unavailable"
+    );
+    assert_eq!(blocked_lanes[0]["resumable"], true);
+    assert_eq!(blocked_lanes[0]["error"]["details"]["retryable"], true);
+    assert_eq!(blocked_lanes[1]["ok"], true);
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "the independent valid lane must launch on the first call"
+    );
+
+    fs::create_dir(&missing_checkout).expect("repaired checkout");
+    let unverified = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(unverified.code, 0, "outcome={}", unverified.stdout_text());
+    assert_eq!(
+        data(&unverified)["lanes"][0]["error"]["code"],
+        "provider-trust-unverified"
+    );
+    assert_eq!(data(&unverified)["lanes"][0]["resumable"], true);
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "unverifiable trust replay must not duplicate the completed lane"
+    );
+
+    fs::write(codex_home.join("config.toml"), "").expect("untrusted Codex config");
+    let trust_required = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(
+        trust_required.code,
+        0,
+        "outcome={}",
+        trust_required.stdout_text()
+    );
+    assert_eq!(
+        data(&trust_required)["lanes"][0]["error"]["code"],
+        "provider-trust-required"
+    );
+    assert_eq!(data(&trust_required)["lanes"][0]["resumable"], true);
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "required trust replay must not duplicate the completed lane"
+    );
+
+    write_trusted_codex_config(&codex_home, &[&missing_checkout]);
+    let repaired = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(repaired.code, 0, "outcome={}", repaired.stdout_text());
+    assert!(
+        data(&repaired)["lanes"]
+            .as_array()
+            .expect("repaired lanes")
+            .iter()
+            .all(|lane| lane["ok"] == true),
+        "the exact replay must converge every lane: {}",
+        repaired.stdout_text()
+    );
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        2,
+        "repair replay must launch only the formerly blocked lane"
+    );
+    let replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(data(&replay), data(&repaired));
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        2,
+        "completed replay must not duplicate either lane"
+    );
+}
+
+#[test]
 fn main_agent_worker_start_batch_stale_lane_owner_cannot_create_the_child_session() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -14155,6 +14991,8 @@ fn main_agent_worker_start_batch_stale_lane_owner_cannot_create_the_child_sessio
             "scopes": ["crates/agent-session"], "durable_refs": []
         }),
     );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
     let barrier = tmp.path().join("batch-lane-barrier");
     fs::create_dir(&barrier).expect("barrier");
     let idempotency_key = "batch-stale-owner-0001";
@@ -14177,6 +15015,7 @@ fn main_agent_worker_start_batch_stale_lane_owner_cannot_create_the_child_sessio
             .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
             .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
             .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("CODEX_HOME", &codex_home)
             .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
             .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_LEASE_SECS", "1")
             .stdout(Stdio::piped())
@@ -14260,6 +15099,734 @@ fn main_agent_worker_start_batch_stale_lane_owner_cannot_create_the_child_sessio
     let replay_json: serde_json::Value =
         serde_json::from_slice(&replay.stdout).expect("replay json");
     assert_eq!(replay_json["data"], successor_json["data"]);
+}
+
+#[test]
+fn main_agent_worker_start_revalidates_controller_claim_immediately_before_session_create() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-controller-fence.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-controller-fence",
+            "task_summary": "Fence a controller whose claim ended before launch",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null,
+                "session_id": "worker-controller-fence",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": checkout, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let barrier = tmp.path().join("controller-claim-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let mut command = Command::new(bin::resolve("main-agent"));
+    command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-controller-fence-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "before_session_create",
+        )
+        .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("spawn worker start");
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "worker start never reached the session create boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+            .expect("active controller claim");
+        claim["state"] = json!("released");
+        claim["revision"] = json!(claim["revision"].as_u64().expect("claim revision") + 1);
+    });
+    fs::write(barrier.join("release"), b"release").expect("release worker start");
+    let output = child.wait_with_output().expect("worker start output");
+    assert!(
+        !output.status.success(),
+        "claimless controller must be fenced"
+    );
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("worker start error json");
+    assert_eq!(outcome["error"]["code"], "claim-not-active");
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "the final claim fence must run before tmux new-session"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-controller-fence").exists(),
+        "the fenced controller must not create a child session record"
+    );
+    let registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-controller-fence"]["state"], "starting",
+        "the durable pending assignment remains resumable by an authorized controller"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_fences_claim_release_through_attachment_and_pins_codex_home() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let coordination = load_coordination_registry(&state_dir);
+    let claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("active main claim");
+    let claim_id = claim["claim_id"].as_str().expect("claim id").to_string();
+    let claim_revision = claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home_a = tmp.path().join("codex-home-a");
+    let codex_home_b = tmp.path().join("codex-home-b");
+    write_trusted_codex_config(&codex_home_a, &[&checkout]);
+    write_trusted_codex_config(&codex_home_b, &[&checkout]);
+    let codex_home_link = tmp.path().join("codex-home-current");
+    std::os::unix::fs::symlink(&codex_home_a, &codex_home_link).expect("Codex home link");
+    let assignment_path = tmp.path().join("assignment-authority-fence.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-authority-fence",
+            "task_summary": "Hold controller authority through worker attachment",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null,
+                "session_id": "worker-authority-fence",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": checkout, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let barrier = tmp.path().join("authority-fence-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let mut command = Command::new(bin::resolve("main-agent"));
+    command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-authority-fence-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home_link)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_authority_fence",
+        )
+        .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("spawn worker start");
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "worker start never established the authority fence"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::remove_file(&codex_home_link).expect("remove original Codex home link");
+    std::os::unix::fs::symlink(&codex_home_b, &codex_home_link).expect("retarget Codex home link");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let release_while_fenced = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "work-context",
+            "release",
+            "--session",
+            "main-one",
+            "--claim",
+            &claim_id,
+            "--if-revision",
+            &claim_revision,
+            "--idempotency-key",
+            "release-controller-while-worker-starting-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(release_while_fenced.code, 0);
+    assert_eq!(
+        release_while_fenced.stdout_json()["error"]["code"],
+        "operation-in-progress"
+    );
+    fs::write(barrier.join("release"), b"release").expect("release worker start");
+    let output = child.wait_with_output().expect("worker start output");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worker: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions/worker-authority-fence/session.json"))
+            .expect("worker session"),
+    )
+    .expect("worker session json");
+    let canonical_codex_home_a =
+        fs::canonicalize(&codex_home_a).expect("canonical original Codex home");
+    assert_eq!(
+        worker["runtime"]["agent_profile_provider_config_dir"],
+        canonical_codex_home_a.to_string_lossy().as_ref()
+    );
+    assert!(
+        tmux_calls(&tmux_log).iter().any(|call| {
+            call.iter().any(|arg| {
+                arg == &format!("CODEX_HOME={}", canonical_codex_home_a.to_string_lossy())
+            })
+        }),
+        "retargeting the input symlink must not change the provider configuration root"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-authority-fence"]["worker"]["session_id"],
+        "worker-authority-fence",
+        "the fence must remain active until the worker is durably attached"
+    );
+    let release_after_attach = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "work-context",
+            "release",
+            "--session",
+            "main-one",
+            "--claim",
+            &claim_id,
+            "--if-revision",
+            &claim_revision,
+            "--idempotency-key",
+            "release-controller-after-worker-start-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        release_after_attach.code,
+        0,
+        "stderr={}",
+        release_after_attach.stderr_text()
+    );
+}
+
+#[test]
+fn main_agent_worker_start_replay_reuses_the_crash_retained_authority_fence() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let coordination = load_coordination_registry(&state_dir);
+    let claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("active main claim");
+    let claim_id = claim["claim_id"].as_str().expect("claim id").to_string();
+    let claim_revision = claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-fence-replay.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-fence-replay",
+            "task_summary": "Reuse a crash-retained worker start fence",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null,
+                "session_id": "worker-fence-replay",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": checkout, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let barrier = tmp.path().join("fence-replay-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let contender_ready = tmp.path().join("fence-contender-ready");
+    let make_command = |pause: bool| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "0",
+                "--idempotency-key",
+                "worker-start-fence-replay-0001",
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+            .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+            .env("CODEX_HOME", &codex_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if pause {
+            command
+                .env(
+                    "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+                    "before_worker_attachment",
+                )
+                .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier);
+        } else {
+            command.env(
+                "NILS_AGENT_SESSION_TEST_FENCE_CONTENDER_READY",
+                &contender_ready,
+            );
+        }
+        command
+    };
+    let mut interrupted = make_command(true).spawn().expect("spawn interrupted start");
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "interrupted start never reached durable pre-attachment state"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let retained_registry = load_coordination_registry(&state_dir);
+    let retained_fences = retained_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|operation| operation["operation"] == "main-agent-worker-start")
+        .collect::<Vec<_>>();
+    assert_eq!(retained_fences.len(), 1);
+    let retained_lease_id = retained_fences[0]["lease_id"]
+        .as_str()
+        .expect("fence lease id")
+        .to_string();
+    let retained_token_digest = retained_fences[0]["execution_token_digest"]
+        .as_str()
+        .expect("fence token digest")
+        .to_string();
+    let mut joined = make_command(false).spawn().expect("spawn exact join");
+    let contender_deadline = Instant::now() + Duration::from_secs(10);
+    while !contender_ready.is_file() {
+        assert!(
+            Instant::now() < contender_deadline,
+            "exact replay never observed the live fence owner"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        joined.try_wait().expect("poll exact join").is_none(),
+        "a live exact replay must wait for the current fence owner"
+    );
+    let live_registry = load_coordination_registry(&state_dir);
+    let live_fence = live_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .find(|operation| operation["lease_id"] == retained_lease_id)
+        .expect("live worker start fence");
+    assert_eq!(
+        live_fence["execution_token_digest"], retained_token_digest,
+        "a live exact replay must not rotate the current owner's fence token"
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let release_while_unattached = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "work-context",
+            "release",
+            "--session",
+            "main-one",
+            "--claim",
+            &claim_id,
+            "--if-revision",
+            &claim_revision,
+            "--idempotency-key",
+            "release-controller-before-replay-attachment-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(release_while_unattached.code, 0);
+    assert_eq!(
+        release_while_unattached.stdout_json()["error"]["code"],
+        "operation-in-progress"
+    );
+    interrupted.kill().expect("interrupt worker start fixture");
+    let interrupted = interrupted.wait().expect("wait interrupted start");
+    assert!(!interrupted.success());
+    assert!(
+        state_dir.join("sessions/worker-fence-replay").exists(),
+        "the fixture interruption occurs after durable session creation"
+    );
+
+    let replay = joined.wait_with_output().expect("joined worker start");
+    assert!(
+        replay.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let completed_registry = load_coordination_registry(&state_dir);
+    let completed_fences = completed_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|operation| operation["operation"] == "main-agent-worker-start")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_fences.len(),
+        1,
+        "exact replay must reuse rather than stack the crash-retained fence"
+    );
+    assert_eq!(completed_fences[0]["lease_id"], retained_lease_id);
+    assert_eq!(completed_fences[0]["state"], "completed");
+    let receipt_key = "main-one:main-incarnation-one:worker-start-fence-replay-0001".to_string();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let terminal = registry["receipts"][&receipt_key]["outcome"].clone();
+        registry["receipts"][&receipt_key]["outcome"] = json!({
+            "schema_version": "main-agent.worker-start-readiness-progress.v1",
+            "state": "awaiting_readiness",
+            "deadline_at_epoch": 1,
+            "finalizer_id": "fixture-retained-fence-finalizer",
+            "finalizer_lease_until_epoch": 1,
+            "submit_key_recovery_eligible": false,
+            "recovery_continuation": null,
+            "outcome": terminal
+        });
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let fence = registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .iter_mut()
+            .find(|operation| operation["lease_id"] == retained_lease_id)
+            .expect("worker start fence");
+        fence["state"] = json!("active");
+        fence["terminal_at_epoch"] = serde_json::Value::Null;
+        fence["outcome"] = serde_json::Value::Null;
+    });
+    let terminal_replay = make_command(false)
+        .output()
+        .expect("readiness receipt fence cleanup replay");
+    assert!(
+        terminal_replay.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&terminal_replay.stdout),
+        String::from_utf8_lossy(&terminal_replay.stderr)
+    );
+    let cleaned_registry = load_coordination_registry(&state_dir);
+    let cleaned_fence = cleaned_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .find(|operation| operation["lease_id"] == retained_lease_id)
+        .expect("cleaned worker start fence");
+    assert_eq!(
+        cleaned_fence["state"], "completed",
+        "nested readiness receipt replay must finish a fence retained after attachment commit"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let fence = registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .iter_mut()
+            .find(|operation| operation["lease_id"] == retained_lease_id)
+            .expect("worker start fence");
+        fence["state"] = json!("active");
+        fence["terminal_at_epoch"] = serde_json::Value::Null;
+        fence["outcome"] = serde_json::Value::Null;
+    });
+    let final_replay = make_command(false)
+        .output()
+        .expect("terminal receipt fence cleanup replay");
+    assert!(
+        final_replay.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&final_replay.stdout),
+        String::from_utf8_lossy(&final_replay.stderr)
+    );
+    let final_registry = load_coordination_registry(&state_dir);
+    let final_fence = final_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .find(|operation| operation["lease_id"] == retained_lease_id)
+        .expect("final worker start fence");
+    assert_eq!(final_fence["state"], "completed");
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1
+    );
+    let release_after_replay = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "work-context",
+            "release",
+            "--session",
+            "main-one",
+            "--claim",
+            &claim_id,
+            "--if-revision",
+            &claim_revision,
+            "--idempotency-key",
+            "release-controller-after-replay-attachment-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        release_after_replay.code,
+        0,
+        "stderr={}",
+        release_after_replay.stderr_text()
+    );
+}
+
+#[test]
+fn main_agent_worker_start_distinct_null_id_requests_hold_distinct_authority_fences() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-null-ids.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": null,
+            "task_summary": "Launch distinct workers from the same null-id packet",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null,
+                "session_id": null, "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": checkout, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let first_barrier = tmp.path().join("null-id-first-barrier");
+    let second_barrier = tmp.path().join("null-id-second-barrier");
+    fs::create_dir(&first_barrier).expect("first barrier");
+    fs::create_dir(&second_barrier).expect("second barrier");
+    let spawn = |idempotency_key: &str, barrier: &Path| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "0",
+                "--idempotency-key",
+                idempotency_key,
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+            .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+            .env("CODEX_HOME", &codex_home)
+            .env(
+                "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+                "before_session_create",
+            )
+            .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn worker start")
+    };
+    let first = spawn("worker-start-null-ids-0001", &first_barrier);
+    let second = spawn("worker-start-null-ids-0002", &second_barrier);
+    let overlap_deadline = Instant::now() + Duration::from_secs(10);
+    while !first_barrier.join("ready").is_file() || !second_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < overlap_deadline,
+            "both null-id contenders did not reach the pre-create boundary concurrently"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(first_barrier.join("release"), b"release").expect("release first contender");
+    fs::write(second_barrier.join("release"), b"release").expect("release second contender");
+    let first = first.wait_with_output().expect("first worker start");
+    let second = second.wait_with_output().expect("second worker start");
+    for output in [&first, &second] {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).expect("first json");
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).expect("second json");
+    assert_ne!(
+        first["data"]["assignment"]["assignment_id"],
+        second["data"]["assignment"]["assignment_id"]
+    );
+    assert_ne!(
+        first["data"]["worker"]["session_id"],
+        second["data"]["worker"]["session_id"]
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    let fences = coordination["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|operation| operation["operation"] == "main-agent-worker-start")
+        .collect::<Vec<_>>();
+    assert_eq!(fences.len(), 2);
+    assert_ne!(fences[0]["lease_id"], fences[1]["lease_id"]);
+    assert!(fences.iter().all(|fence| fence["state"] == "completed"));
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -14395,6 +15962,9 @@ fn main_agent_worker_start_batch_converges_concurrently_from_historical_lane_rec
             "created_at_epoch": 1
         });
     });
+    let codex_home = tmp.path().join("codex-home");
+    fs::create_dir(&codex_home).expect("Codex home");
+    fs::write(codex_home.join("config.toml"), "[projects.").expect("malformed Codex config");
     let barrier = tmp.path().join("historical-batch-barrier");
     fs::create_dir(&barrier).expect("barrier");
     let spawn_batch = |pause: bool| {
@@ -14416,6 +15986,7 @@ fn main_agent_worker_start_batch_converges_concurrently_from_historical_lane_rec
             .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
             .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
             .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+            .env("CODEX_HOME", &codex_home)
             .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -14429,6 +16000,28 @@ fn main_agent_worker_start_batch_converges_concurrently_from_historical_lane_rec
         }
         command.spawn().expect("spawn batch")
     };
+    let blocked = spawn_batch(false)
+        .wait_with_output()
+        .expect("blocked historical batch");
+    assert!(
+        blocked.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    let blocked: serde_json::Value =
+        serde_json::from_slice(&blocked.stdout).expect("blocked historical batch json");
+    assert_eq!(
+        blocked["data"]["lanes"][1]["error"]["code"],
+        "provider-trust-unverified"
+    );
+    assert_eq!(blocked["data"]["lanes"][1]["resumable"], true);
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "historical trust preflight failure must not duplicate the completed lane or launch the pending lane"
+    );
+
+    write_trusted_codex_config(&codex_home, &[&checkout]);
     let first = spawn_batch(true);
     let barrier_deadline = Instant::now() + Duration::from_secs(10);
     while !barrier.join("ready").is_file() {
@@ -14577,6 +16170,8 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             "durable_refs": []
         }),
     );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
@@ -14598,7 +16193,7 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     let explicit_hook_arg = explicit_hook.to_string_lossy().into_owned();
     let enter_count_file = tmp.path().join("automatic-explicit-enter-count");
     let enter_count_arg = enter_count_file.to_string_lossy().into_owned();
-    let started = run_main_agent(
+    let started = run_main_agent_with_codex_trust(
         &checkout,
         &[
             "--state-dir",
@@ -14625,6 +16220,8 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT", "2"),
         ],
+        &codex_home,
+        &[&checkout],
     );
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = data(&started)["readiness"].clone();
@@ -14871,6 +16468,8 @@ fn main_agent_worker_start_concurrent_replays_join_one_readiness_finalizer() {
             "durable_refs": []
         }),
     );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
     let assignment_arg = assignment_path.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
@@ -14896,6 +16495,7 @@ fn main_agent_worker_start_concurrent_replays_join_one_readiness_finalizer() {
             .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
             .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
             .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+            .env("CODEX_HOME", &codex_home)
             .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -15021,6 +16621,8 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
                 "durable_refs": []
             }),
         );
+        let codex_home = tmp.path().join("codex-home");
+        write_trusted_codex_config(&codex_home, &[&checkout]);
         let barrier = tmp.path().join(format!("readiness-{crash_stage}-barrier"));
         fs::create_dir(&barrier).expect("barrier");
         let takeover_barrier = tmp
@@ -15056,6 +16658,7 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
                 .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
                 .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
                 .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+                .env("CODEX_HOME", &codex_home)
                 .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
                 .env(
                     "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
@@ -15288,11 +16891,15 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
         let tmux_arg = tmux_bin.to_string_lossy().into_owned();
         let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
         let codex_arg = codex_bin.to_string_lossy().into_owned();
+        let codex_home = tmp.path().join("codex-home");
+        write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+        let codex_home_arg = codex_home.to_string_lossy().into_owned();
         let envs = [
             ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
             ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
             ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
             ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
         ];
         let started = run_main_agent(
             &checkout,
@@ -16607,6 +18214,9 @@ fn main_agent_submit_recovery_fences_concurrent_manager_mutations_until_resolved
         let tmux_arg = tmux_bin.to_string_lossy().into_owned();
         let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
         let codex_arg = codex_bin.to_string_lossy().into_owned();
+        let codex_home = tmp.path().join("codex-home");
+        write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+        let codex_home_arg = codex_home.to_string_lossy().into_owned();
         let started = run_main_agent(
             &checkout,
             &[
@@ -16628,6 +18238,7 @@ fn main_agent_submit_recovery_fences_concurrent_manager_mutations_until_resolved
                 ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
                 ("AGENT_SESSION_CODEX_BIN", &codex_arg),
                 ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("CODEX_HOME", &codex_home_arg),
             ],
         );
         assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
@@ -16816,6 +18427,8 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
             "durable_refs": []
         }),
     );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&worker_checkout]);
 
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
@@ -16840,6 +18453,7 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
         .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
         .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("CODEX_HOME", &codex_home)
         .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -17079,7 +18693,8 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let enter_hook_arg = enter_hook.to_string_lossy().into_owned();
     let enter_count_arg = enter_count.to_string_lossy().into_owned();
-    let started = run_main_agent(
+    let codex_home = tmp.path().join("codex-home");
+    let started = run_main_agent_with_codex_trust(
         &checkout,
         &[
             "--state-dir",
@@ -17105,6 +18720,8 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
             ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &enter_hook_arg),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
         ],
+        &codex_home,
+        &[&worker_checkout],
     );
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = data(&started)["readiness"].clone();
@@ -17339,7 +18956,8 @@ grep -q worker-bootstrap-checkout-mismatch {output}
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let enter_hook_arg = enter_hook.to_string_lossy().into_owned();
     let enter_count_arg = enter_count.to_string_lossy().into_owned();
-    let started = run_main_agent(
+    let codex_home = tmp.path().join("codex-home");
+    let started = run_main_agent_with_codex_trust(
         &checkout,
         &[
             "--state-dir",
@@ -17365,6 +18983,8 @@ grep -q worker-bootstrap-checkout-mismatch {output}
             ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &enter_hook_arg),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
         ],
+        &codex_home,
+        &[&worker_checkout],
     );
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = &data(&started)["readiness"];
@@ -17462,11 +19082,15 @@ fn main_agent_submit_recovery_is_bounded_idempotent_and_never_sends_a_second_ent
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
     let envs = [
         ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
         ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("CODEX_HOME", codex_home_arg.as_str()),
     ];
     let started = run_main_agent(
         &checkout,
@@ -17886,8 +19510,9 @@ fn main_agent_quick_idempotency_binds_the_canonical_readiness_wait() {
             "durable_refs": []
         }),
     );
+    let codex_home = tmp.path().join("codex-home");
     let run = |await_ready: &str| {
-        run_main_agent(
+        run_main_agent_with_codex_trust(
             &checkout,
             &[
                 "--state-dir",
@@ -17919,6 +19544,8 @@ fn main_agent_quick_idempotency_binds_the_canonical_readiness_wait() {
                     tmux_log.to_str().expect("tmux log"),
                 ),
             ],
+            &codex_home,
+            &[&checkout],
         )
     };
 

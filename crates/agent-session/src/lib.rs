@@ -2172,9 +2172,13 @@ fn persist_initial_profile_context(
     profile_auto_resume_supported: Option<bool>,
     codex_usage_account: Option<&str>,
 ) -> Result<(), CliError> {
-    let Some(agent_profile) = agent_profile else {
+    if agent_profile.is_none()
+        && provider_config_dir.is_none()
+        && profile_auto_resume_supported.is_none()
+        && codex_usage_account.is_none()
+    {
         return Ok(());
-    };
+    }
     let Some(runtime) = created.record.runtime.as_mut() else {
         cleanup_created_record(context, created);
         return Err(CliError::runtime(
@@ -2183,9 +2187,11 @@ fn persist_initial_profile_context(
             Some(json!({ "id": created.record.id })),
         ));
     };
-    runtime
-        .extra
-        .insert(AGENT_PROFILE_RUNTIME_KEY.to_string(), json!(agent_profile));
+    if let Some(agent_profile) = agent_profile {
+        runtime
+            .extra
+            .insert(AGENT_PROFILE_RUNTIME_KEY.to_string(), json!(agent_profile));
+    }
     if let Some(config_dir) = provider_config_dir {
         runtime.extra.insert(
             AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY.to_string(),

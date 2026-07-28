@@ -107,6 +107,16 @@ path under a repository or project output tree.
 Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
 for packet examples, revision and retry rules, interactive worker acceptance,
 resume/rebind, relationship transfers, and terminal cleanup. In particular,
+fresh worker launch first validates that `launch.cwd` is an existing canonical
+directory. Fresh Codex launch also requires explicit trust for that exact
+directory in the active Codex configuration; missing or unverifiable trust
+fails with typed guidance before assignment persistence or provider launch.
+The canonical verified Codex configuration directory is bound into the pending
+receipt, session record, and provider environment, so a long-lived service
+cannot preflight one configuration and launch against another. A durable
+controller-claim operation fence blocks claim release from the final authority
+check through child attachment. The runtime never accepts provider trust
+automatically. In addition,
 bare single-assignment `worker start` defaults to waiting up to 5 minutes for
 the typed readiness proof; select explicit `--await-ready 0` for launch-only
 behavior. Batch launch remains transport-only so its bounded lane count cannot

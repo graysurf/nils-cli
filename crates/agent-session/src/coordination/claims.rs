@@ -1,4 +1,10 @@
-use std::fs;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +64,194 @@ pub(crate) struct OperationLease {
     pub reconcile_observed_at_epoch: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+}
+
+pub(crate) struct MainAgentWorkerStartFence {
+    lease_id: String,
+    session_id: String,
+    session_incarnation: String,
+    execution_token: String,
+    _owner_lock: fs::File,
+}
+
+impl MainAgentWorkerStartFence {
+    pub(crate) fn finish(self, context: &CliContext, succeeded: bool) -> Result<(), CliError> {
+        finish_main_agent_worker_start_fence(
+            context,
+            &self.session_id,
+            &self.session_incarnation,
+            &self.lease_id,
+            succeeded,
+            true,
+            Some(&self.execution_token),
+        )
+    }
+}
+
+fn finish_main_agent_worker_start_fence(
+    context: &CliContext,
+    session_id: &str,
+    session_incarnation: &str,
+    lease_id: &str,
+    succeeded: bool,
+    required: bool,
+    execution_token: Option<&str>,
+) -> Result<(), CliError> {
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    let Some(lease) = locked.registry.operations.iter_mut().find(|lease| {
+        lease.lease_id == lease_id
+            && lease.session_id == session_id
+            && lease.session_incarnation == session_incarnation
+            && lease.operation == "main-agent-worker-start"
+    }) else {
+        return if required {
+            Err(operation_unavailable())
+        } else {
+            Ok(())
+        };
+    };
+    if execution_token
+        .is_some_and(|token| lease.execution_token_digest != digest_bytes(token.as_bytes()))
+    {
+        return Err(revision_conflict("operation-revision-conflict"));
+    }
+    if matches!(lease.state.as_str(), "completed" | "failed" | "abandoned") {
+        return Ok(());
+    }
+    if !matches!(
+        lease.state.as_str(),
+        "active" | "completing" | "reconcile_pending"
+    ) {
+        return Err(revision_conflict("operation-revision-conflict"));
+    }
+    lease.state = if succeeded {
+        "completed".to_string()
+    } else {
+        "failed".to_string()
+    };
+    lease.revision = lease.revision.saturating_add(1);
+    lease.terminal_at_epoch = Some(now);
+    lease.outcome = Some(if succeeded { "pass" } else { "fail" }.to_string());
+    locked.save()
+}
+
+fn main_agent_worker_start_fence_lease_id(
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    fence_key: &str,
+) -> String {
+    request_digest(
+        "main-agent-worker-start-fence",
+        &(record.id.as_str(), incarnation, fence_key),
+    )
+}
+
+fn acquire_main_agent_worker_start_owner_lock(
+    context: &CliContext,
+    lease_id: &str,
+) -> Result<fs::File, CliError> {
+    let coordination_root = super::coordination_root(context)?;
+    let directory = coordination_root.join("worker-start-fences");
+    match fs::symlink_metadata(&directory) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(super::store_unavailable()),
+            }
+        }
+        Err(_) => return Err(super::store_unavailable()),
+    }
+    let directory_metadata =
+        fs::symlink_metadata(&directory).map_err(|_| super::store_unavailable())?;
+    if directory_metadata.file_type().is_symlink()
+        || !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(super::store_untrusted());
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| super::store_unavailable())?;
+    let canonical_directory =
+        fs::canonicalize(&directory).map_err(|_| super::store_unavailable())?;
+    if !canonical_directory
+        .starts_with(fs::canonicalize(coordination_root).map_err(|_| super::store_unavailable())?)
+    {
+        return Err(super::store_untrusted());
+    }
+    let shard_digest = digest_bytes(lease_id.as_bytes());
+    let shard_hex = shard_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&shard_digest);
+    let shard = shard_hex.get(..2).ok_or_else(super::store_corrupt)?;
+    // A fixed 256-way shard set keeps owner-lock storage bounded. Unrelated
+    // starts that collide on one shard only serialize for the short
+    // launch/attachment window; their registry leases and tokens stay distinct.
+    let path = directory.join(format!("shard-{shard}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| super::store_unavailable())?;
+    let metadata = file.metadata().map_err(|_| super::store_unavailable())?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err(super::store_untrusted());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut contention_reported = false;
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the lifetime of the
+        // returned fence. The bounded nonblocking loop lets unrelated shard
+        // collisions serialize and prevents an exact replay from stealing.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        #[cfg(debug_assertions)]
+        if !contention_reported
+            && let Some(path) =
+                env::var_os("NILS_AGENT_SESSION_TEST_FENCE_CONTENDER_READY").map(PathBuf::from)
+        {
+            fs::write(path, b"contended\n").map_err(|_| super::store_unavailable())?;
+            contention_reported = true;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::runtime(
+                "worker-start-fence-wait-timeout",
+                "worker start authority remained owned past the bounded wait",
+                Some(json!({ "retryable": true })),
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = contention_reported;
+    Ok(file)
+}
+
+pub(crate) fn finish_retained_main_agent_worker_start_fence(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    fence_key: &str,
+) -> Result<(), CliError> {
+    let lease_id = main_agent_worker_start_fence_lease_id(record, incarnation, fence_key);
+    finish_main_agent_worker_start_fence(
+        context,
+        &record.id,
+        incarnation,
+        &lease_id,
+        true,
+        false,
+        None,
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1227,6 +1421,78 @@ pub(crate) fn active_claim<'a>(
                 && claim.state == "active"
         })
         .ok_or_else(claim_unavailable)
+}
+
+pub(crate) fn acquire_main_agent_worker_start_fence(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    fence_key: &str,
+) -> Result<MainAgentWorkerStartFence, CliError> {
+    let now = now_epoch();
+    let lease_id = main_agent_worker_start_fence_lease_id(record, incarnation, fence_key);
+    let owner_lock = acquire_main_agent_worker_start_owner_lock(context, &lease_id)?;
+    let mut locked = lock_registry(context)?;
+    clean_expired(&mut locked.registry, now);
+    ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    let claim = active_claim(&locked.registry, &record.id, incarnation)?.clone();
+    let execution_token = uuid::Uuid::new_v4().to_string();
+    if let Some(lease) = locked.registry.operations.iter_mut().find(|lease| {
+        lease.lease_id == lease_id
+            && lease.session_id == record.id
+            && lease.session_incarnation == incarnation
+            && lease.operation == "main-agent-worker-start"
+    }) {
+        lease.claim_id = claim.claim_id;
+        lease.claim_revision = claim.revision;
+        lease.state = "active".to_string();
+        lease.revision = lease.revision.saturating_add(1);
+        lease.expires_at = timestamp(now.saturating_add(OPERATION_TTL_SECS));
+        lease.expires_at_epoch = now.saturating_add(OPERATION_TTL_SECS);
+        lease.terminal_at_epoch = None;
+        lease.outcome = None;
+        lease.execution_token_digest = digest_bytes(execution_token.as_bytes());
+        locked.save()?;
+        return Ok(MainAgentWorkerStartFence {
+            lease_id,
+            session_id: record.id.clone(),
+            session_incarnation: incarnation.to_string(),
+            execution_token,
+            _owner_lock: owner_lock,
+        });
+    }
+    locked.registry.operations.push(OperationLease {
+        schema_version: OPERATION_LEASE_VERSION.to_string(),
+        lease_id: lease_id.clone(),
+        session_id: record.id.clone(),
+        session_incarnation: incarnation.to_string(),
+        claim_id: claim.claim_id,
+        claim_revision: claim.revision,
+        operation: "main-agent-worker-start".to_string(),
+        targets: Vec::new(),
+        provider_targets: Vec::new(),
+        state: "active".to_string(),
+        revision: 1,
+        started_at: timestamp(now),
+        expires_at: timestamp(now.saturating_add(OPERATION_TTL_SECS)),
+        expires_at_epoch: now.saturating_add(OPERATION_TTL_SECS),
+        terminal_at_epoch: None,
+        execution_token_digest: digest_bytes(execution_token.as_bytes()),
+        activity_revision: 0,
+        activity_identity_digest: String::new(),
+        runtime_identity_digest: String::new(),
+        descendant: None,
+        reconcile_observed_at_epoch: None,
+        outcome: None,
+    });
+    locked.save()?;
+    Ok(MainAgentWorkerStartFence {
+        lease_id,
+        session_id: record.id.clone(),
+        session_incarnation: incarnation.to_string(),
+        execution_token,
+        _owner_lock: owner_lock,
+    })
 }
 
 /// Return whether the authenticated worker's active claim is the exact

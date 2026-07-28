@@ -132,7 +132,46 @@ Assignment creation is fenced by the caller's active claim, the current-main
 check, and assignment-absence — not by the run revision. `--if-run-revision` is
 therefore optional on `worker start`: supply it to assert an expected run
 revision, or omit it so parallel and batch launches do not serialize on a shared
-run revision. An assignment packet may declare `depends_on: [assignment_id]`
+run revision. Before creating a fresh assignment or provider session, `worker
+start` MUST canonicalize `launch.cwd` and prove it is an existing directory.
+Failure returns `assignment-launch-cwd-unavailable` with
+`next_action: create-managed-worktree`; the invalid path is not persisted or
+returned. A fresh Codex launch additionally requires that exact canonical
+directory to carry `trust_level = "trusted"` in the active Codex
+`config.toml`. Parent-directory trust is insufficient. Missing project trust
+returns `provider-trust-required`; an unreadable, malformed, oversized, or
+otherwise unverifiable configuration returns `provider-trust-unverified`.
+The bounded read MUST reject non-regular files without blocking for external
+input. The Codex configuration directory used for this decision MUST be
+canonicalized, recorded in the pending start receipt and session runtime, and
+passed explicitly to the child provider launch.
+Both occur before assignment persistence, session creation, tmux launch, or
+prompt delivery. Trust remains a user-owned provider decision and MUST NOT be
+accepted automatically. Exact idempotent replay of an already persisted start
+restores the request-digest-bound canonical cwd and provider configuration
+directory from its pending receipt rather than re-running fresh-launch trust.
+Historical pending receipts without either field perform the same bounded
+preflight once and durably upgrade the receipt before launch. A successful
+fresh preflight passes the canonical directory itself into session and provider
+launch; the untrusted path spelling is not re-resolved at that boundary.
+Because preflight I/O runs outside the orchestration registry lock, the
+caller's active claim and all registry guards are revalidated before assignment
+persistence. Before session creation, the exact active claim MUST acquire a
+durable operation fence that blocks claim release or replacement through
+successful child attachment. With that fence active, the exact current-main,
+starting-assignment, pending-receipt, and batch-lane authority MUST be
+revalidated before the child side effect; the fence becomes terminal only after
+the child is attached or the launch fails. Fence identity MUST bind the request
+digest, idempotency key, resolved assignment ID, and resolved worker session ID.
+Each acquisition MUST carry a private generation token so a stale invocation
+cannot terminalize a newer owner. A bounded sharded live-owner lock MUST prevent
+concurrent exact replay from rotating that token; the replay joins the durable
+receipt, and only proven owner-lock release permits crash takeover. Exact
+pending replay MUST adopt the retained fence before attaching an existing
+child; readiness or terminal receipt replay MUST finish the same fence before
+returning so a post-commit cleanup failure cannot leave claim mutation blocked.
+
+An assignment packet may declare `depends_on: [assignment_id]`
 (same-run assignment ids, max 64). `worker start` refuses with
 `dependency-not-satisfied` — listing each unmet dependency and its observed
 state (or null when missing or in another run) — until every dependency has been
@@ -153,6 +192,12 @@ parent idempotency key first commits an immutable sorted manifest of lane names
 and raw packet digests. Exact replay resumes incomplete manifest lanes;
 transient or ambiguous child failures remain incomplete and reconcile from the
 child receipt, while deterministic failures become terminal lane results.
+Manually repairable `assignment-launch-cwd-unavailable`,
+`provider-trust-required`, and `provider-trust-unverified` lanes are returned
+as isolated `ok: false, resumable: true` results while independent lanes
+continue. The parent remains in progress; after the stated manual action, an
+exact parent-key and manifest replay reclaims only those resumable lanes and
+does not duplicate completed lanes.
 Membership, name, order, or raw-byte changes conflict before any new worker
 launch. The immutable parent manifest makes the historical
 `{parent}-{index}` child key unambiguous, so new and rolling-upgrade callers

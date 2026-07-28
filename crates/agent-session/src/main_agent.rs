@@ -49,6 +49,7 @@ const ASSIGNMENT_REVISION_HELP: &str =
 const RUN_REVISION_HELP: &str =
     "Expected current run revision; stale values fail closed and report current_revision.";
 const MAX_IDEMPOTENCY_RECEIPTS: usize = 32_768;
+const CODEX_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(test)]
 static IDEMPOTENCY_RECEIPT_CAPACITY_FOR_TEST: AtomicUsize =
     AtomicUsize::new(MAX_IDEMPOTENCY_RECEIPTS);
@@ -2408,6 +2409,7 @@ fn run_worker_start_single_input(
     ensure_active_claim(context, &record)?;
     let (packet_value, request_digest, legacy_request_digest) =
         worker_start_request_digests(&input, &args.await_ready)?;
+    let expected_packet_digest = orchestration::packet_digest(&packet_value)?;
     let mut locked = orchestration::lock_registry(context)?;
     if let Some(batch_lane) = batch_lane {
         renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
@@ -2424,6 +2426,14 @@ fn run_worker_start_single_input(
     let pending_start = match replay {
         Some(value) if worker_start_readiness_is_pending(&value) => {
             drop(locked);
+            finish_retained_worker_start_fence_for_outcome(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &value,
+            )?;
             return finish_worker_start_readiness(
                 context,
                 &record,
@@ -2446,23 +2456,68 @@ fn run_worker_start_single_input(
                 .unwrap_or_else(|| {
                     retry_stable_worker_session_id(&assignment_id, &legacy_request_digest)
                 });
-            Some((assignment_id, worker_session_id))
+            let canonical_launch_cwd = value["canonical_launch_cwd"].as_str().map(str::to_string);
+            let provider_config_dir = value["provider_config_dir"].as_str().map(str::to_string);
+            Some((
+                assignment_id,
+                worker_session_id,
+                canonical_launch_cwd,
+                provider_config_dir,
+            ))
         }
-        Some(value) => return Ok(value),
+        Some(value) => {
+            drop(locked);
+            finish_retained_worker_start_fence_for_outcome(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &value,
+            )?;
+            return Ok(value);
+        }
         None => None,
     };
+    let mut launch_input = input.clone();
     let assignment_id = input
         .assignment_id
         .clone()
-        .or_else(|| pending_start.as_ref().map(|(id, _)| id.clone()))
+        .or_else(|| pending_start.as_ref().map(|(id, _, _, _)| id.clone()))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     orchestration::validate_slug("assignment id", &assignment_id, 128)?;
     let worker_session_id = pending_start
         .as_ref()
-        .map(|(_, id)| id.clone())
+        .map(|(_, id, _, _)| id.clone())
         .or_else(|| input.launch.session_id.clone())
         .unwrap_or_else(|| retry_stable_worker_session_id(&assignment_id, &legacy_request_digest));
     crate::validate_id(&worker_session_id)?;
+    let worker_start_fence_key = worker_start_fence_key(
+        &request_digest,
+        &args.idempotency_key,
+        &assignment_id,
+        &worker_session_id,
+    );
+    if let Some((_, _, Some(canonical_launch_cwd), _)) = &pending_start {
+        if !Path::new(canonical_launch_cwd).is_absolute() {
+            return Err(invalid_input(
+                "pending worker start canonical launch cwd is invalid",
+            ));
+        }
+        launch_input.launch.cwd = canonical_launch_cwd.clone();
+    }
+    let mut launch_provider_config_dir = pending_start
+        .as_ref()
+        .and_then(|(_, _, _, provider_config_dir)| provider_config_dir.as_deref())
+        .map(PathBuf::from);
+    if launch_provider_config_dir
+        .as_ref()
+        .is_some_and(|provider_config_dir| !provider_config_dir.is_absolute())
+    {
+        return Err(invalid_input(
+            "pending worker start provider config directory is invalid",
+        ));
+    }
     let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
     // T2: the run-revision fence is now advisory. Assignment creation is fenced
     // by the active claim, current-main check, and assignment-absence below, so
@@ -2472,7 +2527,6 @@ fn run_worker_start_single_input(
         ensure_revision(expected, run.revision, "run")?;
     }
     if pending_start.is_some() {
-        let expected_packet_digest = orchestration::packet_digest(&packet_value)?;
         let current = locked
             .registry
             .assignments
@@ -2491,6 +2545,128 @@ fn run_worker_start_single_input(
                 Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
             ));
         }
+        if pending_start.as_ref().is_some_and(
+            |(_, _, canonical_launch_cwd, provider_config_dir)| {
+                canonical_launch_cwd.is_none()
+                    || (input.launch.agent == "codex" && provider_config_dir.is_none())
+            },
+        ) {
+            drop(locked);
+            let canonical_cwd = pending_start
+                .as_ref()
+                .and_then(|(_, _, canonical_launch_cwd, _)| canonical_launch_cwd.as_deref())
+                .map(PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(|| require_assignment_launch_cwd(Path::new(&input.launch.cwd)))?;
+            if input.launch.agent == "codex" {
+                launch_provider_config_dir = Some(require_codex_project_trust(&canonical_cwd)?);
+            }
+            launch_input.launch.cwd = canonical_cwd
+                .into_os_string()
+                .into_string()
+                .map_err(|_| assignment_launch_cwd_error())?;
+            ensure_active_claim(context, &record)?;
+            locked = orchestration::lock_registry(context)?;
+            if let Some(batch_lane) = batch_lane {
+                renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
+                locked.save()?;
+            }
+            let mut pending = match worker_start_idempotency_replay(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+            )? {
+                Some(value) if worker_start_is_pending(&value) => value,
+                Some(value) if worker_start_readiness_is_pending(&value) => {
+                    drop(locked);
+                    return finish_worker_start_readiness(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        value,
+                        None,
+                    );
+                }
+                Some(value) => return Ok(value),
+                None => {
+                    return Err(CliError::data(
+                        "assignment-start-conflict",
+                        "persisted assignment cannot resume worker start",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    ));
+                }
+            };
+            let canonical_was_upgraded = pending["canonical_launch_cwd"]
+                .as_str()
+                .map(|canonical_launch_cwd| {
+                    if !Path::new(canonical_launch_cwd).is_absolute() {
+                        return Err(invalid_input(
+                            "pending worker start canonical launch cwd is invalid",
+                        ));
+                    }
+                    launch_input.launch.cwd = canonical_launch_cwd.to_string();
+                    Ok(())
+                })
+                .transpose()?
+                .is_some();
+            let provider_config_was_upgraded = pending["provider_config_dir"]
+                .as_str()
+                .map(|provider_config_dir| {
+                    let provider_config_dir = PathBuf::from(provider_config_dir);
+                    if !provider_config_dir.is_absolute() {
+                        return Err(invalid_input(
+                            "pending worker start provider config directory is invalid",
+                        ));
+                    }
+                    launch_provider_config_dir = Some(provider_config_dir);
+                    Ok(())
+                })
+                .transpose()?
+                .is_some();
+            let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
+            if let Some(expected) = args.if_run_revision {
+                ensure_revision(expected, run.revision, "run")?;
+            }
+            let current = locked
+                .registry
+                .assignments
+                .get(&assignment_id)
+                .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+            ensure_primary_manager(current, &record, &incarnation)?;
+            if current.run_id != run.run_id
+                || current.state != "starting"
+                || current.revision != 1
+                || current.worker.is_some()
+                || current.private_packet_digest != expected_packet_digest
+            {
+                return Err(CliError::data(
+                    "assignment-start-conflict",
+                    "persisted assignment cannot resume worker start",
+                    Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
+                ));
+            }
+            if !canonical_was_upgraded
+                || (input.launch.agent == "codex" && !provider_config_was_upgraded)
+            {
+                pending["canonical_launch_cwd"] = json!(launch_input.launch.cwd.clone());
+                pending["provider_config_dir"] = json!(launch_provider_config_dir.clone());
+                store_receipt(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    "worker-start",
+                    &request_digest,
+                    pending,
+                )?;
+                locked.save()?;
+            }
+        }
     } else {
         if locked.registry.assignments.contains_key(&assignment_id) {
             return Err(CliError::data(
@@ -2504,6 +2680,53 @@ fn run_worker_start_single_input(
         // against live state under the lock; a missing, cross-run, or
         // pre-terminal dependency blocks the launch with a typed result the
         // caller can wait on (`worker wait --until terminal`) and retry.
+        let blocked_on = unsatisfied_dependencies(&locked.registry, &run.run_id, &input.depends_on);
+        if !blocked_on.is_empty() {
+            return Err(CliError::data(
+                "dependency-not-satisfied",
+                "assignment dependencies have not been accepted",
+                Some(json!({ "assignment_id": assignment_id, "blocked_on": blocked_on })),
+            ));
+        }
+        drop(locked);
+        let canonical_cwd = require_assignment_launch_cwd(Path::new(&input.launch.cwd))?;
+        if input.launch.agent == "codex" {
+            launch_provider_config_dir = Some(require_codex_project_trust(&canonical_cwd)?);
+        }
+        launch_input.launch.cwd = canonical_cwd
+            .into_os_string()
+            .into_string()
+            .map_err(|_| assignment_launch_cwd_error())?;
+        ensure_active_claim(context, &record)?;
+        locked = orchestration::lock_registry(context)?;
+        if let Some(batch_lane) = batch_lane {
+            renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
+            locked.save()?;
+        }
+        if worker_start_idempotency_replay(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            &request_digest,
+            &legacy_request_digest,
+        )?
+        .is_some()
+        {
+            drop(locked);
+            return run_worker_start_single_input(context, args, input, batch_lane);
+        }
+        let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
+        if let Some(expected) = args.if_run_revision {
+            ensure_revision(expected, run.revision, "run")?;
+        }
+        if locked.registry.assignments.contains_key(&assignment_id) {
+            return Err(CliError::data(
+                "assignment-exists",
+                "orchestration assignment already exists",
+                Some(json!({ "assignment_id": assignment_id })),
+            ));
+        }
         let blocked_on = unsatisfied_dependencies(&locked.registry, &run.run_id, &input.depends_on);
         if !blocked_on.is_empty() {
             return Err(CliError::data(
@@ -2550,6 +2773,8 @@ fn run_worker_start_single_input(
             "schema_version": "main-agent.worker-start-result.v1",
             "assignment_id": assignment_id,
             "worker_session_id": worker_session_id,
+            "canonical_launch_cwd": launch_input.launch.cwd.clone(),
+            "provider_config_dir": launch_provider_config_dir.clone(),
             "state": "starting",
             "acceptance": "pending"
         });
@@ -2581,7 +2806,7 @@ fn run_worker_start_single_input(
     }
     let existing = match load_session_record(context, &worker_session_id) {
         Ok(worker) if runtime_is_proven_never_launched(&worker) => {
-            ensure_worker_launch_matches(context, &worker, &input, &prompt)?;
+            ensure_worker_launch_matches(context, &worker, &launch_input, &prompt)?;
             delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
             None
         }
@@ -2590,16 +2815,56 @@ fn run_worker_start_single_input(
         Err(error) => return Err(error),
     };
     let fresh_launch = existing.is_none();
+    let mut worker_start_fence = None;
     let (worker_record, worker_status) = if let Some(worker) = existing {
-        ensure_worker_launch_matches(context, &worker, &input, &prompt)?;
+        ensure_worker_launch_matches(context, &worker, &launch_input, &prompt)?;
         let status = session_status(&resolve_tmux_bin(None), &worker);
         (worker, status)
     } else {
         let mut create_guard = || {
             pause_batch_lane_for_test("before_session_create")?;
-            batch_lane.map_or(Ok(()), |batch_lane| {
-                renew_worker_start_batch_lane(context, batch_lane)
-            })
+            let fence = crate::coordination::claims::acquire_main_agent_worker_start_fence(
+                context,
+                &record,
+                &incarnation,
+                &worker_start_fence_key,
+            )?;
+            let validation = (|| {
+                let mut locked = orchestration::lock_registry(context)?;
+                if let Some(batch_lane) = batch_lane {
+                    renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
+                }
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                )?;
+                if batch_lane.is_some() {
+                    locked.save()?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                fence.finish(context, false)?;
+                return Err(error);
+            }
+            worker_start_fence = Some(fence);
+            if let Err(error) = pause_batch_lane_for_test("after_authority_fence") {
+                worker_start_fence
+                    .take()
+                    .expect("worker start fence was just stored")
+                    .finish(context, false)?;
+                return Err(error);
+            }
+            Ok(())
         };
         let started = crate::start_session_with_create_guard(
             context,
@@ -2612,99 +2877,265 @@ fn run_worker_start_single_input(
                 initial_codex_account: None,
                 initial_title_state: None,
                 initial_agent_profile: None,
-                initial_provider_config_dir: None,
+                initial_provider_config_dir: launch_provider_config_dir.clone(),
                 initial_profile_auto_resume_supported: None,
                 initial_codex_usage_account: None,
                 agent,
-                cwd: Some(PathBuf::from(&input.launch.cwd)),
-                title: input.launch.title.clone(),
-                id: Some(worker_session_id),
+                cwd: Some(PathBuf::from(&launch_input.launch.cwd)),
+                title: launch_input.launch.title.clone(),
+                id: Some(worker_session_id.clone()),
                 prompt: Some(prompt),
                 prompt_file: None,
                 prompt_stdin: false,
                 tmux_bin: None,
                 agent_bin: None,
-                agent_args: input.launch.agent_args.clone(),
-                coordination_mode: input.launch.coordination_mode,
+                agent_args: launch_input.launch.agent_args.clone(),
+                coordination_mode: launch_input.launch.coordination_mode,
                 paste_delay_ms: cli::DEFAULT_PASTE_DELAY_MS,
                 format: OutputFormat::Json,
             },
             StartFailureDisposition::ReturnError,
             PromptDelivery::ManagedWorkerExactlyOnce,
             Some(&mut create_guard),
-        )?;
-        let worker = load_session_record(context, &started.result.id)?;
+        );
+        let started = match started {
+            Ok(started) => started,
+            Err(error) => {
+                if let Some(fence) = worker_start_fence.take() {
+                    fence.finish(context, false)?;
+                }
+                return Err(error);
+            }
+        };
+        let worker = match load_session_record(context, &started.result.id) {
+            Ok(worker) => worker,
+            Err(error) => {
+                if let Some(fence) = worker_start_fence.take() {
+                    fence.finish(context, false)?;
+                }
+                return Err(error);
+            }
+        };
         (worker, started.result.status)
     };
-    let worker_incarnation = worker_record
+    let worker_incarnation = match worker_record
         .runtime
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+    {
+        Some(worker_incarnation) => worker_incarnation,
+        None => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, false)?;
+            }
+            return Err(invalid_input("worker session incarnation is unavailable"));
+        }
+    };
+    if worker_start_fence.is_none() {
+        let join_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let locked = orchestration::lock_registry(context)?;
+            let replay = worker_start_idempotency_replay(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+            )?;
+            drop(locked);
+            match replay {
+                Some(value) if worker_start_readiness_is_pending(&value) => {
+                    finish_retained_worker_start_fence_for_outcome(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &value,
+                    )?;
+                    return finish_worker_start_readiness(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        value,
+                        None,
+                    );
+                }
+                Some(value) if worker_start_is_pending(&value) => {}
+                Some(value) => {
+                    finish_retained_worker_start_fence_for_outcome(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &value,
+                    )?;
+                    return Ok(value);
+                }
+                None => {
+                    return Err(CliError::data(
+                        "assignment-start-conflict",
+                        "persisted worker start authority is unavailable",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    ));
+                }
+            }
+            match crate::coordination::claims::acquire_main_agent_worker_start_fence(
+                context,
+                &record,
+                &incarnation,
+                &worker_start_fence_key,
+            ) {
+                Ok(fence) => {
+                    let locked = orchestration::lock_registry(context)?;
+                    let replay = worker_start_idempotency_replay(
+                        &locked.registry,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                    )?;
+                    drop(locked);
+                    if let Some(value) = replay
+                        && !worker_start_is_pending(&value)
+                    {
+                        fence.finish(context, true)?;
+                        if worker_start_readiness_is_pending(&value) {
+                            return finish_worker_start_readiness(
+                                context,
+                                &record,
+                                &incarnation,
+                                &args.idempotency_key,
+                                &request_digest,
+                                value,
+                                None,
+                            );
+                        }
+                        return Ok(value);
+                    }
+                    worker_start_fence = Some(fence);
+                    break;
+                }
+                Err(error) if error.code() == "worker-start-fence-owned" => {
+                    if Instant::now() >= join_deadline {
+                        return Err(CliError::runtime(
+                            "worker-start-fence-wait-timeout",
+                            "the exact worker start owner did not finish within the bounded wait",
+                            Some(json!({ "retryable": true })),
+                        ));
+                    }
+                    thread::sleep(WORKER_WAIT_POLL_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    if let Err(error) = pause_batch_lane_for_test("before_worker_attachment") {
+        worker_start_fence
+            .take()
+            .expect("worker start fence is active before attachment")
+            .finish(context, false)?;
+        return Err(error);
+    }
 
-    let mut locked = orchestration::lock_registry(context)?;
-    if let Some(batch_lane) = batch_lane {
-        renew_worker_start_batch_lane_after_child_side_effect_locked(
-            &mut locked.registry,
-            batch_lane,
+    let attachment = (|| {
+        ensure_active_claim(context, &record)?;
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(batch_lane) = batch_lane {
+            renew_worker_start_batch_lane_after_child_side_effect_locked(
+                &mut locked.registry,
+                batch_lane,
+            )?;
+        }
+        validate_worker_start_authority_locked(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &assignment_id,
+            &worker_session_id,
+            &expected_packet_digest,
+            &args.idempotency_key,
+            &request_digest,
+            &legacy_request_digest,
+            &launch_input.launch.cwd,
+            launch_provider_config_dir.as_deref(),
         )?;
-    }
-    let current = locked
-        .registry
-        .assignments
-        .get_mut(&assignment_id)
-        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
-    if current.state != "starting" || current.revision != 1 || current.worker.is_some() {
-        return Err(CliError::data(
-            "assignment-start-conflict",
-            "assignment changed while the worker was starting",
-            Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
-        ));
-    }
-    current.worker = Some(session_ref(context, &worker_record, &worker_incarnation));
-    current.revision = 2;
-    current.updated_at = timestamp();
-    let outcome = json!({
-        "schema_version": "main-agent.worker-start-result.v1",
-        "assignment": public_assignment_view(current),
-        "worker": {
-            "session_id": worker_record.id,
-            "session_incarnation": worker_incarnation,
-            "status": worker_status
-        },
-        "acceptance": {
-            "state": "pending-worker-checkpoint",
-            "transport_only": true
-        },
-        "polling": worker_start_polling_evidence(await_ready)
-    });
-    let receipt_outcome = await_ready.map_or_else(
-        || outcome.clone(),
-        |timeout| {
-            worker_start_readiness_progress(
-                outcome.clone(),
-                timeout,
-                worker_submit_key_recovery_eligible(fresh_launch, agent),
-            )
-        },
-    );
-    store_receipt(
-        &mut locked.registry,
-        &record,
-        &incarnation,
-        &args.idempotency_key,
-        "worker-start",
-        &request_digest,
-        receipt_outcome.clone(),
-    )?;
-    locked.save()?;
+        let current = locked
+            .registry
+            .assignments
+            .get_mut(&assignment_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        if current.state != "starting" || current.revision != 1 || current.worker.is_some() {
+            return Err(CliError::data(
+                "assignment-start-conflict",
+                "assignment changed while the worker was starting",
+                Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
+            ));
+        }
+        current.worker = Some(session_ref(context, &worker_record, &worker_incarnation));
+        current.revision = 2;
+        current.updated_at = timestamp();
+        let outcome = json!({
+            "schema_version": "main-agent.worker-start-result.v1",
+            "assignment": public_assignment_view(current),
+            "worker": {
+                "session_id": worker_record.id,
+                "session_incarnation": worker_incarnation,
+                "status": worker_status
+            },
+            "acceptance": {
+                "state": "pending-worker-checkpoint",
+                "transport_only": true
+            },
+            "polling": worker_start_polling_evidence(await_ready)
+        });
+        let receipt_outcome = await_ready.map_or_else(
+            || outcome.clone(),
+            |timeout| {
+                worker_start_readiness_progress(
+                    outcome.clone(),
+                    timeout,
+                    worker_submit_key_recovery_eligible(fresh_launch, agent),
+                )
+            },
+        );
+        store_receipt(
+            &mut locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            "worker-start",
+            &request_digest,
+            receipt_outcome.clone(),
+        )?;
+        locked.save()?;
+        Ok((outcome, receipt_outcome))
+    })();
+    let (outcome, receipt_outcome) = match attachment {
+        Ok(result) => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, true)?;
+            }
+            result
+        }
+        Err(error) => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, false)?;
+            }
+            return Err(error);
+        }
+    };
     // T1: fold the readiness proof. Drop the write lock first so the wait never
     // blocks the worker's own checkpoint. The worker's authenticated,
     // revision-fenced, incarnation-matched checkpoint advancing the assignment
     // past `starting` is the readiness + newer-turn + identity proof; a bounded
     // poll classifies it into a typed result. `--await-ready 0` stays launch-only.
-    drop(locked);
     if await_ready.is_some() {
         let finalizer_id = receipt_outcome["finalizer_id"]
             .as_str()
@@ -2739,6 +3170,60 @@ fn worker_start_request_digests(
         }),
     );
     Ok((packet_value, request_digest, legacy_request_digest))
+}
+
+fn worker_start_fence_key(
+    request_digest: &str,
+    idempotency_key: &str,
+    assignment_id: &str,
+    worker_session_id: &str,
+) -> String {
+    crate::coordination::request_digest(
+        "main-agent-worker-start-fence-key",
+        &(
+            request_digest,
+            idempotency_key,
+            assignment_id,
+            worker_session_id,
+        ),
+    )
+}
+
+fn finish_retained_worker_start_fence_for_outcome(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    outcome: &Value,
+) -> Result<(), CliError> {
+    let outcome = worker_start_fence_outcome(outcome);
+    let Some(assignment_id) = outcome["assignment"]["assignment_id"].as_str() else {
+        return Ok(());
+    };
+    let Some(worker_session_id) = outcome["worker"]["session_id"].as_str() else {
+        return Ok(());
+    };
+    let fence_key = worker_start_fence_key(
+        request_digest,
+        idempotency_key,
+        assignment_id,
+        worker_session_id,
+    );
+    crate::coordination::claims::finish_retained_main_agent_worker_start_fence(
+        context,
+        record,
+        incarnation,
+        &fence_key,
+    )
+}
+
+fn worker_start_fence_outcome(value: &Value) -> &Value {
+    if worker_start_readiness_is_pending(value) {
+        &value["outcome"]
+    } else {
+        value
+    }
 }
 
 fn worker_start_polling_evidence(timeout: Option<Duration>) -> Value {
@@ -3163,9 +3648,18 @@ fn run_worker_start_batch(
                                 {
                                     batch_lane_success(&assignment_file, value)
                                 }
+                                Some(value)
+                                    if worker_start_is_pending(&value)
+                                        && batch_lane_error_is_manually_resumable(&error) =>
+                                {
+                                    batch_lane_resumable_failure(&assignment_file, error)
+                                }
                                 Some(_) => {
                                     release_worker_start_batch_lane(context, &lane_fence)?;
                                     return Err(error);
+                                }
+                                None if batch_lane_error_is_manually_resumable(&error) => {
+                                    batch_lane_resumable_failure(&assignment_file, error)
                                 }
                                 None if batch_lane_error_is_resumable(&error) => {
                                     release_worker_start_batch_lane(context, &lane_fence)?;
@@ -3196,6 +3690,12 @@ fn run_worker_start_batch(
         "schema_version": "main-agent.worker-start-batch.v1",
         "lanes": progress["lanes"]
     });
+    if progress["lanes"]
+        .as_array()
+        .is_some_and(|lanes| lanes.iter().any(worker_start_batch_lane_is_incomplete))
+    {
+        return Ok(outcome);
+    }
     let mut locked = orchestration::lock_registry(context)?;
     let mut current = idempotency_replay(
         &locked.registry,
@@ -3465,7 +3965,9 @@ fn worker_start_batch_lane_is_claim(value: &Value) -> bool {
 }
 
 fn worker_start_batch_lane_is_incomplete(value: &Value) -> bool {
-    value.is_null() || worker_start_batch_lane_is_claim(value)
+    value.is_null()
+        || worker_start_batch_lane_is_claim(value)
+        || (value["ok"] == false && value["resumable"] == true)
 }
 
 fn worker_start_batch_lane_lease_secs() -> i64 {
@@ -3537,6 +4039,21 @@ fn batch_lane_failure(assignment_file: &str, error: CliError) -> Value {
     })
 }
 
+fn batch_lane_resumable_failure(assignment_file: &str, error: CliError) -> Value {
+    let mut failure = batch_lane_failure(assignment_file, error);
+    failure["resumable"] = json!(true);
+    failure
+}
+
+fn batch_lane_error_is_manually_resumable(error: &CliError) -> bool {
+    matches!(
+        error.code(),
+        "assignment-launch-cwd-unavailable"
+            | "provider-trust-required"
+            | "provider-trust-unverified"
+    )
+}
+
 fn batch_lane_error_is_resumable(error: &CliError) -> bool {
     is_store_retryable(error)
         || matches!(
@@ -3546,6 +4063,7 @@ fn batch_lane_error_is_resumable(error: &CliError) -> bool {
                 | "command-failed"
                 | "worker-start-finalizer-changed"
                 | "worker-start-batch-lane-owner-changed"
+                | "worker-start-fence-wait-timeout"
         )
 }
 
@@ -3553,6 +4071,73 @@ fn worker_start_is_pending(value: &Value) -> bool {
     value["schema_version"] == "main-agent.worker-start-result.v1"
         && value["state"] == "starting"
         && value["acceptance"] == "pending"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_worker_start_authority_locked(
+    registry: &orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    assignment_id: &str,
+    worker_session_id: &str,
+    expected_packet_digest: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    canonical_launch_cwd: &str,
+    provider_config_dir: Option<&Path>,
+) -> Result<(), CliError> {
+    let run = require_current_main(registry, record, incarnation)?;
+    let assignment = registry
+        .assignments
+        .get(assignment_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, record, incarnation)?;
+    if assignment.run_id != run.run_id
+        || assignment.state != "starting"
+        || assignment.revision != 1
+        || assignment.worker.is_some()
+        || assignment.private_packet_digest != expected_packet_digest
+    {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "persisted assignment cannot resume worker start",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "revision": assignment.revision
+            })),
+        ));
+    }
+    let pending = worker_start_idempotency_replay(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+    )?
+    .filter(worker_start_is_pending)
+    .ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted worker start authority is unavailable",
+            Some(json!({ "assignment_id": assignment_id })),
+        )
+    })?;
+    let expected_provider_config_dir =
+        provider_config_dir.map(|path| path.to_string_lossy().into_owned());
+    if pending["assignment_id"].as_str() != Some(assignment_id)
+        || pending["worker_session_id"].as_str() != Some(worker_session_id)
+        || pending["canonical_launch_cwd"].as_str() != Some(canonical_launch_cwd)
+        || pending["provider_config_dir"].as_str() != expected_provider_config_dir.as_deref()
+    {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "persisted worker start authority changed before session creation",
+            Some(json!({ "assignment_id": assignment_id })),
+        ));
+    }
+    Ok(())
 }
 
 fn worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
@@ -14269,6 +14854,197 @@ fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
     Ok(())
 }
 
+fn require_assignment_launch_cwd(cwd: &Path) -> Result<PathBuf, CliError> {
+    let canonical = fs::canonicalize(cwd).map_err(|_| assignment_launch_cwd_error())?;
+    if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(assignment_launch_cwd_error());
+    }
+    Ok(canonical)
+}
+
+fn assignment_launch_cwd_error() -> CliError {
+    CliError::data(
+        "assignment-launch-cwd-unavailable",
+        "assignment launch working directory is unavailable",
+        Some(json!({
+            "retryable": true,
+            "next_action": "create-managed-worktree",
+            "recovery": {
+                "kind": "managed-worktree-create",
+                "owner": "main-agent",
+                "automatic": false
+            }
+        })),
+    )
+}
+
+fn require_codex_project_trust(canonical_cwd: &Path) -> Result<PathBuf, CliError> {
+    let Some(project_key) = canonical_cwd.to_str() else {
+        return Err(provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "use-utf8-project-path",
+            "provider-project-preflight",
+        ));
+    };
+    let codex_home = env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+        .ok_or_else(|| {
+            provider_trust_error(
+                "provider-trust-unverified",
+                "Codex project trust could not be verified before managed worker launch",
+                "repair-provider-config",
+                "provider-config-review",
+            )
+        })?;
+    if !codex_home.is_absolute() {
+        return Err(provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        ));
+    }
+    let codex_home = fs::canonicalize(codex_home).map_err(|_| {
+        provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        )
+    })?;
+    if !fs::metadata(&codex_home).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        ));
+    }
+    let config_path = codex_home.join("config.toml");
+    let mut config_file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&config_path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                provider_trust_error(
+                    "provider-trust-required",
+                    "Codex project trust is required before managed worker launch",
+                    "review-and-trust-project",
+                    "provider-project-trust",
+                )
+            } else {
+                provider_trust_error(
+                    "provider-trust-unverified",
+                    "Codex project trust could not be verified before managed worker launch",
+                    "repair-provider-config",
+                    "provider-config-review",
+                )
+            }
+        })?;
+    let metadata = config_file.metadata().map_err(|_| {
+        provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(CODEX_CONFIG_MAX_BYTES + 1))
+            .unwrap_or(CODEX_CONFIG_MAX_BYTES as usize + 1),
+    );
+    std::io::Read::by_ref(&mut config_file)
+        .take(CODEX_CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            provider_trust_error(
+                "provider-trust-unverified",
+                "Codex project trust could not be verified before managed worker launch",
+                "repair-provider-config",
+                "provider-config-review",
+            )
+        })?;
+    if bytes.len() as u64 > CODEX_CONFIG_MAX_BYTES {
+        return Err(provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        ));
+    }
+    let raw = String::from_utf8(bytes).map_err(|_| {
+        provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        )
+    })?;
+    let document = raw.parse::<toml_edit::DocumentMut>().map_err(|_| {
+        provider_trust_error(
+            "provider-trust-unverified",
+            "Codex project trust could not be verified before managed worker launch",
+            "repair-provider-config",
+            "provider-config-review",
+        )
+    })?;
+    let trusted = document
+        .get("projects")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|projects| projects.get(project_key))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|project| project.get("trust_level"))
+        .and_then(toml_edit::Item::as_str)
+        == Some("trusted");
+    if !trusted {
+        return Err(provider_trust_error(
+            "provider-trust-required",
+            "Codex project trust is required before managed worker launch",
+            "review-and-trust-project",
+            "provider-project-trust",
+        ));
+    }
+    Ok(codex_home)
+}
+
+fn provider_trust_error(
+    code: &str,
+    message: &str,
+    next_action: &str,
+    recovery_kind: &str,
+) -> CliError {
+    CliError::data(
+        code,
+        message,
+        Some(json!({
+            "provider": "codex",
+            "retryable": true,
+            "next_action": next_action,
+            "recovery": {
+                "kind": recovery_kind,
+                "owner": "user",
+                "automatic": false
+            }
+        })),
+    )
+}
+
 fn validate_bootstrap_checkout_binding(
     record: &SessionRecord,
     assignment: &AssignmentRecord,
@@ -14616,6 +15392,28 @@ mod tests {
 
     fn busy() -> CliError {
         CliError::unavailable("orchestration-store-busy", "busy", None)
+    }
+
+    #[test]
+    fn worker_start_fence_identity_unwraps_readiness_progress() {
+        let terminal = json!({
+            "schema_version": "main-agent.worker-start-result.v1",
+            "assignment": { "assignment_id": "assignment-one" },
+            "worker": { "session_id": "worker-one" }
+        });
+        let readiness = json!({
+            "schema_version": "main-agent.worker-start-readiness-progress.v1",
+            "state": "awaiting_readiness",
+            "outcome": terminal
+        });
+        assert_eq!(
+            worker_start_fence_outcome(&readiness)["assignment"]["assignment_id"],
+            "assignment-one"
+        );
+        assert_eq!(
+            worker_start_fence_outcome(&readiness)["worker"]["session_id"],
+            "worker-one"
+        );
     }
 
     #[test]
