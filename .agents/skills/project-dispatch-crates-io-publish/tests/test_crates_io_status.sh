@@ -101,21 +101,55 @@ start_mock_api() {
   local fixture="$2"
   local port_file="$3"
   local log_file="$4"
+  local pid_var="$5"
   python3 "$server_py" "$fixture" "$port_file" >"$log_file" 2>&1 &
-  local pid=$!
+  local server_pid=$!
   for _ in $(seq 1 80); do
     if [[ -s "$port_file" ]]; then
       break
     fi
     sleep 0.05
   done
-  [[ -s "$port_file" ]] || fail "mock api did not start"
-  echo "$pid"
+  if [[ ! -s "$port_file" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    fail "mock api did not start"
+  fi
+  printf -v "$pid_var" '%s' "$server_pid"
 }
 
-test_explicit_version_fail_on_missing() {
-  local tmp
+cleanup_mock_api_test_case() {
+  local status=$?
+  local cleanup_status=0
+  trap - EXIT
+
+  if [[ -n "${pid:-}" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "error: mock api survived cleanup: $pid" >&2
+      cleanup_status=1
+    fi
+  fi
+
+  if [[ -n "${tmp:-}" ]]; then
+    rm -rf -- "$tmp"
+    if [[ -e "$tmp" ]]; then
+      echo "error: test temp directory survived cleanup: $tmp" >&2
+      cleanup_status=1
+    fi
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    exit "$status"
+  fi
+  exit "$cleanup_status"
+}
+
+test_explicit_version_fail_on_missing() (
+  local tmp pid=""
   tmp="$(mktemp -d)"
+  trap cleanup_mock_api_test_case EXIT
   local bin_dir="${tmp}/bin"
   mkdir -p "$bin_dir"
   create_mock_cargo "$bin_dir"
@@ -134,9 +168,7 @@ JSON
   local port_file="${tmp}/port.txt"
   local api_log="${tmp}/api.log"
   create_mock_api_server_script "$server_py"
-  local pid
-  pid="$(start_mock_api "$server_py" "$fixture" "$port_file" "$api_log")"
-  trap "kill $pid 2>/dev/null || true" RETURN
+  start_mock_api "$server_py" "$fixture" "$port_file" "$api_log" pid
   local port
   port="$(cat "$port_file")"
 
@@ -164,12 +196,12 @@ assert by_name["nils-b"]["status"] == "missing"
 assert data["summary"]["missing"] == 1
 print("ok")
 PY
-  trap - RETURN
-}
+)
 
-test_workspace_mode_text_and_json() {
-  local tmp
+test_workspace_mode_text_and_json() (
+  local tmp pid=""
   tmp="$(mktemp -d)"
+  trap cleanup_mock_api_test_case EXIT
   local bin_dir="${tmp}/bin"
   mkdir -p "$bin_dir"
   create_mock_cargo "$bin_dir"
@@ -188,9 +220,7 @@ JSON
   local port_file="${tmp}/port.txt"
   local api_log="${tmp}/api.log"
   create_mock_api_server_script "$server_py"
-  local pid
-  pid="$(start_mock_api "$server_py" "$fixture" "$port_file" "$api_log")"
-  trap "kill $pid 2>/dev/null || true" RETURN
+  start_mock_api "$server_py" "$fixture" "$port_file" "$api_log" pid
   local port
   port="$(cat "$port_file")"
 
@@ -215,8 +245,26 @@ assert data["summary"]["published"] == 2
 assert data["summary"]["missing"] == 0
 print("ok")
 PY
-  trap - RETURN
-}
+)
+
+test_mock_api_cleanup_failure_path() (
+  local probe_root="$1"
+  local tmp="${probe_root}/case"
+  local pid=""
+  mkdir -p "$tmp"
+  trap cleanup_mock_api_test_case EXIT
+
+  local fixture="${tmp}/fixture.json"
+  local server_py="${tmp}/mock_api.py"
+  local port_file="${tmp}/port.txt"
+  local api_log="${tmp}/api.log"
+  printf '{}\n' >"$fixture"
+  create_mock_api_server_script "$server_py"
+  start_mock_api "$server_py" "$fixture" "$port_file" "$api_log" pid
+  printf '%s\n' "$pid" >"${probe_root}/pid.txt"
+
+  return 23
+)
 
 if [[ ! -x "$entrypoint" ]]; then
   fail "missing executable: $entrypoint"
@@ -224,5 +272,20 @@ fi
 
 test_explicit_version_fail_on_missing
 test_workspace_mode_text_and_json
+
+cleanup_probe_root="$(mktemp -d)"
+trap 'rm -rf -- "$cleanup_probe_root"' EXIT
+set +e
+test_mock_api_cleanup_failure_path "$cleanup_probe_root"
+cleanup_probe_rc=$?
+set -e
+[[ "$cleanup_probe_rc" -eq 23 ]] || fail "expected cleanup probe exit code 23, got $cleanup_probe_rc"
+cleanup_probe_pid="$(cat "${cleanup_probe_root}/pid.txt")"
+if kill -0 "$cleanup_probe_pid" 2>/dev/null; then
+  fail "mock api survived a failing test case"
+fi
+[[ ! -e "${cleanup_probe_root}/case" ]] || fail "failing test case temp directory survived cleanup"
+rm -rf -- "$cleanup_probe_root"
+trap - EXIT
 
 echo "ok: crates.io status tests passed"
