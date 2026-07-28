@@ -33,8 +33,9 @@ use crate::orchestration::{
     AccountHandoffReservationRecord, AssignmentRecord, CHECKPOINT_INPUT_SCHEMA,
     GroupCleanupProgressReceipt, IdempotencyReceipt, LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA,
     PACKET_SCHEMA, RunCheckpoint, RunRecord, SUBMIT_RECOVERY_SCHEMA, SessionRef,
-    SubmitRecoveryRecord, TimedRelationship, WORKER_QUARANTINE_SCHEMA,
-    WORKER_READINESS_STOP_PROOF_SCHEMA, WORKER_RUNTIME_STOP_RESERVATION_SCHEMA,
+    SubmitRecoveryRecord, TimedRelationship, WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA,
+    WORKER_QUARANTINE_SCHEMA, WORKER_READINESS_STOP_PROOF_SCHEMA,
+    WORKER_RUNTIME_STOP_RESERVATION_SCHEMA, WorkerClaimRevocationReservationRecord,
     WorkerQuarantineRecord, WorkerReadinessStopProofRecord, WorkerRuntimeStopReservationRecord,
 };
 use crate::{
@@ -298,6 +299,10 @@ enum WorkerCommand {
     /// deleting the run, or touching its managed worktree.
     #[command(name = "reconcile-stopped")]
     ReconcileStopped(WorkerReconcileStoppedArgs),
+    /// Revoke only the exact authoritative-idle worker claim when that worker
+    /// cannot finish its own release, preserving its session and worktree.
+    #[command(name = "revoke-claim")]
+    RevokeClaim(WorkerRevokeClaimArgs),
     /// Terminalize only a proven failed pre-claim assignment.
     Cancel(WorkerCancelArgs),
     /// Cancel and retire a safely reassignable worker, then start one distinct
@@ -395,6 +400,23 @@ struct WorkerStopRuntimeArgs {
     worker_incarnation: String,
     #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerRevokeClaimArgs {
+    assignment_id: String,
+    /// Exact worker incarnation currently bound to the assignment.
+    #[arg(long)]
+    worker_incarnation: String,
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
+    if_revision: u64,
+    /// Bounded durable reason for fencing this idle worker's authority.
+    #[arg(long)]
+    reason: String,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -2075,33 +2097,11 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
         }
         return Err(error);
     }
-    let repository = packet.repository.clone().ok_or_else(|| {
-        invalid_input("worker bootstrap requires the assignment packet to declare a repository")
-    })?;
-    let work_context = WorkContextInput {
-        schema_version: WORK_CONTEXT_INPUT_VERSION.to_string(),
-        intent: "implementation".to_string(),
+    let work_context = assignment_worker_work_context_from_packet(
+        &packet,
         tier,
-        repositories: vec![repository.clone()],
-        // `AssignmentInput::worktree` is durable routing metadata and may be
-        // the literal managed-worktree path. The claim schema accepts only
-        // HMAC fingerprints. `claims::claim` derives that fingerprint from the
-        // authenticated worker session's canonical cwd, so never serialize the
-        // routing value into this field.
-        worktrees: Vec::new(),
-        provider_refs: Vec::new(),
-        plan_refs: Vec::new(),
-        scopes: packet
-            .scopes
-            .iter()
-            .map(|value| Scope {
-                kind: ScopeKind::PathPrefix,
-                repository: repository.clone(),
-                value: value.clone(),
-            })
-            .collect(),
-        summary: packet.task_summary.clone(),
-    };
+        "worker bootstrap requires the assignment packet to declare a repository",
+    )?;
     if let Err(error) = ensure_or_acquire_claim(
         context,
         &record,
@@ -2385,6 +2385,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
         WorkerCommand::ReconcileRecovery(args) => run_worker_reconcile_recovery(context, args),
         WorkerCommand::StopRuntime(args) => run_worker_stop_runtime(context, args),
         WorkerCommand::ReconcileStopped(args) => run_worker_reconcile_stopped(context, args),
+        WorkerCommand::RevokeClaim(args) => run_worker_revoke_claim(context, args),
         WorkerCommand::Cancel(args) => run_worker_cancel(context, args),
         WorkerCommand::Reassign(args) => run_worker_reassign(context, args),
     }
@@ -2788,6 +2789,7 @@ fn run_worker_start_single_input(
             worker_quarantine: None,
             account_handoff: None,
             runtime_stop: None,
+            claim_revocation: None,
             readiness_stop_proof: None,
             created_at: now.clone(),
             updated_at: now,
@@ -6158,10 +6160,10 @@ fn run_worker_diagnose(context: &CliContext, args: WorkerDiagnoseArgs) -> Result
 
 fn run_worker_supervise(context: &CliContext, args: WorkerDiagnoseArgs) -> Result<Value, CliError> {
     let diagnosis = diagnose_worker(context, &args.assignment_id)?;
-    let schema_version = if diagnosis["schema_version"] == "main-agent.worker-diagnose-result.v3" {
-        "main-agent.worker-supervise-result.v3"
-    } else {
-        "main-agent.worker-supervise-result.v2"
+    let schema_version = match diagnosis["schema_version"].as_str() {
+        Some("main-agent.worker-diagnose-result.v4") => "main-agent.worker-supervise-result.v4",
+        Some("main-agent.worker-diagnose-result.v3") => "main-agent.worker-supervise-result.v3",
+        _ => "main-agent.worker-supervise-result.v2",
     };
     Ok(json!({
         "schema_version": schema_version,
@@ -6526,12 +6528,14 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     // tmux query: a live or unknown runtime fails closed, and this is the same
     // combined cgroup/process-session/process-group proof the terminalization
     // re-establishes under the session-record lock.
-    let durable_runtime_stopped = session_evidence.value().is_some_and(|record| {
-        matches!(
-            crate::coordination_runtime_evidence(record).map(|evidence| evidence.status),
-            Ok(crate::CoordinationRuntimeStatus::Stopped)
-        )
-    });
+    let durable_runtime_status = session_evidence
+        .value()
+        .and_then(|record| crate::coordination_runtime_evidence(record).ok())
+        .map(|evidence| evidence.status);
+    let durable_runtime_stopped =
+        durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Stopped);
+    let durable_runtime_running =
+        durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Running);
     // The B2 fact: bootstrap already recorded the `working` checkpoint, so the
     // worker held its assignment-derived claim before its exact runtime died.
     // `worker_failed_preclaim` deliberately refuses this state, and the claim
@@ -6544,6 +6548,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         && !terminal_recovery_reconciled;
     let account_handoff_in_flight = assignment.account_handoff.is_some();
     let runtime_stop_in_flight = assignment.runtime_stop.is_some();
+    let claim_revocation_in_flight = assignment.claim_revocation.is_some();
     let readiness_stop_required = assignment.state == "starting"
         && assignment.worker.as_ref().is_some_and(|worker| {
             has_exhausted_worker_start_readiness(
@@ -6560,7 +6565,20 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         && uncertain_operations == 0
         && !submit_recovery_in_flight(&assignment)
         && !account_handoff_in_flight
-        && !runtime_stop_in_flight;
+        && !runtime_stop_in_flight
+        && !claim_revocation_in_flight;
+    let idle_claim_revocation_required =
+        matches!(assignment.state.as_str(), "working" | "accepted")
+            && assignment.worker.is_some()
+            && durable_runtime_running
+            && provider_terminated
+            && claim_active
+            && broker_authoritative
+            && active_operations == 0
+            && uncertain_operations == 0
+            && !submit_recovery_in_flight(&assignment)
+            && !account_handoff_in_flight
+            && !runtime_stop_in_flight;
     let starting_provider_terminated = assignment.state == "starting" && provider_terminated;
     let terminal_quiescent = matches!(assignment.state.as_str(), "cancelled" | "released")
         && !claim_active
@@ -6619,8 +6637,10 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         active_or_uncertain_operation: active_operations > 0 || uncertain_operations > 0,
         post_claim_runtime_gone,
         runtime_stop_in_flight,
+        claim_revocation_in_flight,
         account_handoff_in_flight,
         readiness_stop_required,
+        idle_claim_revocation_required,
         coordination_broker_stale,
         edit_authority_stale,
         claim_renewal_required: claim_renewal_required && !failed_preclaim,
@@ -6658,6 +6678,11 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         })
     });
     let diagnosis_schema = if matches!(
+        classification,
+        "idle_claim_revocation_required" | "idle_claim_revocation_in_progress"
+    ) {
+        "main-agent.worker-diagnose-result.v4"
+    } else if matches!(
         classification,
         "account_handoff_in_flight" | "readiness_stop_required" | "readiness_stop_in_progress"
     ) {
@@ -6760,6 +6785,10 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         diagnosis["runtime_stop"] = json!({
             "in_flight": runtime_stop_in_flight
         });
+    } else if diagnosis_schema == "main-agent.worker-diagnose-result.v4" {
+        diagnosis["claim_revocation"] = json!({
+            "in_flight": claim_revocation_in_flight
+        });
     }
     Ok(diagnosis)
 }
@@ -6849,6 +6878,63 @@ fn worker_recovery_action(
                 reservation.worker.session_incarnation,
                 "--if-revision",
                 reservation.reserved_revision.to_string(),
+                "--idempotency-key",
+                reservation.idempotency_key,
+                "--format",
+                "json"
+            ]);
+        }
+        "idle_claim_revocation_required" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v4");
+            action["kind"] = json!("exact_worker_claim_revocation");
+            let worker = assignment
+                .worker
+                .as_ref()
+                .expect("idle claim revocation requires a bound worker");
+            let key_material = crate::coordination::request_digest(
+                "worker-revoke-claim-supervision-key",
+                &json!({
+                    "assignment_id": assignment.assignment_id,
+                    "assignment_revision": assignment.revision,
+                    "worker_incarnation": worker.session_incarnation
+                }),
+            );
+            let stable_key = format!("worker-revoke-{}", &key_material[..24]);
+            action["argv"] = json!([
+                "main-agent",
+                "worker",
+                "revoke-claim",
+                assignment.assignment_id,
+                "--worker-incarnation",
+                worker.session_incarnation,
+                "--if-revision",
+                assignment.revision.to_string(),
+                "--reason",
+                "authoritative provider turn ended without worker claim release",
+                "--idempotency-key",
+                stable_key,
+                "--format",
+                "json"
+            ]);
+        }
+        "idle_claim_revocation_in_progress" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v4");
+            action["kind"] = json!("exact_worker_claim_revocation_replay");
+            let reservation = assignment
+                .claim_revocation
+                .as_ref()
+                .expect("claim revocation in-progress classification requires a reservation");
+            action["argv"] = json!([
+                "main-agent",
+                "worker",
+                "revoke-claim",
+                assignment.assignment_id,
+                "--worker-incarnation",
+                reservation.worker.session_incarnation,
+                "--if-revision",
+                reservation.reserved_revision.to_string(),
+                "--reason",
+                reservation.reason,
                 "--idempotency-key",
                 reservation.idempotency_key,
                 "--format",
@@ -7076,6 +7162,9 @@ struct WorkerDiagnosisFacts {
     /// The exact assignment is already fenced by an admitted runtime stop.
     /// Competing mutations must wait for completion or exact replay.
     runtime_stop_in_flight: bool,
+    /// An exact worker claim revocation owns the assignment until its durable
+    /// receipt is replayed and finalization clears the reservation.
+    claim_revocation_in_flight: bool,
     /// A durable account-handoff reservation owns the worker lifecycle. It
     /// must be completed or cancelled before any readiness runtime stop can be
     /// advertised.
@@ -7084,6 +7173,11 @@ struct WorkerDiagnosisFacts {
     /// proving bounded authenticated-checkpoint readiness exhausted. It has no
     /// worker claim or operation and no unknown recovery send in flight.
     readiness_stop_required: bool,
+    /// A live worker has authoritatively returned to an idle provider boundary
+    /// while its exact assignment-derived claim and broker remain active, with
+    /// no active or uncertain operation. Main can fence that authority without
+    /// sending provider input or deleting the session/worktree.
+    idle_claim_revocation_required: bool,
     coordination_broker_stale: bool,
     edit_authority_stale: bool,
     claim_renewal_required: bool,
@@ -7109,7 +7203,13 @@ struct WorkerDiagnosisFacts {
 }
 
 fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'static str, bool) {
-    if facts.evidence_unavailable {
+    if facts.claim_revocation_in_flight {
+        (
+            "idle_claim_revocation_in_progress",
+            "preserve the exact worker and replay only the projected revision- and incarnation-fenced `main-agent worker revoke-claim` request with its original idempotency key",
+            false,
+        )
+    } else if facts.evidence_unavailable {
         (
             "evidence_unavailable",
             "preserve the exact worker and restore the unavailable or mismatched session, activity, packet, coordination, or worktree evidence",
@@ -7149,6 +7249,12 @@ fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'st
         (
             "readiness_stop_required",
             "run the projected exact-incarnation `main-agent worker stop-runtime` action; it sends no provider input and preserves the assignment, session state, and worktree so guarded pre-claim cancellation can follow",
+            false,
+        )
+    } else if facts.idle_claim_revocation_required {
+        (
+            "idle_claim_revocation_required",
+            "run the projected revision- and incarnation-fenced `main-agent worker revoke-claim` action; it sends no provider input, preserves the session and worktree, and revokes only the exact authoritative-idle worker authority",
             false,
         )
     } else if facts.coordination_broker_stale {
@@ -9248,6 +9354,800 @@ fn pause_reconcile_stopped_for_test(stage: &str) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+const REVOKE_CLAIM_RESULT_SCHEMA: &str = "main-agent.worker-revoke-claim-result.v1";
+const REVOKE_CLAIM_PROGRESS_SCHEMA: &str = "main-agent.worker-revoke-claim-progress.v1";
+const REVOKE_CLAIM_QUARANTINE_REASON: &str =
+    "authoritative-idle worker claim revoked by exact Main Agent";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RevokeClaimProgressReceipt {
+    schema_version: String,
+    state: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    assignment_state: String,
+    terminal_revision: u64,
+    worker: SessionRef,
+    activity_revision: u64,
+    runtime_identity_digest: String,
+    reason: String,
+}
+
+fn parse_revoke_claim_progress(
+    value: Value,
+    assignment_id: &str,
+) -> Result<RevokeClaimProgressReceipt, CliError> {
+    let progress: RevokeClaimProgressReceipt = serde_json::from_value(value).map_err(|_| {
+        CliError::data(
+            "orchestration-store-invalid",
+            "worker revoke-claim progress receipt is invalid",
+            None,
+        )
+    })?;
+    if progress.schema_version != REVOKE_CLAIM_PROGRESS_SCHEMA
+        || progress.state != "in_progress"
+        || progress.assignment_id != assignment_id
+        || !matches!(progress.assignment_state.as_str(), "working" | "accepted")
+        || progress
+            .assignment_revision
+            .checked_add(1)
+            .is_none_or(|revision| revision != progress.terminal_revision)
+        || progress.runtime_identity_digest.len() != 64
+        || !progress
+            .runtime_identity_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || orchestration::validate_summary("worker claim revocation reason", &progress.reason)
+            .is_err()
+    {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker revoke-claim progress receipt is invalid",
+            None,
+        ));
+    }
+    Ok(progress)
+}
+
+fn worker_claim_revocation_reservation_matches(
+    reservation: &WorkerClaimRevocationReservationRecord,
+    progress: &RevokeClaimProgressReceipt,
+    request_digest: &str,
+    idempotency_key: &str,
+    run_id: &str,
+    controller: &SessionRef,
+) -> bool {
+    reservation.schema_version == WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA
+        && reservation.request_digest == request_digest
+        && reservation.idempotency_key == idempotency_key
+        && reservation.run_id == run_id
+        && reservation.controller == *controller
+        && reservation.worker == progress.worker
+        && reservation.reserved_revision == progress.assignment_revision
+        && reservation.terminal_revision == progress.terminal_revision
+        && reservation.runtime_identity_digest == progress.runtime_identity_digest
+        && reservation.reason == progress.reason
+}
+
+fn worker_claim_revocation_revision_is_valid(
+    reservation: &WorkerClaimRevocationReservationRecord,
+    assignment_revision: u64,
+) -> bool {
+    orchestration::worker_claim_revocation_revision_is_valid(
+        reservation.reserved_revision,
+        reservation.adopted_revision,
+        assignment_revision,
+    )
+}
+
+fn assignment_worker_work_context_from_packet(
+    packet: &AssignmentInput,
+    tier: String,
+    missing_repository_message: &'static str,
+) -> Result<WorkContextInput, CliError> {
+    let repository = packet
+        .repository
+        .clone()
+        .ok_or_else(|| invalid_input(missing_repository_message))?;
+    Ok(WorkContextInput {
+        schema_version: WORK_CONTEXT_INPUT_VERSION.to_string(),
+        intent: "implementation".to_string(),
+        tier,
+        repositories: vec![repository.clone()],
+        // The packet worktree is routing metadata and may be a literal path.
+        // Claim acquisition derives the private checkout fingerprint from the
+        // authenticated worker cwd instead.
+        worktrees: Vec::new(),
+        provider_refs: Vec::new(),
+        plan_refs: Vec::new(),
+        scopes: packet
+            .scopes
+            .iter()
+            .map(|value| Scope {
+                kind: ScopeKind::PathPrefix,
+                repository: repository.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        summary: packet.task_summary.clone(),
+    })
+}
+
+fn assignment_worker_work_context(
+    context: &CliContext,
+    registry: &orchestration::Registry,
+    assignment: &AssignmentRecord,
+) -> Result<WorkContextInput, CliError> {
+    let packet_value = orchestration::read_packet(context, &assignment.private_packet_digest)?;
+    let packet: AssignmentInput = serde_json::from_value(packet_value)
+        .map_err(|_| invalid_input("stored assignment packet is invalid"))?;
+    validate_assignment_input(&packet)?;
+    let tier = registry
+        .runs
+        .get(&assignment.run_id)
+        .map(|run| run.tier.clone())
+        .ok_or_else(|| not_found("run-not-found", "orchestration run was not found"))?;
+    assignment_worker_work_context_from_packet(
+        &packet,
+        tier,
+        "worker claim revocation requires the packet repository",
+    )
+}
+
+fn current_revoke_claim_live_evidence(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    assignment: &AssignmentRecord,
+) -> Result<(u64, String), CliError> {
+    let activity = crate::activity::activity_status_for_record(context, worker_record)?.turn_state;
+    let authoritative_idle = activity.phase == crate::activity::TurnPhase::Waiting
+        && activity.current_turn.is_none()
+        && activity.last_turn.is_some()
+        && activity.source.confidence == crate::activity::Confidence::Authoritative;
+    if !authoritative_idle {
+        return Err(CliError::data(
+            "worker-turn-not-idle",
+            "worker revoke-claim requires an authoritatively completed provider turn",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "activity_revision": activity.revision
+            })),
+        ));
+    }
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "assignment has no bound worker claim to revoke",
+            None,
+        )
+    })?;
+    let runtime_evidence = crate::coordination_runtime_evidence(worker_record)?;
+    match runtime_evidence.status {
+        crate::CoordinationRuntimeStatus::Running => {
+            Ok((activity.revision, runtime_evidence.identity_digest))
+        }
+        crate::CoordinationRuntimeStatus::Stopped => Err(CliError::data(
+            "worker-runtime-stopped",
+            "worker revoke-claim requires the exact worker runtime to still be running; use worker reconcile-stopped for a durably stopped post-claim worker",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": worker.session_incarnation
+            })),
+        )),
+        crate::CoordinationRuntimeStatus::Unknown => Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "worker revoke-claim cannot prove the exact worker runtime is still running",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": worker.session_incarnation
+            })),
+        )),
+    }
+}
+
+fn pause_revoke_claim_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "revoke-claim-test-barrier",
+                "worker claim revocation test barrier is unavailable",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), stage).map_err(|_| {
+            CliError::runtime(
+                "revoke-claim-test-barrier",
+                "worker claim revocation test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "revoke-claim-test-barrier",
+                    "worker claim revocation test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
+fn pause_revoke_claim_before_worker_lifecycle_for_test() -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        env::var_os("NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BEFORE_LIFECYCLE_BARRIER_DIR")
+            .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "revoke-claim-test-barrier",
+                "worker claim revocation lifecycle test barrier is unavailable",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), "before_worker_lifecycle").map_err(|_| {
+            CliError::runtime(
+                "revoke-claim-test-barrier",
+                "worker claim revocation lifecycle test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "revoke-claim-test-barrier",
+                    "worker claim revocation lifecycle test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
+fn run_worker_revoke_claim(
+    context: &CliContext,
+    args: WorkerRevokeClaimArgs,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    orchestration::validate_summary("claim revocation reason", &args.reason)?;
+    let (main, main_incarnation, controller_claim) =
+        crate::coordination::authenticate_any_from_file_with_active_claim_observational(
+            context, None,
+        )?;
+    let request_digest = crate::coordination::request_digest(
+        "worker-revoke-claim",
+        &json!({
+            "assignment_id": args.assignment_id,
+            "worker_incarnation": args.worker_incarnation,
+            "if_revision": args.if_revision,
+            "reason": args.reason
+        }),
+    );
+    let registry = orchestration::load_registry_readonly(context)?;
+    let resumed = match idempotency_replay(
+        &registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-revoke-claim",
+        &request_digest,
+    )? {
+        Some(value) if value["schema_version"] == REVOKE_CLAIM_RESULT_SCHEMA => {
+            return Ok(value);
+        }
+        Some(value) => Some(parse_revoke_claim_progress(value, &args.assignment_id)?),
+        None => None,
+    };
+    let mut is_resumed = resumed.is_some();
+
+    let (assignment, expected_work_context, mut progress) = {
+        let run = require_current_main(&registry, &main, &main_incarnation)?;
+        let assignment = registry
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
+            .clone();
+        ensure_primary_manager(&assignment, &main, &main_incarnation)?;
+        let progress = if let Some(progress) = resumed {
+            if assignment
+                .claim_revocation
+                .as_ref()
+                .is_none_or(|reservation| {
+                    !worker_claim_revocation_revision_is_valid(reservation, assignment.revision)
+                })
+                || assignment.state != progress.assignment_state
+                || assignment.worker.as_ref() != Some(&progress.worker)
+            {
+                return Err(CliError::data(
+                    "orchestration-store-invalid",
+                    "worker revoke-claim progress no longer matches the assignment",
+                    None,
+                ));
+            }
+            if assignment
+                .claim_revocation
+                .as_ref()
+                .is_none_or(|reservation| {
+                    !worker_claim_revocation_reservation_matches(
+                        reservation,
+                        &progress,
+                        &request_digest,
+                        &args.idempotency_key,
+                        &run.run_id,
+                        &assignment.primary_manager,
+                    )
+                })
+            {
+                return Err(CliError::data(
+                    "orchestration-store-invalid",
+                    "worker revoke-claim progress has no matching assignment reservation",
+                    None,
+                ));
+            }
+            progress
+        } else {
+            ensure_revision(args.if_revision, assignment.revision, "assignment")?;
+            ensure_submit_recovery_not_in_flight(&assignment)?;
+            ensure_worker_claim_revocation_not_in_flight(&assignment)?;
+            ensure_assignment_mutation_admitted(
+                context,
+                &assignment,
+                AssignmentMutationOwner::ClaimRevocation,
+            )?;
+            if !matches!(assignment.state.as_str(), "working" | "accepted") {
+                return Err(CliError::data(
+                    "assignment-state-conflict",
+                    "worker revoke-claim requires a working or accepted assignment",
+                    Some(json!({
+                        "state": assignment.state,
+                        "revision": assignment.revision
+                    })),
+                ));
+            }
+            let worker = assignment.worker.clone().ok_or_else(|| {
+                CliError::data(
+                    "worker-incarnation-changed",
+                    "assignment has no bound worker claim to revoke",
+                    None,
+                )
+            })?;
+            if worker.session_incarnation != args.worker_incarnation {
+                return Err(CliError::data(
+                    "worker-incarnation-changed",
+                    "bound worker incarnation does not match --worker-incarnation",
+                    None,
+                ));
+            }
+            let terminal_revision = assignment.revision.checked_add(1).ok_or_else(|| {
+                CliError::data(
+                    "orchestration-revision-capacity",
+                    "worker claim revocation cannot advance the assignment revision",
+                    Some(json!({ "current_revision": assignment.revision })),
+                )
+            })?;
+            RevokeClaimProgressReceipt {
+                schema_version: REVOKE_CLAIM_PROGRESS_SCHEMA.to_string(),
+                state: "in_progress".to_string(),
+                assignment_id: assignment.assignment_id.clone(),
+                assignment_revision: assignment.revision,
+                assignment_state: assignment.state.clone(),
+                terminal_revision,
+                worker,
+                activity_revision: 0,
+                runtime_identity_digest: String::new(),
+                reason: args.reason.clone(),
+            }
+        };
+        let expected_work_context =
+            assignment_worker_work_context(context, &registry, &assignment)?;
+        (assignment, expected_work_context, progress)
+    };
+
+    pause_revoke_claim_before_worker_lifecycle_for_test()?;
+    let worker_lifecycle = acquire_session_record_lock(context, &progress.worker.session_id)?;
+    let registry_after_lifecycle = orchestration::load_registry_readonly(context)?;
+    if let Some(value) = idempotency_replay(
+        &registry_after_lifecycle,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-revoke-claim",
+        &request_digest,
+    )? {
+        if value["schema_version"] == REVOKE_CLAIM_RESULT_SCHEMA {
+            return Ok(value);
+        }
+        if !is_resumed {
+            let observed = parse_revoke_claim_progress(value, &args.assignment_id)?;
+            let run = require_current_main(&registry_after_lifecycle, &main, &main_incarnation)?;
+            let current = registry_after_lifecycle
+                .assignments
+                .get(&args.assignment_id)
+                .filter(|assignment| assignment.run_id == run.run_id)
+                .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+            ensure_primary_manager(current, &main, &main_incarnation)?;
+            if current.claim_revocation.as_ref().is_none_or(|reservation| {
+                !worker_claim_revocation_revision_is_valid(reservation, current.revision)
+                    || !worker_claim_revocation_reservation_matches(
+                        reservation,
+                        &observed,
+                        &request_digest,
+                        &args.idempotency_key,
+                        &run.run_id,
+                        &current.primary_manager,
+                    )
+            }) || current.state != observed.assignment_state
+                || current.worker.as_ref() != Some(&observed.worker)
+            {
+                return Err(CliError::data(
+                    "orchestration-store-invalid",
+                    "concurrent worker revoke-claim progress no longer matches the assignment",
+                    None,
+                ));
+            }
+            progress = observed;
+            is_resumed = true;
+        }
+    }
+    let worker_record = load_session_record(context, &progress.worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&progress.worker, &worker_record, record_incarnation)
+        || record_incarnation != args.worker_incarnation
+    {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker identity changed before claim revocation",
+            None,
+        ));
+    }
+    let _activity_lock =
+        crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
+    let quarantine_matches = if is_resumed {
+        orchestration::session_authority_quarantine_matches(
+            context,
+            &assignment.assignment_id,
+            progress.terminal_revision,
+            &progress.worker,
+            REVOKE_CLAIM_QUARANTINE_REASON,
+            &format!("sha256:{}", progress.runtime_identity_digest),
+        )?
+    } else {
+        false
+    };
+    let progress = if is_resumed {
+        if !quarantine_matches {
+            let (activity_revision, runtime_identity_digest) =
+                current_revoke_claim_live_evidence(context, &worker_record, &assignment)?;
+            if activity_revision != progress.activity_revision
+                || runtime_identity_digest != progress.runtime_identity_digest
+            {
+                return Err(CliError::data(
+                    "worker-claim-revocation-evidence-drift",
+                    "worker activity or runtime identity changed before the missing authority quarantine could be recovered",
+                    Some(json!({
+                        "assignment_id": assignment.assignment_id,
+                        "activity_revision": activity_revision
+                    })),
+                ));
+            }
+        }
+        progress
+    } else {
+        let (activity_revision, runtime_identity_digest) =
+            current_revoke_claim_live_evidence(context, &worker_record, &assignment)?;
+        RevokeClaimProgressReceipt {
+            activity_revision,
+            runtime_identity_digest,
+            ..progress
+        }
+    };
+    let proposed_quarantine = WorkerQuarantineRecord {
+        schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+        worker: progress.worker.clone(),
+        reason: REVOKE_CLAIM_QUARANTINE_REASON.to_string(),
+        runtime_identity_digest: format!("sha256:{}", progress.runtime_identity_digest),
+        created_at: timestamp(),
+    };
+
+    // A fresh request must own the active exact claim, so it can proceed
+    // directly to the revocation guard without first parsing the global
+    // coordination registry a second time. Only replay needs to distinguish a
+    // reservation whose target authority was already sealed before a crash.
+    let already_sealed = if is_resumed && quarantine_matches {
+        let quiescence = crate::coordination::lock_session_quiescence(
+            context,
+            &progress.worker.session_id,
+            &progress.worker.session_incarnation,
+        )?;
+        !quiescence.active_claim
+            && !quiescence.broker_authoritative
+            && !quiescence.active_operation
+            && !quiescence.uncertain_operation
+    } else {
+        false
+    };
+    if !already_sealed {
+        let mut revocation = if is_resumed && !quarantine_matches {
+            crate::coordination::lock_worker_claim_revocation_replay(
+                context,
+                &worker_record,
+                &progress.worker.session_incarnation,
+                &expected_work_context,
+                &main.id,
+                &main_incarnation,
+                &controller_claim,
+            )?
+        } else {
+            crate::coordination::lock_worker_claim_revocation(
+                context,
+                &worker_record,
+                &progress.worker.session_incarnation,
+                &expected_work_context,
+                &main.id,
+                &main_incarnation,
+                &controller_claim,
+            )?
+        };
+        let mut locked = orchestration::lock_registry(context)?;
+        let current_run = require_current_main(&locked.registry, &main, &main_incarnation)?.clone();
+        let current = locked
+            .registry
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == current_run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        ensure_primary_manager(current, &main, &main_incarnation)?;
+        if current.claim_revocation.as_ref().is_none_or(|reservation| {
+            !worker_claim_revocation_revision_is_valid(reservation, current.revision)
+        }) {
+            ensure_revision(progress.assignment_revision, current.revision, "assignment")?;
+        }
+        if !is_resumed {
+            ensure_worker_claim_revocation_not_in_flight(current)?;
+        }
+        ensure_assignment_mutation_admitted(
+            context,
+            current,
+            AssignmentMutationOwner::ClaimRevocation,
+        )?;
+        if current.state != progress.assignment_state
+            || current.worker.as_ref() != Some(&progress.worker)
+        {
+            return Err(CliError::data(
+                "orchestration-revision-conflict",
+                "assignment changed before worker claim revocation admission",
+                None,
+            ));
+        }
+        if is_resumed {
+            if current.claim_revocation.as_ref().is_none_or(|reservation| {
+                !worker_claim_revocation_reservation_matches(
+                    reservation,
+                    &progress,
+                    &request_digest,
+                    &args.idempotency_key,
+                    &current_run.run_id,
+                    &current.primary_manager,
+                )
+            }) {
+                return Err(CliError::data(
+                    "orchestration-store-invalid",
+                    "worker claim revocation reservation no longer matches its progress receipt",
+                    None,
+                ));
+            }
+        } else {
+            let created_at = timestamp();
+            let current = locked
+                .registry
+                .assignments
+                .get_mut(&args.assignment_id)
+                .expect("validated claim revocation assignment remains present");
+            current.claim_revocation = Some(WorkerClaimRevocationReservationRecord {
+                schema_version: WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA.to_string(),
+                request_digest: request_digest.clone(),
+                idempotency_key: args.idempotency_key.clone(),
+                run_id: current_run.run_id.clone(),
+                controller: current.primary_manager.clone(),
+                worker: progress.worker.clone(),
+                reserved_revision: progress.assignment_revision,
+                adopted_revision: None,
+                terminal_revision: progress.terminal_revision,
+                runtime_identity_digest: progress.runtime_identity_digest.clone(),
+                reason: progress.reason.clone(),
+                created_at,
+            });
+            store_receipt(
+                &mut locked.registry,
+                &main,
+                &main_incarnation,
+                &args.idempotency_key,
+                "worker-revoke-claim",
+                &request_digest,
+                serde_json::to_value(&progress).map_err(|_| {
+                    CliError::data(
+                        "orchestration-store-invalid",
+                        "worker revoke-claim progress receipt is invalid",
+                        None,
+                    )
+                })?,
+            )?;
+            locked.save()?;
+            pause_revoke_claim_for_test("after_reservation")?;
+        }
+        orchestration::persist_session_authority_quarantine(
+            context,
+            &assignment.assignment_id,
+            progress.terminal_revision,
+            &proposed_quarantine,
+        )?;
+        if !is_resumed {
+            pause_revoke_claim_for_test("after_progress")?;
+        }
+        revocation.seal(context)?;
+        drop(revocation);
+        drop(locked);
+        pause_revoke_claim_for_test("after_authority_seal")?;
+    } else {
+        let locked = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&locked, &main, &main_incarnation)?;
+        let current = locked
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        if current.claim_revocation.as_ref().is_none_or(|reservation| {
+            !worker_claim_revocation_reservation_matches(
+                reservation,
+                &progress,
+                &request_digest,
+                &args.idempotency_key,
+                &run.run_id,
+                &current.primary_manager,
+            )
+        }) {
+            return Err(CliError::data(
+                "orchestration-store-invalid",
+                "sealed worker claim revocation has no matching assignment reservation",
+                None,
+            ));
+        }
+    }
+    let mut locked = orchestration::lock_registry(context)?;
+    let committed = idempotency_replay(
+        &locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-revoke-claim",
+        &request_digest,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "orchestration-store-invalid",
+            "worker revoke-claim progress receipt is missing",
+            None,
+        )
+    })?;
+    if committed["schema_version"] == REVOKE_CLAIM_RESULT_SCHEMA {
+        return Ok(committed);
+    }
+    let committed_progress = parse_revoke_claim_progress(committed, &args.assignment_id)?;
+    if committed_progress != progress {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker revoke-claim progress changed before finalization",
+            None,
+        ));
+    }
+    let run = require_current_main(&locked.registry, &main, &main_incarnation)?.clone();
+    let current = locked
+        .registry
+        .assignments
+        .get_mut(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(current, &main, &main_incarnation)?;
+    if current.claim_revocation.as_ref().is_none_or(|reservation| {
+        !worker_claim_revocation_revision_is_valid(reservation, current.revision)
+    }) || current.state != progress.assignment_state
+        || current.worker.as_ref() != Some(&progress.worker)
+        || current.claim_revocation.as_ref().is_none_or(|reservation| {
+            !worker_claim_revocation_reservation_matches(
+                reservation,
+                &progress,
+                &request_digest,
+                &args.idempotency_key,
+                &run.run_id,
+                &current.primary_manager,
+            )
+        })
+    {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "assignment changed before worker claim revocation finalization",
+            None,
+        ));
+    }
+    orchestration::require_session_authority_quarantine(
+        context,
+        &current.assignment_id,
+        progress.terminal_revision,
+        &progress.worker,
+        REVOKE_CLAIM_QUARANTINE_REASON,
+        &format!("sha256:{}", progress.runtime_identity_digest),
+    )?;
+    if current.state == "working" {
+        current.state = "cancelled".to_string();
+        current.blocker_summary = Some(format!(
+            "Terminalized after the authoritative-idle worker could not release its claim: {}",
+            args.reason
+        ));
+    }
+    let terminal_revision = current
+        .claim_revocation
+        .as_ref()
+        .and_then(|reservation| reservation.adopted_revision)
+        .unwrap_or(progress.terminal_revision);
+    current.claim_revocation = None;
+    current.revision = terminal_revision;
+    current.updated_at = timestamp();
+    let assignment_view = public_assignment_view(current);
+    let outcome = json!({
+        "schema_version": REVOKE_CLAIM_RESULT_SCHEMA,
+        "assignment": assignment_view,
+        "worker_claim_active_before": true,
+        "worker_claim_active_after": false,
+        "broker_authoritative_after": false,
+        "input_sent": false,
+        "worktree_preserved": true,
+        "durable_session_preserved": true,
+        "proof": {
+            "worker_turn": "authoritative_idle",
+            "activity_revision": progress.activity_revision,
+            "coordination": "quiescent",
+            "runtime_identity_digest": progress.runtime_identity_digest,
+            "authority_fence": "exact-worker-session-quarantine"
+        },
+        "next_action": if progress.assignment_state == "accepted" {
+            "retire this exact accepted assignment"
+        } else {
+            "retire this exact cancelled assignment or start a distinct replacement"
+        }
+    });
+    store_receipt(
+        &mut locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-revoke-claim",
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    drop(locked);
+    drop(worker_lifecycle);
+    Ok(outcome)
 }
 
 fn has_exhausted_worker_start_readiness(
@@ -12298,11 +13198,32 @@ fn ensure_worker_runtime_stop_not_in_flight(assignment: &AssignmentRecord) -> Re
     Ok(())
 }
 
+fn worker_claim_revocation_in_flight(assignment: &AssignmentRecord) -> CliError {
+    CliError::unavailable(
+        "worker-claim-revocation-in-flight",
+        "assignment mutation is fenced until the exact worker claim revocation completes or its durable receipt is replayed",
+        Some(json!({
+            "assignment_id": assignment.assignment_id,
+            "revision": assignment.revision
+        })),
+    )
+}
+
+fn ensure_worker_claim_revocation_not_in_flight(
+    assignment: &AssignmentRecord,
+) -> Result<(), CliError> {
+    if assignment.claim_revocation.is_some() {
+        return Err(worker_claim_revocation_in_flight(assignment));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssignmentMutationOwner {
     Ordinary,
     AccountHandoff,
     RuntimeStop,
+    ClaimRevocation,
 }
 
 fn ensure_assignment_mutation_admitted(
@@ -12318,6 +13239,9 @@ fn ensure_assignment_mutation_admitted(
         if orchestration::assignment_runtime_stop_fence_in_progress(context, assignment)? {
             return Err(worker_runtime_stop_in_flight(assignment));
         }
+    }
+    if owner != AssignmentMutationOwner::ClaimRevocation {
+        ensure_worker_claim_revocation_not_in_flight(assignment)?;
     }
     Ok(())
 }
@@ -13178,7 +14102,142 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         )
     })?;
 
-    let runtime_stop_rebind = if let Some(reservation) = snapshot.runtime_stop.as_ref() {
+    let claim_revocation_progress = if let Some(reservation) = snapshot.claim_revocation.as_ref() {
+        if reservation.reserved_revision >= adopted_revision {
+            return Err(CliError::data(
+                "orchestration-store-invalid",
+                "orphan claim revocation ownership revision cannot advance safely",
+                None,
+            ));
+        }
+        let original_receipt_key = receipt_key(
+            &reservation.controller.session_id,
+            &reservation.controller.session_incarnation,
+            &reservation.idempotency_key,
+        );
+        let progress_value = locked
+            .registry
+            .receipts
+            .get(&original_receipt_key)
+            .filter(|receipt| {
+                receipt.principal_session_id == reservation.controller.session_id
+                    && receipt.principal_incarnation == reservation.controller.session_incarnation
+                    && receipt.operation == "worker-revoke-claim"
+                    && receipt.request_digest == reservation.request_digest
+            })
+            .map(|receipt| receipt.outcome.clone())
+            .ok_or_else(|| {
+                CliError::data(
+                    "worker-claim-revocation-progress-lost",
+                    "orphan claim revocation reservation has no matching progress receipt",
+                    None,
+                )
+            })?;
+        let progress =
+            parse_revoke_claim_progress(progress_value.clone(), &snapshot.assignment_id)?;
+        if progress.assignment_revision != reservation.reserved_revision
+            || progress.assignment_state != snapshot.state
+            || progress.worker != reservation.worker
+            || !worker_claim_revocation_reservation_matches(
+                reservation,
+                &progress,
+                &reservation.request_digest,
+                &reservation.idempotency_key,
+                &reservation.run_id,
+                &snapshot.primary_manager,
+            )
+        {
+            return Err(CliError::data(
+                "orchestration-store-invalid",
+                "orphan claim revocation reservation and progress receipt do not match",
+                None,
+            ));
+        }
+        Some((progress_value, progress))
+    } else {
+        None
+    };
+    if let (Some(reservation), Some((_, progress))) = (
+        snapshot.claim_revocation.as_ref(),
+        claim_revocation_progress.as_ref(),
+    ) && !orchestration::session_authority_quarantine_matches(
+        context,
+        &snapshot.assignment_id,
+        progress.terminal_revision,
+        &reservation.worker,
+        REVOKE_CLAIM_QUARANTINE_REASON,
+        &format!("sha256:{}", reservation.runtime_identity_digest),
+    )? {
+        let expected_work_context =
+            assignment_worker_work_context(context, &locked.registry, &snapshot)?;
+        let reservation = reservation.clone();
+        let progress = progress.clone();
+        drop(locked);
+        recover_missing_claim_revocation_quarantine_for_adopt(
+            context,
+            &record,
+            &incarnation,
+            &snapshot,
+            &reservation,
+            &progress,
+            &expected_work_context,
+        )?;
+        locked = orchestration::lock_registry(context)?;
+        if let Some(value) = idempotency_replay(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            "adopt",
+            &request_digest,
+        )? {
+            return Ok(value);
+        }
+        let refreshed_run = require_current_main(&locked.registry, &record, &incarnation)?;
+        let refreshed_assignment = locked
+            .registry
+            .assignments
+            .get(&args.assignment_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        let run_unchanged = refreshed_run.run_id == run.run_id
+            && refreshed_run.revision == run.revision
+            && refreshed_run.state == run.state
+            && refreshed_run.controller == run.controller;
+        let assignment_unchanged = refreshed_assignment.run_id == snapshot.run_id
+            && refreshed_assignment.revision == snapshot.revision
+            && refreshed_assignment.state == snapshot.state
+            && refreshed_assignment.primary_manager == snapshot.primary_manager
+            && refreshed_assignment.worker == snapshot.worker
+            && refreshed_assignment.claim_revocation == snapshot.claim_revocation;
+        if !run_unchanged || !assignment_unchanged {
+            return Err(CliError::data(
+                "orchestration-revision-conflict",
+                "assignment changed while the missing authority quarantine was recovered",
+                Some(json!({
+                    "current_revision": refreshed_assignment.revision
+                })),
+            ));
+        }
+        if orchestration::session_ref_is_live(context, &snapshot.primary_manager) {
+            return Err(CliError::data(
+                "assignment-not-orphaned",
+                "assignment primary manager became live while claim-revocation recovery was fenced",
+                None,
+            ));
+        }
+        orchestration::require_session_authority_quarantine(
+            context,
+            &snapshot.assignment_id,
+            progress.terminal_revision,
+            &reservation.worker,
+            REVOKE_CLAIM_QUARANTINE_REASON,
+            &format!("sha256:{}", reservation.runtime_identity_digest),
+        )?;
+    }
+
+    let (runtime_stop_rebind, claim_revocation_rebind) = if let Some(reservation) =
+        snapshot.runtime_stop.as_ref()
+    {
         if !orchestration::worker_runtime_stop_revision_is_valid(
             reservation.reserved_revision,
             Some(adopted_revision),
@@ -13260,14 +14319,55 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
             &reservation.request_digest,
         )?;
         pause_runtime_stop_adopt_for_test("after_fence_rebind")?;
-        Some((
-            reservation.clone(),
-            progress_value,
-            successor_replay.is_none(),
-        ))
+        (
+            Some((
+                reservation.clone(),
+                progress_value,
+                successor_replay.is_none(),
+            )),
+            None,
+        )
+    } else if let Some(reservation) = snapshot.claim_revocation.as_ref() {
+        let (progress_value, progress) = claim_revocation_progress
+            .as_ref()
+            .expect("validated claim revocation progress remains present");
+        orchestration::require_session_authority_quarantine(
+            context,
+            &snapshot.assignment_id,
+            progress.terminal_revision,
+            &reservation.worker,
+            REVOKE_CLAIM_QUARANTINE_REASON,
+            &format!("sha256:{}", reservation.runtime_identity_digest),
+        )?;
+        let successor_replay = idempotency_replay(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &reservation.idempotency_key,
+            "worker-revoke-claim",
+            &reservation.request_digest,
+        )?;
+        if successor_replay
+            .as_ref()
+            .is_some_and(|value| value != progress_value)
+        {
+            return Err(CliError::data(
+                "idempotency-conflict",
+                "successor controller already owns a different claim revocation receipt",
+                None,
+            ));
+        }
+        (
+            None,
+            Some((
+                reservation.clone(),
+                progress_value.clone(),
+                successor_replay.is_none(),
+            )),
+        )
     } else {
         ensure_assignment_mutation_admitted(context, &snapshot, AssignmentMutationOwner::Ordinary)?;
-        None
+        (None, None)
     };
 
     let current = locked
@@ -13288,10 +14388,20 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         reservation.controller = run.controller.clone();
         reservation.adopted_revision = Some(adopted_revision);
     }
+    if let Some((_, _, _)) = claim_revocation_rebind.as_ref() {
+        let reservation = current
+            .claim_revocation
+            .as_mut()
+            .expect("validated claim revocation reservation remains present");
+        reservation.run_id = run.run_id.clone();
+        reservation.controller = run.controller.clone();
+        reservation.adopted_revision = Some(adopted_revision);
+    }
     let outcome = json!({
         "schema_version": "main-agent.assignment-mutation-result.v1",
         "assignment": public_assignment_view(current)
     });
+    let claim_revocation_adopting = claim_revocation_rebind.is_some();
     if let Some((reservation, progress_value, copy_receipt)) = runtime_stop_rebind
         && copy_receipt
     {
@@ -13305,6 +14415,19 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
             progress_value,
         )?;
     }
+    if let Some((reservation, progress_value, copy_receipt)) = claim_revocation_rebind
+        && copy_receipt
+    {
+        store_receipt(
+            &mut locked.registry,
+            &record,
+            &incarnation,
+            &reservation.idempotency_key,
+            "worker-revoke-claim",
+            &reservation.request_digest,
+            progress_value,
+        )?;
+    }
     store_receipt(
         &mut locked.registry,
         &record,
@@ -13314,8 +14437,136 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         &request_digest,
         outcome.clone(),
     )?;
+    if claim_revocation_adopting {
+        pause_claim_revocation_adopt_for_test("before_registry_save")?;
+    }
     locked.save()?;
     Ok(outcome)
+}
+
+fn recover_missing_claim_revocation_quarantine_for_adopt(
+    context: &CliContext,
+    expected_main: &SessionRecord,
+    expected_main_incarnation: &str,
+    assignment: &AssignmentRecord,
+    reservation: &WorkerClaimRevocationReservationRecord,
+    progress: &RevokeClaimProgressReceipt,
+    expected_work_context: &WorkContextInput,
+) -> Result<(), CliError> {
+    let (main, main_incarnation, controller_claim) =
+        crate::coordination::authenticate_any_from_file_with_active_claim_observational(
+            context, None,
+        )?;
+    if main.id != expected_main.id || main_incarnation != expected_main_incarnation {
+        return Err(crate::coordination::unauthorized());
+    }
+    let _worker_lifecycle = acquire_session_record_lock(context, &reservation.worker.session_id)?;
+    let worker_record = load_session_record(context, &reservation.worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&reservation.worker, &worker_record, record_incarnation)
+    {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker identity changed before orphan claim-revocation recovery",
+            None,
+        ));
+    }
+    let _activity_lock =
+        crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
+    let activity = crate::activity::activity_status_for_record(context, &worker_record)?.turn_state;
+    let authoritative_idle = activity.phase == crate::activity::TurnPhase::Waiting
+        && activity.current_turn.is_none()
+        && activity.last_turn.is_some()
+        && activity.source.confidence == crate::activity::Confidence::Authoritative
+        && activity.revision == progress.activity_revision;
+    if !authoritative_idle {
+        return Err(CliError::data(
+            "worker-turn-not-idle",
+            "orphan claim-revocation recovery requires the unchanged authoritative idle boundary",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "activity_revision": activity.revision
+            })),
+        ));
+    }
+    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    if runtime_evidence.status != crate::CoordinationRuntimeStatus::Running
+        || runtime_evidence.identity_digest != progress.runtime_identity_digest
+    {
+        return Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "orphan claim-revocation recovery cannot prove the unchanged running worker",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": reservation.worker.session_incarnation
+            })),
+        ));
+    }
+    let _revocation = crate::coordination::lock_worker_claim_revocation(
+        context,
+        &worker_record,
+        &reservation.worker.session_incarnation,
+        expected_work_context,
+        &main.id,
+        &main_incarnation,
+        &controller_claim,
+    )?;
+    let quarantine = WorkerQuarantineRecord {
+        schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+        worker: reservation.worker.clone(),
+        reason: REVOKE_CLAIM_QUARANTINE_REASON.to_string(),
+        runtime_identity_digest: format!("sha256:{}", progress.runtime_identity_digest),
+        created_at: timestamp(),
+    };
+    orchestration::persist_session_authority_quarantine(
+        context,
+        &assignment.assignment_id,
+        progress.terminal_revision,
+        &quarantine,
+    )?;
+    Ok(())
+}
+
+fn pause_claim_revocation_adopt_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_CLAIM_REVOCATION_ADOPT_BARRIER_STAGE").as_deref()
+        == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_CLAIM_REVOCATION_ADOPT_BARRIER_DIR")
+                .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "claim revocation adopt test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), stage.as_bytes()).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "claim revocation adopt test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "claim revocation adopt test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
 }
 
 fn pause_runtime_stop_adopt_for_test(stage: &str) -> Result<(), CliError> {
@@ -16349,6 +17600,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::ReconcileRecovery(_) => "worker-reconcile-recovery",
             WorkerCommand::StopRuntime(_) => "worker-stop-runtime",
             WorkerCommand::ReconcileStopped(_) => "worker-reconcile-stopped",
+            WorkerCommand::RevokeClaim(_) => "worker-revoke-claim",
             WorkerCommand::Cancel(_) => "worker-cancel",
             WorkerCommand::Reassign(_) => "worker-reassign",
         },
@@ -16400,6 +17652,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::ReconcileRecovery(args) => args.format,
             WorkerCommand::StopRuntime(args) => args.format,
             WorkerCommand::ReconcileStopped(args) => args.format,
+            WorkerCommand::RevokeClaim(args) => args.format,
             WorkerCommand::Cancel(args) => args.format,
             WorkerCommand::Reassign(args) => args.format,
         },
@@ -17180,6 +18433,7 @@ mod tests {
             worker_quarantine: None,
             account_handoff: None,
             runtime_stop: None,
+            claim_revocation: None,
             readiness_stop_proof: None,
             created_at: "2030-01-01T00:00:00Z".to_string(),
             updated_at: "2030-01-01T00:00:00Z".to_string(),
@@ -22517,8 +23771,10 @@ mod tests {
             active_or_uncertain_operation: false,
             post_claim_runtime_gone: false,
             runtime_stop_in_flight: false,
+            claim_revocation_in_flight: false,
             account_handoff_in_flight: false,
             readiness_stop_required: false,
+            idle_claim_revocation_required: false,
             coordination_broker_stale: false,
             edit_authority_stale: false,
             claim_renewal_required: false,
@@ -22967,6 +24223,7 @@ mod tests {
         for owner in [
             AssignmentMutationOwner::Ordinary,
             AssignmentMutationOwner::RuntimeStop,
+            AssignmentMutationOwner::ClaimRevocation,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &account_owned, owner)
@@ -22982,8 +24239,8 @@ mod tests {
             request_digest: "b".repeat(64),
             idempotency_key: "stop-key".to_string(),
             run_id: "run".to_string(),
-            controller,
-            worker,
+            controller: controller.clone(),
+            worker: worker.clone(),
             reserved_revision: 1,
             adopted_revision: None,
             controller_claim_id: "claim".to_string(),
@@ -23002,12 +24259,50 @@ mod tests {
         for owner in [
             AssignmentMutationOwner::Ordinary,
             AssignmentMutationOwner::AccountHandoff,
+            AssignmentMutationOwner::ClaimRevocation,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &runtime_owned, owner)
                     .unwrap_err()
                     .code(),
                 "worker-runtime-stop-in-flight"
+            );
+        }
+
+        let mut revocation_owned = dep_assignment("assignment", "run", "working");
+        revocation_owned.worker = Some(worker.clone());
+        revocation_owned.claim_revocation = Some(WorkerClaimRevocationReservationRecord {
+            schema_version: WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA.to_string(),
+            request_digest: "c".repeat(64),
+            idempotency_key: "revoke-key".to_string(),
+            run_id: "run".to_string(),
+            controller,
+            worker,
+            reserved_revision: 1,
+            adopted_revision: None,
+            terminal_revision: 2,
+            runtime_identity_digest: "d".repeat(64),
+            reason: "authoritative worker turn ended without claim release".to_string(),
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+        });
+        assert!(
+            ensure_assignment_mutation_admitted(
+                &context,
+                &revocation_owned,
+                AssignmentMutationOwner::ClaimRevocation
+            )
+            .is_ok()
+        );
+        for owner in [
+            AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::AccountHandoff,
+            AssignmentMutationOwner::RuntimeStop,
+        ] {
+            assert_eq!(
+                ensure_assignment_mutation_admitted(&context, &revocation_owned, owner)
+                    .unwrap_err()
+                    .code(),
+                "worker-claim-revocation-in-flight"
             );
         }
     }
@@ -23076,12 +24371,37 @@ mod tests {
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
                 readiness_stop_required: true,
+                idle_claim_revocation_required: true,
                 claim_renewal_required: true,
                 ..base
             })
             .0,
             "readiness_stop_required",
             "durably exhausted live readiness must outrank the generic missing-claim instruction"
+        );
+        assert_eq!(
+            classify_worker_diagnosis(WorkerDiagnosisFacts {
+                claim_revocation_in_flight: true,
+                evidence_unavailable: true,
+                worker_unreachable: true,
+                post_claim_runtime_gone: true,
+                idle_claim_revocation_required: true,
+                ..base
+            })
+            .0,
+            "idle_claim_revocation_in_progress",
+            "a durable revocation reservation must project its exact replay even after live evidence drifts"
+        );
+        assert_eq!(
+            classify_worker_diagnosis(WorkerDiagnosisFacts {
+                idle_claim_revocation_required: true,
+                coordination_broker_stale: true,
+                claim_renewal_required: true,
+                ..base
+            })
+            .0,
+            "idle_claim_revocation_required",
+            "an authoritative idle claim must project its exact Main-owned fencing action"
         );
         let broker_stale = classify_worker_diagnosis(WorkerDiagnosisFacts {
             coordination_broker_stale: true,
@@ -23218,11 +24538,27 @@ mod tests {
             session_incarnation: "worker-incarnation-one".to_string(),
             session_created_at: "2030-01-01T00:00:00Z".to_string(),
         });
+        assignment.claim_revocation = Some(WorkerClaimRevocationReservationRecord {
+            schema_version: WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA.to_string(),
+            request_digest: "a".repeat(64),
+            idempotency_key: "claim-revocation-one".to_string(),
+            run_id: assignment.run_id.clone(),
+            controller: assignment.primary_manager.clone(),
+            worker: assignment.worker.clone().expect("worker"),
+            reserved_revision: assignment.revision,
+            adopted_revision: None,
+            terminal_revision: assignment.revision + 1,
+            runtime_identity_digest: "b".repeat(64),
+            reason: "authoritative worker turn ended without claim release".to_string(),
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+        });
         for classification in [
             "evidence_unavailable",
             "worker_unreachable",
             "uncertain_mutation",
             "readiness_stop_required",
+            "idle_claim_revocation_in_progress",
+            "idle_claim_revocation_required",
             "coordination_broker_stale",
             "edit_authority_stale",
             "claim_renewal_required",
@@ -23243,7 +24579,17 @@ mod tests {
                 Some("worker-claim-one"),
                 Some(7),
             );
-            let expected_schema = if classification == "readiness_stop_required" {
+            let expected_schema = if matches!(
+                classification,
+                "idle_claim_revocation_required" | "idle_claim_revocation_in_progress"
+            ) {
+                "main-agent.worker-recovery-action.v4"
+            } else if matches!(
+                classification,
+                "account_handoff_in_flight"
+                    | "readiness_stop_required"
+                    | "readiness_stop_in_progress"
+            ) {
                 "main-agent.worker-recovery-action.v3"
             } else {
                 "main-agent.worker-recovery-action.v2"
@@ -23280,6 +24626,21 @@ mod tests {
             runtime_stop["argv"]
                 .as_array()
                 .expect("runtime stop argv")
+                .iter()
+                .all(|part| part != "<idempotency-key>")
+        );
+        let claim_revocation =
+            worker_recovery_action("idle_claim_revocation_required", &assignment, None, None);
+        assert_eq!(claim_revocation["kind"], "exact_worker_claim_revocation");
+        assert_eq!(claim_revocation["owner"]["role"], "main");
+        assert_eq!(claim_revocation["executable"], true);
+        assert_eq!(claim_revocation["argv"][2], "revoke-claim");
+        assert_eq!(claim_revocation["argv"][5], "worker-incarnation-one");
+        assert_eq!(claim_revocation["argv"][7], assignment.revision.to_string());
+        assert!(
+            claim_revocation["argv"]
+                .as_array()
+                .expect("claim revocation argv")
                 .iter()
                 .all(|part| part != "<idempotency-key>")
         );

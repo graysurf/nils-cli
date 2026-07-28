@@ -1041,6 +1041,16 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
             ][..],
         ),
         (
+            &["worker", "revoke-claim", "--help"][..],
+            &[
+                "authoritative-idle worker claim",
+                "preserving its session and worktree",
+                "exact worker incarnation",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
             &["worker", "guidance-reconcile", "--help"][..],
             &[
                 "unread guidance",
@@ -11229,7 +11239,13 @@ fn runtime_stop_admission_guards_are_fail_closed() {
         ],
         &envs,
     );
-    assert_eq!(active_operation.code, 65);
+    assert_eq!(
+        active_operation.code,
+        65,
+        "stdout={} stderr={}",
+        active_operation.stdout_text(),
+        active_operation.stderr_text()
+    );
     assert_eq!(
         active_operation.stdout_json()["error"]["code"],
         "worker-not-quiescent"
@@ -11343,6 +11359,1654 @@ fn runtime_stop_admission_guards_are_fail_closed() {
         data(&supervised)["recovery_action"]["argv"][5],
         "worker-exhausted-incarnation"
     );
+}
+
+/// F31: Main must be able to fence only an exact idle worker that cannot
+/// finish its claim release. A `working` assignment becomes `cancelled`; an
+/// already `accepted` assignment remains accepted so ordinary retirement can
+/// continue. The action sends no provider input, preserves the durable session
+/// and worktree, and leaves unrelated coordination authority untouched.
+#[test]
+fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    let unrelated_checkout = tmp.path().join("unrelated-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [&main_checkout, &worker_checkout, &unrelated_checkout] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-f31-0001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "main-two",
+                "main-incarnation-two",
+                "main-private-capability-material-f31-0002",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-f31",
+                "worker-f31-incarnation",
+                "worker-private-capability-material-f31-0001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-unrelated",
+                "worker-unrelated-incarnation",
+                "worker-unrelated-private-capability-f31-0001",
+                unrelated_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    seed_active_claim(
+        &state_dir,
+        "main-two",
+        "main-incarnation-two",
+        "main-two-f31-claim",
+    );
+    let main_two_capability = capability(&state_dir, "main-two");
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut controller = registry["runs"]["run-one"]["controller"].clone();
+        controller["session_id"] = json!("main-two");
+        controller["session_incarnation"] = json!("main-incarnation-two");
+        registry["runs"]["run-two"] = json!({
+            "schema_version": "agent-session.orchestration-run.v1",
+            "run_id": "run-two",
+            "revision": 1,
+            "state": "active",
+            "tier": "L0",
+            "objective_summary": "Claim revocation ownership transfer fence",
+            "objective_packet_digest":
+                registry["runs"]["run-one"]["objective_packet_digest"].clone(),
+            "controller": controller,
+            "durable_refs": [],
+            "checkpoint": null,
+            "created_at": "2030-01-01T00:00:00Z",
+            "updated_at": "2030-01-01T00:00:00Z"
+        });
+    });
+    let packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-f31",
+        "task_summary": "Idle worker cannot release its claim",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-f31",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/f31"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-f31",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-f31",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Idle worker cannot release its claim",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-f31",
+                "session_incarnation": "worker-f31-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/f31"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-f31");
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "bootstrap",
+            "--idempotency-key",
+            "f31-bootstrap-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        bootstrapped.code,
+        0,
+        "stdout={} stderr={}",
+        bootstrapped.stdout_text(),
+        bootstrapped.stderr_text()
+    );
+    assert_eq!(
+        data(&bootstrapped)["assignment"]["record"]["state"],
+        "working"
+    );
+    assert_eq!(data(&bootstrapped)["assignment"]["record"]["revision"], 3);
+    let _live_runtime =
+        seed_live_runtime_identity(&state_dir, "worker-f31", "worker-f31-incarnation", 73);
+    let worker_record_path = state_dir.join("sessions/worker-f31/session.json");
+    let worker_record_before = fs::read(&worker_record_path).expect("worker session record");
+    let retained_progress = worker_checkout.join("worker-progress-to-preserve");
+    fs::write(&retained_progress, "unsubmitted worker output").expect("worker progress");
+    seed_active_claim(
+        &state_dir,
+        "worker-unrelated",
+        "worker-unrelated-incarnation",
+        "worker-unrelated-f31-claim",
+    );
+    seed_operation(
+        &state_dir,
+        "worker-unrelated",
+        "worker-unrelated-incarnation",
+        "worker-unrelated-f31-operation",
+        "active",
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut unrelated = registry["assignments"]["assignment-f31"].clone();
+        unrelated["assignment_id"] = json!("assignment-unrelated-f31");
+        unrelated["revision"] = json!(9);
+        unrelated["state"] = json!("submitted");
+        unrelated["task_summary"] = json!("Unrelated submitted assignment");
+        unrelated["worker"] = serde_json::Value::Null;
+        unrelated["checkpoint"] = serde_json::Value::Null;
+        unrelated["result_summary"] = json!("Unrelated result");
+        registry["assignments"]["assignment-unrelated-f31"] = unrelated;
+    });
+
+    let envs = [("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str())];
+    let invoke = |revision: &str, incarnation: &str, key: &str| {
+        run_main_agent(
+            &main_checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                "revoke-claim",
+                "assignment-f31",
+                "--worker-incarnation",
+                incarnation,
+                "--if-revision",
+                revision,
+                "--reason",
+                "worker turn ended without a task checkpoint",
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ],
+            &envs,
+        )
+    };
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-f31"]["revision"] = json!(u64::MAX);
+    });
+    let max_revision_orchestration = orchestration_registry(&state_dir);
+    let max_revision_coordination = load_coordination_registry(&state_dir);
+    let exhausted_revision = invoke(
+        "18446744073709551615",
+        "worker-f31-incarnation",
+        "f31-revision-capacity-0001",
+    );
+    assert_eq!(exhausted_revision.code, 65);
+    assert_eq!(
+        exhausted_revision.stdout_json()["error"]["code"],
+        "orchestration-revision-capacity"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        max_revision_orchestration
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        max_revision_coordination
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-f31"]["revision"] = json!(3);
+    });
+
+    seed_activity_state(
+        &state_dir,
+        "worker-f31",
+        "worker-f31-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-f31-active",
+            "started_at": "2030-01-01T00:00:01Z",
+            "last_progress_at": "2030-01-01T00:00:02Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let active_turn = invoke("3", "worker-f31-incarnation", "f31-active-turn-0001");
+    assert_eq!(active_turn.code, 65);
+    assert_eq!(
+        active_turn.stdout_json()["error"]["code"],
+        "worker-turn-not-idle"
+    );
+
+    seed_activity_state(
+        &state_dir,
+        "worker-f31",
+        "worker-f31-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "turn-f31-complete",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:03Z",
+            "outcome": "completed"
+        }),
+    );
+    seed_operation(
+        &state_dir,
+        "worker-f31",
+        "worker-f31-incarnation",
+        "worker-f31-active-operation",
+        "active",
+    );
+    let active_operation = invoke("3", "worker-f31-incarnation", "f31-active-operation-0001");
+    assert_eq!(
+        active_operation.code,
+        65,
+        "stdout={} stderr={}",
+        active_operation.stdout_text(),
+        active_operation.stderr_text()
+    );
+    assert_eq!(
+        active_operation.stdout_json()["error"]["code"],
+        "worker-not-quiescent"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .retain(|operation| operation["session_id"] != "worker-f31");
+    });
+    let claim_match_orchestration = orchestration_registry(&state_dir);
+    rewrite_registry(&state_dir, |registry| {
+        let worker_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-f31"
+                    && claim["session_incarnation"] == "worker-f31-incarnation"
+                    && claim["state"] == "active"
+            })
+            .expect("active worker claim");
+        worker_claim["summary"] = json!("different assignment-derived claim");
+    });
+    let mismatched_claim_coordination = load_coordination_registry(&state_dir);
+    let mismatched_claim = invoke(
+        "3",
+        "worker-f31-incarnation",
+        "f31-assignment-claim-mismatch-0001",
+    );
+    assert_eq!(mismatched_claim.code, 65);
+    assert_eq!(
+        mismatched_claim.stdout_json()["error"]["code"],
+        "worker-claim-mismatch"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        claim_match_orchestration,
+        "claim mismatch must not mutate orchestration"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        mismatched_claim_coordination,
+        "claim mismatch must not mutate coordination"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let worker_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-f31"
+                    && claim["session_incarnation"] == "worker-f31-incarnation"
+                    && claim["state"] == "active"
+            })
+            .expect("active worker claim");
+        worker_claim["summary"] = json!("Idle worker cannot release its claim");
+    });
+
+    let set_runtime_identity = |identity: serde_json::Value| {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
+                .expect("worker session json");
+        record["delete_tmux_identity"] = identity;
+        write_private_json(&worker_record_path, &record);
+    };
+    let live_identity = serde_json::from_slice::<serde_json::Value>(&worker_record_before)
+        .expect("worker session json")["delete_tmux_identity"]
+        .clone();
+    let coordination_before_runtime_refusals = load_coordination_registry(&state_dir);
+    let orchestration_before_runtime_refusals = orchestration_registry(&state_dir);
+    set_runtime_identity(json!({
+        "launch_id": "worker-f31-incarnation",
+        "session_id": "$73",
+        "pane_id": "%73",
+        "pane_pid": 2_000_000_000,
+        "process_group_id": 2_000_000_000
+    }));
+    let stopped_runtime = invoke("3", "worker-f31-incarnation", "f31-stopped-runtime-0001");
+    assert_eq!(stopped_runtime.code, 65);
+    assert_eq!(
+        stopped_runtime.stdout_json()["error"]["code"],
+        "worker-runtime-stopped"
+    );
+    set_runtime_identity(json!({
+        "launch_id": "worker-f31-incarnation",
+        "session_id": "$73",
+        "pane_id": "%73",
+        "pane_pid": 2_000_000_000
+    }));
+    let unknown_runtime = invoke("3", "worker-f31-incarnation", "f31-unknown-runtime-0001");
+    assert_eq!(unknown_runtime.code, 1);
+    assert_eq!(
+        unknown_runtime.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_runtime_refusals,
+        "runtime-status refusal must not mutate any coordination authority"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        orchestration_before_runtime_refusals,
+        "runtime-status refusal must not persist progress or mutate orchestration"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    set_runtime_identity(live_identity);
+
+    let stale = invoke("2", "worker-f31-incarnation", "f31-stale-revision-0001");
+    assert_eq!(stale.code, 65);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    let wrong_incarnation = invoke("3", "worker-f31-replacement", "f31-wrong-incarnation-0001");
+    assert_eq!(wrong_incarnation.code, 65);
+    assert_eq!(
+        wrong_incarnation.stdout_json()["error"]["code"],
+        "worker-incarnation-changed"
+    );
+
+    let supervised = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "supervise",
+            "assignment-f31",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(
+        supervised.code,
+        0,
+        "stdout={} stderr={}",
+        supervised.stdout_text(),
+        supervised.stderr_text()
+    );
+    assert_eq!(
+        data(&supervised)["schema_version"],
+        "main-agent.worker-supervise-result.v4"
+    );
+    assert_eq!(
+        data(&supervised)["classification"],
+        "idle_claim_revocation_required"
+    );
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["schema_version"],
+        "main-agent.worker-diagnose-result.v4"
+    );
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["claim_revocation"]["in_flight"],
+        false
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["kind"],
+        "exact_worker_claim_revocation"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["schema_version"],
+        "main-agent.worker-recovery-action.v4"
+    );
+    assert_eq!(data(&supervised)["recovery_action"]["executable"], true);
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][2],
+        "revoke-claim"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][5],
+        "worker-f31-incarnation"
+    );
+    assert_eq!(data(&supervised)["recovery_action"]["argv"][7], "3");
+    assert!(
+        data(&supervised)["recovery_action"]["argv"]
+            .as_array()
+            .expect("revoke claim argv")
+            .iter()
+            .all(|part| part != "<idempotency-key>")
+    );
+    let coordination_before_success = load_coordination_registry(&state_dir);
+    let unrelated_broker_before =
+        coordination_before_success["brokers"]["worker-unrelated"].clone();
+    let unrelated_claims_before = coordination_before_success["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .filter(|claim| claim["session_id"] == "worker-unrelated")
+        .cloned()
+        .collect::<Vec<_>>();
+    let normalized_unrelated_operations = |registry: &serde_json::Value| {
+        registry["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .filter(|operation| operation["session_id"] == "worker-unrelated")
+            .cloned()
+            .map(|mut operation| {
+                let object = operation.as_object_mut().expect("operation");
+                for field in [
+                    "provider_targets",
+                    "descendant",
+                    "outcome",
+                    "reconcile_observed_at_epoch",
+                    "terminal_at_epoch",
+                ] {
+                    object.remove(field);
+                }
+                operation
+            })
+            .collect::<Vec<_>>()
+    };
+    let unrelated_operations_before = normalized_unrelated_operations(&coordination_before_success);
+    let orchestration_before_success = orchestration_registry(&state_dir);
+    let normalized_unrelated_assignment = |registry: &serde_json::Value| {
+        let mut assignment = registry["assignments"]["assignment-unrelated-f31"].clone();
+        assignment
+            .as_object_mut()
+            .expect("assignment")
+            .retain(|_, value| !value.is_null());
+        assignment
+    };
+    let unrelated_assignment_before =
+        normalized_unrelated_assignment(&orchestration_before_success);
+    let run_before = orchestration_before_success["runs"]["run-one"].clone();
+
+    let worker_activity_path = state_dir.join("sessions/worker-f31/activity.json");
+    let idle_activity_before_reservation =
+        fs::read(&worker_activity_path).expect("idle worker activity");
+    let barrier = tmp.path().join("f31-after-reservation");
+    let mut interrupted = Command::new(bin::resolve("main-agent"));
+    interrupted
+        .current_dir(&main_checkout)
+        .args([
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-f31",
+            "--worker-incarnation",
+            "worker-f31-incarnation",
+            "--if-revision",
+            "3",
+            "--reason",
+            "worker turn ended without a task checkpoint",
+            "--idempotency-key",
+            "f31-revoke-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env("NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = interrupted.spawn().expect("spawn interrupted revoke-claim");
+    wait_for_barrier(&barrier);
+    let activity_lock_path = state_dir.join("sessions/worker-f31/.activity.lock");
+    let activity_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&activity_lock_path)
+        .expect("worker activity lock");
+    assert_ne!(
+        // SAFETY: flock observes the valid descriptor owned by activity_probe.
+        unsafe { libc::flock(activity_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "claim revocation must retain the activity fence through progress persistence and authority sealing"
+    );
+    terminate_at_barrier(child, "revoke-claim after reservation");
+    assert_eq!(
+        // SAFETY: flock observes the valid descriptor owned by activity_probe.
+        unsafe { libc::flock(activity_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the interrupted process must release its activity fence"
+    );
+    assert_eq!(
+        // SAFETY: flock releases the lock owned by activity_probe.
+        unsafe { libc::flock(activity_probe.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    assert!(
+        !orchestration_registry(&state_dir)["assignments"]["assignment-f31"]["claim_revocation"]
+            .is_null()
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "active"),
+        "a crash before the seal must leave the pre-existing authority intact"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists(),
+        "the reservation crash regression must stop before quarantine persistence"
+    );
+    seed_activity_state(
+        &state_dir,
+        "worker-f31",
+        "worker-f31-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-f31-after-reservation-drift",
+            "started_at": "2030-01-01T00:00:04Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let activity_drift_replay = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
+    assert_eq!(activity_drift_replay.code, 65);
+    assert_eq!(
+        activity_drift_replay.stdout_json()["error"]["code"],
+        "worker-turn-not-idle"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists(),
+        "stale activity evidence must not create the authority fence"
+    );
+    fs::write(&worker_activity_path, &idle_activity_before_reservation)
+        .expect("restore idle worker activity");
+    let mut newer_idle_activity: serde_json::Value =
+        serde_json::from_slice(&idle_activity_before_reservation).expect("idle activity JSON");
+    newer_idle_activity["state"]["revision"] = json!(2);
+    write_private_json(&worker_activity_path, &newer_idle_activity);
+    let activity_revision_drift_coordination = load_coordination_registry(&state_dir);
+    let activity_revision_drift_orchestration = orchestration_registry(&state_dir);
+    let activity_revision_drift = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
+    assert_eq!(activity_revision_drift.code, 65);
+    assert_eq!(
+        activity_revision_drift.stdout_json()["error"]["code"],
+        "worker-claim-revocation-evidence-drift"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        activity_revision_drift_coordination
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        activity_revision_drift_orchestration
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    fs::write(&worker_activity_path, &idle_activity_before_reservation)
+        .expect("restore original idle worker activity");
+    let replacement_runtime =
+        seed_live_runtime_identity(&state_dir, "worker-f31", "worker-f31-incarnation", 75);
+    let runtime_identity_drift_coordination = load_coordination_registry(&state_dir);
+    let runtime_identity_drift_orchestration = orchestration_registry(&state_dir);
+    let runtime_identity_drift = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
+    assert_eq!(runtime_identity_drift.code, 65);
+    assert_eq!(
+        runtime_identity_drift.stdout_json()["error"]["code"],
+        "worker-claim-revocation-evidence-drift"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        runtime_identity_drift_coordination
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        runtime_identity_drift_orchestration
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    let restored_runtime_identity =
+        serde_json::from_slice::<serde_json::Value>(&worker_record_before)
+            .expect("worker session json")["delete_tmux_identity"]
+            .clone();
+    set_runtime_identity(restored_runtime_identity.clone());
+    drop(replacement_runtime);
+    let stopped_identity = json!({
+        "launch_id": "worker-f31-incarnation",
+        "session_id": "$73",
+        "pane_id": "%73",
+        "pane_pid": 2_000_000_000,
+        "process_group_id": 2_000_000_000
+    });
+    set_runtime_identity(stopped_identity);
+    let runtime_drift_replay = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
+    assert_eq!(runtime_drift_replay.code, 65);
+    assert_eq!(
+        runtime_drift_replay.stdout_json()["error"]["code"],
+        "worker-runtime-stopped"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists(),
+        "stale runtime evidence must not create the authority fence"
+    );
+    set_runtime_identity(restored_runtime_identity);
+    rewrite_registry(&state_dir, |registry| {
+        let worker_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "active")
+            .expect("active worker claim");
+        worker_claim["summary"] = json!("post-reservation claim mismatch");
+    });
+    let post_reservation_mismatch_coordination = load_coordination_registry(&state_dir);
+    let post_reservation_mismatch_orchestration = orchestration_registry(&state_dir);
+    let post_reservation_mismatch = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
+    assert_eq!(post_reservation_mismatch.code, 65);
+    assert_eq!(
+        post_reservation_mismatch.stdout_json()["error"]["code"],
+        "worker-claim-mismatch"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        post_reservation_mismatch_coordination,
+        "post-reservation claim mismatch must not persist a quarantine"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        post_reservation_mismatch_orchestration
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .exists()
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let worker_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "active")
+            .expect("active worker claim");
+        worker_claim["summary"] = json!("Idle worker cannot release its claim");
+    });
+    fs::rename(
+        state_dir.join("sessions/main-one"),
+        state_dir.join("stale-main-one"),
+    )
+    .expect("make original claim-revocation controller unavailable");
+    let successor_env = [(
+        "AGENT_SESSION_CAPABILITY_FILE",
+        main_two_capability.as_str(),
+    )];
+    let adopt_barrier = tmp.path().join("f31-orphan-adopt-before-save");
+    let mut interrupted_adopt = Command::new(bin::resolve("main-agent"));
+    interrupted_adopt
+        .current_dir(&main_checkout)
+        .args([
+            "--state-dir",
+            &state_arg,
+            "adopt",
+            "assignment-f31",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "f31-orphan-adopt-main-two-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_CLAIM_REVOCATION_ADOPT_BARRIER_STAGE",
+            "before_registry_save",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_CLAIM_REVOCATION_ADOPT_BARRIER_DIR",
+            &adopt_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let interrupted_adopt = interrupted_adopt
+        .spawn()
+        .expect("spawn interrupted claim-revocation adopt");
+    wait_for_barrier(&adopt_barrier);
+    assert!(
+        state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .is_file(),
+        "successor adoption must reconstruct the missing authority fence before its registry save"
+    );
+    terminate_at_barrier(
+        interrupted_adopt,
+        "claim-revocation adopt before registry save",
+    );
+    let after_interrupted_adopt = orchestration_registry(&state_dir);
+    assert_eq!(
+        after_interrupted_adopt["assignments"]["assignment-f31"]["revision"],
+        3
+    );
+    assert_eq!(
+        after_interrupted_adopt["assignments"]["assignment-f31"]["primary_manager"]["session_id"],
+        "main-one"
+    );
+    assert_eq!(
+        after_interrupted_adopt["assignments"]["assignment-f31"]["claim_revocation"]["controller"]
+            ["session_id"],
+        "main-one"
+    );
+    assert!(
+        after_interrupted_adopt["assignments"]["assignment-f31"]["claim_revocation"]
+            ["adopted_revision"]
+            .is_null(),
+        "a crash before the registry save must leave the original reservation owner intact"
+    );
+    let adopted = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "adopt",
+            "assignment-f31",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "f31-orphan-adopt-main-two-0001",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(
+        adopted.code,
+        0,
+        "stdout={} stderr={}",
+        adopted.stdout_text(),
+        adopted.stderr_text()
+    );
+    assert_eq!(data(&adopted)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&adopted)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+    seed_activity_state(
+        &state_dir,
+        "worker-f31",
+        "worker-f31-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-f31-after-progress",
+            "started_at": "2030-01-01T00:00:04Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let target_path = worker_checkout.join("docs/f31/operation.txt");
+    fs::create_dir_all(target_path.parent().expect("target parent")).expect("target parent");
+    fs::write(&target_path, "retained worker mutation target").expect("target");
+    let targets = tmp.path().join("f31-after-progress-targets.json");
+    fs::write(
+        &targets,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "docs/f31/operation.txt"
+            }]
+        }))
+        .expect("targets"),
+    )
+    .expect("targets file");
+    let execution_token = tmp.path().join("f31-after-progress-execution-token");
+    fs::write(&execution_token, "f31-after-progress-execution-token").expect("execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+    let coordination_before_fenced_admit = load_coordination_registry(&state_dir);
+    let worker_claim = coordination_before_fenced_admit["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "active")
+        .expect("active worker claim");
+    let claim_id = worker_claim["claim_id"].as_str().expect("claim id");
+    let claim_revision = worker_claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+    let fenced_admit = run(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "work-context",
+            "admit",
+            "--session",
+            "worker-f31",
+            "--claim",
+            claim_id,
+            "--if-revision",
+            &claim_revision,
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &worker_capability,
+            "--idempotency-key",
+            "f31-after-progress-admit-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(fenced_admit.code, 65);
+    assert_eq!(
+        fenced_admit.stdout_json()["error"]["code"],
+        "worker-quarantined"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_fenced_admit,
+        "quarantine refusal must not persist an operation or replay receipt"
+    );
+    drop(_live_runtime);
+    let replay_supervision = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "supervise",
+            "assignment-f31",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(
+        data(&replay_supervision)["classification"],
+        "idle_claim_revocation_in_progress"
+    );
+    assert_eq!(
+        data(&replay_supervision)["schema_version"],
+        "main-agent.worker-supervise-result.v4"
+    );
+    assert_eq!(
+        data(&replay_supervision)["last_proven_safe_state"]["claim_revocation"]["in_flight"],
+        true
+    );
+    assert_eq!(
+        data(&replay_supervision)["recovery_action"]["kind"],
+        "exact_worker_claim_revocation_replay"
+    );
+    assert_eq!(
+        data(&replay_supervision)["recovery_action"]["argv"][11],
+        "f31-revoke-0001"
+    );
+
+    let concurrent_barrier = tmp.path().join("f31-concurrent-replay-after-seal");
+    let revoke_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "revoke-claim",
+        "assignment-f31",
+        "--worker-incarnation",
+        "worker-f31-incarnation",
+        "--if-revision",
+        "3",
+        "--reason",
+        "worker turn ended without a task checkpoint",
+        "--idempotency-key",
+        "f31-revoke-0001",
+        "--format",
+        "json",
+    ];
+    let mut winner = Command::new(bin::resolve("main-agent"));
+    winner
+        .current_dir(&main_checkout)
+        .args(revoke_args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE",
+            "after_authority_seal",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_DIR",
+            &concurrent_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let winner = winner.spawn().expect("spawn winning revoke-claim");
+    wait_for_barrier(&concurrent_barrier);
+    let sealed_before_replay = load_coordination_registry(&state_dir);
+    assert!(
+        sealed_before_replay["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "released")
+    );
+    assert_eq!(
+        sealed_before_replay["brokers"]["worker-f31"]["state"],
+        "stopped"
+    );
+    assert!(
+        !orchestration_registry(&state_dir)["assignments"]["assignment-f31"]["claim_revocation"]
+            .is_null(),
+        "the sealed crash boundary must retain progress and its assignment reservation"
+    );
+    let mut waiter = Command::new(bin::resolve("main-agent"));
+    waiter
+        .current_dir(&main_checkout)
+        .args(revoke_args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut waiter = waiter
+        .spawn()
+        .expect("spawn concurrent revoke-claim replay");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        waiter
+            .try_wait()
+            .expect("probe concurrent replay")
+            .is_none(),
+        "the identical replay must wait on the exact worker lifecycle lock"
+    );
+    terminate_at_barrier(winner, "revoke-claim after authority seal");
+    let waiter_output = waiter
+        .wait_with_output()
+        .expect("wait for concurrent revoke-claim");
+    assert!(
+        waiter_output.status.success(),
+        "waiter stdout={} stderr={}",
+        String::from_utf8_lossy(&waiter_output.stdout),
+        String::from_utf8_lossy(&waiter_output.stderr)
+    );
+    let waiter_json: serde_json::Value =
+        serde_json::from_slice(&waiter_output.stdout).expect("waiter JSON");
+
+    let revoked = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-f31",
+            "--worker-incarnation",
+            "worker-f31-incarnation",
+            "--if-revision",
+            "3",
+            "--reason",
+            "worker turn ended without a task checkpoint",
+            "--idempotency-key",
+            "f31-revoke-0001",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(
+        revoked.code,
+        0,
+        "stdout={} stderr={}",
+        revoked.stdout_text(),
+        revoked.stderr_text()
+    );
+    assert_eq!(
+        revoked.stdout_json(),
+        waiter_json,
+        "sealed crash replay and later terminal replay must return the same result"
+    );
+    assert_eq!(
+        data(&revoked)["schema_version"],
+        "main-agent.worker-revoke-claim-result.v1"
+    );
+    assert_eq!(data(&revoked)["assignment"]["state"], "cancelled");
+    assert_eq!(data(&revoked)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&revoked)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+    assert_eq!(data(&revoked)["worker_claim_active_before"], true);
+    assert_eq!(data(&revoked)["worker_claim_active_after"], false);
+    assert_eq!(data(&revoked)["broker_authoritative_after"], false);
+    assert_eq!(data(&revoked)["input_sent"], false);
+    assert_eq!(data(&revoked)["worktree_preserved"], true);
+    assert_eq!(data(&revoked)["proof"]["worker_turn"], "authoritative_idle");
+    assert_eq!(data(&revoked)["proof"]["coordination"], "quiescent");
+    assert!(retained_progress.is_file());
+    assert!(state_dir.join("sessions/worker-f31/session.json").is_file());
+    assert!(
+        state_dir
+            .join("sessions/worker-f31/authority-quarantine.json")
+            .is_file()
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| claim["session_id"] == "worker-f31" && claim["state"] == "released")
+    );
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| claim["session_id"] == "worker-unrelated" && claim["state"] == "active")
+    );
+    assert_eq!(coordination["brokers"]["worker-f31"]["state"], "stopped");
+    assert_eq!(
+        coordination["brokers"]["worker-unrelated"]["state"],
+        "ready"
+    );
+    assert_eq!(
+        fs::read(&worker_record_path).expect("worker session record after revocation"),
+        worker_record_before,
+        "claim revocation must preserve the exact worker process runtime record"
+    );
+    let coordination_after_success = load_coordination_registry(&state_dir);
+    assert_eq!(
+        coordination_after_success["brokers"]["worker-unrelated"],
+        unrelated_broker_before
+    );
+    assert_eq!(
+        coordination_after_success["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .filter(|claim| claim["session_id"] == "worker-unrelated")
+            .cloned()
+            .collect::<Vec<_>>(),
+        unrelated_claims_before
+    );
+    assert_eq!(
+        normalized_unrelated_operations(&coordination_after_success),
+        unrelated_operations_before
+    );
+    let orchestration_after_success = orchestration_registry(&state_dir);
+    assert_eq!(
+        normalized_unrelated_assignment(&orchestration_after_success),
+        unrelated_assignment_before
+    );
+    assert_eq!(orchestration_after_success["runs"]["run-one"], run_before);
+
+    let replay = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-f31",
+            "--worker-incarnation",
+            "worker-f31-incarnation",
+            "--if-revision",
+            "3",
+            "--reason",
+            "worker turn ended without a task checkpoint",
+            "--idempotency-key",
+            "f31-revoke-0001",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(replay.code, 0);
+    assert_eq!(data(&replay), data(&revoked));
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_after_success,
+        "terminal replay must not mutate any coordination state"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        orchestration_after_success,
+        "terminal replay must not mutate orchestration state"
+    );
+}
+
+#[test]
+fn main_agent_revoke_claim_keeps_accepted_assignment_retirable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [&main_checkout, &worker_checkout] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-f31-accepted",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-f31-accepted",
+                "worker-f31-accepted-incarnation",
+                "worker-private-capability-f31-accepted",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-f31-accepted",
+        "task_summary": "Accepted worker cannot release its claim",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-f31-accepted",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/f31-accepted"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-f31-accepted",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-f31-accepted",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Accepted worker cannot release its claim",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-f31-accepted",
+                "session_incarnation": "worker-f31-accepted-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/f31-accepted"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-f31-accepted");
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "bootstrap",
+            "--idempotency-key",
+            "f31-accepted-bootstrap-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(bootstrapped.code, 0);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-f31-accepted"];
+        assignment["state"] = json!("accepted");
+        assignment["revision"] = json!(5);
+        assignment["checkpoint"] = json!({
+            "revision": 5,
+            "summary": "Result accepted",
+            "next_action": "Release worker claim",
+            "updated_at": "2030-01-01T00:00:04Z"
+        });
+        assignment["result_summary"] = json!("Accepted result");
+    });
+    let live_runtime = seed_live_runtime_identity(
+        &state_dir,
+        "worker-f31-accepted",
+        "worker-f31-accepted-incarnation",
+        74,
+    );
+    seed_activity_state(
+        &state_dir,
+        "worker-f31-accepted",
+        "worker-f31-accepted-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "turn-f31-accepted",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:03Z",
+            "outcome": "completed"
+        }),
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-f31-accepted"]["revision"] = json!(u64::MAX);
+    });
+    let max_revision_orchestration = orchestration_registry(&state_dir);
+    let max_revision_coordination = load_coordination_registry(&state_dir);
+    let exhausted_revision = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-f31-accepted",
+            "--worker-incarnation",
+            "worker-f31-accepted-incarnation",
+            "--if-revision",
+            "18446744073709551615",
+            "--reason",
+            "accepted worker could not release its claim",
+            "--idempotency-key",
+            "f31-accepted-revision-capacity-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(exhausted_revision.code, 65);
+    assert_eq!(
+        exhausted_revision.stdout_json()["error"]["code"],
+        "orchestration-revision-capacity"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        max_revision_orchestration
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        max_revision_coordination
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31-accepted/authority-quarantine.json")
+            .exists()
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-f31-accepted"]["revision"] = json!(5);
+    });
+    let supervised = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "supervise",
+            "assignment-f31-accepted",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        supervised.code,
+        0,
+        "stdout={} stderr={}",
+        supervised.stdout_text(),
+        supervised.stderr_text()
+    );
+    assert_eq!(
+        data(&supervised)["classification"],
+        "idle_claim_revocation_required"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][7],
+        "5",
+        "accepted assignments must project their exact current revision"
+    );
+    let first_lifecycle_barrier = tmp.path().join("f31-accepted-first-before-lifecycle");
+    let second_lifecycle_barrier = tmp.path().join("f31-accepted-second-before-lifecycle");
+    let reservation_barrier = tmp.path().join("f31-accepted-after-reservation");
+    let seal_barrier = tmp.path().join("f31-accepted-after-seal");
+    let revoke_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "revoke-claim",
+        "assignment-f31-accepted",
+        "--worker-incarnation",
+        "worker-f31-accepted-incarnation",
+        "--if-revision",
+        "5",
+        "--reason",
+        "accepted worker could not release its claim",
+        "--idempotency-key",
+        "f31-accepted-revoke-0001",
+        "--format",
+        "json",
+    ];
+    let mut first = Command::new(bin::resolve("main-agent"));
+    first
+        .current_dir(&main_checkout)
+        .args(revoke_args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BEFORE_LIFECYCLE_BARRIER_DIR",
+            &first_lifecycle_barrier,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_DIR",
+            &reservation_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let first = first.spawn().expect("spawn first fresh revoke-claim");
+    wait_for_barrier(&first_lifecycle_barrier);
+    let mut second = Command::new(bin::resolve("main-agent"));
+    second
+        .current_dir(&main_checkout)
+        .args(revoke_args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BEFORE_LIFECYCLE_BARRIER_DIR",
+            &second_lifecycle_barrier,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE",
+            "after_authority_seal",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_DIR",
+            &seal_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let second = second.spawn().expect("spawn second fresh revoke-claim");
+    wait_for_barrier(&second_lifecycle_barrier);
+    fs::write(first_lifecycle_barrier.join("release"), "release")
+        .expect("release first fresh revoke-claim");
+    wait_for_barrier(&reservation_barrier);
+    assert!(
+        !state_dir
+            .join("sessions/worker-f31-accepted/authority-quarantine.json")
+            .exists(),
+        "the first fresh invocation must pause before quarantine persistence"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let worker_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-f31-accepted"
+                    && claim["session_incarnation"] == "worker-f31-accepted-incarnation"
+                    && claim["state"] == "active"
+            })
+            .expect("active accepted-worker claim");
+        worker_claim["state"] = json!("released");
+    });
+    fs::write(second_lifecycle_barrier.join("release"), "release")
+        .expect("release second fresh revoke-claim");
+    terminate_at_barrier(first, "first fresh revoke-claim after reservation");
+    wait_for_barrier(&seal_barrier);
+    let sealed_coordination = load_coordination_registry(&state_dir);
+    assert!(
+        sealed_coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-f31-accepted" && claim["state"] == "released"
+            })
+    );
+    assert_eq!(
+        sealed_coordination["brokers"]["worker-f31-accepted"]["state"],
+        "stopped"
+    );
+    assert!(
+        !orchestration_registry(&state_dir)["assignments"]["assignment-f31-accepted"]
+            ["claim_revocation"]
+            .is_null()
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-f31-accepted/authority-quarantine.json")
+            .is_file(),
+        "the durable authority fence must exist before the seal is exposed"
+    );
+    fs::write(seal_barrier.join("release"), "release")
+        .expect("release second fresh revoke-claim after seal");
+    let second_output = second
+        .wait_with_output()
+        .expect("wait for second fresh revoke-claim");
+    assert!(
+        second_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second_output.stdout),
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let second_result: serde_json::Value =
+        serde_json::from_slice(&second_output.stdout).expect("second revoke-claim JSON");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let fenced_resume = run_with_env(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "worker-f31-accepted",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(fenced_resume.code, 65);
+    assert_eq!(
+        fenced_resume.stdout_json()["error"]["code"],
+        "worker-quarantined",
+        "the retained worker must not reprovision authority after the seal"
+    );
+    drop(live_runtime);
+    let revoked = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-f31-accepted",
+            "--worker-incarnation",
+            "worker-f31-accepted-incarnation",
+            "--if-revision",
+            "5",
+            "--reason",
+            "accepted worker could not release its claim",
+            "--idempotency-key",
+            "f31-accepted-revoke-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        revoked.code,
+        0,
+        "stdout={} stderr={}",
+        revoked.stdout_text(),
+        revoked.stderr_text()
+    );
+    assert_eq!(
+        data(&revoked),
+        second_result["data"],
+        "a fresh lifecycle-lock waiter must adopt progress and commit the one terminal result"
+    );
+    assert_eq!(data(&revoked)["assignment"]["state"], "accepted");
+    assert_eq!(data(&revoked)["assignment"]["revision"], 6);
+    assert_eq!(data(&revoked)["worker_claim_active_after"], false);
+    assert_eq!(
+        data(&revoked)["next_action"],
+        "retire this exact accepted assignment"
+    );
+    assert_eq!(
+        data(&revoked)["assignment"]["checkpoint"]["summary"],
+        "Result accepted"
+    );
+    assert_eq!(
+        data(&revoked)["assignment"]["result_summary"],
+        "Accepted result"
+    );
+
+    let retire_env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+    ];
+    let retired = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "retire",
+            "assignment-f31-accepted",
+            "--if-revision",
+            "6",
+            "--idempotency-key",
+            "f31-accepted-retire-0001",
+            "--format",
+            "json",
+        ],
+        &retire_env,
+    );
+    assert_eq!(
+        retired.code,
+        0,
+        "stdout={} stderr={}",
+        retired.stdout_text(),
+        retired.stderr_text()
+    );
+    assert_eq!(data(&retired)["released"], true);
+    assert_eq!(data(&retired)["deleted"], true);
+    assert_eq!(data(&retired)["retired"], true);
+    assert!(!state_dir.join("sessions/worker-f31-accepted").exists());
 }
 
 /// B2: a worker that dies *after* bootstrap acquired its assignment-derived

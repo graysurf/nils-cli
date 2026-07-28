@@ -25,6 +25,7 @@ fn macro_first_worker_surface_is_discoverable() {
         "submit-recovery",
         "reconcile-recovery",
         "stop-runtime",
+        "revoke-claim",
         "account-handoff-cancel",
         "request-changes",
         "cancel",
@@ -72,6 +73,13 @@ fn recovery_primitives_publish_their_guards() {
     assert!(stop.contains("exact worker incarnation"));
     assert!(stop.contains("expected current assignment revision"));
     assert!(stop.contains("same idempotency key"));
+
+    let revoke = help(&["worker", "revoke-claim", "--help"]).to_ascii_lowercase();
+    assert!(revoke.contains("authoritative-idle worker claim"));
+    assert!(revoke.contains("preserving its session and worktree"));
+    assert!(revoke.contains("exact worker incarnation"));
+    assert!(revoke.contains("expected current assignment revision"));
+    assert!(revoke.contains("same idempotency key"));
 
     let cancel = help(&["worker", "cancel", "--help"]).to_ascii_lowercase();
     assert!(cancel.contains("failed pre-claim assignment"));

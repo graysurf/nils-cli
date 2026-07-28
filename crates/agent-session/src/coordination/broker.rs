@@ -138,6 +138,10 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     let path = capability_path(context, &record.id, &incarnation);
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    // Close the race where provisioning passes the optimistic filesystem check
+    // immediately before Main persists a session authority fence, then waits
+    // for the coordination lock while Main seals the old broker.
+    crate::orchestration::ensure_session_not_authority_quarantined(context, record)?;
     let previous_broker = locked
         .registry
         .brokers

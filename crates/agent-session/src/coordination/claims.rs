@@ -691,6 +691,7 @@ pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_authority_quarantined(context, &record)?;
     clean_expired(&mut locked.registry, now);
     if let Some(replay) = idempotency_replay(
         &locked.registry,
@@ -842,6 +843,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_authority_quarantined(context, &record)?;
     clean_expired(&mut locked.registry, now);
     if let Some(replay) = idempotency_replay(
         &locked.registry,
@@ -1511,10 +1513,29 @@ pub(crate) fn main_agent_worker_claim_match(
         .map(|runtime| runtime.launch_id.as_str())
         .filter(|value| !value.is_empty())
         .ok_or_else(claim_unavailable)?;
-    let mut expected = candidate.clone().validate_and_canonicalize()?;
     let locked = lock_registry(context)?;
-    ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
-    let Some(claim) = locked.registry.claims.iter().find(|claim| {
+    main_agent_worker_claim_match_in_registry(
+        context,
+        &locked.registry,
+        record,
+        incarnation,
+        candidate,
+    )
+}
+
+/// Check the exact assignment-derived worker claim against an already locked
+/// coordination registry. This lets Main-owned authority revocation bind scope
+/// identity and the destructive seal to one registry snapshot.
+pub(crate) fn main_agent_worker_claim_match_in_registry(
+    context: &CliContext,
+    registry: &Registry,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    candidate: &WorkContextInput,
+) -> Result<Option<bool>, CliError> {
+    let mut expected = candidate.clone().validate_and_canonicalize()?;
+    ensure_current_broker(context, registry, &record.id, incarnation)?;
+    let Some(claim) = registry.claims.iter().find(|claim| {
         claim.session_id == record.id
             && claim.session_incarnation == incarnation
             && claim.state == "active"
@@ -1523,7 +1544,7 @@ pub(crate) fn main_agent_worker_claim_match(
     };
     let record_cwd = std::path::Path::new(&record.cwd);
     let checkout = checkout_root(record_cwd).unwrap_or_else(|_| record_cwd.to_path_buf());
-    let fingerprint = worktree_fingerprint(&locked.registry, &checkout)?;
+    let fingerprint = worktree_fingerprint(registry, &checkout)?;
     if !expected.worktrees.contains(&fingerprint) {
         expected.worktrees.push(fingerprint);
         expected.worktrees.sort();

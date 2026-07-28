@@ -878,6 +878,8 @@ pub(crate) const ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v3";
 pub(crate) const WORKER_RUNTIME_STOP_RESERVATION_SCHEMA: &str =
     "main-agent.worker-runtime-stop-reservation.v1";
+pub(crate) const WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA: &str =
+    "main-agent.worker-claim-revocation-reservation.v1";
 pub(crate) const WORKER_READINESS_STOP_PROOF_SCHEMA: &str =
     "main-agent.worker-readiness-stop-proof.v1";
 pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA: &str =
@@ -1269,6 +1271,8 @@ pub(crate) struct AssignmentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_stop: Option<WorkerRuntimeStopReservationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_revocation: Option<WorkerClaimRevocationReservationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_stop_proof: Option<WorkerReadinessStopProofRecord>,
     pub created_at: String,
     pub updated_at: String,
@@ -1289,6 +1293,24 @@ pub(crate) struct WorkerRuntimeStopReservationRecord {
     pub controller_claim_id: String,
     pub controller_claim_revision: u64,
     pub controller_claim_expires_at_epoch: i64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerClaimRevocationReservationRecord {
+    pub schema_version: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub run_id: String,
+    pub controller: SessionRef,
+    pub worker: SessionRef,
+    pub reserved_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_revision: Option<u64>,
+    pub terminal_revision: u64,
+    pub runtime_identity_digest: String,
+    pub reason: String,
     pub created_at: String,
 }
 
@@ -1489,12 +1511,14 @@ impl Registry {
                 ));
             }
             if let Some(reservation) = &assignment.account_handoff
-                && (!matches!(
-                    reservation.schema_version.as_str(),
-                    ACCOUNT_HANDOFF_RESERVATION_SCHEMA
-                        | LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA
-                        | LEGACY_ACCOUNT_HANDOFF_RESERVATION_SCHEMA
-                ) || reservation.request_digest.len() != 64
+                && (assignment.claim_revocation.is_some()
+                    || !matches!(
+                        reservation.schema_version.as_str(),
+                        ACCOUNT_HANDOFF_RESERVATION_SCHEMA
+                            | LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA
+                            | LEGACY_ACCOUNT_HANDOFF_RESERVATION_SCHEMA
+                    )
+                    || reservation.request_digest.len() != 64
                     || !reservation
                         .request_digest
                         .bytes()
@@ -1551,6 +1575,7 @@ impl Registry {
             }
             if let Some(reservation) = &assignment.runtime_stop
                 && (assignment.account_handoff.is_some()
+                    || assignment.claim_revocation.is_some()
                     || reservation.schema_version != WORKER_RUNTIME_STOP_RESERVATION_SCHEMA
                     || reservation.request_digest.len() != 64
                     || !reservation
@@ -1578,6 +1603,47 @@ impl Registry {
             {
                 return Err(store_invalid(
                     "orchestration worker runtime stop reservation identity is invalid",
+                ));
+            }
+            if let Some(reservation) = &assignment.claim_revocation
+                && (assignment.account_handoff.is_some()
+                    || assignment.runtime_stop.is_some()
+                    || reservation.schema_version != WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA
+                    || reservation.request_digest.len() != 64
+                    || !reservation
+                        .request_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || validate_slug(
+                        "worker claim revocation idempotency key",
+                        &reservation.idempotency_key,
+                        128,
+                    )
+                    .is_err()
+                    || reservation.run_id != assignment.run_id
+                    || reservation.controller != assignment.primary_manager
+                    || assignment.worker.as_ref() != Some(&reservation.worker)
+                    || !matches!(assignment.state.as_str(), "working" | "accepted")
+                    || !worker_claim_revocation_revision_is_valid(
+                        reservation.reserved_revision,
+                        reservation.adopted_revision,
+                        assignment.revision,
+                    )
+                    || reservation
+                        .reserved_revision
+                        .checked_add(1)
+                        .is_none_or(|revision| revision != reservation.terminal_revision)
+                    || reservation.runtime_identity_digest.len() != 64
+                    || !reservation
+                        .runtime_identity_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || validate_summary("worker claim revocation reason", &reservation.reason)
+                        .is_err()
+                    || reservation.created_at.is_empty())
+            {
+                return Err(store_invalid(
+                    "orchestration worker claim revocation reservation identity is invalid",
                 ));
             }
             if let Some(proof) = &assignment.readiness_stop_proof
@@ -1623,6 +1689,19 @@ impl Registry {
 }
 
 pub(crate) fn worker_runtime_stop_revision_is_valid(
+    reserved_revision: u64,
+    adopted_revision: Option<u64>,
+    assignment_revision: u64,
+) -> bool {
+    match adopted_revision {
+        Some(adopted_revision) => {
+            adopted_revision == assignment_revision && adopted_revision > reserved_revision
+        }
+        None => reserved_revision == assignment_revision,
+    }
+}
+
+pub(crate) fn worker_claim_revocation_revision_is_valid(
     reserved_revision: u64,
     adopted_revision: Option<u64>,
     assignment_revision: u64,
@@ -1808,12 +1887,24 @@ pub(crate) fn ensure_session_not_quarantined(
             })),
         ));
     }
+    ensure_session_not_authority_quarantined(context, record)
+}
+
+/// Recheck only the session authority-quarantine marker at a coordination
+/// ingress that already performed the broader optimistic fence check. This is
+/// the post-lock race fence for live-idle claim revocation; keeping it to one
+/// bounded marker read avoids serializing three absent-file probes under the
+/// global coordination lock.
+pub(crate) fn ensure_session_not_authority_quarantined(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
     let Some(marker) = validated_session_authority_quarantine(context, record)? else {
         return Ok(());
     };
     Err(CliError::data(
         "worker-quarantined",
-        "worker execution authority is quarantined after stopped-runtime reconciliation",
+        "worker execution authority is quarantined after Main-owned authority fencing",
         Some(json!({
             "assignment_id": marker.assignment_id,
             "current_revision": marker.assignment_revision
@@ -2238,15 +2329,14 @@ pub(crate) fn persist_session_authority_quarantine(
         read_session_authority_quarantine(context, &quarantine.worker.session_id)?
     {
         validate_session_authority_quarantine(&existing)?;
-        let retry_matches = existing.schema_version == marker.schema_version
-            && existing.assignment_id == marker.assignment_id
-            && existing.assignment_revision == marker.assignment_revision
-            && existing.quarantine.schema_version == marker.quarantine.schema_version
-            && existing.quarantine.worker == marker.quarantine.worker
-            && existing.quarantine.reason == marker.quarantine.reason
-            && existing.quarantine.runtime_identity_digest
-                == marker.quarantine.runtime_identity_digest;
-        if !retry_matches {
+        if !session_authority_quarantine_identity_matches(
+            &existing,
+            assignment_id,
+            assignment_revision,
+            &quarantine.worker,
+            &quarantine.reason,
+            &quarantine.runtime_identity_digest,
+        ) {
             return Err(CliError::data(
                 "worker-quarantine-conflict",
                 "worker execution authority has a different persistent quarantine",
@@ -2279,17 +2369,61 @@ pub(crate) fn require_session_authority_quarantine(
     let marker = read_session_authority_quarantine(context, &worker.session_id)?
         .ok_or_else(|| store_invalid("session authority quarantine is missing"))?;
     validate_session_authority_quarantine(&marker)?;
-    if marker.assignment_id != assignment_id
-        || marker.assignment_revision != assignment_revision
-        || marker.quarantine.worker != *worker
-        || marker.quarantine.reason != reason
-        || marker.quarantine.runtime_identity_digest != runtime_identity_digest
-    {
+    if !session_authority_quarantine_identity_matches(
+        &marker,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    ) {
         return Err(store_invalid(
             "session authority quarantine identity is invalid",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn session_authority_quarantine_matches(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> Result<bool, CliError> {
+    let Some(marker) = read_session_authority_quarantine(context, &worker.session_id)? else {
+        return Ok(false);
+    };
+    validate_session_authority_quarantine(&marker)?;
+    if !session_authority_quarantine_identity_matches(
+        &marker,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    ) {
+        return Err(store_invalid(
+            "session authority quarantine identity is invalid",
+        ));
+    }
+    Ok(true)
+}
+
+fn session_authority_quarantine_identity_matches(
+    marker: &SessionAuthorityQuarantine,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> bool {
+    marker.assignment_id == assignment_id
+        && marker.assignment_revision == assignment_revision
+        && marker.quarantine.worker == *worker
+        && marker.quarantine.reason == reason
+        && marker.quarantine.runtime_identity_digest == runtime_identity_digest
 }
 
 fn read_session_authority_quarantine(

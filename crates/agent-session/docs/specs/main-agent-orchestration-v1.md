@@ -108,6 +108,7 @@ main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --id
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
 main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --idempotency-key KEY --format json
 main-agent worker reconcile-stopped ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
+main-agent worker revoke-claim ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker reassign ASSIGNMENT_ID --assignment-file FILE --if-revision N --reason TEXT [--await-ready D] --idempotency-key KEY --format json
 main-agent worker message|accept|release|delete ...
@@ -306,6 +307,15 @@ required-stop recovery action MUST be Main-owned, directly executable, and conta
 `worker stop-runtime` argv with assignment revision, worker incarnation, and a
 stable idempotency key.
 
+The closed v3 classification and recovery-action unions remain unchanged.
+`idle_claim_revocation_required` and `idle_claim_revocation_in_progress` use
+`main-agent.worker-diagnose-result.v4`,
+`main-agent.worker-supervise-result.v4`, and
+`main-agent.worker-recovery-action.v4`. A v4 diagnosis carries the explicit
+`claim_revocation.in_flight` projection and does not reuse the v3-only
+`runtime_stop` projection. Existing v2 and v3 classifications retain their
+exact schema identifiers and top-level projections.
+
 `worker stop-runtime` MUST authenticate the exact current Main controller and
 its active, unexpired claim; revalidate run ownership, assignment revision,
 primary manager, worker binding, and the final readiness receipt; and hold the
@@ -458,15 +468,78 @@ state fail closed.
 Accept/release are explicit Main Agent transitions. The ordinary successful
 path is `submitted -> accepted -> released`. Once an assignment is `accepted`,
 `released`, or `cancelled`, worker checkpoints are rejected before any result,
-checkpoint, worker binding, state, or revision mutation. `worker cancel` and
-`worker reconcile-stopped` are the only public facade transitions into
-`cancelled`; daemon-owned force group cleanup reaches the same state through its
-own contract below. `worker cancel` may terminalize only the named
+checkpoint, worker binding, state, or revision mutation. `worker cancel`,
+`worker reconcile-stopped`, and the live-idle `worker revoke-claim` transition
+below are the only public facade transitions into `cancelled`; daemon-owned
+force group cleanup reaches the same state through its own contract below.
+`worker cancel` may terminalize only the named
 failed pre-claim assignment, with an exact revision, active Main Agent claim,
 no worker claim, and no active or uncertain worker operation. The coordination
 registry lock remains held across the orchestration transition so claim
 acquisition cannot race cancellation. Operators MUST NOT synthesize
 cancellation by editing the private registry.
+
+### Live authoritative-idle claim revocation
+
+`worker revoke-claim` owns the case where a `working` or `accepted` worker
+runtime is still durably running, its provider has authoritatively returned to
+an idle turn boundary, and its exact assignment-derived claim remains active.
+It sends no provider input. A `working` assignment becomes `cancelled`; an
+`accepted` assignment remains accepted. Without ownership transfer, both
+transitions advance the assignment revision exactly once, while revision
+exhaustion fails before any durable write.
+
+Eligibility requires the authenticated current Main Agent and active exact
+controller claim, current assignment revision and worker incarnation, durably
+running process identity, authoritative idle activity, exact assignment-derived
+worker claim, authoritative broker, and zero active or uncertain operations.
+The session-record and activity locks remain held through the coordination seal.
+Under that seal the command atomically persists a strict progress receipt and
+per-assignment claim-revocation reservation. The reservation blocks every
+competing assignment mutation.
+
+The command persists the session authority quarantine after the reservation
+and before exposing either crash boundary or applying the target-only seal.
+That durable fence blocks resume, bootstrap, broker provisioning, claim
+acquisition, checkpointing, and operation admission while the retained process
+still exists. The seal then releases that worker claim, stops its broker, and
+removes its capability. A crash after the reservation or seal is recovered only
+by the identical request and idempotency key; supervision reports
+`idle_claim_revocation_in_progress` with the exact replay argv even if the
+runtime or activity evidence later drifts. Replay may rely on persisted
+admission evidence only after the exact session authority quarantine exists.
+If execution stopped after the reservation save but before that fence, replay
+must re-prove the unchanged authoritative idle activity revision and running
+runtime identity before persisting it. Otherwise it returns
+`worker-claim-revocation-evidence-drift` without creating the quarantine or
+changing either registry; the operator must restore a provably matching safe
+boundary or retain the reservation for explicit recovery. Missing-fence replay
+also revalidates the assignment-derived claim before writing the quarantine. A
+matching claim may still be active, or it may already be released while the
+same authoritative broker and quiescent worker remain; a different active
+claim fails with `worker-claim-mismatch` and leaves the quarantine absent.
+Finalization clears the reservation,
+preserves the session and worktree, and stores
+`main-agent.worker-revoke-claim-result.v1`. Stopped or unknown runtime evidence
+on a fresh request is rejected and remains owned by `worker reconcile-stopped`.
+
+If the reservation controller is no longer live, orphan `adopt` MAY transfer
+the exact reservation and progress receipt to an authenticated active successor
+Main. The worker, request digest, original idempotency key, original requested
+revision, persisted activity/runtime proof, and session authority quarantine
+identity MUST remain unchanged. Each successful ownership transfer advances
+the assignment revision monotonically; terminal replay still uses the original
+requested revision and does not add another revision after the transfer. A
+crash before the atomic registry save leaves the prior owner authoritative, so
+the unchanged adoption can be retried. If the controller crashed after the
+reservation save but before quarantine persistence, adoption MAY reconstruct
+that exact quarantine only while holding the worker lifecycle and activity
+locks plus a matching active worker-claim seal. The current provider boundary,
+runtime identity, assignment-derived claim, broker, and operation quiescence
+MUST still match the persisted proof; drift fails closed. Concurrent identical
+calls MUST re-read the receipt after acquiring the exact worker lifecycle lock:
+a waiter adopts matching progress or returns the matching terminal result even
+when both calls initially observed no receipt.
 
 ### Post-claim stopped-worker terminalization
 

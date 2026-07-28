@@ -385,8 +385,11 @@ progress. Existing classifications use
 `main-agent.worker-supervise-result.v2` and
 `main-agent.worker-recovery-action.v2`. The additive
 `account_handoff_in_flight`, `readiness_stop_required`, and
-`readiness_stop_in_progress` classifications use the corresponding v3
-envelopes. Branch on `classification`, never on prose:
+`readiness_stop_in_progress` classifications use the corresponding closed v3
+envelopes. `idle_claim_revocation_required` and
+`idle_claim_revocation_in_progress` use the v4 envelopes with an explicit
+`claim_revocation.in_flight` projection. Branch on `classification`, never on
+prose:
 
 | Classification | Deterministic action |
 | --- | --- |
@@ -399,6 +402,8 @@ envelopes. Branch on `classification`, never on prose:
 | `account_handoff_in_flight` | Complete the reserved account handoff or execute its typed `worker account-handoff-cancel` action before any readiness stop. |
 | `readiness_stop_required` | Execute the returned Main-owned exact argv for `worker stop-runtime`. It sends no provider input and preserves state; then re-supervise and use guarded pre-claim cancellation. |
 | `readiness_stop_in_progress` | Execute the returned exact replay argv. It contains the original privately retained idempotency key and cannot send provider input. |
+| `idle_claim_revocation_required` | Execute the returned Main-owned exact argv for `worker revoke-claim`. It fences only a durably running, authoritative-idle exact worker and sends no provider input. |
+| `idle_claim_revocation_in_progress` | Replay only the returned exact argv and original idempotency key. Its assignment reservation blocks every competing lifecycle mutation. |
 | `uncertain_mutation` | Preserve the exact worker and reconcile the operation. Do not cancel, retire, or reassign. |
 | `coordination_broker_stale` | Route to the exact worker's authenticated broker owner. Do not copy its capability or renew its claim as a substitute. |
 | `edit_authority_stale` | Preserve the exact worker and perform a bounded supervision recheck; route only durable broker-lost evidence to broker recovery. |
@@ -412,7 +417,7 @@ envelopes. Branch on `classification`, never on prose:
 | `safe_reassignment` | Start only a distinct assignment/session and clean worktree. Never reuse the old prompt. |
 
 `worker diagnose` returns the same evidence without the supervisor wrapper. It
-uses v3 for the same three additive classifications listed above and v2
+uses v3 for the same five additive classifications listed above and v2
 otherwise:
 
 ```bash
@@ -653,6 +658,72 @@ required. If the send remains `attempting` or `sent`, do not stop the live
 runtime or inject input; preserve the fence. Only after the exact runtime has
 stopped may `worker reconcile-recovery` terminalize that unknown send.
 
+If the worker runtime is still durably running and the provider has
+authoritatively returned to an idle turn boundary but the assignment-derived
+claim remains active, supervision returns `idle_claim_revocation_required`.
+This classification and its in-progress replay use the v4 diagnose, supervise,
+and recovery-action envelopes with an explicit
+`claim_revocation.in_flight` projection; the existing closed v3 runtime-stop
+contract is unchanged.
+Execute its exact argv:
+
+```bash
+main-agent worker revoke-claim ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --reason "authoritative provider turn ended without worker claim release" \
+  --idempotency-key revoke-claim-001 \
+  --format json
+```
+
+The command requires the exact running process identity, activity boundary,
+claim, broker, revision, incarnation, and zero active/uncertain operations. It
+holds the session and activity locks through a target-only coordination seal,
+and persists a per-assignment reservation with its progress receipt before the
+seal. That reservation makes every competing assignment mutation return
+`worker-claim-revocation-in-flight`. If supervision reports
+`idle_claim_revocation_in_progress`, replay only its returned argv.
+
+The command writes the session authority quarantine after the reservation and
+before either crash boundary or the seal. That durable fence rejects resume,
+bootstrap, broker provisioning, claim acquisition, checkpointing, and operation
+admission while the retained process still exists. The seal then removes the
+exact worker capability, stops its broker, and releases its claim. Exact replay
+after a crash may use the persisted admission proof across later runtime or
+activity drift only when the exact authority quarantine is already durable. A
+replay from the reservation-only gap must first re-prove the same idle activity
+revision and running runtime identity before writing that fence.
+`worker-claim-revocation-evidence-drift` means those identities changed; it
+leaves the quarantine and registries untouched and is not an instruction to
+retry against the new evidence. The same recovery guard checks the exact
+assignment-derived claim before persisting the fence. It accepts an unchanged
+active claim or an already released claim with the same authoritative broker
+and quiescent worker, but a different active claim returns
+`worker-claim-mismatch` without fencing the session. A sealed replay then
+converges without a second revocation. It produces one revision advance and one
+terminal receipt. A `working` assignment becomes
+`cancelled`; an `accepted` assignment remains accepted and can be retired
+normally. Session metadata and the managed worktree are preserved, and
+`input_sent:false` proves that no prompt, paste, Enter, or provider-exit command
+was used. On a fresh request, `worker-runtime-stopped` routes to
+`worker reconcile-stopped`; `coordination-runtime-unverified` fails closed.
+
+If the recorded Main becomes unavailable while the reservation is in progress,
+an authenticated active successor may run revision-fenced orphan `adopt`.
+Adoption transfers only the exact worker, original request and idempotency key,
+persisted admission proof, progress receipt, and authority-quarantine identity.
+It advances the ownership revision but leaves the original revoke revision
+fixed; replay the supervision-provided argv with that original revision.
+A crash before the adoption registry save leaves the prior owner intact and
+the same adoption remains retryable. If the prior controller died between the
+reservation save and quarantine write, the successor reconstructs the exact
+fence only after re-proving the unchanged idle activity revision, running
+runtime identity, assignment-derived claim, authoritative broker, and operation
+quiescence under the worker lifecycle/activity/coordination guards. Drift
+fails closed. Concurrent identical revoke calls re-read the receipt after the
+lifecycle lock; a waiter that initially saw no receipt adopts the winner's
+progress, while a waiter behind finalization returns the one terminal receipt.
+
 If instead the worker already reached `working` — bootstrap acquired its
 assignment-derived claim — and then its exact runtime died, supervision returns
 `post_claim_failure`. Do not reach for `worker cancel`, `worker reassign`, or
@@ -825,8 +896,9 @@ The normal successful path is `submitted -> accepted -> released`.
 `cancelled` is reachable only through guarded `worker cancel` for a proven
 failed pre-claim assignment with no claim and no active/uncertain operation, or
 through guarded `worker reconcile-stopped` for a `working` assignment whose exact
-worker runtime is durably stopped. Never synthesize cancellation by editing the
-private registry.
+worker runtime is durably stopped, or through guarded `worker revoke-claim` for
+a durably running authoritative-idle worker whose exact assignment-derived claim
+remains active. Never synthesize cancellation by editing the private registry.
 
 ### 6. Delete the released worker
 

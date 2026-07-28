@@ -321,6 +321,10 @@ pub(crate) struct StoppedWorkerTerminalizationGuard {
     worker_claim_observed: bool,
 }
 
+pub(crate) struct WorkerClaimRevocationGuard {
+    seal: WorkerAuthoritySealGuard,
+}
+
 pub(crate) struct WorkerRuntimeStopGuard {
     seal: WorkerAuthoritySealGuard,
 }
@@ -404,6 +408,15 @@ impl StoppedWorkerTerminalizationGuard {
 
     /// Seal only the exact stopped worker while the exact active, unexpired
     /// controller claim remains unchanged under this same registry lock.
+    pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
+        self.seal.seal(context)
+    }
+}
+
+impl WorkerClaimRevocationGuard {
+    /// Fence only the exact idle worker while the admitted controller claim,
+    /// assignment-derived worker claim, and zero-operation proof remain bound
+    /// to this one coordination registry lock.
     pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
         self.seal.seal(context)
     }
@@ -629,6 +642,98 @@ pub(crate) fn lock_stopped_worker_terminalization(
         seal,
         worker_claim_observed,
     })
+}
+
+pub(crate) fn lock_worker_claim_revocation(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    worker_incarnation: &str,
+    expected_work_context: &context::WorkContextInput,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+) -> Result<WorkerClaimRevocationGuard, CliError> {
+    lock_worker_claim_revocation_inner(
+        context,
+        worker_record,
+        worker_incarnation,
+        expected_work_context,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        true,
+    )
+}
+
+pub(crate) fn lock_worker_claim_revocation_replay(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    worker_incarnation: &str,
+    expected_work_context: &context::WorkContextInput,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+) -> Result<WorkerClaimRevocationGuard, CliError> {
+    lock_worker_claim_revocation_inner(
+        context,
+        worker_record,
+        worker_incarnation,
+        expected_work_context,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lock_worker_claim_revocation_inner(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    worker_incarnation: &str,
+    expected_work_context: &context::WorkContextInput,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+    require_active_worker_claim: bool,
+) -> Result<WorkerClaimRevocationGuard, CliError> {
+    let (seal, worker_claim_observed) = lock_worker_authority_seal(
+        context,
+        &worker_record.id,
+        worker_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        true,
+        true,
+    )?;
+    if require_active_worker_claim && !worker_claim_observed {
+        return Err(CliError::data(
+            "claim-not-active",
+            "the exact worker has no active claim to revoke",
+            None,
+        ));
+    }
+    match claims::main_agent_worker_claim_match_in_registry(
+        context,
+        &seal.locked.registry,
+        worker_record,
+        worker_incarnation,
+        expected_work_context,
+    )? {
+        Some(true) => Ok(WorkerClaimRevocationGuard { seal }),
+        Some(false) => Err(CliError::data(
+            "worker-claim-mismatch",
+            "Main Agent claim revocation requires the exact assignment-derived worker claim",
+            None,
+        )),
+        None if require_active_worker_claim => Err(CliError::data(
+            "claim-not-active",
+            "the exact worker has no active claim to revoke",
+            None,
+        )),
+        None => Ok(WorkerClaimRevocationGuard { seal }),
+    }
 }
 
 pub(crate) fn lock_session_quiescence(
