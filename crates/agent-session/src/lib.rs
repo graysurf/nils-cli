@@ -6698,15 +6698,36 @@ enum SessionTerminationOperation {
     Delete,
     Resume,
     FailedLaunch,
+    RuntimeStop,
 }
 
 impl SessionTerminationOperation {
     fn retry_action(self) -> &'static str {
         match self {
             Self::Resume => "retry-resume",
+            Self::RuntimeStop => "retry-runtime-stop",
             Self::Delete | Self::FailedLaunch => "retry-delete",
         }
     }
+}
+
+pub(crate) fn stop_session_runtime_locked(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    terminate_tmux_session_with_timeouts(
+        context,
+        record,
+        tmux_bin,
+        None,
+        PANE_INPUT_COMMAND_TIMEOUT,
+        DELETE_TERMINATION_VERIFY_TIMEOUT,
+        true,
+    )
+    .map_err(|reason| {
+        session_termination_error(record, reason, SessionTerminationOperation::RuntimeStop)
+    })
 }
 
 impl SessionTerminationFailure {

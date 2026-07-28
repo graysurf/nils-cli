@@ -381,10 +381,12 @@ main-agent worker supervise ASSIGNMENT_ID --format json
 
 It combines the durable assignment with privacy-safe provider activity, claim,
 active/uncertain operation counts, exact worker identity, and clean-worktree
-progress. The public envelope is
-`main-agent.worker-supervise-result.v2`; its `recovery_action` uses
-`main-agent.worker-recovery-action.v2`. Branch on `classification`, never on
-prose:
+progress. Existing classifications use
+`main-agent.worker-supervise-result.v2` and
+`main-agent.worker-recovery-action.v2`. The additive
+`account_handoff_in_flight`, `readiness_stop_required`, and
+`readiness_stop_in_progress` classifications use the corresponding v3
+envelopes. Branch on `classification`, never on prose:
 
 | Classification | Deterministic action |
 | --- | --- |
@@ -394,6 +396,9 @@ prose:
 | `worker_unreachable` | Preserve the assignment and investigate the missing bound worker. Do not infer safe reassignment from absence alone. |
 | `pre_claim_failure` | When `reassignment_safe:true`, cancel/retire or use `worker reassign`; otherwise preserve the worker. |
 | `post_claim_failure` | The worker held its assignment-derived claim before its runtime died. Run revision-fenced `worker reconcile-stopped`, then retire. `worker cancel` and `worker reassign` refuse this state by design. |
+| `account_handoff_in_flight` | Complete the reserved account handoff or execute its typed `worker account-handoff-cancel` action before any readiness stop. |
+| `readiness_stop_required` | Execute the returned Main-owned exact argv for `worker stop-runtime`. It sends no provider input and preserves state; then re-supervise and use guarded pre-claim cancellation. |
+| `readiness_stop_in_progress` | Execute the returned exact replay argv. It contains the original privately retained idempotency key and cannot send provider input. |
 | `uncertain_mutation` | Preserve the exact worker and reconcile the operation. Do not cancel, retire, or reassign. |
 | `coordination_broker_stale` | Route to the exact worker's authenticated broker owner. Do not copy its capability or renew its claim as a substitute. |
 | `edit_authority_stale` | Preserve the exact worker and perform a bounded supervision recheck; route only durable broker-lost evidence to broker recovery. |
@@ -406,8 +411,9 @@ prose:
 | `submitted_or_waiting_without_checkpoint` | Do not resend the prompt or inject Enter. Reassign only when the returned safety evidence permits it. |
 | `safe_reassignment` | Start only a distinct assignment/session and clean worktree. Never reuse the old prompt. |
 
-`worker diagnose` returns the same evidence without the supervisor wrapper in
-`main-agent.worker-diagnose-result.v2`:
+`worker diagnose` returns the same evidence without the supervisor wrapper. It
+uses v3 for the same three additive classifications listed above and v2
+otherwise:
 
 ```bash
 main-agent worker diagnose ASSIGNMENT_ID --format json
@@ -599,6 +605,53 @@ checkpoint result unless a newer worker checkpoint already proves input was
 consumed. Success requires that newer authenticated checkpoint from the
 reserved worker; later accepted, released, or relationship revisions do not
 invalidate the worker-authored proof.
+
+If instead the final durable worker-start receipt proves
+`worker-checkpoint-timeout`, the recovery is terminal rather than unknown, and
+the exact worker runtime remains live without a claim or operation,
+supervision returns `readiness_stop_required` with a complete executable argv.
+Run that argv, or equivalently:
+
+```bash
+main-agent worker stop-runtime ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key stop-runtime-001 \
+  --format json
+```
+
+This is a Main-owned stop-only lifecycle action, not provider input. It
+revalidates the exact controller, run, manager, assignment revision, worker
+incarnation, final readiness receipt, absent worker claim, quiescent
+operations, no account-handoff reservation, and live verified runtime. It
+briefly holds both registries to persist the session-owned exact-worker fence
+before the assignment stopping reservation, then revokes only that worker's
+broker capability. It releases those global locks before terminating the exact
+tmux/cgroup/process boundary under the session lifecycle lock. The assignment remains `starting` at the same revision
+with its session record and managed worktree. A session-owned fence denies all
+resume and worker-authority restoration until `retire` deletes that exact
+stopped session. While its state is `in_progress`, it also blocks ownership,
+revision, and relationship mutations, including handoff and adopt. Verified
+termination advances the fence to `stopped` before the assignment reservation
+is cleared. If the recorded Main is no longer live after reservation, an
+authenticated active successor may use orphan `adopt`; it transfers only the
+exact worker, request digest, original idempotency key, progress receipt, and
+fence replay authority. It does not restore worker authority or authorize a
+different stop request. If that successor also becomes unavailable, repeat
+orphan `adopt`; only the ownership revision advances while the original stop
+revision remains fixed. If a successor disappears after the session fence
+rebind but before the registry commit, a later successor may replace it only
+after proving that pending controller is unavailable. Exact replay is idempotent.
+Re-run `worker supervise`; the stopped lane must now be
+`pre_claim_failure`, after which revision-fenced `worker cancel` followed by
+`retire`, or a distinct safe `reassign`, completes the ordinary pre-claim
+lifecycle.
+
+Never infer this action from `submit_recovery.state: failed` alone. The final
+worker-start receipt and its exact `worker-checkpoint-timeout` proof are
+required. If the send remains `attempting` or `sent`, do not stop the live
+runtime or inject input; preserve the fence. Only after the exact runtime has
+stopped may `worker reconcile-recovery` terminalize that unknown send.
 
 If instead the worker already reached `working` — bootstrap acquired its
 assignment-derived claim — and then its exact runtime died, supervision returns

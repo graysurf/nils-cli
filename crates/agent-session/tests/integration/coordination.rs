@@ -1030,6 +1030,17 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
             ][..],
         ),
         (
+            &["worker", "stop-runtime", "--help"][..],
+            &[
+                "exact live runtime",
+                "durably exhausted",
+                "preserving the assignment, session, and worktree",
+                "exact worker incarnation",
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+        (
             &["worker", "guidance-reconcile", "--help"][..],
             &[
                 "unread guidance",
@@ -9648,6 +9659,23 @@ impl Drop for KillChild {
     }
 }
 
+fn terminate_at_barrier(child: Child, label: &str) {
+    let mut child = KillChild(Some(child));
+    child
+        .0
+        .as_mut()
+        .expect(label)
+        .kill()
+        .unwrap_or_else(|error| panic!("kill {label}: {error}"));
+    child
+        .0
+        .as_mut()
+        .expect(label)
+        .wait()
+        .unwrap_or_else(|error| panic!("wait {label}: {error}"));
+    child.0 = None;
+}
+
 fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Value {
     let mut stream = TcpStream::connect(address).expect("connect HTTP server");
     let request = format!(
@@ -9666,6 +9694,1289 @@ fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Va
         .map(|index| &response[index + 4..])
         .expect("HTTP response body");
     serde_json::from_slice(body).expect("HTTP JSON response")
+}
+
+struct ExhaustedReadinessRuntimeStopFixture {
+    tmp: tempfile::TempDir,
+    state_dir: PathBuf,
+    state_arg: String,
+    main_checkout: PathBuf,
+    worker_checkout: PathBuf,
+    main_capability: String,
+    main_two_capability: String,
+    main_three_capability: String,
+    main_four_capability: String,
+    worker_start_receipt: serde_json::Value,
+    runtime: TestProcessGroup,
+    tmux_log: PathBuf,
+    tmux_arg: String,
+    tmux_log_arg: String,
+    runtime_pid_arg: String,
+    state_runtime_arg: String,
+}
+
+impl ExhaustedReadinessRuntimeStopFixture {
+    fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state_arg = state_dir.to_string_lossy().into_owned();
+        let main_checkout = tmp.path().join("main-checkout");
+        let worker_checkout = tmp.path().join("worker-checkout");
+        fs::create_dir(&state_dir).expect("state");
+        init_checkout(
+            &main_checkout,
+            "https://example.invalid/example/repository.git",
+        );
+        init_checkout(
+            &worker_checkout,
+            "https://example.invalid/example/repository.git",
+        );
+        seed_brokers_at(
+            &state_dir,
+            &[
+                (
+                    "main-one",
+                    "main-incarnation-one",
+                    "main-private-capability-b3-runtime-stop",
+                    main_checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "worker-exhausted",
+                    "worker-exhausted-incarnation",
+                    "worker-private-capability-b3-runtime-stop",
+                    worker_checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "main-two",
+                    "main-incarnation-two",
+                    "main-private-capability-b3-runtime-stop-two",
+                    main_checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "main-three",
+                    "main-incarnation-three",
+                    "main-private-capability-b3-runtime-stop-three",
+                    main_checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "main-four",
+                    "main-incarnation-four",
+                    "main-private-capability-b3-runtime-stop-four",
+                    main_checkout.as_path(),
+                    Some("enforce"),
+                ),
+            ],
+        );
+        let main_capability = init_main_run(
+            tmp.path(),
+            &state_dir,
+            &main_checkout,
+            "main-one",
+            "run-one",
+        );
+        seed_active_claim(
+            &state_dir,
+            "main-two",
+            "main-incarnation-two",
+            "main-two-claim",
+        );
+        let main_two_capability = capability(&state_dir, "main-two");
+        seed_active_claim(
+            &state_dir,
+            "main-three",
+            "main-incarnation-three",
+            "main-three-claim",
+        );
+        let main_three_capability = capability(&state_dir, "main-three");
+        seed_active_claim(
+            &state_dir,
+            "main-four",
+            "main-incarnation-four",
+            "main-four-claim",
+        );
+        let main_four_capability = capability(&state_dir, "main-four");
+        rewrite_orchestration_registry(&state_dir, |registry| {
+            let mut controller = registry["runs"]["run-one"]["controller"].clone();
+            controller["session_id"] = json!("main-two");
+            controller["session_incarnation"] = json!("main-incarnation-two");
+            registry["runs"]["run-two"] = json!({
+                "schema_version": "agent-session.orchestration-run.v1",
+                "run_id": "run-two",
+                "revision": 1,
+                "state": "active",
+                "tier": "L0",
+                "objective_summary": "Runtime stop ownership transfer fence",
+                "objective_packet_digest":
+                    registry["runs"]["run-one"]["objective_packet_digest"].clone(),
+                "controller": controller,
+                "durable_refs": [],
+                "checkpoint": null,
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:00Z"
+            });
+            controller["session_id"] = json!("main-three");
+            controller["session_incarnation"] = json!("main-incarnation-three");
+            registry["runs"]["run-three"] = json!({
+                "schema_version": "agent-session.orchestration-run.v1",
+                "run_id": "run-three",
+                "revision": 1,
+                "state": "active",
+                "tier": "L0",
+                "objective_summary": "Repeated runtime stop ownership transfer fence",
+                "objective_packet_digest":
+                    registry["runs"]["run-one"]["objective_packet_digest"].clone(),
+                "controller": controller,
+                "durable_refs": [],
+                "checkpoint": null,
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:00Z"
+            });
+            controller["session_id"] = json!("main-four");
+            controller["session_incarnation"] = json!("main-incarnation-four");
+            registry["runs"]["run-four"] = json!({
+                "schema_version": "agent-session.orchestration-run.v1",
+                "run_id": "run-four",
+                "revision": 1,
+                "state": "active",
+                "tier": "L0",
+                "objective_summary": "Partial runtime stop transfer recovery",
+                "objective_packet_digest":
+                    registry["runs"]["run-one"]["objective_packet_digest"].clone(),
+                "controller": controller,
+                "durable_refs": [],
+                "checkpoint": null,
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:00Z"
+            });
+        });
+        let assignment_packet = json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-exhausted",
+            "task_summary": "Readiness exhausted before worker bootstrap",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": "worker-exhausted",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/exhausted"],
+            "durable_refs": []
+        });
+        insert_orchestration_assignment(
+            &state_dir,
+            "assignment-exhausted",
+            json!({
+                "schema_version": "agent-session.orchestration-assignment.v1",
+                "assignment_id": "assignment-exhausted",
+                "run_id": "run-one",
+                "revision": 3,
+                "state": "starting",
+                "task_summary": "Readiness exhausted before worker bootstrap",
+                "private_packet_digest": "replaced-by-fixture",
+                "primary_manager": {
+                    "session_id": "main-one",
+                    "session_incarnation": "main-incarnation-one",
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                },
+                "worker": {
+                    "session_id": "worker-exhausted",
+                    "session_incarnation": "worker-exhausted-incarnation",
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                },
+                "collaborators": [],
+                "borrowed_by": [],
+                "repository": "example/repository",
+                "worktree": worker_checkout,
+                "base_ref": "main",
+                "scopes": ["docs/exhausted"],
+                "durable_refs": [],
+                "checkpoint": null,
+                "result_summary": null,
+                "blocker_summary": null,
+                "submit_recovery": {
+                    "schema_version": "main-agent.submit-recovery.v1",
+                    "attempt_id": "b3-exhausted-attempt",
+                    "origin": "automatic",
+                    "run_id": "run-one",
+                    "controller": {
+                        "session_id": "main-one",
+                        "session_incarnation": "main-incarnation-one",
+                        "session_created_at": "2030-01-01T00:00:00Z"
+                    },
+                    "session_incarnation": "worker-exhausted-incarnation",
+                    "reserved_revision": 3,
+                    "state": "failed",
+                    "attempt_count": 1,
+                    "result": "checkpoint-timeout",
+                    "attempted_at": "2030-01-01T00:00:01Z",
+                    "updated_at": "2030-01-01T00:00:02Z"
+                },
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:02Z"
+            }),
+            &assignment_packet,
+        );
+        let unrelated_packet = json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-unrelated",
+            "task_summary": "Unrelated submitted lane",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": null,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/unrelated"],
+            "durable_refs": []
+        });
+        insert_orchestration_assignment(
+            &state_dir,
+            "assignment-unrelated",
+            json!({
+                "schema_version": "agent-session.orchestration-assignment.v1",
+                "assignment_id": "assignment-unrelated",
+                "run_id": "run-one",
+                "revision": 1,
+                "state": "submitted",
+                "task_summary": "Unrelated submitted lane",
+                "private_packet_digest": "replaced-by-fixture",
+                "primary_manager": {
+                    "session_id": "main-one",
+                    "session_incarnation": "main-incarnation-one",
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                },
+                "worker": null,
+                "collaborators": [],
+                "borrowed_by": [],
+                "repository": "example/repository",
+                "worktree": worker_checkout,
+                "base_ref": "main",
+                "scopes": ["docs/unrelated"],
+                "durable_refs": [],
+                "checkpoint": null,
+                "result_summary": "Reviewed unrelated result",
+                "blocker_summary": null,
+                "submit_recovery": null,
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:00Z"
+            }),
+            &unrelated_packet,
+        );
+        let worker_start_receipt = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-start",
+            "request_digest": "b3-worker-start-request",
+            "outcome": {
+                "schema_version": "main-agent.worker-start-result.v1",
+                "assignment": {
+                    "assignment_id": "assignment-exhausted",
+                    "revision": 3,
+                    "state": "starting"
+                },
+                "worker": {
+                    "session_id": "worker-exhausted",
+                    "session_incarnation": "worker-exhausted-incarnation"
+                },
+                "readiness": {
+                    "state": "readiness_failed",
+                    "assignment_state": "starting",
+                    "worker_launched": true,
+                    "delivery": {
+                        "state": "unverified",
+                        "transport_state": "submit-key-recovery-succeeded",
+                        "proof": "worker-checkpoint-timeout"
+                    },
+                    "submit_key_recovery": {
+                        "eligible": true,
+                        "attempted": true,
+                        "attempt_count": 1,
+                        "result": "checkpoint-timeout"
+                    },
+                    "automatic_retry_safe": false
+                }
+            },
+            "created_at_epoch": 1
+        });
+        rewrite_orchestration_registry(&state_dir, |registry| {
+            registry["receipts"]["main-one:main-incarnation-one:b3-worker-start"] =
+                worker_start_receipt.clone();
+        });
+
+        let runtime = seed_live_runtime_identity(
+            &state_dir,
+            "worker-exhausted",
+            "worker-exhausted-incarnation",
+            77,
+        );
+        let runtime_pid_arg = runtime.pid().to_string();
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+        let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+        let state_runtime_arg = state_dir.to_string_lossy().into_owned();
+        Self {
+            tmp,
+            state_dir,
+            state_arg,
+            main_checkout,
+            worker_checkout,
+            main_capability,
+            main_two_capability,
+            main_three_capability,
+            main_four_capability,
+            worker_start_receipt,
+            runtime,
+            tmux_log,
+            tmux_arg,
+            tmux_log_arg,
+            runtime_pid_arg,
+            state_runtime_arg,
+        }
+    }
+
+    fn envs(&self) -> [(&str, &str); 10] {
+        [
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                self.main_capability.as_str(),
+            ),
+            ("AGENT_SESSION_TMUX_BIN", self.tmux_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", self.tmux_log_arg.as_str()),
+            (
+                "AGENT_SESSION_FAKE_TMUX_PANE_PID",
+                self.runtime_pid_arg.as_str(),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+                self.runtime_pid_arg.as_str(),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
+                "worker-exhausted",
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_STATE_DIR",
+                self.state_runtime_arg.as_str(),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+                "worker-exhausted-incarnation",
+            ),
+        ]
+    }
+
+    fn stop_args(&self) -> [&str; 13] {
+        [
+            "--state-dir",
+            self.state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-0001",
+            "--format",
+            "json",
+        ]
+    }
+
+    fn spawn_stop_at(&self, stage: &str, barrier: &Path) -> Child {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .args(self.stop_args())
+            .current_dir(&self.main_checkout)
+            .env("NILS_AGENT_SESSION_TEST_RUNTIME_STOP_BARRIER_STAGE", stage)
+            .env("NILS_AGENT_SESSION_TEST_RUNTIME_STOP_BARRIER_DIR", barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in self.envs() {
+            command.env(key, value);
+        }
+        command.spawn().expect("spawn runtime stop")
+    }
+}
+
+#[test]
+fn runtime_stop_projects_typed_executable_action() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let supervised = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "worker",
+            "supervise",
+            "assignment-exhausted",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["schema_version"],
+        "main-agent.worker-supervise-result.v3"
+    );
+    assert_eq!(
+        data(&supervised)["classification"],
+        "readiness_stop_required"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["kind"],
+        "exact_worker_runtime_stop"
+    );
+    assert_eq!(data(&supervised)["recovery_action"]["executable"], true);
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["runtime_stop"]["in_flight"],
+        false
+    );
+}
+
+#[test]
+fn runtime_stop_marker_first_crash_fences_worker_claim_and_is_adoptable() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let barrier = fixture.tmp.path().join("runtime-stop-marker-first");
+    let child = fixture.spawn_stop_at("after_session_fence", &barrier);
+    wait_for_barrier(&barrier);
+    terminate_at_barrier(child, "marker-first runtime stop");
+
+    let registry = orchestration_registry(&fixture.state_dir);
+    assert!(
+        registry["assignments"]["assignment-exhausted"]["runtime_stop"].is_null(),
+        "the session fence must commit before the orchestration reservation"
+    );
+    assert!(
+        registry["receipts"]["main-one:main-incarnation-one:b3-stop-runtime-0001"].is_null(),
+        "the session fence must commit before the progress receipt"
+    );
+    let handoff = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "handoff",
+            "assignment-exhausted",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "marker-first-handoff-0001",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(handoff.code, 69);
+    assert_eq!(
+        handoff.stdout_json()["error"]["code"],
+        "worker-runtime-stop-in-flight"
+    );
+
+    let main_session = fixture.state_dir.join("sessions/main-one");
+    let stale_main_session = fixture.state_dir.join("stale-main-one");
+    fs::rename(&main_session, &stale_main_session).expect("make prior manager orphaned");
+    let adopt = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "adopt",
+            "assignment-exhausted",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "marker-first-adopt-0001",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_two_capability.as_str(),
+        )],
+    );
+    assert_eq!(adopt.code, 69);
+    assert_eq!(
+        adopt.stdout_json()["error"]["code"],
+        "worker-runtime-stop-in-flight"
+    );
+    fs::rename(&stale_main_session, &main_session).expect("restore original manager");
+
+    let worker_claim_candidate = fixture.tmp.path().join("marker-first-worker-claim.json");
+    candidate(
+        &worker_claim_candidate,
+        "docs/exhausted",
+        "Marker-first runtime stop must reject worker mutation authority",
+    );
+    let claim = run(
+        &fixture.worker_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "work-context",
+            "claim",
+            "--session",
+            "worker-exhausted",
+            "--file",
+            worker_claim_candidate.to_str().expect("candidate path"),
+            "--capability-file",
+            &capability(&fixture.state_dir, "worker-exhausted"),
+            "--idempotency-key",
+            "marker-first-worker-claim-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(claim.code, 65);
+    assert_eq!(
+        claim.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+
+    let stopped = run_main_agent(
+        &fixture.main_checkout,
+        &fixture.stop_args(),
+        &fixture.envs(),
+    );
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert_eq!(data(&stopped)["runtime_stopped"], true);
+}
+
+#[test]
+fn runtime_stop_releases_global_registries_after_authority_seal() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let barrier = fixture.tmp.path().join("runtime-stop-authority-seal");
+    let child = fixture.spawn_stop_at("after_authority_seal", &barrier);
+    wait_for_barrier(&barrier);
+
+    let fenced = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "worker",
+            "accept",
+            "assignment-exhausted",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "fenced-accept-0001",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(fenced.code, 69);
+    assert_eq!(
+        fenced.stdout_json()["error"]["code"],
+        "worker-runtime-stop-in-flight"
+    );
+    let unrelated = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "worker",
+            "accept",
+            "assignment-unrelated",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "unrelated-accept-0001",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(unrelated.code, 0, "outcome={}", unrelated.stdout_text());
+    terminate_at_barrier(child, "authority-sealed runtime stop");
+}
+
+#[test]
+fn runtime_stop_crash_after_authority_seal_replays_exactly() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let barrier = fixture.tmp.path().join("runtime-stop-sealed-crash");
+    let child = fixture.spawn_stop_at("after_authority_seal", &barrier);
+    wait_for_barrier(&barrier);
+    assert!(fixture.runtime.is_running());
+    terminate_at_barrier(child, "authority-sealed runtime stop");
+
+    let supervised = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "worker",
+            "supervise",
+            "assignment-exhausted",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(
+        data(&supervised)["classification"],
+        "readiness_stop_in_progress"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][9],
+        "b3-stop-runtime-0001"
+    );
+    let stopped = run_main_agent(
+        &fixture.main_checkout,
+        &fixture.stop_args(),
+        &fixture.envs(),
+    );
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert!(!fixture.runtime.is_running());
+}
+
+fn assert_runtime_stop_orphan_recovery(stage: &str) {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let barrier = fixture
+        .tmp
+        .path()
+        .join(format!("runtime-stop-orphan-{stage}"));
+    let child = fixture.spawn_stop_at(stage, &barrier);
+    wait_for_barrier(&barrier);
+    terminate_at_barrier(child, "orphaned runtime stop");
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-one"),
+        fixture.state_dir.join("stale-main-one"),
+    )
+    .expect("make original runtime-stop controller unavailable");
+    let successor_env = [(
+        "AGENT_SESSION_CAPABILITY_FILE",
+        fixture.main_two_capability.as_str(),
+    )];
+    let adopted = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "adopt",
+            "assignment-exhausted",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            &format!("orphan-runtime-stop-adopt-{stage}"),
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(adopted.code, 0, "outcome={}", adopted.stdout_text());
+    assert_eq!(data(&adopted)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&adopted)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+
+    let mut replay_env = fixture.envs().to_vec();
+    replay_env[0] = (
+        "AGENT_SESSION_CAPABILITY_FILE",
+        fixture.main_two_capability.as_str(),
+    );
+    if stage == "after_runtime_stop" {
+        replay_env.push(("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"));
+    }
+    let replay = run_main_agent(&fixture.main_checkout, &fixture.stop_args(), &replay_env);
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay)["runtime_stopped"], true);
+    assert_eq!(data(&replay)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&replay)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+}
+
+#[test]
+fn runtime_stop_orphan_after_authority_seal_transfers_exact_replay() {
+    assert_runtime_stop_orphan_recovery("after_authority_seal");
+}
+
+#[test]
+fn runtime_stop_orphan_after_process_stop_transfers_finalization_only() {
+    assert_runtime_stop_orphan_recovery("after_runtime_stop");
+}
+
+#[test]
+fn runtime_stop_partial_fence_rebind_survives_pending_successor_loss() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let stop_barrier = fixture.tmp.path().join("runtime-stop-repeat-orphan");
+    let child = fixture.spawn_stop_at("after_authority_seal", &stop_barrier);
+    wait_for_barrier(&stop_barrier);
+    terminate_at_barrier(child, "initial orphaned runtime stop");
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-one"),
+        fixture.state_dir.join("stale-main-one"),
+    )
+    .expect("make initial runtime-stop controller unavailable");
+    let first_adopt = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "adopt",
+            "assignment-exhausted",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "runtime-stop-adopt-main-two",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_two_capability.as_str(),
+        )],
+    );
+    assert_eq!(first_adopt.code, 0, "outcome={}", first_adopt.stdout_text());
+    assert_eq!(data(&first_adopt)["assignment"]["revision"], 4);
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-two"),
+        fixture.state_dir.join("stale-main-two"),
+    )
+    .expect("make first successor unavailable");
+    let adopt_barrier = fixture.tmp.path().join("runtime-stop-adopt-rebind");
+    let second_adopt_args = [
+        "--state-dir",
+        fixture.state_arg.as_str(),
+        "adopt",
+        "assignment-exhausted",
+        "--if-revision",
+        "4",
+        "--idempotency-key",
+        "runtime-stop-adopt-main-three",
+        "--format",
+        "json",
+    ];
+    let mut second_adopt = Command::new(bin::resolve("main-agent"));
+    second_adopt
+        .current_dir(&fixture.main_checkout)
+        .args(second_adopt_args)
+        .env(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_three_capability.as_str(),
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_RUNTIME_STOP_ADOPT_BARRIER_STAGE",
+            "after_fence_rebind",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_RUNTIME_STOP_ADOPT_BARRIER_DIR",
+            &adopt_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = second_adopt
+        .spawn()
+        .expect("spawn second runtime-stop adopt");
+    wait_for_barrier(&adopt_barrier);
+    terminate_at_barrier(child, "partially rebound runtime-stop adopt");
+
+    let final_adopt_args = [
+        "--state-dir",
+        fixture.state_arg.as_str(),
+        "adopt",
+        "assignment-exhausted",
+        "--if-revision",
+        "4",
+        "--idempotency-key",
+        "runtime-stop-adopt-main-four",
+        "--format",
+        "json",
+    ];
+    let pending_successor_live = run_main_agent(
+        &fixture.main_checkout,
+        &final_adopt_args,
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_four_capability.as_str(),
+        )],
+    );
+    assert_eq!(pending_successor_live.code, 65);
+    assert_eq!(
+        pending_successor_live.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fence-conflict"
+    );
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-three"),
+        fixture.state_dir.join("stale-main-three"),
+    )
+    .expect("make pending successor unavailable");
+    let final_adopt = run_main_agent(
+        &fixture.main_checkout,
+        &final_adopt_args,
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_four_capability.as_str(),
+        )],
+    );
+    assert_eq!(final_adopt.code, 0, "outcome={}", final_adopt.stdout_text());
+    assert_eq!(data(&final_adopt)["assignment"]["revision"], 5);
+    assert_eq!(
+        data(&final_adopt)["assignment"]["primary_manager"]["session_id"],
+        "main-four"
+    );
+
+    let mut replay_env = fixture.envs().to_vec();
+    replay_env[0] = (
+        "AGENT_SESSION_CAPABILITY_FILE",
+        fixture.main_four_capability.as_str(),
+    );
+    let replay = run_main_agent(&fixture.main_checkout, &fixture.stop_args(), &replay_env);
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay)["runtime_stopped"], true);
+    assert_eq!(data(&replay)["assignment"]["revision"], 5);
+    assert_eq!(
+        data(&replay)["assignment"]["primary_manager"]["session_id"],
+        "main-four"
+    );
+}
+
+#[test]
+fn runtime_stop_crash_after_process_stop_finalizes_without_second_kill() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let barrier = fixture.tmp.path().join("runtime-stop-process-stopped");
+    let child = fixture.spawn_stop_at("after_runtime_stop", &barrier);
+    wait_for_barrier(&barrier);
+    assert!(!fixture.runtime.is_running());
+    terminate_at_barrier(child, "process-stopped runtime stop");
+    let kill_count = tmux_calls(&fixture.tmux_log)
+        .iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.iter().any(|arg| arg.starts_with("kill-session -t "))
+        })
+        .count();
+
+    let mut replay_env = fixture.envs().to_vec();
+    replay_env.push(("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"));
+    let stopped = run_main_agent(&fixture.main_checkout, &fixture.stop_args(), &replay_env);
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert_eq!(data(&stopped)["runtime_stopped"], true);
+    assert_eq!(
+        tmux_calls(&fixture.tmux_log)
+            .iter()
+            .filter(|call| {
+                call.first().is_some_and(|arg| arg == "if-shell")
+                    && call.iter().any(|arg| arg.starts_with("kill-session -t "))
+            })
+            .count(),
+        kill_count,
+        "stopped-runtime replay must not issue another runtime kill"
+    );
+}
+
+#[test]
+fn runtime_stop_then_cancel_keeps_completed_replay_stable() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let stopped = run_main_agent(
+        &fixture.main_checkout,
+        &fixture.stop_args(),
+        &fixture.envs(),
+    );
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    let mut stopped_env = fixture.envs().to_vec();
+    stopped_env.push(("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"));
+    let cancelled = run_main_agent(
+        &fixture.main_checkout,
+        &[
+            "--state-dir",
+            fixture.state_arg.as_str(),
+            "worker",
+            "cancel",
+            "assignment-exhausted",
+            "--if-revision",
+            "3",
+            "--reason",
+            "typed runtime stop proved exhausted pre-claim worker stopped",
+            "--idempotency-key",
+            "cancel-after-stop-0001",
+            "--format",
+            "json",
+        ],
+        &stopped_env,
+    );
+    assert_eq!(cancelled.code, 0, "outcome={}", cancelled.stdout_text());
+    assert_eq!(data(&cancelled)["assignment"]["state"], "cancelled");
+    let calls_after_cancel = tmux_calls(&fixture.tmux_log);
+    let replay = run_main_agent(&fixture.main_checkout, &fixture.stop_args(), &stopped_env);
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay), data(&stopped));
+    assert_eq!(tmux_calls(&fixture.tmux_log), calls_after_cancel);
+}
+
+/// B3 admission rejects every ambiguous or already-owned precondition before
+/// advertising the typed stop action.
+#[test]
+fn runtime_stop_admission_guards_are_fail_closed() {
+    let ExhaustedReadinessRuntimeStopFixture {
+        tmp: _tmp,
+        state_dir,
+        state_arg,
+        main_checkout,
+        worker_checkout: _,
+        main_capability,
+        main_two_capability: _,
+        main_three_capability: _,
+        main_four_capability: _,
+        worker_start_receipt,
+        runtime,
+        tmux_log: _,
+        tmux_arg,
+        tmux_log_arg,
+        runtime_pid_arg,
+        state_runtime_arg,
+    } = ExhaustedReadinessRuntimeStopFixture::new();
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid_arg.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
+            "worker-exhausted",
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_STATE_DIR",
+            state_runtime_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-exhausted-incarnation",
+        ),
+    ];
+    let wrong_incarnation = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-replacement-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-wrong-incarnation",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(wrong_incarnation.code, 65);
+    assert_eq!(
+        wrong_incarnation.stdout_json()["error"]["code"],
+        "worker-incarnation-changed"
+    );
+    assert!(runtime.is_running());
+
+    let stale_revision = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "b3-stop-runtime-stale-revision",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(stale_revision.code, 65);
+    assert_eq!(
+        stale_revision.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert!(runtime.is_running());
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]
+            .as_object_mut()
+            .expect("receipts")
+            .remove("main-one:main-incarnation-one:b3-worker-start");
+    });
+    let missing_final_proof = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-submit-failure-alone",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(missing_final_proof.code, 65);
+    assert_eq!(
+        missing_final_proof.stdout_json()["error"]["code"],
+        "worker-readiness-not-exhausted",
+        "submit_recovery.state=failed alone must never authorize a stop"
+    );
+    assert!(runtime.is_running());
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]["main-one:main-incarnation-one:b3-worker-start"] =
+            worker_start_receipt.clone();
+        registry["assignments"]["assignment-exhausted"]["submit_recovery"]["state"] =
+            json!("attempting");
+    });
+    let recovery_in_flight = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-recovery-in-flight",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(recovery_in_flight.code, 65);
+    assert_eq!(
+        recovery_in_flight.stdout_json()["error"]["code"],
+        "submit-recovery-in-flight"
+    );
+    assert!(runtime.is_running());
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-exhausted"]["submit_recovery"]["state"] =
+            json!("failed");
+    });
+
+    seed_active_claim(
+        &state_dir,
+        "worker-exhausted",
+        "worker-exhausted-incarnation",
+        "b3-worker-live-claim",
+    );
+    let active_worker_claim = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-active-worker-claim",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(active_worker_claim.code, 65);
+    assert_eq!(
+        active_worker_claim.stdout_json()["error"]["code"],
+        "worker-not-quiescent"
+    );
+    assert!(runtime.is_running());
+    rewrite_registry(&state_dir, |registry| {
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .retain(|claim| claim["session_id"] != "worker-exhausted");
+    });
+
+    seed_operation(
+        &state_dir,
+        "worker-exhausted",
+        "worker-exhausted-incarnation",
+        "b3-worker-active-operation",
+        "active",
+    );
+    let active_operation = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "stop-runtime",
+            "assignment-exhausted",
+            "--worker-incarnation",
+            "worker-exhausted-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "b3-stop-runtime-active-operation",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(active_operation.code, 65);
+    assert_eq!(
+        active_operation.stdout_json()["error"]["code"],
+        "worker-not-quiescent"
+    );
+    assert!(runtime.is_running());
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .retain(|operation| operation["session_id"] != "worker-exhausted");
+    });
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-exhausted"];
+        assignment["account_handoff"] = json!({
+            "schema_version": "main-agent.account-handoff-reservation.v3",
+            "request_digest": "a".repeat(64),
+            "reservation_id": "b3-handoff-reservation",
+            "account_intent_id": "b3-handoff-intent",
+            "run_id": "run-one",
+            "controller": assignment["primary_manager"].clone(),
+            "worker": assignment["worker"].clone(),
+            "reserved_revision": 2,
+            "account": "fallback",
+            "created_at": "2030-01-01T00:00:03Z",
+            "updated_at": "2030-01-01T00:00:03Z"
+        });
+    });
+    let handoff_fenced = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "supervise",
+            "assignment-exhausted",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(
+        handoff_fenced.code,
+        0,
+        "outcome={}",
+        handoff_fenced.stdout_text()
+    );
+    assert_eq!(
+        data(&handoff_fenced)["schema_version"],
+        "main-agent.worker-supervise-result.v3"
+    );
+    assert_eq!(
+        data(&handoff_fenced)["classification"],
+        "account_handoff_in_flight"
+    );
+    assert_eq!(
+        data(&handoff_fenced)["recovery_action"]["schema_version"],
+        "main-agent.worker-recovery-action.v3"
+    );
+    assert_eq!(
+        data(&handoff_fenced)["recovery_action"]["kind"],
+        "managed_account_handoff_cancel"
+    );
+    assert_eq!(
+        data(&handoff_fenced)["recovery_action"]["executable"],
+        false
+    );
+    assert_eq!(
+        data(&handoff_fenced)["recovery_action"]["argv_template"][2],
+        "account-handoff-cancel"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-exhausted"]
+            .as_object_mut()
+            .expect("assignment")
+            .remove("account_handoff");
+    });
+
+    let supervised = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "supervise",
+            "assignment-exhausted",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["schema_version"],
+        "main-agent.worker-supervise-result.v3"
+    );
+    assert_eq!(
+        data(&supervised)["classification"],
+        "readiness_stop_required"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["kind"],
+        "exact_worker_runtime_stop"
+    );
+    assert_eq!(data(&supervised)["recovery_action"]["executable"], true);
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][2],
+        "stop-runtime"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][5],
+        "worker-exhausted-incarnation"
+    );
 }
 
 /// B2: a worker that dies *after* bootstrap acquired its assignment-derived
@@ -11681,14 +12992,14 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let account_broker = r#"["/bin/false"]"#;
-    let supervise = || {
+    let observe = |command| {
         run_main_agent(
             &main_checkout,
             &[
                 "--state-dir",
                 state_dir.to_str().expect("state dir"),
                 "worker",
-                "supervise",
+                command,
                 "assignment-matrix",
                 "--format",
                 "json",
@@ -11701,13 +13012,86 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
             ],
         )
     };
+    let supervise = || observe("supervise");
 
+    let diagnosed = observe("diagnose");
+    assert_eq!(diagnosed.code, 0, "stderr={}", diagnosed.stderr_text());
+    let diagnosed = data(&diagnosed);
+    assert_eq!(
+        diagnosed["schema_version"],
+        "main-agent.worker-diagnose-result.v2"
+    );
+    let expected_diagnose_keys = BTreeSet::from([
+        "account",
+        "activity",
+        "assignment_id",
+        "assignment_revision",
+        "assignment_state",
+        "auto_resume",
+        "automatic_retry_safe",
+        "cancel_then_reassign_safe",
+        "classification",
+        "coordination",
+        "evidence",
+        "failed_preclaim",
+        "guidance",
+        "new_assignment_safe",
+        "next_action",
+        "post_claim_terminalization_safe",
+        "progress",
+        "provider_resume_preserved",
+        "quota_or_credit_evidence",
+        "raw_rate_limit_diagnostic",
+        "reassignment_safe",
+        "recovery_action",
+        "schema_version",
+        "submit_recovery",
+        "worker",
+        "worktree_progress",
+    ]);
+    assert_eq!(
+        diagnosed
+            .as_object()
+            .expect("v2 diagnosis object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_diagnose_keys
+    );
     let healthy = supervise();
     assert_eq!(healthy.code, 0, "stderr={}", healthy.stderr_text());
-    assert_eq!(data(&healthy)["classification"], "healthy_progress");
+    let healthy = data(&healthy);
+    assert_eq!(healthy["classification"], "healthy_progress");
     assert_eq!(
-        data(&healthy)["last_proven_safe_state"]["assignment_revision"],
-        2
+        healthy["schema_version"],
+        "main-agent.worker-supervise-result.v2"
+    );
+    assert_eq!(
+        healthy
+            .as_object()
+            .expect("v2 supervise object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "assignment_id",
+            "automatic_retry_safe",
+            "classification",
+            "last_proven_safe_state",
+            "next_action",
+            "recovery_action",
+            "schema_version",
+        ])
+    );
+    assert_eq!(healthy["last_proven_safe_state"]["assignment_revision"], 2);
+    assert_eq!(
+        healthy["last_proven_safe_state"]
+            .as_object()
+            .expect("nested v2 diagnosis")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_diagnose_keys
     );
 
     let progress_file = worker_checkout.join("large-progress.bin");
@@ -16355,10 +17739,56 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
         assignment["submit_recovery"]["session_incarnation"],
         data(&started)["worker"]["session_incarnation"]
     );
+    assert_eq!(
+        assignment["readiness_stop_proof"],
+        json!({
+            "schema_version": "main-agent.worker-readiness-stop-proof.v1",
+            "worker": assignment["worker"],
+            "readiness_state": "readiness_failed",
+            "delivery_proof": "worker-checkpoint-timeout",
+            "automatic_retry_safe": false,
+            "recorded_at": assignment["readiness_stop_proof"]["recorded_at"]
+        }),
+        "the real readiness finalizer must persist the direct stop proof"
+    );
     let revision = assignment["revision"]
         .as_u64()
         .expect("assignment revision");
     let revision_arg = revision.to_string();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]
+            .as_object_mut()
+            .expect("receipts")
+            .remove("main-one:main-incarnation-one:worker-start-await-ready-0001");
+    });
+    let supervised_after_receipt_eviction = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-await-ready",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(
+        supervised_after_receipt_eviction.code,
+        0,
+        "outcome={}",
+        supervised_after_receipt_eviction.stdout_text()
+    );
+    assert_eq!(
+        data(&supervised_after_receipt_eviction)["classification"],
+        "readiness_stop_required",
+        "the direct assignment proof must authorize stop supervision after receipt eviction"
+    );
     let explicit = run_main_agent(
         &checkout,
         &[

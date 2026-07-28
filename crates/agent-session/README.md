@@ -71,6 +71,7 @@ main-agent worker guidance-reconcile ASSIGNMENT_ID --if-revision 3 --idempotency
 main-agent worker account-handoff ASSIGNMENT_ID --account ACCOUNT --if-revision 3 --authorize-account-change --idempotency-key account-001 --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision 2 --timeout 5s --idempotency-key recover-001 --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision 3 --idempotency-key reconcile-001 --format json
+main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation WORKER_INCARNATION --if-revision 3 --idempotency-key stop-001 --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key cancel-001 --format json
 main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key reassign-001 --format json
 main-agent worker list --format json
@@ -198,6 +199,35 @@ separately from work-context expiry. `coordination_broker_stale` routes recovery
 to the target session's exact authenticated broker owner;
 `edit_authority_stale` requests a bounded recheck; only
 `claim_renewal_required` asks the worker to renew its own claim.
+
+When the final durable `worker-start` receipt proves bounded readiness ended
+with `worker-checkpoint-timeout`, the exact worker is still live, no worker
+claim or operation exists, and no recovery send is `attempting`,
+supervision returns `readiness_stop_required` in the additive v3 diagnose,
+supervise, and recovery-action envelopes. Its executable Main-owned action is
+revision- and exact-incarnation-fenced `worker stop-runtime`. The command
+first persists a session-owned exact-worker fence, then commits the
+per-assignment stopping reservation and seals only that worker's coordination
+authority. Both global registries are released before stopping the verified
+runtime process boundary. It sends no provider input and preserves the
+assignment, session record, and worktree. The session-owned fence denies
+CLI/HTTP/maintenance resume, broker, claim, bootstrap, and checkpoint authority
+until guarded retirement deletes the stopped session. Its `in_progress` state
+also blocks every non-owner assignment mutation during marker-first recovery;
+verified termination advances it to `stopped` before the assignment
+reservation is cleared. If the recorded Main controller becomes unavailable
+after reservation, authenticated orphan `adopt` transfers only the exact
+fence, reservation, and progress replay authority to an active successor Main.
+Successive orphan transfers may advance only the ownership revision; the
+original stop revision and every other stop identity remain immutable.
+An account-handoff reservation must be completed or cancelled before the stop is advertised.
+After an interrupted admitted stop, supervision reports
+`readiness_stop_in_progress` until exact replay converges. A following
+supervision read must classify the stopped lane as `pre_claim_failure`;
+ordinary guarded cancel/retire or a distinct reassign then owns
+terminalization. A failed submit-recovery record alone never authorizes the
+stop, and an unknown `attempting` send remains on the stopped-runtime `worker
+reconcile-recovery` path.
 
 `main-agent self recover` is the ownership-qualified controller recovery macro.
 It proves the current caller is the exact Main Agent incarnation with an

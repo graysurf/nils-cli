@@ -876,12 +876,17 @@ pub(crate) const GROUP_CLEANUP_PROGRESS_RECEIPT_V1_SCHEMA: &str =
     "agent-session.main-agent-group-cleanup-receipt.v1";
 pub(crate) const ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v3";
+pub(crate) const WORKER_RUNTIME_STOP_RESERVATION_SCHEMA: &str =
+    "main-agent.worker-runtime-stop-reservation.v1";
+pub(crate) const WORKER_READINESS_STOP_PROOF_SCHEMA: &str =
+    "main-agent.worker-readiness-stop-proof.v1";
 pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v2";
 pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v1";
 const SESSION_AUTHORITY_QUARANTINE_SCHEMA: &str = "agent-session.worker-authority-quarantine.v1";
 const SESSION_GROUP_CLEANUP_FENCE_SCHEMA: &str = "agent-session.group-cleanup-fence.v1";
+const SESSION_RUNTIME_STOP_FENCE_SCHEMA: &str = "agent-session.runtime-stop-fence.v1";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1073,6 +1078,7 @@ const MAX_GROUP_CLEANUP_PROGRESS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_AUTHORITY_QUARANTINE_BYTES: u64 = 64 * 1024;
 const SESSION_AUTHORITY_QUARANTINE_FILE: &str = "authority-quarantine.json";
 const SESSION_GROUP_CLEANUP_FENCE_FILE: &str = "group-cleanup-fence.json";
+const SESSION_RUNTIME_STOP_FENCE_FILE: &str = "runtime-stop-fence.json";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1198,6 +1204,21 @@ pub(crate) struct SessionGroupCleanupFence {
     created_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionRuntimeStopFence {
+    schema_version: String,
+    state: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    worker: SessionRef,
+    controller: SessionRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_controller: Option<SessionRef>,
+    request_digest: String,
+    created_at: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssignmentRecord {
@@ -1245,8 +1266,41 @@ pub(crate) struct AssignmentRecord {
     pub worker_quarantine: Option<WorkerQuarantineRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_handoff: Option<AccountHandoffReservationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_stop: Option<WorkerRuntimeStopReservationRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_stop_proof: Option<WorkerReadinessStopProofRecord>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerRuntimeStopReservationRecord {
+    pub schema_version: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub run_id: String,
+    pub controller: SessionRef,
+    pub worker: SessionRef,
+    pub reserved_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_revision: Option<u64>,
+    pub controller_claim_id: String,
+    pub controller_claim_revision: u64,
+    pub controller_claim_expires_at_epoch: i64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerReadinessStopProofRecord {
+    pub schema_version: String,
+    pub worker: SessionRef,
+    pub readiness_state: String,
+    pub delivery_proof: String,
+    pub automatic_retry_safe: bool,
+    pub recorded_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1495,6 +1549,50 @@ impl Registry {
                     "orchestration account handoff reservation identity is invalid",
                 ));
             }
+            if let Some(reservation) = &assignment.runtime_stop
+                && (assignment.account_handoff.is_some()
+                    || reservation.schema_version != WORKER_RUNTIME_STOP_RESERVATION_SCHEMA
+                    || reservation.request_digest.len() != 64
+                    || !reservation
+                        .request_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || validate_slug(
+                        "worker runtime stop idempotency key",
+                        &reservation.idempotency_key,
+                        128,
+                    )
+                    .is_err()
+                    || reservation.run_id != assignment.run_id
+                    || reservation.controller != assignment.primary_manager
+                    || assignment.worker.as_ref() != Some(&reservation.worker)
+                    || !worker_runtime_stop_revision_is_valid(
+                        reservation.reserved_revision,
+                        reservation.adopted_revision,
+                        assignment.revision,
+                    )
+                    || reservation.controller_claim_id.is_empty()
+                    || reservation.controller_claim_revision == 0
+                    || reservation.controller_claim_expires_at_epoch <= 0
+                    || reservation.created_at.is_empty())
+            {
+                return Err(store_invalid(
+                    "orchestration worker runtime stop reservation identity is invalid",
+                ));
+            }
+            if let Some(proof) = &assignment.readiness_stop_proof
+                && (proof.schema_version != WORKER_READINESS_STOP_PROOF_SCHEMA
+                    || proof.worker.session_id.is_empty()
+                    || proof.worker.session_incarnation.is_empty()
+                    || proof.readiness_state != "readiness_failed"
+                    || proof.delivery_proof != "worker-checkpoint-timeout"
+                    || proof.automatic_retry_safe
+                    || proof.recorded_at.is_empty())
+            {
+                return Err(store_invalid(
+                    "orchestration worker readiness stop proof is invalid",
+                ));
+            }
             for collaborator in &assignment.collaborators {
                 validate_session_ref(collaborator)?;
             }
@@ -1521,6 +1619,19 @@ impl Registry {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn worker_runtime_stop_revision_is_valid(
+    reserved_revision: u64,
+    adopted_revision: Option<u64>,
+    assignment_revision: u64,
+) -> bool {
+    match adopted_revision {
+        Some(adopted_revision) => {
+            adopted_revision == assignment_revision && adopted_revision > reserved_revision
+        }
+        None => reserved_revision == assignment_revision,
     }
 }
 
@@ -1687,6 +1798,16 @@ pub(crate) fn ensure_session_not_quarantined(
             })),
         ));
     }
+    if let Some(marker) = validated_session_runtime_stop_fence(context, record)? {
+        return Err(CliError::data(
+            "worker-runtime-stop-fenced",
+            "worker execution authority is fenced after a Main-owned exhausted-readiness runtime stop",
+            Some(json!({
+                "assignment_id": marker.assignment_id,
+                "assignment_revision": marker.assignment_revision
+            })),
+        ));
+    }
     let Some(marker) = validated_session_authority_quarantine(context, record)? else {
         return Ok(());
     };
@@ -1705,6 +1826,9 @@ pub(crate) fn session_authority_is_quarantined(
     record: &SessionRecord,
 ) -> Result<bool, CliError> {
     if validated_session_group_cleanup_fence(context, record)?.is_some() {
+        return Ok(true);
+    }
+    if validated_session_runtime_stop_fence(context, record)?.is_some() {
         return Ok(true);
     }
     validated_session_authority_quarantine(context, record).map(|marker| marker.is_some())
@@ -1809,6 +1933,271 @@ fn validate_session_group_cleanup_fence(marker: &SessionGroupCleanupFence) -> Re
     if marker.created_at.trim().is_empty() || marker.created_at.len() > 64 {
         return Err(store_invalid(
             "session group cleanup fence timestamp is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validated_session_runtime_stop_fence(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<Option<SessionRuntimeStopFence>, CliError> {
+    let Some(marker) = read_session_runtime_stop_fence(context, &record.id)? else {
+        return Ok(None);
+    };
+    validate_session_runtime_stop_fence(&marker)?;
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !session_ref_matches(&marker.worker, record, incarnation) {
+        return Err(store_invalid(
+            "session runtime stop fence identity is invalid",
+        ));
+    }
+    Ok(Some(marker))
+}
+
+pub(crate) fn persist_session_runtime_stop_fence(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    controller: &SessionRef,
+    request_digest: &str,
+) -> Result<SessionRuntimeStopFence, CliError> {
+    let marker = SessionRuntimeStopFence {
+        schema_version: SESSION_RUNTIME_STOP_FENCE_SCHEMA.to_string(),
+        state: "in_progress".to_string(),
+        assignment_id: assignment_id.to_string(),
+        assignment_revision,
+        worker: worker.clone(),
+        controller: controller.clone(),
+        previous_controller: None,
+        request_digest: request_digest.to_string(),
+        created_at: crate::coordination::timestamp(crate::coordination::now_epoch()),
+    };
+    validate_session_runtime_stop_fence(&marker)?;
+    if let Some(existing) = read_session_runtime_stop_fence(context, &worker.session_id)? {
+        validate_session_runtime_stop_fence(&existing)?;
+        let retry_matches = existing.schema_version == marker.schema_version
+            && existing.assignment_id == marker.assignment_id
+            && existing.assignment_revision == marker.assignment_revision
+            && existing.worker == marker.worker
+            && existing.controller == marker.controller
+            && existing.request_digest == marker.request_digest;
+        if !retry_matches {
+            return Err(CliError::data(
+                "worker-runtime-stop-fence-conflict",
+                "worker execution authority has a different persistent runtime stop fence",
+                None,
+            ));
+        }
+        return Ok(existing);
+    }
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|_| store_invalid("session runtime stop fence is invalid"))?;
+    if bytes.len() as u64 > MAX_SESSION_AUTHORITY_QUARANTINE_BYTES {
+        return Err(store_invalid(
+            "session runtime stop fence exceeds byte limit",
+        ));
+    }
+    let path =
+        crate::session_dir(context, &worker.session_id).join(SESSION_RUNTIME_STOP_FENCE_FILE);
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())?;
+    Ok(marker)
+}
+
+pub(crate) fn mark_session_runtime_stop_fence_stopped(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    controller: &SessionRef,
+    request_digest: &str,
+) -> Result<(), CliError> {
+    let mut marker =
+        read_session_runtime_stop_fence(context, &worker.session_id)?.ok_or_else(|| {
+            CliError::data(
+                "worker-runtime-stop-fence-missing",
+                "verified runtime stop has no session-owned authority fence",
+                None,
+            )
+        })?;
+    validate_session_runtime_stop_fence(&marker)?;
+    if marker.assignment_id != assignment_id
+        || marker.assignment_revision != assignment_revision
+        || marker.worker != *worker
+        || marker.controller != *controller
+        || marker.request_digest != request_digest
+    {
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "session-owned runtime stop fence no longer matches finalization authority",
+            None,
+        ));
+    }
+    if marker.state == "stopped" {
+        return Ok(());
+    }
+    marker.state = "stopped".to_string();
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|_| store_invalid("session runtime stop fence is invalid"))?;
+    let path =
+        crate::session_dir(context, &worker.session_id).join(SESSION_RUNTIME_STOP_FENCE_FILE);
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn rebind_session_runtime_stop_fence_controller(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    prior_controller: &SessionRef,
+    successor_controller: &SessionRef,
+    request_digest: &str,
+) -> Result<(), CliError> {
+    let mut marker =
+        read_session_runtime_stop_fence(context, &worker.session_id)?.ok_or_else(|| {
+            CliError::data(
+                "worker-runtime-stop-fence-missing",
+                "orphan runtime stop has no session-owned authority fence",
+                None,
+            )
+        })?;
+    validate_session_runtime_stop_fence(&marker)?;
+    if marker.assignment_id != assignment_id
+        || marker.assignment_revision != assignment_revision
+        || marker.worker != *worker
+        || marker.request_digest != request_digest
+    {
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "session-owned runtime stop fence cannot be rebound to the successor controller",
+            None,
+        ));
+    }
+    if marker.controller == *successor_controller {
+        if marker.previous_controller.as_ref() == Some(prior_controller) {
+            return Ok(());
+        }
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "session-owned runtime stop fence retry does not match the registry controller",
+            None,
+        ));
+    }
+    let direct_transfer = marker.controller == *prior_controller;
+    let recoverable_partial_transfer = marker.previous_controller.as_ref()
+        == Some(prior_controller)
+        && !session_ref_is_live(context, &marker.controller);
+    if !direct_transfer && !recoverable_partial_transfer {
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "session-owned runtime stop fence cannot be rebound to the successor controller",
+            None,
+        ));
+    }
+    marker.previous_controller = Some(prior_controller.clone());
+    marker.controller = successor_controller.clone();
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|_| store_invalid("session runtime stop fence is invalid"))?;
+    let path =
+        crate::session_dir(context, &worker.session_id).join(SESSION_RUNTIME_STOP_FENCE_FILE);
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn assignment_runtime_stop_fence_in_progress(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<bool, CliError> {
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(false);
+    };
+    let Some(marker) = read_session_runtime_stop_fence(context, &worker.session_id)? else {
+        return Ok(false);
+    };
+    validate_session_runtime_stop_fence(&marker)?;
+    if marker.state == "stopped" {
+        return Ok(false);
+    }
+    if marker.assignment_id != assignment.assignment_id
+        || marker.assignment_revision != assignment.revision
+        || marker.worker != *worker
+        || marker.controller != assignment.primary_manager
+    {
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "in-progress session runtime stop fence does not match assignment ownership",
+            None,
+        ));
+    }
+    Ok(true)
+}
+
+fn read_session_runtime_stop_fence(
+    context: &CliContext,
+    session_id: &str,
+) -> Result<Option<SessionRuntimeStopFence>, CliError> {
+    let path = crate::session_dir(context, session_id).join(SESSION_RUNTIME_STOP_FENCE_FILE);
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "session runtime stop fence permissions are unsafe",
+        "session runtime stop fence exceeds byte limit",
+        "session runtime stop fence changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("session runtime stop fence is invalid"))
+}
+
+fn validate_session_runtime_stop_fence(marker: &SessionRuntimeStopFence) -> Result<(), CliError> {
+    if marker.schema_version != SESSION_RUNTIME_STOP_FENCE_SCHEMA {
+        return Err(store_invalid(
+            "session runtime stop fence schema is invalid",
+        ));
+    }
+    if !matches!(marker.state.as_str(), "in_progress" | "stopped") {
+        return Err(store_invalid("session runtime stop fence state is invalid"));
+    }
+    validate_slug(
+        "runtime stop fence assignment id",
+        &marker.assignment_id,
+        128,
+    )?;
+    if marker.assignment_revision == 0 {
+        return Err(store_invalid(
+            "session runtime stop fence revision is invalid",
+        ));
+    }
+    validate_session_ref(&marker.worker)?;
+    validate_session_ref(&marker.controller)?;
+    if let Some(previous_controller) = marker.previous_controller.as_ref() {
+        validate_session_ref(previous_controller)?;
+        if previous_controller == &marker.controller {
+            return Err(store_invalid(
+                "session runtime stop fence controller transition is invalid",
+            ));
+        }
+    }
+    if marker.request_digest.len() != 64
+        || !marker
+            .request_digest
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(store_invalid(
+            "session runtime stop fence request digest is invalid",
+        ));
+    }
+    if marker.created_at.trim().is_empty() || marker.created_at.len() > 64 {
+        return Err(store_invalid(
+            "session runtime stop fence timestamp is invalid",
         ));
     }
     Ok(())

@@ -317,11 +317,80 @@ pub(crate) struct ControllerClaimTuple {
 }
 
 pub(crate) struct StoppedWorkerTerminalizationGuard {
+    seal: WorkerAuthoritySealGuard,
+    worker_claim_observed: bool,
+}
+
+pub(crate) struct WorkerRuntimeStopGuard {
+    seal: WorkerAuthoritySealGuard,
+}
+
+struct WorkerAuthoritySealGuard {
     locked: LockedRegistry,
     worker: (String, String),
     controller: (String, String),
     controller_claim: ControllerClaimTuple,
-    worker_claim_observed: bool,
+    allow_active_worker_claims: bool,
+    require_unexpired_at_seal: bool,
+}
+
+fn controller_claim_matches_admission(
+    registry: &Registry,
+    controller: &(String, String),
+    authorized: &ControllerClaimTuple,
+    now: i64,
+    require_unexpired: bool,
+) -> bool {
+    registry.claims.iter().any(|claim| {
+        claim.session_id == controller.0
+            && claim.session_incarnation == controller.1
+            && claim.claim_id == authorized.claim_id
+            && claim.revision == authorized.revision
+            && claim.expires_at_epoch == authorized.expires_at_epoch
+            && claim.state == "active"
+            && (!require_unexpired || claim.expires_at_epoch > now)
+    })
+}
+
+impl WorkerAuthoritySealGuard {
+    fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
+        let now = now_epoch();
+        let controller_claim_current = controller_claim_matches_admission(
+            &self.locked.registry,
+            &self.controller,
+            &self.controller_claim,
+            now,
+            self.require_unexpired_at_seal,
+        );
+        if !controller_claim_current {
+            return Err(CliError::data(
+                "claim-not-active",
+                "Main Agent claim no longer satisfies the exact admitted worker authority seal",
+                None,
+            ));
+        }
+        ensure_group_cleanup_quiescence(
+            &self.locked.registry,
+            std::slice::from_ref(&self.worker),
+            self.allow_active_worker_claims,
+        )?;
+        seal_coordination_sessions(
+            &mut self.locked,
+            context,
+            std::slice::from_ref(&self.worker),
+        )
+    }
+}
+
+impl WorkerRuntimeStopGuard {
+    /// Seal only the exact pre-claim worker before its runtime is stopped.
+    /// Admission requires an unexpired controller claim. The caller persists
+    /// its orchestration reservation while this registry lock is held, then
+    /// seals coordination authority before dropping the lock and performing
+    /// bounded external runtime termination.
+    pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
+        self.seal.seal(context)
+    }
 }
 
 impl StoppedWorkerTerminalizationGuard {
@@ -330,39 +399,13 @@ impl StoppedWorkerTerminalizationGuard {
     }
 
     pub(crate) fn controller_claim(&self) -> &ControllerClaimTuple {
-        &self.controller_claim
+        &self.seal.controller_claim
     }
 
     /// Seal only the exact stopped worker while the exact active, unexpired
     /// controller claim remains unchanged under this same registry lock.
     pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
-        let now = now_epoch();
-        let controller_claim_current = self.locked.registry.claims.iter().any(|claim| {
-            claim.session_id == self.controller.0
-                && claim.session_incarnation == self.controller.1
-                && claim.claim_id == self.controller_claim.claim_id
-                && claim.revision == self.controller_claim.revision
-                && claim.expires_at_epoch == self.controller_claim.expires_at_epoch
-                && claim.state == "active"
-                && claim.expires_at_epoch > now
-        });
-        if !controller_claim_current {
-            return Err(CliError::data(
-                "claim-not-active",
-                "Main Agent claim is no longer exact, active, and unexpired at the worker authority seal",
-                None,
-            ));
-        }
-        ensure_group_cleanup_quiescence(
-            &self.locked.registry,
-            std::slice::from_ref(&self.worker),
-            true,
-        )?;
-        seal_coordination_sessions(
-            &mut self.locked,
-            context,
-            std::slice::from_ref(&self.worker),
-        )
+        self.seal.seal(context)
     }
 }
 
@@ -469,18 +512,38 @@ pub(crate) fn lock_group_cleanup_quiescence(
     })
 }
 
-pub(crate) fn lock_stopped_worker_terminalization(
+pub(crate) fn lock_worker_runtime_stop(
     context: &CliContext,
     worker_session_id: &str,
     worker_incarnation: &str,
     controller_session_id: &str,
     controller_incarnation: &str,
     authorized_controller_claim: &ControllerClaimTuple,
-) -> Result<StoppedWorkerTerminalizationGuard, CliError> {
-    // Destructive authority sealing must observe the controller claim exactly
-    // as persisted. The normal registry lock opportunistically renews claims
-    // for healthy brokers, which would turn a claim that expired between the
-    // two durable stages back into valid sealing authority.
+) -> Result<WorkerRuntimeStopGuard, CliError> {
+    let (seal, _) = lock_worker_authority_seal(
+        context,
+        worker_session_id,
+        worker_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        false,
+        false,
+    )?;
+    Ok(WorkerRuntimeStopGuard { seal })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lock_worker_authority_seal(
+    context: &CliContext,
+    worker_session_id: &str,
+    worker_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+    allow_active_worker_claims: bool,
+    require_unexpired_at_seal: bool,
+) -> Result<(WorkerAuthoritySealGuard, bool), CliError> {
     let locked = lock_registry_observational(context)?;
     ensure_group_cleanup_quiescence(
         &locked.registry,
@@ -488,7 +551,7 @@ pub(crate) fn lock_stopped_worker_terminalization(
             worker_session_id.to_string(),
             worker_incarnation.to_string(),
         )],
-        true,
+        allow_active_worker_claims,
     )?;
     let now = now_epoch();
     let controller_claim = locked
@@ -507,7 +570,7 @@ pub(crate) fn lock_stopped_worker_terminalization(
         .ok_or_else(|| {
             CliError::data(
                 "claim-not-active",
-                "Main Agent claim must be exact, active, and unexpired for stopped-worker terminalization",
+                "Main Agent claim must be exact, active, and unexpired for worker authority admission",
                 None,
             )
         })?;
@@ -521,17 +584,49 @@ pub(crate) fn lock_stopped_worker_terminalization(
         revision: controller_claim.revision,
         expires_at_epoch: controller_claim.expires_at_epoch,
     };
+    Ok((
+        WorkerAuthoritySealGuard {
+            locked,
+            worker: (
+                worker_session_id.to_string(),
+                worker_incarnation.to_string(),
+            ),
+            controller: (
+                controller_session_id.to_string(),
+                controller_incarnation.to_string(),
+            ),
+            controller_claim,
+            allow_active_worker_claims,
+            require_unexpired_at_seal,
+        },
+        worker_claim_observed,
+    ))
+}
+
+pub(crate) fn lock_stopped_worker_terminalization(
+    context: &CliContext,
+    worker_session_id: &str,
+    worker_incarnation: &str,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+) -> Result<StoppedWorkerTerminalizationGuard, CliError> {
+    // Destructive authority sealing must observe the controller claim exactly
+    // as persisted. The normal registry lock opportunistically renews claims
+    // for healthy brokers, which would turn a claim that expired between the
+    // two durable stages back into valid sealing authority.
+    let (seal, worker_claim_observed) = lock_worker_authority_seal(
+        context,
+        worker_session_id,
+        worker_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        true,
+        true,
+    )?;
     Ok(StoppedWorkerTerminalizationGuard {
-        locked,
-        worker: (
-            worker_session_id.to_string(),
-            worker_incarnation.to_string(),
-        ),
-        controller: (
-            controller_session_id.to_string(),
-            controller_incarnation.to_string(),
-        ),
-        controller_claim,
+        seal,
         worker_claim_observed,
     })
 }
@@ -2008,6 +2103,50 @@ mod tests {
         let error =
             read_bounded_bytes(&path, 64, "oversized-input").expect_err("must reject oversized");
         assert_eq!(error.code(), "oversized-input");
+    }
+
+    #[test]
+    fn runtime_stop_seal_accepts_admitted_claim_after_wall_clock_expiry_under_guard() {
+        let registry = serde_json::from_value::<Registry>(json!({
+            "claims": [{
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "main",
+                "session_incarnation": "main-incarnation",
+                "claim_id": "main-claim",
+                "revision": 7,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": [],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [],
+                "summary": "runtime stop admission fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:10Z",
+                "expires_at_epoch": 100
+            }]
+        }))
+        .expect("registry");
+        let controller = ("main".to_string(), "main-incarnation".to_string());
+        let admitted = ControllerClaimTuple {
+            claim_id: "main-claim".to_string(),
+            revision: 7,
+            expires_at_epoch: 100,
+        };
+
+        assert!(controller_claim_matches_admission(
+            &registry,
+            &controller,
+            &admitted,
+            101,
+            false,
+        ));
+        assert!(
+            !controller_claim_matches_admission(&registry, &controller, &admitted, 101, true,),
+            "a fresh command or stopped-worker stage must reauthenticate after expiry"
+        );
     }
 
     #[test]

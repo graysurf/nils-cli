@@ -106,6 +106,7 @@ main-agent worker account-handoff-cancel ASSIGNMENT_ID --reservation-id RESERVAT
 main-agent worker request-changes ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
+main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --idempotency-key KEY --format json
 main-agent worker reconcile-stopped ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker reassign ASSIGNMENT_ID --assignment-file FILE --if-revision N --reason TEXT [--await-ready D] --idempotency-key KEY --format json
@@ -279,6 +280,75 @@ Every single-worker start result also includes additive `polling` evidence. The
 explicit launch-only mode reports zero readiness-registry reads and writes. A
 bounded wait reports its timeout plus conservative read/write upper bounds
 derived from the 250 ms readiness poll and five-second finalizer renewal.
+
+Once a final durable `main-agent.worker-start-result.v1` receipt for the exact
+controller, assignment, worker session, and worker incarnation records
+`readiness.state: readiness_failed`,
+`delivery.proof: worker-checkpoint-timeout`, and
+`automatic_retry_safe: false`, supervision MAY classify the lane
+`readiness_stop_required` only when the assignment is still `starting`, the
+exact runtime is live, the worker claim is absent, operations are quiescent,
+no submit-recovery record is still `attempting` or `sent`, and neither an
+account-handoff reservation nor a runtime-stop reservation exists. An
+account-handoff reservation classifies as `account_handoff_in_flight` and
+routes to its typed cancellation/completion path. A durable runtime-stop
+reservation classifies as `readiness_stop_in_progress` and routes only to a
+typed executable exact replay containing the privately retained original
+idempotency key. The additive
+`main-agent.worker-diagnose-result.v3`,
+`main-agent.worker-supervise-result.v3`, and
+`main-agent.worker-recovery-action.v3` envelopes are emitted for
+`account_handoff_in_flight` and the two runtime-stop classifications; existing
+classifications retain the exact v2 top-level shape. The additive
+`runtime_stop` projection is present only in the v3 diagnosis (and its nested
+v3 supervision snapshot). The
+required-stop recovery action MUST be Main-owned, directly executable, and contain the exact
+`worker stop-runtime` argv with assignment revision, worker incarnation, and a
+stable idempotency key.
+
+`worker stop-runtime` MUST authenticate the exact current Main controller and
+its active, unexpired claim; revalidate run ownership, assignment revision,
+primary manager, worker binding, and the final readiness receipt; and hold the
+worker lifecycle lock through the runtime side effect. While briefly holding
+the coordination and orchestration registries together, it MUST first persist
+the session-owned exact-worker runtime-stop fence, then persist an exact
+per-assignment reservation and strict claim-bound progress receipt before
+sealing only that worker's broker/capability. A marker-first interruption MUST
+be safely adopted by exact replay. It MUST release both global registry locks
+before external process I/O. Competing assignment
+mutations MUST reject the reservation, while unrelated coordination and
+orchestration mutations remain available. It MUST refuse a worker claim, active/completing/
+reconcile-pending operation, changed incarnation, non-live or unverifiable
+runtime, missing final readiness proof, in-flight recovery, or an
+account-handoff reservation. It terminates the verified
+tmux/cgroup/process-session/process-group boundary without provider input.
+The admitted controller claim is rechecked at the seal boundary; expiry after
+that seal cannot restore the already-revoked worker authority, while any
+crash/replay must authenticate a current active, unexpired claim anew. After
+verified termination it CAS-finalizes the unchanged reservation, clears the
+assignment fence, and stores the result while preserving the assignment
+revision and state, session directory and record, and managed worktree. A
+session-owned exact-worker runtime-stop fence MUST remain until guarded
+retirement deletes the session; every CLI, HTTP, maintenance, broker, claim,
+bootstrap, and checkpoint authority-restoration path MUST reject it. Exact replay MUST
+return the stored result without a second termination. Its `in_progress` state
+MUST block every non-runtime-stop assignment mutation, including ownership and
+revision transfer after a marker-first interruption. Verified termination MUST
+advance the fence to `stopped` before the assignment reservation is cleared. A following
+stopped-runtime diagnosis MUST be non-healthy
+and route to the existing guarded pre-claim cancel/retire/reassign lifecycle.
+If the reservation controller is no longer live, orphan `adopt` MAY transfer
+replay authority to an authenticated active successor Main only by atomically
+rebinding the exact session fence, assignment reservation, and original
+progress receipt. The worker, request digest, original idempotency key, and
+reserved fence revision MUST remain unchanged. Adoption MUST fail while the
+recorded controller remains live and MUST NOT restore worker authority.
+Successive orphan transfers MUST remain recoverable: each transfer advances
+the assignment ownership revision monotonically while the original reserved
+stop revision remains immutable. The session fence MUST retain the prior
+registry controller during its pre-commit rebind so a later successor can
+replace an unavailable pending successor without widening any stop identity.
+A `submit_recovery.state: failed` record alone is never a discriminator.
 Prompt load-buffer, paste-buffer, and Enter effects occur exactly once for a
 completed worker-start stage. A retry may remove and relaunch only an exact
 matching worker record that durably proves tmux never launched; it never treats

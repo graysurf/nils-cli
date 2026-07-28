@@ -659,6 +659,40 @@ Successful HTTP send and reply envelopes carry the same content-free
 `controller_available: true`. The response schedules work only; it does not
 promise immediate delivery or mark a message read.
 
+## Main-owned pre-claim runtime stop guard
+
+The Main Agent orchestration facade uses an observational coordination guard
+to admit and seal an exact exhausted-readiness worker runtime stop. This guard
+MUST bind the exact worker session/incarnation and exact current Main
+controller session/incarnation plus its claim tuple, which MUST be active and
+unexpired at command admission. It MUST require the worker claim to be absent
+and reject any
+active/completing/reconcile-pending worker operation or a broker bound to a
+different incarnation. While this guard and the orchestration registry are
+briefly held together, the session-owned exact-worker runtime-stop fence is
+committed before the durable per-assignment stopping reservation and
+claim-bound progress receipt. A marker-first interruption is safe for exact
+replay to adopt. Its seal transaction rechecks the
+same admitted tuple and worker quiescence under the same coordination lock,
+then marks only the matching worker broker stopped, clears its capability
+digest, and removes its capability file. Both global registry locks are
+released before external process termination; the exact session lifecycle lock
+and durable assignment reservation remain the narrow fence. Claim expiry after
+the seal cannot restore revoked worker authority; a crash or replay must
+authenticate a currently active, unexpired claim again. The seal does not
+release a worker claim, normalize unrelated registry state, delete session
+state, or touch another session. The session-owned fence remains after result
+finalization and blocks CLI/HTTP/maintenance resume, broker, claim, bootstrap,
+and checkpoint authority until guarded retirement deletes the exact session.
+Its `in_progress` state also fences every non-owner assignment mutation;
+verified termination advances it to `stopped` before orchestration clears the
+assignment reservation.
+When the recorded controller is unavailable, orphan adoption may rebind the
+fence controller only together with the exact orchestration reservation and
+original progress receipt; the worker, request digest, idempotency key, and
+reserved fence revision remain immutable across successive orphan transfers.
+Only the assignment ownership revision advances monotonically.
+
 ## Public list and glance additions
 
 List and glance may add only:

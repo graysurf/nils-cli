@@ -18462,6 +18462,8 @@ esac
                     submit_recovery: None,
                     worker_quarantine: None,
                     account_handoff: None,
+                    runtime_stop: None,
+                    readiness_stop_proof: None,
                     created_at: "2030-01-01T00:00:00Z".to_string(),
                     updated_at: "2030-01-01T00:00:00Z".to_string(),
                 },
