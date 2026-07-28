@@ -1,0 +1,140 @@
+{
+  "schema_version": "agent-session.activity-scenarios.v1",
+  "scenarios": [
+    {
+      "id": "raw-stop-without-completion",
+      "provider": "claude",
+      "truth": "working_or_unknown",
+      "events": ["turn_started", "stop_observed"],
+      "shadow": "unknown",
+      "expected": {
+        "phase": "working",
+        "diagnostic": "completion_evidence_pending",
+        "false_idle": false
+      }
+    },
+    {
+      "id": "dropped-codex-completion",
+      "provider": "codex",
+      "truth": "unknown",
+      "events": ["turn_started", "stop_observed"],
+      "shadow": "waiting",
+      "expected": {
+        "phase": "working",
+        "shadow_disagrees": true,
+        "false_idle": false
+      }
+    },
+    {
+      "id": "generic-permission-later-progress",
+      "provider": "claude",
+      "truth": "working_with_unconfirmed_attention",
+      "events": ["attention_requested", "progress"],
+      "attention_certainty": "conservative",
+      "expected": {
+        "phase": "needs_input",
+        "false_blocked": false
+      }
+    },
+    {
+      "id": "exact-correlated-prompt",
+      "provider": "codex",
+      "truth": "needs_input",
+      "events": ["attention_requested"],
+      "attention_certainty": "exact",
+      "expected": {
+        "phase": "needs_input",
+        "false_blocked": false
+      }
+    },
+    {
+      "id": "nested-agent-completion",
+      "provider": "claude",
+      "truth": "working",
+      "events": ["turn_started", "progress"],
+      "shadow": "waiting",
+      "expected": {
+        "phase": "working",
+        "shadow_disagrees": true
+      }
+    },
+    {
+      "id": "background-helper-output",
+      "provider": "codex",
+      "truth": "waiting",
+      "events": ["turn_completed"],
+      "shadow": "working",
+      "expected": {
+        "phase": "waiting",
+        "shadow_disagrees": true
+      }
+    },
+    {
+      "id": "transcript-view",
+      "provider": "claude",
+      "truth": "unknown",
+      "events": [],
+      "shadow": "unknown",
+      "expected": {
+        "phase": "unknown",
+        "false_idle": false
+      }
+    },
+    {
+      "id": "osc-disabled",
+      "provider": "codex",
+      "truth": "unknown",
+      "events": [],
+      "shadow": "unknown",
+      "expected": {
+        "phase": "unknown",
+        "false_idle": false
+      }
+    },
+    {
+      "id": "stale-osc-title",
+      "provider": "claude",
+      "truth": "waiting",
+      "events": ["turn_completed"],
+      "shadow": "working",
+      "expected": {
+        "phase": "waiting",
+        "shadow_disagrees": true
+      }
+    },
+    {
+      "id": "runtime-reconnect",
+      "provider": "codex",
+      "truth": "starting",
+      "events": ["runtime_changed"],
+      "shadow": "unknown",
+      "expected": {
+        "phase": "starting",
+        "false_idle": false
+      }
+    },
+    {
+      "id": "duplicate-out-of-order-events",
+      "provider": "codex",
+      "truth": "working",
+      "events": ["turn_started", "progress", "duplicate_progress", "late_completion"],
+      "shadow": "working",
+      "expected": {
+        "phase": "working",
+        "false_working": false
+      }
+    },
+    {
+      "id": "provider-ui-drift",
+      "provider": "claude",
+      "truth": "unknown",
+      "events": [],
+      "shadow": "unknown",
+      "expected": {
+        "phase": "unknown",
+        "false_idle": false,
+        "false_blocked": false
+      }
+    }
+  ]
+}

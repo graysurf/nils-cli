@@ -65,10 +65,10 @@ use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
     SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
-    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    profile_unavailable, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
-    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
-    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
+    delete_session, glance_session, load_session_record, non_empty_env, profile_unavailable,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
+    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title_if_revision, write_session_attachment,
 };
 
@@ -213,7 +213,7 @@ impl CodexAccountSwitchRegistry {
 }
 
 fn default_session_collector() -> SessionCollector {
-    Arc::new(|context, tmux_bin| list_sessions(context, Some(tmux_bin)))
+    Arc::new(|context, tmux_bin| crate::list_sessions_for_serve(context, Some(tmux_bin)))
 }
 
 #[derive(Clone, Debug)]
@@ -1663,6 +1663,18 @@ fn activity_notify_event_root_lost(event: &NotifyEvent, sessions_root: &Path) ->
 }
 
 fn activity_notify_event_relevant(event: &NotifyEvent) -> bool {
+    let shadow_only = !event.paths.is_empty()
+        && event.paths.iter().all(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == crate::activity::shadow::SHADOW_FILE
+                        || name.starts_with(".activity.shadow.json.tmp-")
+                })
+        });
+    if shadow_only {
+        return false;
+    }
     let known_snapshot_path = event.paths.iter().any(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
@@ -7879,6 +7891,29 @@ mod tests {
     const TOKEN: &str = "s3cr3t-token";
 
     #[test]
+    fn shadow_sidecar_replacements_do_not_trigger_activity_refresh_feedback() {
+        let shadow_replace = NotifyEvent::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(PathBuf::from(
+            "/state/sessions/example/.activity.shadow.json.tmp-1-2-0",
+        ))
+        .add_path(PathBuf::from(
+            "/state/sessions/example/activity.shadow.json",
+        ));
+        assert!(!activity_notify_event_relevant(&shadow_replace));
+
+        let session_replace = NotifyEvent::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(PathBuf::from(
+            "/state/sessions/example/.session.json.tmp-1-2-0",
+        ))
+        .add_path(PathBuf::from("/state/sessions/example/session.json"));
+        assert!(activity_notify_event_relevant(&session_replace));
+    }
+
+    #[test]
     fn launch_profiles_advertise_only_ready_safe_summaries() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_dir = tmp.path().join("claude-gpt");
@@ -12066,7 +12101,7 @@ esac
             } else {
                 "source-after"
             };
-            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+            crate::list_sessions(context, Some(tmux_bin)).map(|sessions| {
                 sessions
                     .into_iter()
                     .filter(|session| session.id == expected_id)
@@ -12142,7 +12177,7 @@ esac
             } else {
                 "storm-before"
             };
-            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+            crate::list_sessions(context, Some(tmux_bin)).map(|sessions| {
                 sessions
                     .into_iter()
                     .filter(|session| session.id == expected_id)
@@ -12404,7 +12439,7 @@ esac
             } else {
                 "slow-final"
             };
-            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+            crate::list_sessions(context, Some(tmux_bin)).map(|sessions| {
                 sessions
                     .into_iter()
                     .filter(|session| session.id == expected_id)

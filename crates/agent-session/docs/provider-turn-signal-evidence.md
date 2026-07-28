@@ -303,6 +303,26 @@ The live release probe uses a no-content marker turn for each installed provider
 after the released binary is installed. Retained evidence records only provider
 version, event names, phase/revision changes, and pass/fail status.
 
+Provider hook and notification normalization is isolated in
+`src/activity/provider.rs`; reducer, persistence, replay, and public projection
+remain in the central activity owner. Characterization tests continue consuming
+the existing provider fixtures across that boundary.
+
+The privacy-scrubbed
+`tests/fixtures/activity/provider-activity-scenarios.json` corpus names the
+interruption, dropped completion, conservative permission, exact prompt, nested
+completion, background helper, transcript, OSC, reconnect, ordering, and
+provider-drift cases executed against the producer reducer. The consumer owns a
+separate canonical wire fixture and poll/SSE parity tests for the same public
+contract. Both fixtures record only allowlisted metadata and expected
+categories; neither contains captured pane, prompt, command, response,
+transcript, or provider identifier.
+
+The optional terminal observer is a shadow diagnostic, not another lifecycle
+adapter. It samples only uncertain running Claude or Codex sessions, publishes
+bounded rule/version/projection metadata, and cannot mutate phase, attention,
+completion, or auto-resume authority.
+
 ## Setup selection and failure behavior
 
 No audited provider offers an invocation-scoped hook flag that covers all

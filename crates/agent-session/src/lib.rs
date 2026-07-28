@@ -5436,6 +5436,21 @@ fn list_sessions(
     context: &CliContext,
     tmux_bin: Option<&Path>,
 ) -> Result<Vec<SessionView>, CliError> {
+    list_sessions_with_shadow_sampling(context, tmux_bin, false)
+}
+
+fn list_sessions_for_serve(
+    context: &CliContext,
+    tmux_bin: Option<&Path>,
+) -> Result<Vec<SessionView>, CliError> {
+    list_sessions_with_shadow_sampling(context, tmux_bin, true)
+}
+
+fn list_sessions_with_shadow_sampling(
+    context: &CliContext,
+    tmux_bin: Option<&Path>,
+    schedule_shadow_sampling: bool,
+) -> Result<Vec<SessionView>, CliError> {
     let sessions_root = context.state_dir.join("sessions");
     if !sessions_root.exists() {
         return Ok(Vec::new());
@@ -5497,6 +5512,8 @@ fn list_sessions(
                     &record,
                     status,
                     last_terminal_activity_at,
+                    &tmux_bin,
+                    schedule_shadow_sampling,
                 ));
             }
         }
@@ -6085,7 +6102,14 @@ fn session_view(
     };
     let status = forced_status.unwrap_or_else(|| session_status(tmux_bin, record));
     let last_terminal_activity_at = last_terminal_activity_at(tmux_bin, record, &status);
-    session_view_from_parts(context, record, status, last_terminal_activity_at)
+    session_view_from_parts(
+        context,
+        record,
+        status,
+        last_terminal_activity_at,
+        tmux_bin,
+        false,
+    )
 }
 
 fn session_view_from_parts(
@@ -6093,6 +6117,8 @@ fn session_view_from_parts(
     record: &SessionRecord,
     status: String,
     last_terminal_activity_at: Option<String>,
+    tmux_bin: &Path,
+    schedule_shadow_sampling: bool,
 ) -> SessionView {
     let resume_blocked_reason =
         match orchestration::session_authority_is_quarantined(context, record) {
@@ -6106,6 +6132,16 @@ fn session_view_from_parts(
     } else {
         Ok(None)
     };
+    let turn_state = activity::state_for_view(context, record).map(|state| {
+        activity::shadow::annotate_for_view(
+            context,
+            record,
+            &status,
+            tmux_bin,
+            state,
+            schedule_shadow_sampling,
+        )
+    });
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
@@ -6154,7 +6190,7 @@ fn session_view_from_parts(
             .runtime
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
-        turn_state: activity::state_for_view(context, record),
+        turn_state,
         // Populated on demand by the list handler; never computed in the shared
         // collector so the expensive transcript path stays out of the hot build.
         last_prompt: None,

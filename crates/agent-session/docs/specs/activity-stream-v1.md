@@ -73,6 +73,10 @@ The JSON shape is:
           "provider": "codex",
           "confidence": "authoritative"
         },
+        "semantic_event": {
+          "kind": "turn_completed",
+          "observed_at": "2026-07-11T16:59:00Z"
+        },
         "last_turn": {
           "provider_turn_id": "opaque-id",
           "started_at": "2026-07-11T16:58:00Z",
@@ -115,8 +119,9 @@ snapshot is emitted as the recovery transition. Polling remains authoritative
 and available.
 
 Nested optional `turn_state` leaves use the same omission semantics as
-`GET /sessions`: absent provider ids, progress timestamps, attention, current
-turn, and last turn are omitted rather than serialized as `null`. The
+`GET /sessions`: absent provider ids, progress timestamps, semantic events,
+diagnostics, shadow observations, attention, current turn, and last turn are
+omitted rather than serialized as `null`. The
 session-level `turn_state: null` remains intentional and means no valid activity
 snapshot. The exact multi-session Rust producer fixture consumed by downstream
 contract tests is
@@ -156,10 +161,20 @@ saturation.
 
 Filesystem notifications for `activity.json` and session lifecycle changes use
 a capacity-one dirty bit. The first isolated refresh waits for a trailing 25 ms
-quiet window. Under a continuous burst, a refresh starts by the 250 ms cadence;
-after any refresh starts, the next refresh cannot start for at least 250 ms.
-Notifications arriving during a scan stay dirty and converge in a later
-rate-bounded refresh.
+quiet window. Under
+a continuous burst, a refresh starts by the 250 ms cadence; after any refresh
+starts, the next refresh cannot start for at least 250 ms. Notifications
+arriving during a scan stay dirty and converge in a later rate-bounded refresh.
+
+Shadow observations are populated asynchronously by the long-lived serve
+session collector and do not make list or SSE refresh wait for tmux capture.
+One-shot CLI list/status paths read the cache without launching detached work.
+The sampler runs at most four captures concurrently, uses a shadow-specific
+nonblocking lock, revalidates launch identity and generation before writing,
+and never holds the provider activity-ingestion lock. Its own `activity.shadow.json`
+writes are intentionally not broker refresh triggers; the next ordinary
+provider/session refresh or authoritative four-second poll exposes the cached
+diagnostic without a feedback rescan.
 
 A notify event marked `need_rescan()` forces the same full snapshot collection
 even when it has no relevant path. Removal or rename of the watched sessions
@@ -173,9 +188,11 @@ normal transition source.
 ## Privacy boundary
 
 Stream state is constructed from an allowlist. It may contain session id,
-phase/timestamps/revision, provider source/confidence, opaque projected turn id,
-attention kind/time/count, and outcome. Forward-compatible unknown fields from
-durable snapshots are deliberately excluded.
+phase/timestamps/revision, provider source/confidence, the last semantic event
+kind/time, an allowlisted diagnostic reason, opaque projected turn id, attention
+kind/time/count/certainty, bounded shadow observer metadata, and outcome.
+Forward-compatible unknown fields from durable snapshots are deliberately
+excluded.
 
 Prompt, response, command, tool payload, terminal output, transcript/config
 paths or contents, and credentials are forbidden. Provider hook processes only

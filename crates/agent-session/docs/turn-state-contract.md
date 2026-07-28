@@ -95,6 +95,10 @@ Example:
     "provider": "codex",
     "confidence": "observed"
   },
+  "semantic_event": {
+    "kind": "progress",
+    "observed_at": "2026-07-10T12:31:41Z"
+  },
   "current_turn": {
     "provider_turn_id": "turn-id",
     "started_at": "2026-07-10T12:31:08Z",
@@ -102,7 +106,8 @@ Example:
     "attention": {
       "kind": "approval",
       "requested_at": "2026-07-10T12:31:28Z",
-      "pending_count": 2
+      "pending_count": 2,
+      "certainty": "conservative"
     }
   },
   "last_turn": {
@@ -133,6 +138,28 @@ focus, browser clocks, or provider-supplied timestamps. Exact
 `AskUserQuestion` completion/failure counts as progress while clearing only its
 own runtime-scoped clarification correlation. Old snapshots omit the field and
 remain valid.
+
+`semantic_event` is the last accepted structured provider event and contains
+only its allowlisted kind plus daemon receive time. Polling, SSE delivery,
+reconnect, and browser clocks do not advance it. Clients may use its age to
+describe uncertainty, but age never proves Waiting or completion.
+
+Attention `certainty` is `exact` only when the selected provider adapter owns a
+stable request/resolution correlation. Generic permission and identifier-less
+elicitation evidence is `conservative`. Old snapshots omit the field and
+therefore deserialize conservatively.
+
+Optional `diagnostic.reason` values are producer-owned allowlisted codes:
+`completion_evidence_pending`, `attention_authority_mismatch`,
+`provider_projection_unavailable`, `runtime_activity_unhealthy`, and
+`activity_state_unavailable`. Free-form provider or runtime errors never cross
+the session-view or stream boundary.
+
+Optional `shadow_observation` is diagnostics-only. It contains
+`observer_version`, a bounded `rule_id`, daemon `observed_at`, one of
+`working`, `needs_input`, `waiting`, or `unknown`, and a `disagrees` flag. It
+never changes phase, completion, attention correlation, auto-resume, or any
+other automation condition.
 
 ## Attention correlation authority
 
@@ -262,6 +289,11 @@ Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are
 derived by clients and are never persisted separately.
 
+A raw Stop also projects `diagnostic.reason:
+completion_evidence_pending` while the turn remains open. The next accepted
+provider event replaces that diagnostic; it does not retroactively treat Stop
+as completion.
+
 ## Client presentation projection
 
 Durable phase remains conservative for old-client safety. A new client may
@@ -329,6 +361,22 @@ assistant, and cwd content remains transiently observable through same-host
 process inspection until the helper exits. Restricted process visibility is a
 deployment requirement; eliminating this upstream argv exposure requires a
 future provider-supported stdin/metadata-only transport or App Server boundary.
+
+Provider hook and notification normalization lives behind the
+`activity/provider.rs` adapter boundary. The central module retains the typed
+reducer, persistence, replay, and public projection.
+
+The `activity/shadow.rs` observer samples only running Claude or Codex sessions
+whose structured evidence is unknown, at least five minutes old, or has been
+missing for at least five minutes. The long-lived serve collector schedules
+sampling in detached bounded workers and immediately returns cached metadata;
+one-shot CLI views only read that cache and never start work that could be lost
+at process exit. Sampling runs outside the activity-ingestion lock, uses a
+process-wide concurrency cap of four, and is cached for 15 seconds. Each tmux
+metadata/capture command is bounded to 250 ms and 16 KiB, and only the
+metadata-only observation sidecar is persisted. Pane titles and capture bytes
+are discarded in memory. Each sidecar is fenced by runtime launch identity and
+generation, with the active record revalidated immediately before persistence.
 
 `provider-prompt.v1` is a separate, advisory attach/title protocol. It is not a
 turn event source, it is not persisted into activity files, and a prompt-event

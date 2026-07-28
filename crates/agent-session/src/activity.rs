@@ -22,6 +22,11 @@ use crate::{
     load_session_record, mutate_session_record, session_dir,
 };
 
+mod provider;
+pub(crate) mod shadow;
+
+use provider::{normalize_provider_hook, normalize_provider_notification};
+
 pub(crate) const TURN_EVENT_VERSION: &str = "agent-session.turn-event.v1";
 pub(crate) const TURN_STATE_VERSION: &str = "agent-session.turn-state.v1";
 const ACTIVITY_DOCUMENT_VERSION: &str = "agent-session.activity.v1";
@@ -77,6 +82,40 @@ pub(crate) enum SourceKind {
     Runtime,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttentionCertainty {
+    Exact,
+    #[default]
+    Conservative,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SemanticEventView {
+    pub(crate) kind: String,
+    pub(crate) observed_at: String,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ActivityDiagnosticView {
+    pub(crate) reason: String,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ShadowObservationView {
+    pub(crate) observer_version: String,
+    pub(crate) rule_id: String,
+    pub(crate) observed_at: String,
+    pub(crate) projection: String,
+    pub(crate) disagrees: bool,
+    #[serde(default, flatten)]
+    extra: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct TurnSource {
     pub(crate) kind: SourceKind,
@@ -92,6 +131,8 @@ pub(crate) struct AttentionView {
     pub(crate) kind: String,
     pub(crate) requested_at: String,
     pub(crate) pending_count: usize,
+    #[serde(default)]
+    pub(crate) certainty: AttentionCertainty,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
 }
@@ -129,6 +170,12 @@ pub(crate) struct TurnState {
     pub(crate) revision: u64,
     pub(crate) source: TurnSource,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_event: Option<SemanticEventView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<ActivityDiagnosticView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shadow_observation: Option<ShadowObservationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) current_turn: Option<CurrentTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_turn: Option<LastTurn>,
@@ -145,10 +192,31 @@ pub(crate) struct StreamTurnSource {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamSemanticEventView {
+    pub(crate) kind: String,
+    pub(crate) observed_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamActivityDiagnosticView {
+    pub(crate) reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct StreamShadowObservationView {
+    pub(crate) observer_version: String,
+    pub(crate) rule_id: String,
+    pub(crate) observed_at: String,
+    pub(crate) projection: String,
+    pub(crate) disagrees: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct StreamAttentionView {
     pub(crate) kind: String,
     pub(crate) requested_at: String,
     pub(crate) pending_count: usize,
+    pub(crate) certainty: AttentionCertainty,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -180,6 +248,12 @@ pub(crate) struct StreamTurnState {
     pub(crate) revision: u64,
     pub(crate) source: StreamTurnSource,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_event: Option<StreamSemanticEventView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<StreamActivityDiagnosticView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shadow_observation: Option<StreamShadowObservationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) current_turn: Option<StreamCurrentTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_turn: Option<StreamLastTurn>,
@@ -190,6 +264,8 @@ struct PendingAttention {
     id: String,
     kind: String,
     requested_at: String,
+    #[serde(default)]
+    certainty: AttentionCertainty,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
 }
@@ -199,6 +275,8 @@ struct OverflowAttention {
     kind: String,
     requested_at: String,
     count: usize,
+    #[serde(default)]
+    certainty: AttentionCertainty,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
 }
@@ -288,6 +366,8 @@ pub(crate) struct TurnEvent {
     pub(crate) attention_kind: Option<String>,
     #[serde(skip)]
     attention_correlation_ambiguous: bool,
+    #[serde(skip)]
+    attention_correlation_exact: bool,
     pub(crate) confidence: Confidence,
     #[serde(default)]
     pub(crate) source_kind: SourceKind,
@@ -328,6 +408,7 @@ pub(crate) fn ingest_codex_app_server_failure(
             attention_id: None,
             attention_kind: None,
             attention_correlation_ambiguous: false,
+            attention_correlation_exact: false,
             confidence: Confidence::Authoritative,
             // `provider_hook` is the stable v1 wire value for authoritative,
             // provider-structured evidence, including the app-server protocol.
@@ -391,6 +472,7 @@ pub(crate) fn ingest_codex_app_server_attention(
             attention_id: Some(attention_id),
             attention_kind,
             attention_correlation_ambiguous: false,
+            attention_correlation_exact: true,
             confidence: Confidence::Authoritative,
             // `provider_hook` is the stable v1 wire value for all structured
             // provider evidence, including the app-server protocol.
@@ -404,6 +486,21 @@ pub(crate) fn ingest_codex_app_server_attention(
 /// contract. Durable snapshots preserve additive fields for forward
 /// compatibility; those unknown fields must not cross the daemon stream's
 /// metadata-only privacy boundary.
+fn stream_identifier(value: &str) -> bool {
+    value.len() <= 64
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn stream_timestamp(value: &str) -> bool {
+    value.len() <= 64 && value.parse::<jiff::Timestamp>().is_ok()
+}
+
 pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
     StreamTurnState {
         schema_version: state.schema_version.clone(),
@@ -415,6 +512,60 @@ pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
             provider: state.source.provider.clone(),
             confidence: state.source.confidence.clone(),
         },
+        semantic_event: state
+            .semantic_event
+            .as_ref()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    "turn_started"
+                        | "attention_requested"
+                        | "attention_cleared"
+                        | "progress"
+                        | "stop_observed"
+                        | "turn_completed"
+                        | "turn_failed"
+                ) && stream_timestamp(&event.observed_at)
+            })
+            .map(|event| StreamSemanticEventView {
+                kind: event.kind.clone(),
+                observed_at: event.observed_at.clone(),
+            }),
+        diagnostic: state
+            .diagnostic
+            .as_ref()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.reason.as_str(),
+                    "completion_evidence_pending"
+                        | "attention_authority_mismatch"
+                        | "provider_projection_unavailable"
+                        | "runtime_activity_unhealthy"
+                        | "activity_state_unavailable"
+                )
+            })
+            .map(|diagnostic| StreamActivityDiagnosticView {
+                reason: diagnostic.reason.clone(),
+            }),
+        shadow_observation: state
+            .shadow_observation
+            .as_ref()
+            .filter(|observation| {
+                stream_identifier(&observation.observer_version)
+                    && stream_identifier(&observation.rule_id)
+                    && stream_timestamp(&observation.observed_at)
+                    && matches!(
+                        observation.projection.as_str(),
+                        "working" | "needs_input" | "waiting" | "unknown"
+                    )
+            })
+            .map(|observation| StreamShadowObservationView {
+                observer_version: observation.observer_version.clone(),
+                rule_id: observation.rule_id.clone(),
+                observed_at: observation.observed_at.clone(),
+                projection: observation.projection.clone(),
+                disagrees: observation.disagrees,
+            }),
         current_turn: state.current_turn.as_ref().map(|turn| StreamCurrentTurn {
             provider_turn_id: turn.provider_turn_id.clone(),
             started_at: turn.started_at.clone(),
@@ -426,6 +577,7 @@ pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
                     kind: attention.kind.clone(),
                     requested_at: attention.requested_at.clone(),
                     pending_count: attention.pending_count,
+                    certainty: attention.certainty.clone(),
                 }),
         }),
         last_turn: state.last_turn.as_ref().map(|turn| StreamLastTurn {
@@ -763,7 +915,26 @@ fn degraded_state(mut state: TurnState, at: &str) -> TurnState {
     state.phase = TurnPhase::Unknown;
     state.revision = state.revision.saturating_add(1);
     state.source = runtime_source();
+    state.diagnostic = Some(ActivityDiagnosticView {
+        reason: "runtime_activity_unhealthy".to_string(),
+        extra: Map::new(),
+    });
+    state.shadow_observation = None;
     state
+}
+
+fn runtime_diagnostic(reason: &str) -> ActivityDiagnosticView {
+    let reason = if reason.contains("attention_authority") {
+        "attention_authority_mismatch"
+    } else if reason.contains("projection") {
+        "provider_projection_unavailable"
+    } else {
+        "runtime_activity_unhealthy"
+    };
+    ActivityDiagnosticView {
+        reason: reason.to_string(),
+        extra: Map::new(),
+    }
 }
 
 fn marker_state_from_snapshot(
@@ -1147,6 +1318,9 @@ fn starting_state(at: String, revision: u64, last_turn: Option<LastTurn>) -> Tur
         phase_changed_at: at,
         revision,
         source: runtime_source(),
+        semantic_event: None,
+        diagnostic: None,
+        shadow_observation: None,
         current_turn: None,
         last_turn,
         extra: Map::new(),
@@ -1360,8 +1534,9 @@ pub(crate) fn mark_runtime_unhealthy(
     ) {
         return Ok(());
     }
-    let marker_state =
+    let mut marker_state =
         marker_state_from_snapshot(&dir, &record, runtime_id, runtime.generation, &now());
+    marker_state.diagnostic = Some(runtime_diagnostic(reason));
     write_runtime_unhealthy_marker(&dir, runtime_id, runtime.generation, reason, &marker_state)?;
     let _lock = match acquire_lock_with_timeout(&dir, RUNTIME_UNHEALTHY_LOCK_TIMEOUT) {
         Ok(lock) => lock,
@@ -1403,6 +1578,7 @@ pub(crate) fn mark_runtime_unhealthy(
     } else {
         degraded_state(document.state, &now())
     };
+    document.state.diagnostic = Some(runtime_diagnostic(reason));
     write_runtime_unhealthy_marker(
         &dir,
         runtime_id,
@@ -1448,10 +1624,22 @@ fn unknown_state(record: &SessionRecord) -> TurnState {
         phase_changed_at: record.updated_at.clone(),
         revision: 0,
         source: runtime_source(),
+        semantic_event: None,
+        diagnostic: None,
+        shadow_observation: None,
         current_turn: None,
         last_turn: None,
         extra: Map::new(),
     }
+}
+
+fn unknown_state_with_reason(record: &SessionRecord, reason: &str) -> TurnState {
+    let mut state = unknown_state(record);
+    state.diagnostic = Some(ActivityDiagnosticView {
+        reason: reason.to_string(),
+        extra: Map::new(),
+    });
+    state
 }
 
 fn activity_matches_runtime(document: &ActivityDocument, record: &SessionRecord) -> bool {
@@ -1513,7 +1701,10 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
         {
             Some(document.state)
         }
-        Ok(_) | Err(_) => Some(unknown_state(record)),
+        Ok(_) | Err(_) => Some(unknown_state_with_reason(
+            record,
+            "activity_state_unavailable",
+        )),
     }
 }
 
@@ -1900,6 +2091,18 @@ fn ingest_event_with_lock(
     reduce(&mut document, &event, &received_at);
     document.last_event_at = Some(received_at.clone());
     if matches!(event.source_kind, SourceKind::ProviderHook) {
+        document.state.semantic_event = Some(SemanticEventView {
+            kind: turn_event_kind_name(&event.kind).to_string(),
+            observed_at: received_at.clone(),
+            extra: Map::new(),
+        });
+        document.state.diagnostic = (event.kind == TurnEventKind::StopObserved
+            && document.state.current_turn.is_some())
+        .then(|| ActivityDiagnosticView {
+            reason: "completion_evidence_pending".to_string(),
+            extra: Map::new(),
+        });
+        document.state.shadow_observation = None;
         document.last_semantic_event = Some(semantic_key);
         document.last_semantic_event_at = Some(received_at.clone());
         document.last_provider_event_kind = Some(event.kind.clone());
@@ -1985,6 +2188,9 @@ pub(crate) fn activity_status_for_record(
         phase_changed_at: record.updated_at.clone(),
         revision: 0,
         source: runtime_source(),
+        semantic_event: None,
+        diagnostic: None,
+        shadow_observation: None,
         current_turn: None,
         last_turn: None,
         extra: Map::new(),
@@ -2430,311 +2636,6 @@ pub(crate) fn clear_hook_diagnostic(context: &CliContext, agent: AgentKind) {
     }) {
         let _ = fs::remove_file(session_dir(context, &id).join(ACTIVITY_DIAGNOSTIC_FILE));
     }
-}
-
-fn normalize_provider_hook(
-    agent: AgentKind,
-    event_override: Option<&str>,
-    runtime_id: &str,
-    raw: &Value,
-) -> Result<Option<TurnEvent>, CliError> {
-    let event_name = event_override
-        .or_else(|| raw.get("hook_event_name").and_then(Value::as_str))
-        .or_else(|| raw.get("event").and_then(Value::as_str));
-    let Some(event_name) = event_name else {
-        return Ok(None);
-    };
-    let notification = raw.get("notification_type").and_then(Value::as_str);
-    let tool_name = raw.get("tool_name").and_then(Value::as_str);
-    if agent == AgentKind::Claude
-        && event_name == "PermissionRequest"
-        && tool_name == Some("AskUserQuestion")
-    {
-        // AskUserQuestion is already owned by the exact PreToolUse/PostToolUse
-        // correlation below. Claude may also emit an uncorrelated permission
-        // request for the same UI; admitting both would strand a conservative
-        // approval after the exact question resolves.
-        return Ok(None);
-    }
-    let exact_clarification = agent == AgentKind::Claude
-        && tool_name == Some("AskUserQuestion")
-        && matches!(
-            event_name,
-            "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-        );
-    let claude_elicitation =
-        agent == AgentKind::Claude && matches!(event_name, "Elicitation" | "ElicitationResult");
-    let elicitation_id = claude_elicitation
-        .then(|| optional_hook_string(raw, "elicitation_id"))
-        .transpose()?
-        .flatten();
-    if event_name == "ElicitationResult" && elicitation_id.is_none() {
-        // Claude documents this identifier as optional. An identifier-less
-        // result cannot safely clear a conservative request latch.
-        return Ok(None);
-    }
-    let exact_elicitation = claude_elicitation && elicitation_id.is_some();
-    let exact_hermes_approval = agent == AgentKind::Hermes
-        && matches!(
-            event_name,
-            "pre_approval_request" | "post_approval_response"
-        );
-    let hermes_approval_metadata = exact_hermes_approval
-        .then(|| hermes_approval_metadata(raw))
-        .transpose()?;
-    if agent == AgentKind::Hermes
-        && event_name == "post_approval_response"
-        && !matches!(
-            hermes_approval_metadata
-                .and_then(|metadata| metadata.get("choice"))
-                .and_then(Value::as_str),
-            Some("once" | "session" | "always" | "deny" | "timeout")
-        )
-    {
-        return Err(CliError::data(
-            "provider-hook-response-invalid",
-            "recognized Hermes approval response has an invalid or missing choice",
-            None,
-        ));
-    }
-    let (kind, attention_kind, confidence) = match (agent, event_name, notification) {
-        (AgentKind::Codex, "UserPromptSubmit", _) => {
-            (TurnEventKind::TurnStarted, None, Confidence::Observed)
-        }
-        (AgentKind::Codex, "PermissionRequest", _) => (
-            TurnEventKind::AttentionRequested,
-            Some("approval"),
-            Confidence::Observed,
-        ),
-        (AgentKind::Codex, "PostToolUse", _) => {
-            (TurnEventKind::Progress, None, Confidence::Observed)
-        }
-        (AgentKind::Codex, "Stop", _) => (TurnEventKind::StopObserved, None, Confidence::Observed),
-        (AgentKind::Claude, "UserPromptSubmit", _) => {
-            (TurnEventKind::TurnStarted, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "PreToolUse", _) if exact_clarification => (
-            TurnEventKind::AttentionRequested,
-            Some("clarification"),
-            Confidence::Observed,
-        ),
-        (AgentKind::Claude, "PreToolUse", _) => {
-            (TurnEventKind::Progress, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "PostToolUse", _) if exact_clarification => {
-            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "PostToolUseFailure", _) if exact_clarification => {
-            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "Elicitation", _) => (
-            TurnEventKind::AttentionRequested,
-            Some(if raw.get("mode").and_then(Value::as_str) == Some("url") {
-                "authentication"
-            } else {
-                "clarification"
-            }),
-            Confidence::Observed,
-        ),
-        (AgentKind::Claude, "ElicitationResult", _) if exact_elicitation => {
-            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "PermissionRequest", _)
-        | (AgentKind::Claude, "Notification", Some("permission_prompt")) => (
-            TurnEventKind::AttentionRequested,
-            Some("approval"),
-            Confidence::Observed,
-        ),
-        (AgentKind::Claude, "Notification", Some("agent_needs_input")) => (
-            TurnEventKind::AttentionRequested,
-            Some("other"),
-            Confidence::Observed,
-        ),
-        (AgentKind::Claude, "PostToolUse", _) => {
-            (TurnEventKind::Progress, None, Confidence::Observed)
-        }
-        (AgentKind::Claude, "Stop", _) => (TurnEventKind::StopObserved, None, Confidence::Observed),
-        (AgentKind::Claude, "StopFailure", _) => {
-            (TurnEventKind::TurnFailed, None, Confidence::Authoritative)
-        }
-        (AgentKind::Claude, "Notification", Some("idle_prompt")) => {
-            (TurnEventKind::TurnCompleted, None, Confidence::Observed)
-        }
-        (AgentKind::Hermes, "pre_llm_call", _) => {
-            (TurnEventKind::TurnStarted, None, Confidence::Observed)
-        }
-        (AgentKind::Hermes, "post_llm_call", _) => (
-            TurnEventKind::TurnCompleted,
-            None,
-            Confidence::Authoritative,
-        ),
-        (AgentKind::Hermes, "pre_approval_request", _) => (
-            TurnEventKind::AttentionRequested,
-            Some("approval"),
-            Confidence::Observed,
-        ),
-        (AgentKind::Hermes, "post_approval_response", _) => {
-            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
-        }
-        _ => return Ok(None),
-    };
-    let failure_reason = (agent == AgentKind::Claude && event_name == "StopFailure")
-        .then(|| {
-            raw.get("error")
-                .and_then(Value::as_str)
-                .map(normalize_claude_failure_reason)
-        })
-        .flatten();
-    let mut provider_session = optional_hook_string(raw, "session_id")?;
-    if provider_session.is_none() {
-        provider_session = optional_hook_string(raw, "session_key")?;
-    }
-    if provider_session.is_none()
-        && let Some(metadata) = hermes_approval_metadata
-    {
-        provider_session = optional_hook_string(metadata, "session_key")?;
-    }
-    let provider_session_id = provider_session
-        .map(|value| projected_provider_identifier(runtime_id, agent, "session", value))
-        .transpose()?;
-    let mut provider_turn = optional_hook_string(raw, "turn_id")?;
-    if provider_turn.is_none()
-        && let Some(metadata) = hermes_approval_metadata
-    {
-        provider_turn = optional_hook_string(metadata, "turn_id")?;
-    }
-    let provider_turn_id = provider_turn
-        .map(|value| projected_provider_identifier(runtime_id, agent, "turn", value))
-        .transpose()?;
-    let (exact_attention_id, attention_correlation_ambiguous) = if exact_clarification {
-        (
-            raw.get("tool_use_id")
-                .and_then(Value::as_str)
-                .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
-                .transpose()?,
-            false,
-        )
-    } else if exact_elicitation {
-        (
-            elicitation_id
-                .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
-                .transpose()?,
-            false,
-        )
-    } else if let Some(metadata) = hermes_approval_metadata {
-        let (id, ambiguous) = hermes_approval_correlation(runtime_id, metadata)?;
-        (Some(id), ambiguous)
-    } else {
-        (None, false)
-    };
-    if exact_clarification && exact_attention_id.is_none() {
-        return Err(CliError::data(
-            "provider-hook-correlation-missing",
-            "recognized AskUserQuestion hook event is missing tool_use_id",
-            None,
-        ));
-    }
-    let attention_id = match kind {
-        TurnEventKind::AttentionRequested
-            if exact_clarification || exact_elicitation || exact_hermes_approval =>
-        {
-            exact_attention_id
-        }
-        TurnEventKind::AttentionRequested => Some(uuid::Uuid::new_v4().to_string()),
-        TurnEventKind::AttentionCleared => exact_attention_id,
-        _ => None,
-    };
-    let event_id = if exact_hermes_approval && !attention_correlation_ambiguous {
-        stable_hermes_approval_event_id(
-            runtime_id,
-            &kind,
-            attention_id
-                .as_deref()
-                .expect("exact Hermes approval correlation"),
-        )
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
-    Ok(Some(TurnEvent {
-        schema_version: TURN_EVENT_VERSION.to_string(),
-        event_id,
-        runtime_id: runtime_id.to_string(),
-        provider: agent.as_str().to_string(),
-        provider_session_id,
-        provider_turn_id,
-        kind,
-        failure_reason,
-        attention_id,
-        attention_kind: attention_kind.map(str::to_string),
-        attention_correlation_ambiguous,
-        confidence,
-        source_kind: SourceKind::ProviderHook,
-        provider_time: None,
-    }))
-}
-
-fn normalize_claude_failure_reason(reason: &str) -> String {
-    match reason {
-        "rate_limit" => "usage_exhausted",
-        "authentication_failed" => "authentication",
-        "oauth_org_not_allowed" => "organization",
-        "billing_error" => "billing",
-        "invalid_request" => "invalid_request",
-        "server_error" => "service",
-        "max_output_tokens" => "max_output_tokens",
-        _ => "unknown",
-    }
-    .to_string()
-}
-
-fn normalize_provider_notification(
-    agent: AgentKind,
-    runtime_id: &str,
-    raw: &Value,
-) -> Result<Option<TurnEvent>, CliError> {
-    if agent != AgentKind::Codex
-        || raw.get("type").and_then(Value::as_str) != Some("agent-turn-complete")
-    {
-        return Ok(None);
-    }
-    let provider_session_id = raw
-        .get("thread-id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::data(
-                "provider-notification-session-id-missing",
-                "Codex completion notification is missing thread-id",
-                None,
-            )
-        })
-        .and_then(|value| projected_provider_identifier(runtime_id, agent, "session", value))?;
-    let provider_turn_id = raw
-        .get("turn-id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::data(
-                "provider-notification-turn-id-missing",
-                "Codex completion notification is missing turn-id",
-                None,
-            )
-        })
-        .and_then(|value| projected_provider_identifier(runtime_id, agent, "turn", value))?;
-    Ok(Some(TurnEvent {
-        schema_version: TURN_EVENT_VERSION.to_string(),
-        event_id: uuid::Uuid::new_v4().to_string(),
-        runtime_id: runtime_id.to_string(),
-        provider: agent.as_str().to_string(),
-        provider_session_id: Some(provider_session_id),
-        provider_turn_id: Some(provider_turn_id),
-        kind: TurnEventKind::TurnCompleted,
-        failure_reason: None,
-        attention_id: None,
-        attention_kind: None,
-        attention_correlation_ambiguous: false,
-        confidence: Confidence::Authoritative,
-        source_kind: SourceKind::ProviderHook,
-        provider_time: None,
-    }))
 }
 
 pub(crate) fn doctor(
@@ -4112,6 +4013,7 @@ mod tests {
             attention_id: None,
             attention_kind: None,
             attention_correlation_ambiguous: false,
+            attention_correlation_exact: false,
             confidence: Confidence::Observed,
             source_kind: SourceKind::ProviderHook,
             provider_time: None,
@@ -4137,6 +4039,353 @@ mod tests {
             pending_journal: None,
             runtime_unhealthy_reason: None,
             extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn stream_projection_exposes_only_bounded_activity_evidence_metadata() {
+        let state: TurnState = serde_json::from_value(json!({
+            "schema_version": TURN_STATE_VERSION,
+            "phase": "needs_input",
+            "phase_changed_at": "2026-07-29T00:00:00Z",
+            "revision": 9,
+            "source": {
+                "kind": "provider_hook",
+                "provider": "claude",
+                "confidence": "observed"
+            },
+            "semantic_event": {
+                "kind": "progress",
+                "observed_at": "2026-07-29T00:00:04Z"
+            },
+            "diagnostic": {
+                "reason": "completion_evidence_pending"
+            },
+            "shadow_observation": {
+                "observer_version": "terminal-shadow.v1",
+                "rule_id": "claude-working-indicator",
+                "observed_at": "2026-07-29T00:00:05Z",
+                "projection": "working",
+                "disagrees": false,
+                "terminal": "must-not-stream",
+                "prompt": "must-not-stream"
+            },
+            "current_turn": {
+                "started_at": "2026-07-29T00:00:00Z",
+                "attention": {
+                    "kind": "approval",
+                    "requested_at": "2026-07-29T00:00:02Z",
+                    "pending_count": 1,
+                    "certainty": "conservative",
+                    "response": "must-not-stream"
+                }
+            },
+            "provider_payload": "must-not-stream"
+        }))
+        .expect("forward-compatible state");
+
+        let projection = serde_json::to_value(stream_projection(&state)).expect("projection");
+
+        assert_eq!(projection["semantic_event"]["kind"], "progress");
+        assert_eq!(
+            projection["diagnostic"]["reason"],
+            "completion_evidence_pending"
+        );
+        assert_eq!(
+            projection["current_turn"]["attention"]["certainty"],
+            "conservative"
+        );
+        assert_eq!(
+            projection["shadow_observation"]["observer_version"],
+            "terminal-shadow.v1"
+        );
+        let encoded = projection.to_string();
+        for forbidden in [
+            "must-not-stream",
+            "\"provider_payload\":",
+            "\"terminal\":",
+            "\"prompt\":",
+            "\"response\":",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "leaked forbidden field: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_projection_omits_unallowlisted_activity_evidence_metadata() {
+        let mut state = starting_state("2026-07-29T00:00:00Z".to_string(), 1, None);
+        state.semantic_event = Some(SemanticEventView {
+            kind: "provider payload".to_string(),
+            observed_at: "2026-07-29T00:00:01Z".to_string(),
+            extra: Map::new(),
+        });
+        state.diagnostic = Some(ActivityDiagnosticView {
+            reason: "provider secret".to_string(),
+            extra: Map::new(),
+        });
+        state.shadow_observation = Some(ShadowObservationView {
+            observer_version: "terminal-shadow.v1".to_string(),
+            rule_id: "prompt content".to_string(),
+            observed_at: "2026-07-29T00:00:02Z".to_string(),
+            projection: "provider response".to_string(),
+            disagrees: true,
+            extra: Map::new(),
+        });
+
+        let projection = serde_json::to_value(stream_projection(&state)).expect("projection");
+
+        assert!(projection.get("semantic_event").is_none());
+        assert!(projection.get("diagnostic").is_none());
+        assert!(projection.get("shadow_observation").is_none());
+        let encoded = projection.to_string();
+        assert!(!encoded.contains("provider payload"));
+        assert!(!encoded.contains("provider secret"));
+        assert!(!encoded.contains("prompt content"));
+        assert!(!encoded.contains("provider response"));
+    }
+
+    #[test]
+    fn exact_and_uncorrelated_attention_project_distinct_certainty() {
+        let exact_raw = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "exact-question"
+        });
+        let exact = normalize_provider_hook(AgentKind::Claude, None, "runtime-1", &exact_raw)
+            .expect("exact attention")
+            .expect("recognized exact attention");
+        let mut exact_document = document();
+        reduce(&mut exact_document, &exact, "2026-07-29T00:00:01Z");
+
+        let conservative_raw = json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash"
+        });
+        let conservative =
+            normalize_provider_hook(AgentKind::Claude, None, "runtime-1", &conservative_raw)
+                .expect("conservative attention")
+                .expect("recognized conservative attention");
+        let mut conservative_document = document();
+        reduce(
+            &mut conservative_document,
+            &conservative,
+            "2026-07-29T00:00:01Z",
+        );
+
+        let exact_state =
+            serde_json::to_value(stream_projection(&exact_document.state)).expect("exact state");
+        let conservative_state =
+            serde_json::to_value(stream_projection(&conservative_document.state))
+                .expect("conservative state");
+        assert_eq!(
+            exact_state["current_turn"]["attention"]["certainty"],
+            "exact"
+        );
+        assert_eq!(
+            conservative_state["current_turn"]["attention"]["certainty"],
+            "conservative"
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct ActivityScenarioCorpus {
+        schema_version: String,
+        scenarios: Vec<ActivityScenario>,
+    }
+
+    #[derive(Deserialize)]
+    struct ActivityScenario {
+        id: String,
+        provider: String,
+        truth: String,
+        events: Vec<String>,
+        shadow: Option<String>,
+        attention_certainty: Option<AttentionCertainty>,
+        expected: ActivityScenarioExpected,
+    }
+
+    #[derive(Deserialize)]
+    struct ActivityScenarioExpected {
+        phase: TurnPhase,
+        diagnostic: Option<String>,
+        shadow_disagrees: Option<bool>,
+        false_idle: Option<bool>,
+        false_working: Option<bool>,
+        false_blocked: Option<bool>,
+    }
+
+    fn execute_activity_scenario(scenario: &ActivityScenario) -> ActivityDocument {
+        let mut result = document();
+        result.state = TurnState {
+            schema_version: TURN_STATE_VERSION.to_string(),
+            phase: TurnPhase::Unknown,
+            phase_changed_at: "2026-07-10T00:00:00Z".to_string(),
+            revision: 0,
+            source: runtime_source(),
+            semantic_event: None,
+            diagnostic: None,
+            shadow_observation: None,
+            current_turn: None,
+            last_turn: None,
+            extra: Map::new(),
+        };
+        let mut last_progress = None;
+        for (index, action) in scenario.events.iter().enumerate() {
+            if action == "runtime_changed" {
+                result.state =
+                    starting_state(format!("2026-07-10T00:00:{:02}Z", index + 1), 1, None);
+                continue;
+            }
+            let kind = match action.as_str() {
+                "turn_started" => TurnEventKind::TurnStarted,
+                "attention_requested" => TurnEventKind::AttentionRequested,
+                "progress" | "duplicate_progress" => TurnEventKind::Progress,
+                "stop_observed" => TurnEventKind::StopObserved,
+                "turn_completed" => TurnEventKind::TurnCompleted,
+                "late_completion" => TurnEventKind::TurnCompleted,
+                unknown => panic!("{} has unknown corpus event {unknown}", scenario.id),
+            };
+            let event_id = if action == "duplicate_progress" {
+                last_progress
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-progress", scenario.id))
+            } else {
+                format!("{}-{index}", scenario.id)
+            };
+            let mut input = event(kind.clone(), &event_id);
+            input.provider = scenario.provider.clone();
+            if kind == TurnEventKind::AttentionRequested {
+                input.attention_id = Some(format!("{}-attention", scenario.id));
+                input.attention_kind = Some("approval".to_string());
+                input.attention_correlation_exact =
+                    scenario.attention_certainty == Some(AttentionCertainty::Exact);
+            }
+            if action == "late_completion" {
+                input.provider_turn_id = Some("older-turn".to_string());
+            }
+            let at = format!("2026-07-10T00:00:{:02}Z", index + 1);
+            reduce(&mut result, &input, &at);
+            if action == "progress" {
+                last_progress = Some(event_id);
+            }
+            result.state.diagnostic = (kind == TurnEventKind::StopObserved
+                && result.state.current_turn.is_some())
+            .then(|| ActivityDiagnosticView {
+                reason: "completion_evidence_pending".to_string(),
+                extra: Map::new(),
+            });
+        }
+        result
+    }
+
+    #[test]
+    fn provider_activity_scenario_corpus_is_executable_content_free_and_covers_drift_risks() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/activity/provider-activity-scenarios.json"
+        ))
+        .expect("scenario corpus");
+        assert_eq!(
+            fixture["schema_version"],
+            "agent-session.activity-scenarios.v1"
+        );
+        let scenarios = fixture["scenarios"].as_array().expect("scenario array");
+        assert!(scenarios.len() >= 12);
+        let ids = scenarios
+            .iter()
+            .filter_map(|scenario| scenario["id"].as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "raw-stop-without-completion",
+            "dropped-codex-completion",
+            "generic-permission-later-progress",
+            "exact-correlated-prompt",
+            "nested-agent-completion",
+            "background-helper-output",
+            "transcript-view",
+            "osc-disabled",
+            "stale-osc-title",
+            "runtime-reconnect",
+            "duplicate-out-of-order-events",
+            "provider-ui-drift",
+        ] {
+            assert!(ids.contains(&required), "missing scenario {required}");
+        }
+        let encoded = fixture.to_string();
+        for forbidden in [
+            "\"prompt\"",
+            "\"command\"",
+            "\"response\"",
+            "\"terminal\"",
+            "\"transcript_path\"",
+            "\"credential\"",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "scenario corpus leaked a content-bearing field: {forbidden}"
+            );
+        }
+
+        let corpus: ActivityScenarioCorpus =
+            serde_json::from_value(fixture).expect("typed scenario corpus");
+        assert_eq!(corpus.schema_version, "agent-session.activity-scenarios.v1");
+        for scenario in corpus.scenarios {
+            let result = execute_activity_scenario(&scenario);
+            assert_eq!(
+                result.state.phase, scenario.expected.phase,
+                "{} phase",
+                scenario.id
+            );
+            if let Some(expected) = scenario.expected.diagnostic.as_deref() {
+                assert_eq!(
+                    result
+                        .state
+                        .diagnostic
+                        .as_ref()
+                        .map(|value| value.reason.as_str()),
+                    Some(expected),
+                    "{} diagnostic",
+                    scenario.id
+                );
+            }
+            if let Some(expected) = scenario.expected.shadow_disagrees {
+                assert_eq!(
+                    shadow::disagrees(
+                        &result.state.phase,
+                        scenario.shadow.as_deref().unwrap_or("unknown")
+                    ),
+                    expected,
+                    "{} shadow disagreement",
+                    scenario.id
+                );
+            }
+            let false_idle =
+                result.state.phase == TurnPhase::Waiting && scenario.truth != "waiting";
+            let false_working = result.state.phase == TurnPhase::Working
+                && !matches!(
+                    scenario.truth.as_str(),
+                    "working" | "working_or_unknown" | "working_with_unconfirmed_attention"
+                );
+            let exact_attention = result
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_some_and(|attention| attention.certainty == AttentionCertainty::Exact);
+            let false_blocked = result.state.phase == TurnPhase::NeedsInput
+                && exact_attention
+                && scenario.truth != "needs_input";
+            if let Some(expected) = scenario.expected.false_idle {
+                assert_eq!(false_idle, expected, "{} false idle", scenario.id);
+            }
+            if let Some(expected) = scenario.expected.false_working {
+                assert_eq!(false_working, expected, "{} false working", scenario.id);
+            }
+            if let Some(expected) = scenario.expected.false_blocked {
+                assert_eq!(false_blocked, expected, "{} false blocked", scenario.id);
+            }
         }
     }
 
@@ -4251,6 +4500,44 @@ mod tests {
 
     fn test_session(tmp: &tempfile::TempDir) -> (CliContext, crate::CreatedRecord) {
         test_session_for_agent(tmp, AgentKind::Codex)
+    }
+
+    #[test]
+    fn raw_stop_keeps_working_and_projects_pending_completion_evidence() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        activate_runtime(&context, &created.record).expect("activate runtime");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let mut started = event(TurnEventKind::TurnStarted, "started");
+        started.runtime_id = runtime_id.clone();
+        ingest_event(&context, &created.record.id, started).expect("turn start");
+        let mut stop = event(TurnEventKind::StopObserved, "raw-stop");
+        stop.runtime_id = runtime_id;
+        let state = ingest_event(&context, &created.record.id, stop)
+            .expect("raw stop")
+            .turn_state;
+
+        assert_eq!(state.phase, TurnPhase::Working);
+        assert_eq!(
+            state
+                .semantic_event
+                .as_ref()
+                .map(|event| event.kind.as_str()),
+            Some("stop_observed")
+        );
+        assert_eq!(
+            state
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.reason.as_str()),
+            Some("completion_evidence_pending")
+        );
     }
 
     #[test]
@@ -6836,11 +7123,13 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     .unwrap_or_else(|| "other".to_string());
                 if let Some(overflow) = document.overflow_attention.as_mut() {
                     overflow.count = overflow.count.saturating_add(1);
+                    overflow.certainty = AttentionCertainty::Conservative;
                 } else {
                     document.overflow_attention = Some(OverflowAttention {
                         kind,
                         requested_at: at.to_string(),
                         count: 1,
+                        certainty: AttentionCertainty::Conservative,
                         extra: Map::new(),
                     });
                 }
@@ -6858,15 +7147,28 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                         id: attention_id.to_string(),
                         kind,
                         requested_at: at.to_string(),
+                        certainty: if event.attention_correlation_exact {
+                            AttentionCertainty::Exact
+                        } else {
+                            AttentionCertainty::Conservative
+                        },
                         extra: Map::new(),
                     });
                 } else if let Some(overflow) = document.overflow_attention.as_mut() {
                     overflow.count = overflow.count.saturating_add(1);
+                    if !event.attention_correlation_exact {
+                        overflow.certainty = AttentionCertainty::Conservative;
+                    }
                 } else {
                     document.overflow_attention = Some(OverflowAttention {
                         kind,
                         requested_at: at.to_string(),
                         count: 1,
+                        certainty: if event.attention_correlation_exact {
+                            AttentionCertainty::Exact
+                        } else {
+                            AttentionCertainty::Conservative
+                        },
                         extra: Map::new(),
                     });
                 }
@@ -6992,6 +7294,18 @@ fn is_provider_progress_evidence(event: &TurnEvent) -> bool {
     event.source_kind == SourceKind::ProviderHook
 }
 
+fn turn_event_kind_name(kind: &TurnEventKind) -> &'static str {
+    match kind {
+        TurnEventKind::TurnStarted => "turn_started",
+        TurnEventKind::AttentionRequested => "attention_requested",
+        TurnEventKind::AttentionCleared => "attention_cleared",
+        TurnEventKind::Progress => "progress",
+        TurnEventKind::StopObserved => "stop_observed",
+        TurnEventKind::TurnCompleted => "turn_completed",
+        TurnEventKind::TurnFailed => "turn_failed",
+    }
+}
+
 fn advance_last_progress_at(current: &mut CurrentTurn, at: &str) {
     let Ok(candidate) = at.parse::<jiff::Timestamp>() else {
         return;
@@ -7026,6 +7340,19 @@ fn refresh_attention(document: &mut ActivityDocument) {
                     .as_ref()
                     .map_or(0, |overflow| overflow.count),
             ),
+            certainty: if document
+                .pending_attention
+                .iter()
+                .all(|pending| pending.certainty == AttentionCertainty::Exact)
+                && document
+                    .overflow_attention
+                    .as_ref()
+                    .is_none_or(|overflow| overflow.certainty == AttentionCertainty::Exact)
+            {
+                AttentionCertainty::Exact
+            } else {
+                AttentionCertainty::Conservative
+            },
             extra: if pending.extra.is_empty() {
                 prior_extra.clone()
             } else {
@@ -7040,6 +7367,7 @@ fn refresh_attention(document: &mut ActivityDocument) {
                     kind: overflow.kind.clone(),
                     requested_at: overflow.requested_at.clone(),
                     pending_count: overflow.count,
+                    certainty: overflow.certainty.clone(),
                     extra: if overflow.extra.is_empty() {
                         prior_extra.clone()
                     } else {
