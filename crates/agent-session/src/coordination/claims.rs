@@ -1204,7 +1204,7 @@ pub(crate) fn drain_completion_events(context: &CliContext) -> Result<usize, Cli
     Ok(drained)
 }
 
-fn drain_completion_events_in_registry(
+pub(crate) fn drain_completion_events_in_registry(
     registry: &mut Registry,
     now: i64,
 ) -> Result<usize, CliError> {
@@ -1215,65 +1215,97 @@ fn drain_completion_events_in_registry(
         .collect();
     let mut drained = 0;
     for event_id in event_ids {
-        let Some(event) = registry
-            .completion_events
-            .iter()
-            .find(|event| event.event_id == event_id)
-            .cloned()
-        else {
-            continue;
-        };
-        let Some(index) = registry.operations.iter().position(|lease| {
-            lease.session_id == event.session_id
-                && lease.session_incarnation == event.session_incarnation
-                && lease.lease_id == event.lease_id
-        }) else {
-            continue;
-        };
-        let lease = &registry.operations[index];
-        let revision_matches = lease.revision == event.if_revision
-            || (matches!(lease.state.as_str(), "completing" | "reconcile_pending")
-                && lease.revision == event.if_revision.saturating_add(1));
-        if !revision_matches
-            || lease.execution_token_digest != event.execution_token_digest
-            || !matches!(
-                lease.state.as_str(),
-                "active" | "completing" | "reconcile_pending"
-            )
-        {
-            continue;
-        }
-        let mut completed = lease.clone();
-        completed.revision = completed.revision.saturating_add(1);
-        completed.state = if event.outcome == "pass" {
-            "completed".to_string()
-        } else {
-            "failed".to_string()
-        };
-        completed.outcome = Some(event.outcome.clone());
-        completed.terminal_at_epoch = Some(now);
-        let outcome = public_lease(&completed)?;
-        if store_receipt(
-            registry,
-            event.idempotency_key,
-            event.session_id,
-            event.session_incarnation,
-            "work-context-complete".to_string(),
-            event.request_digest,
-            outcome,
-            now,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        registry.operations[index] = completed;
-        registry
-            .completion_events
-            .retain(|candidate| candidate.event_id != event_id);
-        drained += 1;
+        drained += usize::from(drain_completion_event_in_registry(
+            registry, &event_id, now,
+        )?);
     }
     Ok(drained)
+}
+
+pub(crate) fn drain_completion_events_for_lease_in_registry(
+    registry: &mut Registry,
+    session_id: &str,
+    session_incarnation: &str,
+    lease_id: &str,
+    now: i64,
+) -> Result<usize, CliError> {
+    let event_ids = registry
+        .completion_events
+        .iter()
+        .filter(|event| {
+            event.session_id == session_id
+                && event.session_incarnation == session_incarnation
+                && event.lease_id == lease_id
+        })
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let mut drained = 0;
+    for event_id in event_ids {
+        drained += usize::from(drain_completion_event_in_registry(
+            registry, &event_id, now,
+        )?);
+    }
+    Ok(drained)
+}
+
+fn drain_completion_event_in_registry(
+    registry: &mut Registry,
+    event_id: &str,
+    now: i64,
+) -> Result<bool, CliError> {
+    let Some(event) = registry
+        .completion_events
+        .iter()
+        .find(|event| event.event_id == event_id)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let Some(index) = registry.operations.iter().position(|lease| {
+        lease.session_id == event.session_id
+            && lease.session_incarnation == event.session_incarnation
+            && lease.lease_id == event.lease_id
+    }) else {
+        return Ok(false);
+    };
+    let lease = &registry.operations[index];
+    let revision_matches = lease.revision == event.if_revision
+        || (matches!(lease.state.as_str(), "completing" | "reconcile_pending")
+            && lease.revision == event.if_revision.saturating_add(1));
+    if !revision_matches
+        || lease.execution_token_digest != event.execution_token_digest
+        || !matches!(
+            lease.state.as_str(),
+            "active" | "completing" | "reconcile_pending"
+        )
+    {
+        return Ok(false);
+    }
+    let mut completed = lease.clone();
+    completed.revision = completed.revision.saturating_add(1);
+    completed.state = if event.outcome == "pass" {
+        "completed".to_string()
+    } else {
+        "failed".to_string()
+    };
+    completed.outcome = Some(event.outcome.clone());
+    completed.terminal_at_epoch = Some(now);
+    let outcome = public_lease(&completed)?;
+    store_receipt(
+        registry,
+        event.idempotency_key,
+        event.session_id,
+        event.session_incarnation,
+        "work-context-complete".to_string(),
+        event.request_digest,
+        outcome,
+        now,
+    )?;
+    registry.operations[index] = completed;
+    registry
+        .completion_events
+        .retain(|candidate| candidate.event_id != event_id);
+    Ok(true)
 }
 
 pub(crate) fn reconcile(
@@ -1818,13 +1850,43 @@ pub(crate) fn operator_reconcile_in_registry(
     now: i64,
 ) -> Result<Value, CliError> {
     let incarnation = super::incarnation(record)?;
+    let snapshot = exact_nonterminal_operation_snapshot(
+        registry,
+        &record.id,
+        &incarnation,
+        lease_id,
+        if_revision,
+    )?;
+    if !controller_observed_quiescent(context, record, &snapshot) {
+        return Err(CliError::data(
+            "operation-still-running",
+            "operator reconciliation could not prove the operation inactive",
+            None,
+        ));
+    }
+    abandon_exact_operation(registry, &snapshot, now)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OperatorReconcileEvidence {
+    runtime_identity_matches: bool,
+    controller_quiescent: bool,
+}
+
+pub(crate) fn exact_nonterminal_operation_snapshot(
+    registry: &Registry,
+    session_id: &str,
+    session_incarnation: &str,
+    lease_id: &str,
+    if_revision: u64,
+) -> Result<OperationLease, CliError> {
     let snapshot = registry
         .operations
         .iter()
         .find(|lease| {
             lease.lease_id == lease_id
-                && lease.session_id == record.id
-                && lease.session_incarnation == incarnation
+                && lease.session_id == session_id
+                && lease.session_incarnation == session_incarnation
         })
         .cloned()
         .ok_or_else(operation_unavailable)?;
@@ -1836,24 +1898,108 @@ pub(crate) fn operator_reconcile_in_registry(
     {
         return Err(revision_conflict("operation-revision-conflict"));
     }
-    if !controller_observed_quiescent(context, record, &snapshot) {
-        return Err(CliError::data(
-            "operation-still-running",
-            "operator reconciliation could not prove the operation inactive",
-            None,
-        ));
-    }
+    Ok(snapshot)
+}
+
+fn abandon_exact_operation(
+    registry: &mut Registry,
+    snapshot: &OperationLease,
+    now: i64,
+) -> Result<Value, CliError> {
     let lease = registry
         .operations
         .iter_mut()
-        .find(|lease| lease.lease_id == lease_id)
-        .ok_or_else(operation_unavailable)?;
+        .find(|lease| {
+            lease.lease_id == snapshot.lease_id
+                && lease.session_id == snapshot.session_id
+                && lease.session_incarnation == snapshot.session_incarnation
+                && lease.revision == snapshot.revision
+                && matches!(
+                    lease.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                )
+        })
+        .ok_or_else(|| revision_conflict("operation-revision-conflict"))?;
     lease.state = "abandoned".to_string();
     lease.revision = lease.revision.saturating_add(1);
     lease.terminal_at_epoch = Some(now);
     lease.reconcile_observed_at_epoch = None;
     lease.outcome = Some("operator-attested-inactive".to_string());
     public_lease(lease)
+}
+
+fn operator_controller_quiescent(
+    runtime_status: crate::CoordinationRuntimeStatus,
+    activity: Option<&crate::activity::TurnState>,
+    lease: &OperationLease,
+) -> bool {
+    runtime_status == crate::CoordinationRuntimeStatus::Stopped
+        || activity.is_some_and(|activity| {
+            controller_activity_supersedes_lease(activity, &lease.activity_identity_digest)
+                || (activity_identity_digest(activity) == lease.activity_identity_digest
+                    && activity
+                        .semantic_event
+                        .as_ref()
+                        .is_some_and(|event| event.kind == "stop_observed")
+                    && activity.diagnostic.as_ref().is_some_and(|diagnostic| {
+                        diagnostic.reason == "completion_evidence_pending"
+                    }))
+        })
+}
+
+pub(crate) fn operator_reconcile_evidence(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    snapshot: &OperationLease,
+) -> Result<OperatorReconcileEvidence, CliError> {
+    let runtime = crate::coordination_runtime_evidence(record)?;
+    let activity = crate::activity::state_for_view(context, record);
+    Ok(OperatorReconcileEvidence {
+        runtime_identity_matches: !snapshot.runtime_identity_digest.is_empty()
+            && snapshot.runtime_identity_digest == runtime.identity_digest,
+        controller_quiescent: operator_controller_quiescent(
+            runtime.status,
+            activity.as_ref(),
+            snapshot,
+        ),
+    })
+}
+
+pub(crate) fn operator_attested_transition_in_registry(
+    registry: &mut Registry,
+    session_id: &str,
+    session_incarnation: &str,
+    lease_id: &str,
+    if_revision: u64,
+    now: i64,
+    evidence: OperatorReconcileEvidence,
+) -> Result<Value, CliError> {
+    let snapshot = exact_nonterminal_operation_snapshot(
+        registry,
+        session_id,
+        session_incarnation,
+        lease_id,
+        if_revision,
+    )?;
+    if snapshot
+        .descendant
+        .as_ref()
+        .is_some_and(|descendant| descendant_status(descendant) != DescendantStatus::Stopped)
+    {
+        return Err(CliError::data(
+            "operation-still-running",
+            "operator reconciliation could not prove the exact operation descendant stopped",
+            None,
+        ));
+    }
+    if !evidence.runtime_identity_matches || !evidence.controller_quiescent {
+        return Err(CliError::data(
+            "operation-still-running",
+            "operator reconciliation could not prove the exact operation inactive",
+            None,
+        ));
+    }
+    abandon_exact_operation(registry, &snapshot, now)
 }
 
 pub(crate) fn activity_identity_digest(activity: &crate::activity::TurnState) -> String {
@@ -1876,23 +2022,50 @@ pub(crate) fn activity_identity_digest(activity: &crate::activity::TurnState) ->
     digest_bytes(identity.as_bytes())
 }
 
-pub(crate) fn descendant_is_live(descendant: &DescendantIdentity) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescendantStatus {
+    Live,
+    Stopped,
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_status_from_stat(
+    descendant: &DescendantIdentity,
+    stat: Result<&str, ()>,
+) -> DescendantStatus {
+    let Ok(stat) = stat else {
+        return DescendantStatus::Unknown;
+    };
+    let Some(end) = stat.rfind(')') else {
+        return DescendantStatus::Unknown;
+    };
+    let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
+    match fields.get(19).and_then(|value| value.parse::<u64>().ok()) {
+        Some(start_time) if start_time == descendant.start_time => DescendantStatus::Live,
+        Some(_) => DescendantStatus::Stopped,
+        None => DescendantStatus::Unknown,
+    }
+}
+
+fn descendant_status(descendant: &DescendantIdentity) -> DescendantStatus {
     #[cfg(target_os = "linux")]
     {
-        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", descendant.pid)) else {
-            return false;
-        };
-        let Some(end) = stat.rfind(')') else {
-            return false;
-        };
-        let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
-        fields.get(19).and_then(|value| value.parse::<u64>().ok()) == Some(descendant.start_time)
+        match fs::read_to_string(format!("/proc/{}/stat", descendant.pid)) {
+            Ok(stat) => descendant_status_from_stat(descendant, Ok(&stat)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DescendantStatus::Stopped,
+            Err(_) => DescendantStatus::Unknown,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = descendant;
-        true
+        DescendantStatus::Unknown
     }
+}
+
+pub(crate) fn descendant_is_live(descendant: &DescendantIdentity) -> bool {
+    descendant_status(descendant) == DescendantStatus::Live
 }
 
 fn validate_descendant(descendant: Option<&DescendantIdentity>) -> Result<(), CliError> {
@@ -1950,7 +2123,7 @@ fn validate_execution_token(value: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn revision_conflict(code: &'static str) -> CliError {
+pub(crate) fn revision_conflict(code: &'static str) -> CliError {
     CliError::data(code, "coordination revision fence did not match", None)
 }
 
@@ -2164,5 +2337,408 @@ mod tests {
         assert!(registry.completion_events.is_empty());
         assert_eq!(registry.operations[0].state, "completed");
         assert_eq!(registry.operations[0].revision, 3);
+    }
+
+    #[test]
+    fn operator_attestation_reconciles_only_the_exact_orphaned_operation() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": super::super::REGISTRY_VERSION,
+            "operations": [{
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "orphaned-lease",
+                "session_id": "worker",
+                "session_incarnation": "worker-incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 4,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "private-token-digest",
+                "activity_identity_digest": "same-provider-turn"
+            }, {
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "unrelated-lease",
+                "session_id": "other-worker",
+                "session_incarnation": "other-incarnation",
+                "claim_id": "other-claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "other-private-token-digest"
+            }]
+        }))
+        .expect("registry");
+
+        let result = operator_attested_transition_in_registry(
+            &mut registry,
+            "worker",
+            "worker-incarnation",
+            "orphaned-lease",
+            4,
+            10,
+            OperatorReconcileEvidence {
+                runtime_identity_matches: true,
+                controller_quiescent: true,
+            },
+        )
+        .expect("operator reconciliation");
+
+        assert_eq!(result["state"], "abandoned");
+        assert_eq!(result["revision"], 5);
+        assert_eq!(registry.operations[0].state, "abandoned");
+        assert_eq!(
+            registry.operations[0].outcome.as_deref(),
+            Some("operator-attested-inactive")
+        );
+        assert_eq!(registry.operations[1].state, "active");
+        assert!(
+            result.get("execution_token_digest").is_none(),
+            "operator result must retain the public lease projection"
+        );
+    }
+
+    #[test]
+    fn operator_attestation_fails_closed_on_stale_or_cross_incarnation_selectors() {
+        let fixture = || {
+            serde_json::from_value::<Registry>(json!({
+                "schema_version": super::super::REGISTRY_VERSION,
+                "operations": [{
+                    "schema_version": OPERATION_LEASE_VERSION,
+                    "lease_id": "orphaned-lease",
+                    "session_id": "worker",
+                    "session_incarnation": "worker-incarnation",
+                    "claim_id": "claim",
+                    "claim_revision": 1,
+                    "operation": "shell",
+                    "targets": [],
+                    "state": "active",
+                    "revision": 4,
+                    "started_at": "2030-01-01T00:00:00Z",
+                    "expires_at": "2030-01-01T01:00:00Z",
+                    "expires_at_epoch": 1,
+                    "execution_token_digest": "private-token-digest"
+                }]
+            }))
+            .expect("registry")
+        };
+
+        let mut stale = fixture();
+        let error = operator_attested_transition_in_registry(
+            &mut stale,
+            "worker",
+            "worker-incarnation",
+            "orphaned-lease",
+            3,
+            10,
+            OperatorReconcileEvidence {
+                runtime_identity_matches: true,
+                controller_quiescent: true,
+            },
+        )
+        .expect_err("stale revision");
+        assert_eq!(error.code(), "operation-revision-conflict");
+        assert_eq!(stale.operations[0].state, "active");
+
+        let mut cross_incarnation = fixture();
+        let error = operator_attested_transition_in_registry(
+            &mut cross_incarnation,
+            "worker",
+            "replacement-incarnation",
+            "orphaned-lease",
+            4,
+            10,
+            OperatorReconcileEvidence {
+                runtime_identity_matches: true,
+                controller_quiescent: true,
+            },
+        )
+        .expect_err("cross-incarnation selector");
+        assert_eq!(error.code(), "operation-not-found");
+        assert_eq!(cross_incarnation.operations[0].state, "active");
+    }
+
+    #[test]
+    fn operator_attestation_requires_matching_runtime_and_quiescent_controller_evidence() {
+        let fixture = || {
+            serde_json::from_value::<Registry>(json!({
+                "schema_version": super::super::REGISTRY_VERSION,
+                "operations": [{
+                    "schema_version": OPERATION_LEASE_VERSION,
+                    "lease_id": "orphaned-lease",
+                    "session_id": "worker",
+                    "session_incarnation": "worker-incarnation",
+                    "claim_id": "claim",
+                    "claim_revision": 1,
+                    "operation": "shell",
+                    "targets": [],
+                    "state": "active",
+                    "revision": 1,
+                    "started_at": "2030-01-01T00:00:00Z",
+                    "expires_at": "2030-01-01T01:00:00Z",
+                    "expires_at_epoch": 1,
+                    "execution_token_digest": "private-token-digest"
+                }]
+            }))
+            .expect("registry")
+        };
+        for evidence in [
+            OperatorReconcileEvidence {
+                runtime_identity_matches: false,
+                controller_quiescent: true,
+            },
+            OperatorReconcileEvidence {
+                runtime_identity_matches: true,
+                controller_quiescent: false,
+            },
+        ] {
+            let mut registry = fixture();
+            let error = operator_attested_transition_in_registry(
+                &mut registry,
+                "worker",
+                "worker-incarnation",
+                "orphaned-lease",
+                1,
+                10,
+                evidence,
+            )
+            .expect_err("insufficient operator evidence");
+            assert_eq!(error.code(), "operation-still-running");
+            assert_eq!(registry.operations[0].state, "active");
+        }
+    }
+
+    #[test]
+    fn operator_quiescence_requires_stopped_runtime_or_exact_controller_evidence() {
+        let mut lease: OperationLease = serde_json::from_value(json!({
+            "schema_version": OPERATION_LEASE_VERSION,
+            "lease_id": "orphaned-lease",
+            "session_id": "worker",
+            "session_incarnation": "worker-incarnation",
+            "claim_id": "claim",
+            "claim_revision": 1,
+            "operation": "shell",
+            "targets": [],
+            "state": "active",
+            "revision": 1,
+            "started_at": "2030-01-01T00:00:00Z",
+            "expires_at": "2030-01-01T01:00:00Z",
+            "expires_at_epoch": 1,
+            "execution_token_digest": "private-token-digest"
+        }))
+        .expect("lease");
+        let activity = |turn: &str, semantic_event: Option<&str>, diagnostic: Option<&str>| {
+            serde_json::from_value::<crate::activity::TurnState>(json!({
+                "schema_version": crate::activity::TURN_STATE_VERSION,
+                "phase": "working",
+                "phase_changed_at": "2030-01-01T00:00:01Z",
+                "revision": 2,
+                "source": {
+                    "kind": "provider_hook",
+                    "provider": "codex",
+                    "confidence": "authoritative"
+                },
+                "semantic_event": semantic_event.map(|kind| json!({
+                    "kind": kind,
+                    "observed_at": "2030-01-01T00:00:02Z"
+                })),
+                "diagnostic": diagnostic.map(|reason| json!({"reason": reason})),
+                "current_turn": {
+                    "provider_turn_id": turn,
+                    "started_at": "2030-01-01T00:00:00Z"
+                }
+            }))
+            .expect("activity")
+        };
+        let exact_stop = activity(
+            "turn-1",
+            Some("stop_observed"),
+            Some("completion_evidence_pending"),
+        );
+        lease.activity_identity_digest = activity_identity_digest(&exact_stop);
+        assert!(operator_controller_quiescent(
+            crate::CoordinationRuntimeStatus::Running,
+            Some(&exact_stop),
+            &lease
+        ));
+        for insufficient in [
+            activity("turn-1", Some("stop_observed"), None),
+            activity(
+                "turn-1",
+                Some("progress"),
+                Some("completion_evidence_pending"),
+            ),
+        ] {
+            assert!(!operator_controller_quiescent(
+                crate::CoordinationRuntimeStatus::Running,
+                Some(&insufficient),
+                &lease
+            ));
+        }
+        let superseding_turn = activity("turn-2", Some("progress"), None);
+        assert!(operator_controller_quiescent(
+            crate::CoordinationRuntimeStatus::Running,
+            Some(&superseding_turn),
+            &lease
+        ));
+        assert!(operator_controller_quiescent(
+            crate::CoordinationRuntimeStatus::Stopped,
+            None,
+            &lease
+        ));
+        assert!(!operator_controller_quiescent(
+            crate::CoordinationRuntimeStatus::Unknown,
+            None,
+            &lease
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operator_descendant_probe_fails_closed_on_unreadable_or_malformed_proc_evidence() {
+        let descendant = DescendantIdentity {
+            pid: 123,
+            start_time: 456,
+        };
+        assert_eq!(
+            descendant_status_from_stat(&descendant, Err(())),
+            DescendantStatus::Unknown
+        );
+        assert_eq!(
+            descendant_status_from_stat(&descendant, Ok("malformed")),
+            DescendantStatus::Unknown
+        );
+        assert_eq!(
+            descendant_status_from_stat(
+                &descendant,
+                Ok("123 (tool) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 not-a-number")
+            ),
+            DescendantStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn durable_completion_quota_failure_cannot_be_bypassed_by_operator_reconciliation() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": super::super::REGISTRY_VERSION,
+            "operations": [{
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "completion-wins-lease",
+                "session_id": "worker",
+                "session_incarnation": "worker-incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 7,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "completion-token-digest"
+            }],
+            "completion_events": [{
+                "schema_version": "agent-session.operation-completion-event.v1",
+                "event_id": "completion-event",
+                "session_id": "worker",
+                "session_incarnation": "worker-incarnation",
+                "lease_id": "completion-wins-lease",
+                "if_revision": 7,
+                "execution_token_digest": "completion-token-digest",
+                "outcome": "pass",
+                "idempotency_key": "provider-complete-worker-0001",
+                "request_digest": "provider-completion-request",
+                "created_at_epoch": 1
+            }]
+        }))
+        .expect("registry");
+        for index in 0..super::super::MAX_RECEIPTS_PER_PRINCIPAL {
+            registry.receipts.insert(
+                format!("receipt-{index}"),
+                super::super::IdempotencyReceipt {
+                    principal: "worker".to_string(),
+                    incarnation: "worker-incarnation".to_string(),
+                    operation: "existing".to_string(),
+                    digest: format!("digest-{index}"),
+                    outcome: json!({"state": "completed"}),
+                    expires_at_epoch: i64::MAX,
+                },
+            );
+        }
+
+        let error = drain_completion_events_for_lease_in_registry(
+            &mut registry,
+            "worker",
+            "worker-incarnation",
+            "completion-wins-lease",
+            10,
+        )
+        .expect_err("receipt quota must block the durable completion transition");
+        assert_eq!(error.code(), "quota-exceeded");
+        assert_eq!(registry.operations[0].state, "active");
+        assert_eq!(registry.operations[0].revision, 7);
+        assert_eq!(registry.completion_events.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operator_attestation_refuses_an_exact_live_descendant() {
+        let pid = std::process::id() as i32;
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("self stat");
+        let end = stat.rfind(')').expect("stat command boundary");
+        let start_time = stat[end + 1..]
+            .split_whitespace()
+            .nth(19)
+            .expect("start time")
+            .parse::<u64>()
+            .expect("numeric start time");
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": super::super::REGISTRY_VERSION,
+            "operations": [{
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "live-lease",
+                "session_id": "worker",
+                "session_incarnation": "worker-incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "private-token-digest",
+                "descendant": {
+                    "pid": pid,
+                    "start_time": start_time
+                }
+            }]
+        }))
+        .expect("registry");
+
+        let error = operator_attested_transition_in_registry(
+            &mut registry,
+            "worker",
+            "worker-incarnation",
+            "live-lease",
+            1,
+            10,
+            OperatorReconcileEvidence {
+                runtime_identity_matches: true,
+                controller_quiescent: true,
+            },
+        )
+        .expect_err("live descendant");
+        assert_eq!(error.code(), "operation-still-running");
+        assert_eq!(registry.operations[0].state, "active");
     }
 }

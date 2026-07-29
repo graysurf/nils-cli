@@ -778,6 +778,10 @@ fn router(state: Arc<ServeState>) -> Router {
             post(coordination_broker_reconcile_handler),
         )
         .route(
+            "/sessions/{id}/operations/{lease_id}/operator-reconcile/v1",
+            post(coordination_operator_reconcile_handler),
+        )
+        .route(
             "/sessions/{id}/messages/v1",
             get(coordination_inbox_handler).post(coordination_send_handler),
         )
@@ -3320,6 +3324,31 @@ async fn coordination_broker_recovery_handler(
     let context = state.context.clone();
     match tokio::task::spawn_blocking(move || {
         coordination_server::broker_recover(&context, &id, capability.as_str(), body, reconcile)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_operator_reconcile_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath((id, lease_id)): AxPath<(String, String)>,
+    body: Result<Json<coordination_server::OperatorOperationReconcileBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::operator_reconcile_operation(&context, &id, &lease_id, body)
     })
     .await
     {
@@ -21428,6 +21457,312 @@ exit 0
             fs::read(&registry_path).expect("registry after prior-incarnation capability"),
             before_replaced,
             "prior-incarnation HTTP recovery must not mutate coordination state"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_operation_reconcile_uses_server_authority_and_exact_runtime_fences() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let incarnation = alpha
+            .runtime
+            .as_ref()
+            .expect("alpha runtime")
+            .launch_id
+            .clone();
+        alpha.extra.insert(
+            "delete_tmux_identity".to_string(),
+            json!({
+                "launch_id": incarnation,
+                "session_id": "$77",
+                "pane_id": "%77",
+                "pane_pid": i32::MAX,
+                "process_group_id": i32::MAX
+            }),
+        );
+        crate::write_session_record(&state.context, &alpha).expect("stopped runtime identity");
+        let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+            .expect("runtime evidence")
+            .identity_digest;
+        let _session_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let registry_path = tmp.path().join("coordination/registry.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "orphaned-lease",
+                "session_id": "alpha",
+                "session_incarnation": incarnation,
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 7,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "PRIVATE-EXECUTION-TOKEN-DIGEST",
+                "activity_identity_digest": "same-provider-turn",
+                "runtime_identity_digest": runtime_identity_digest
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("persist operation");
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+
+        let request = json!({
+            "schema_version": "agent-session.operator-operation-reconcile-request.v1",
+            "expected_session_incarnation": incarnation,
+            "expected_session_generation": generation,
+            "if_revision": 7,
+            "reason": "post-tool-outcome-missing",
+            "attest_inactive": true,
+            "confirmed": true,
+            "idempotency_key": "operator-reconcile-alpha-0001"
+        });
+        let before_denied = fs::read(&registry_path).expect("registry before denied request");
+        let target_capability_only = Request::builder()
+            .method("POST")
+            .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+            .header(AUTHORIZATION, "Bearer target-session-capability-material")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&request).expect("denied request"),
+            ))
+            .expect("denied request");
+        let (status, denied) = call(router(state.clone()), target_capability_only).await;
+        assert_ne!(status, StatusCode::OK, "{denied}");
+        assert_eq!(denied["error"]["code"], "unauthorized");
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after denied request"),
+            before_denied,
+            "a target session capability must not become cross-session operator authority"
+        );
+
+        let mut stale_incarnation = request.clone();
+        stale_incarnation["expected_session_incarnation"] = json!("replacement-incarnation");
+        stale_incarnation["idempotency_key"] = json!("operator-reconcile-stale-incarnation");
+        let mut stale_generation = request.clone();
+        stale_generation["expected_session_generation"] = json!(generation + 1);
+        stale_generation["idempotency_key"] = json!("operator-reconcile-stale-generation");
+        let mut unconfirmed = request.clone();
+        unconfirmed["confirmed"] = json!(false);
+        unconfirmed["idempotency_key"] = json!("operator-reconcile-unconfirmed");
+        let mut unattested = request.clone();
+        unattested["attest_inactive"] = json!(false);
+        unattested["idempotency_key"] = json!("operator-reconcile-unattested");
+        let mut unsupported_reason = request.clone();
+        unsupported_reason["reason"] = json!("guess-operation-finished");
+        unsupported_reason["idempotency_key"] = json!("operator-reconcile-unsupported-reason");
+        let mut stale_revision = request.clone();
+        stale_revision["if_revision"] = json!(6);
+        stale_revision["idempotency_key"] = json!("operator-reconcile-stale-revision");
+        for (body, expected_code) in [
+            (stale_incarnation, "session-incarnation-conflict"),
+            (stale_generation, "session-incarnation-conflict"),
+            (unconfirmed, "operator-reconcile-confirmation-required"),
+            (unattested, "operator-reconcile-confirmation-required"),
+            (unsupported_reason, "invalid-operator-reconcile-request"),
+            (stale_revision, "operation-revision-conflict"),
+        ] {
+            let before = fs::read(&registry_path).expect("registry before negative request");
+            let negative = Request::builder()
+                .method("POST")
+                .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("negative request"),
+                ))
+                .expect("negative request");
+            let (status, rejected) = call(router(state.clone()), negative).await;
+            assert_ne!(status, StatusCode::OK, "{rejected}");
+            assert_eq!(rejected["error"]["code"], expected_code, "{rejected}");
+            assert_eq!(
+                fs::read(&registry_path).expect("registry after negative request"),
+                before,
+                "operator fence failures must precede registry mutation"
+            );
+        }
+
+        let operator_request = Request::builder()
+            .method("POST")
+            .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&request).expect("operator request"),
+            ))
+            .expect("operator request");
+        let (status, reconciled) = call(router(state.clone()), operator_request).await;
+        assert_eq!(status, StatusCode::OK, "{reconciled}");
+        assert_eq!(
+            reconciled["data"]["coordination"]["operation_reconciliation"]["state"],
+            "abandoned"
+        );
+        assert_eq!(
+            reconciled["data"]["coordination"]["operation_reconciliation"]["revision"],
+            8
+        );
+        assert!(
+            !reconciled
+                .to_string()
+                .contains("PRIVATE-EXECUTION-TOKEN-DIGEST")
+        );
+
+        let replay = Request::builder()
+            .method("POST")
+            .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&request).expect("operator replay"),
+            ))
+            .expect("operator replay");
+        let (status, replayed) = call(router(state), replay).await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        assert_eq!(replayed, reconciled);
+    }
+
+    #[tokio::test]
+    async fn durable_provider_completion_wins_before_operator_reconciliation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let incarnation = alpha
+            .runtime
+            .as_ref()
+            .expect("alpha runtime")
+            .launch_id
+            .clone();
+        alpha.extra.insert(
+            "delete_tmux_identity".to_string(),
+            json!({
+                "launch_id": incarnation,
+                "session_id": "$77",
+                "pane_id": "%77",
+                "pane_pid": i32::MAX,
+                "process_group_id": i32::MAX
+            }),
+        );
+        crate::write_session_record(&state.context, &alpha).expect("stopped runtime identity");
+        let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+            .expect("runtime evidence")
+            .identity_digest;
+        provision_ready_coordination_fixture(&state.context, &alpha);
+        let registry_path = tmp.path().join("coordination/registry.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "completion-wins-lease",
+                "session_id": "alpha",
+                "session_incarnation": incarnation,
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "shell",
+                "targets": [],
+                "state": "active",
+                "revision": 7,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T01:00:00Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "completion-token-digest",
+                "runtime_identity_digest": runtime_identity_digest
+            }));
+        registry["completion_events"]
+            .as_array_mut()
+            .expect("completion events")
+            .push(json!({
+                "schema_version": "agent-session.operation-completion-event.v1",
+                "event_id": "completion-event",
+                "session_id": "alpha",
+                "session_incarnation": incarnation,
+                "lease_id": "completion-wins-lease",
+                "if_revision": 7,
+                "execution_token_digest": "completion-token-digest",
+                "outcome": "pass",
+                "idempotency_key": "provider-complete-alpha-0001",
+                "request_digest": "provider-completion-request",
+                "created_at_epoch": 1
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("persist completion race");
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/alpha/operations/completion-wins-lease/operator-reconcile/v1")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "schema_version": "agent-session.operator-operation-reconcile-request.v1",
+                    "expected_session_incarnation": incarnation,
+                    "expected_session_generation": generation,
+                    "if_revision": 7,
+                    "reason": "post-tool-outcome-missing",
+                    "attest_inactive": true,
+                    "confirmed": true,
+                    "idempotency_key": "operator-reconcile-alpha-completion-race"
+                }))
+                .expect("operator request"),
+            ))
+            .expect("operator request");
+        let (status, rejected) = call(router(state), request).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"], "operation-revision-conflict",
+            "{rejected}"
+        );
+
+        let registry: Value = serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+            .expect("registry json");
+        let lease = registry["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .find(|lease| lease["lease_id"] == "completion-wins-lease")
+            .expect("lease");
+        assert_eq!(lease["state"], "completed");
+        assert_eq!(lease["outcome"], "pass");
+        assert!(
+            registry["completion_events"]
+                .as_array()
+                .expect("completion events")
+                .is_empty()
+        );
+        assert!(
+            registry["receipts"]
+                .as_object()
+                .expect("receipts")
+                .values()
+                .any(|receipt| {
+                    receipt["operation"] == "work-context-complete"
+                        && receipt["outcome"]["state"] == "completed"
+                }),
+            "provider completion receipt must remain replayable"
         );
     }
 

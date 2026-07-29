@@ -272,6 +272,30 @@ fields `schema_version`, `session_incarnation`, and `generation`; it never
 contains an operator token. Broker reconcile additionally requires the CLI or
 HTTP selectors `operation`, `if_revision`, and `attest_inactive: true`.
 
+The loopback server exposes one separate operator-only recovery for a missing
+provider PostTool outcome:
+`POST /sessions/{id}/operations/{lease_id}/operator-reconcile/v1`. It requires
+the server Bearer token, never accepts or derives the target session
+capability, and reads
+`agent-session.operator-operation-reconcile-request.v1`. The strict request
+binds the current session incarnation and generation, exact lease revision,
+the fixed reason `post-tool-outcome-missing`, `attest_inactive: true`,
+`confirmed: true`, and an idempotency key. A live exact descendant, stale
+runtime selector or identity digest, stale lease revision, terminal lease,
+unsupported reason, or missing confirmation fails before mutation. The
+controller activity lock must additionally prove either that the exact runtime
+is stopped, that a later controller activity superseded the lease, or that the
+same provider turn has emitted `stop_observed` with
+`completion_evidence_pending`; ordinary same-turn `working` activity is not
+quiescent evidence. Before abandonment, queued authenticated completion events
+are drained so their pass/fail outcome always wins. Success changes only that
+exact lease to `abandoned` with outcome `operator-attested-inactive`, retains
+the claim and session, stores a replay receipt, and returns the public lease
+projection without capability or execution-token material. This operator
+attestation is deliberately distinct from session-owned `complete` and
+`reconcile`; it is for an observed missing completion signal, not a way to
+guess that an in-flight descendant has stopped.
+
 ### Message
 
 Messages use `agent-session.message.v1`. Public inbox rows contain message ID,
@@ -354,6 +378,7 @@ receive an admitted claim.
 | inbox/show/ack/reply/wait | matching recipient capability |
 | broker status | public registry read; HTTP additionally requires the server operator token |
 | broker adopt/reconcile | local lifecycle lock plus proof selectors matching an unchanged, live, exact persisted runtime whose broker is demonstrably lost |
+| operator operation reconcile over HTTP | server operator token, exact current session incarnation/generation, exact nonterminal lease revision, confirmed inactive attestation, and no live exact descendant |
 | HTTP registry-wide candidate check | server operator token; explicit subject/candidate rules still apply |
 
 Capabilities rotate on resume/replacement and are revoked on delete/target exit.
@@ -667,6 +692,8 @@ POST /sessions/{id}/broker/adopt/v2
 POST /sessions/{id}/broker/reconcile/v2
 POST /sessions/{id}/broker/adopt/v1       (transition alias)
 POST /sessions/{id}/broker/reconcile/v1   (transition alias)
+POST /sessions/{id}/operations/{lease_id}/operator-reconcile/v1
+                                               (HTTP-only, server Bearer)
 GET  /sessions/{id}/messages/v1
 POST /sessions/{id}/messages/v1
 GET  /sessions/{id}/messages/{message_id}/v1

@@ -108,6 +108,21 @@ pub(crate) struct BrokerRecoveryBody {
     pub attest_inactive: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorOperationReconcileBody {
+    pub schema_version: String,
+    pub expected_session_incarnation: String,
+    pub expected_session_generation: u64,
+    pub if_revision: u64,
+    pub reason: String,
+    #[serde(default)]
+    pub attest_inactive: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxQuery {
@@ -390,6 +405,146 @@ pub(crate) fn broker_recover(
             )
         },
     )
+}
+
+pub(crate) fn operator_reconcile_operation(
+    context: &CliContext,
+    id: &str,
+    lease_id: &str,
+    body: OperatorOperationReconcileBody,
+) -> Result<Value, CliError> {
+    if body.schema_version != "agent-session.operator-operation-reconcile-request.v1"
+        || body.reason != "post-tool-outcome-missing"
+    {
+        return Err(CliError::usage(
+            "invalid-operator-reconcile-request",
+            "operator reconciliation request is unsupported",
+            None,
+        ));
+    }
+    if !body.attest_inactive || !body.confirmed {
+        return Err(CliError::data(
+            "operator-reconcile-confirmation-required",
+            "operator reconciliation requires confirmed inactive attestation",
+            None,
+        ));
+    }
+    crate::validate_id(id)?;
+    let observed = crate::load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _session_lock = crate::acquire_session_record_lock(context, &canonical_id)?;
+    let record = crate::load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    let incarnation = super::incarnation(&record)?;
+    let generation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.generation)
+        .ok_or_else(|| {
+            CliError::data(
+                "session-incarnation-conflict",
+                "operator reconciliation requires a current runtime generation",
+                None,
+            )
+        })?;
+    if incarnation != body.expected_session_incarnation
+        || generation != body.expected_session_generation
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "operator reconciliation selectors do not match the current runtime",
+            None,
+        ));
+    }
+    let operation = "operator-operation-reconcile";
+    let digest = super::request_digest(
+        operation,
+        &serde_json::json!({
+            "session_id": canonical_id,
+            "session_incarnation": incarnation,
+            "session_generation": generation,
+            "lease_id": lease_id,
+            "if_revision": body.if_revision,
+            "reason": body.reason,
+            "attest_inactive": body.attest_inactive,
+            "confirmed": body.confirmed,
+        }),
+    );
+    let now = super::now_epoch();
+    let _activity_fence =
+        crate::activity::acquire_coordination_activity_lock(context, &canonical_id)?;
+    let snapshot = {
+        let locked = super::lock_registry(context)?;
+        if let Some(replay) = super::idempotency_replay(
+            &locked.registry,
+            &body.idempotency_key,
+            &canonical_id,
+            &incarnation,
+            operation,
+            &digest,
+        )? {
+            return Ok(replay);
+        }
+        claims::exact_nonterminal_operation_snapshot(
+            &locked.registry,
+            &canonical_id,
+            &incarnation,
+            lease_id,
+            body.if_revision,
+        )?
+    };
+    let evidence = claims::operator_reconcile_evidence(context, &record, &snapshot)?;
+    let mut locked = super::lock_registry(context)?;
+    if let Some(replay) = super::idempotency_replay(
+        &locked.registry,
+        &body.idempotency_key,
+        &canonical_id,
+        &incarnation,
+        operation,
+        &digest,
+    )? {
+        return Ok(replay);
+    }
+    if claims::drain_completion_events_for_lease_in_registry(
+        &mut locked.registry,
+        &canonical_id,
+        &incarnation,
+        lease_id,
+        now,
+    )? > 0
+    {
+        locked.save()?;
+        return Err(claims::revision_conflict("operation-revision-conflict"));
+    }
+    let reconciliation = claims::operator_attested_transition_in_registry(
+        &mut locked.registry,
+        &canonical_id,
+        &incarnation,
+        lease_id,
+        body.if_revision,
+        now,
+        evidence,
+    )?;
+    let result = serde_json::json!({
+        "schema_version": "agent-session.operator-operation-reconcile-result.v1",
+        "session_id": canonical_id,
+        "session_incarnation": incarnation,
+        "session_generation": generation,
+        "reason": body.reason,
+        "operation_reconciliation": reconciliation,
+    });
+    super::store_receipt(
+        &mut locked.registry,
+        body.idempotency_key,
+        canonical_id,
+        incarnation,
+        operation.to_string(),
+        digest,
+        result.clone(),
+        now,
+    )?;
+    locked.save()?;
+    Ok(result)
 }
 
 pub(crate) fn inbox(
