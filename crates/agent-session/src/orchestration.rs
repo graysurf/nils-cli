@@ -2762,8 +2762,17 @@ pub(crate) fn persist_request_changes_identity(
 
 pub(crate) fn request_changes_identity_matches(
     context: &CliContext,
+    registry: &Registry,
     assignment: &AssignmentRecord,
 ) -> Result<bool, CliError> {
+    if read_request_changes_identity(context, &assignment.assignment_id)?.is_none() {
+        let Some((request_digest, idempotency_key)) =
+            released_request_changes_receipt_identity(registry, assignment)?
+        else {
+            return Ok(false);
+        };
+        persist_request_changes_identity(context, assignment, &request_digest, &idempotency_key)?;
+    }
     let Some(identity) = read_request_changes_identity(context, &assignment.assignment_id)? else {
         return Ok(false);
     };
@@ -2773,6 +2782,91 @@ pub(crate) fn request_changes_identity_matches(
         && identity.run_id == assignment.run_id
         && assignment.worker.as_ref() == Some(&identity.worker)
         && identity.controller == assignment.primary_manager)
+}
+
+fn released_request_changes_receipt_identity(
+    registry: &Registry,
+    assignment: &AssignmentRecord,
+) -> Result<Option<(String, String)>, CliError> {
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(None);
+    };
+    let Some(checkpoint) = assignment.checkpoint.as_ref() else {
+        return Ok(None);
+    };
+    let Some(previous_revision) = assignment.revision.checked_sub(1) else {
+        return Ok(None);
+    };
+    if assignment.state != "working" || checkpoint.revision != assignment.revision {
+        return Ok(None);
+    }
+    let receipt_prefix = format!(
+        "{}:{}:",
+        assignment.primary_manager.session_id, assignment.primary_manager.session_incarnation
+    );
+    let mut matched = None;
+    for (receipt_key, receipt) in &registry.receipts {
+        if receipt.operation != "worker-request-changes"
+            || receipt.principal_session_id != assignment.primary_manager.session_id
+            || receipt.principal_incarnation != assignment.primary_manager.session_incarnation
+            || receipt.outcome["schema_version"] != "main-agent.worker-request-changes-result.v1"
+        {
+            continue;
+        }
+        let outcome = &receipt.outcome["assignment"];
+        let outcome_worker = serde_json::from_value::<SessionRef>(outcome["worker"].clone()).ok();
+        let outcome_manager =
+            serde_json::from_value::<SessionRef>(outcome["primary_manager"].clone()).ok();
+        let outcome_reason = outcome["checkpoint"]["next_action"].as_str();
+        if outcome["schema_version"] != assignment.schema_version
+            || outcome["assignment_id"] != assignment.assignment_id
+            || outcome["run_id"] != assignment.run_id
+            || outcome["revision"].as_u64() != Some(assignment.revision)
+            || outcome["state"] != "working"
+            || outcome["checkpoint"]["revision"].as_u64() != Some(assignment.revision)
+            || outcome_worker.as_ref() != Some(worker)
+            || outcome_manager.as_ref() != Some(&assignment.primary_manager)
+            || outcome_reason != Some(checkpoint.next_action.as_str())
+        {
+            continue;
+        }
+        let expected_digest = crate::coordination::request_digest(
+            "worker-request-changes",
+            &serde_json::json!({
+                "assignment_id": assignment.assignment_id,
+                "if_revision": previous_revision,
+                "reason": checkpoint.next_action
+            }),
+        );
+        if receipt.request_digest != expected_digest {
+            continue;
+        }
+        let Some(idempotency_key) = receipt_key.strip_prefix(&receipt_prefix) else {
+            continue;
+        };
+        validate_slug("request-changes idempotency key", idempotency_key, 128)?;
+        let candidate = (receipt.request_digest.clone(), idempotency_key.to_string());
+        if matched
+            .as_ref()
+            .is_some_and(|existing| existing != &candidate)
+        {
+            return Err(CliError::data(
+                "request-changes-identity-conflict",
+                "multiple request-changes receipts match the exact assignment revision",
+                Some(serde_json::json!({
+                    "retryable": false,
+                    "next_action": "inspect-request-changes-receipts",
+                    "recovery": {
+                        "kind": "request-changes-receipt-audit",
+                        "owner": "main-agent",
+                        "automatic": false
+                    }
+                })),
+            ));
+        }
+        matched = Some(candidate);
+    }
+    Ok(matched)
 }
 
 fn worker_reentry_identity_path(

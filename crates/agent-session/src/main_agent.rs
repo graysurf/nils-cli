@@ -14918,7 +14918,7 @@ fn run_worker_reenter(context: &CliContext, args: WorkerReenterArgs) -> Result<V
     ensure_primary_manager(&assignment, &main, &main_incarnation)?;
     ensure_revision(args.if_revision, assignment.revision, "assignment")?;
     if assignment.state != "working"
-        || !orchestration::request_changes_identity_matches(context, &assignment)?
+        || !orchestration::request_changes_identity_matches(context, &registry, &assignment)?
         || assignment
             .checkpoint
             .as_ref()
@@ -15158,7 +15158,7 @@ fn worker_reenter_assignment_for_reservation(
     ensure_primary_manager(assignment, main, main_incarnation)?;
     ensure_revision(assignment_revision, assignment.revision, "assignment")?;
     if assignment.state != "working"
-        || !orchestration::request_changes_identity_matches(context, assignment)?
+        || !orchestration::request_changes_identity_matches(context, registry, assignment)?
         || assignment
             .checkpoint
             .as_ref()

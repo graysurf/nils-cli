@@ -7433,14 +7433,19 @@ fn main_agent_worker_reenter_retries_only_the_exact_idle_notification_generation
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
         );
-    let request_changes_identity: serde_json::Value = serde_json::from_slice(
-        &fs::read(&request_changes_identity_path).expect("request-changes identity"),
-    )
-    .expect("request-changes identity json");
+    let request_changes_receipt = orchestration_registry(&state_dir)["receipts"]
+        .as_object()
+        .expect("receipts")
+        .iter()
+        .find(|(_, receipt)| receipt["operation"] == "worker-request-changes")
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .expect("request-changes receipt");
     fs::remove_file(&request_changes_identity_path).expect("remove typed identity");
     rewrite_orchestration_registry(&state_dir, |registry| {
         registry["assignments"]["assignment-review-reenter"]["checkpoint"]["summary"] =
             json!("Main Agent requested revisions");
+        registry["receipts"][&request_changes_receipt.0]["request_digest"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
     });
     let spoofed_display_checkpoint = run_main_agent(
         &checkout,
@@ -7468,7 +7473,9 @@ fn main_agent_worker_reenter_retries_only_the_exact_idle_notification_generation
         spoofed_display_checkpoint.stdout_json()["error"]["code"],
         "worker-reentry-state-conflict"
     );
-    write_private_json(&request_changes_identity_path, &request_changes_identity);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"][&request_changes_receipt.0] = request_changes_receipt.1.clone();
+    });
 
     let attached_tmux = tmp.path().join("tmux-reentry-attached");
     fs::write(
@@ -7507,6 +7514,18 @@ fn main_agent_worker_reenter_retries_only_the_exact_idle_notification_generation
     assert_eq!(
         attached.stdout_json()["error"]["code"],
         "worker-reentry-session-attached"
+    );
+    let backfilled_request_changes_identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(&request_changes_identity_path).expect("backfilled request-changes identity"),
+    )
+    .expect("backfilled request-changes identity json");
+    assert_eq!(
+        backfilled_request_changes_identity["assignment_revision"],
+        6
+    );
+    assert_eq!(
+        backfilled_request_changes_identity["request_digest"],
+        request_changes_receipt.1["request_digest"]
     );
     assert!(attached.stdout_json()["error"]["details"]["retryable"].is_boolean());
     assert!(attached.stdout_json()["error"]["details"]["next_action"].is_string());

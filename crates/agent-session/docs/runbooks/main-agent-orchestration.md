@@ -943,7 +943,11 @@ records the review reason as the next action, and changes only `submitted` to
 `working`. It also records a private typed companion identity for the exact
 request-changes revision; the frozen assignment.v3 record remains compatible
 and the human-readable checkpoint summary is not re-entry authority. The
-worker must later submit a new exact result.
+worker must later submit a new exact result. A review revision created by an
+older installed binary may backfill that companion only from one exact
+controller-scoped `worker-request-changes` receipt whose run, revision, worker,
+manager, guidance, and recomputed request digest all match. Missing, malformed,
+or ambiguous receipt evidence fails closed.
 
 If the exact Codex turn has already completed and its one private review
 message is still unread, inspect `worker diagnose` first for current activity,

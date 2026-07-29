@@ -514,7 +514,12 @@ record. Checkpoint summary text is display data and never transition authority.
 Its idempotency receipt is scoped to the authenticated
 current Main Agent and exact logical request. Wrong roles, changed
 primary-manager ownership, stale revisions, and every non-submitted source
-state fail closed.
+state fail closed. For an in-place runtime upgrade, an exact released
+`worker-request-changes` receipt may backfill a missing companion identity only
+when its authenticated controller principal, run, revision, worker, manager,
+checkpoint guidance, idempotency-key binding, and recomputed request digest
+all match the current assignment. Receipt absence, corruption, or more than one
+matching candidate is not transition authority and fails closed.
 
 `worker reenter` is the manager-only, idempotent notification retry for an
 already completed Codex `request-changes` turn. It accepts only the exact
