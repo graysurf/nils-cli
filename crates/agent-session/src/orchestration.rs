@@ -1086,6 +1086,10 @@ const SESSION_GROUP_CLEANUP_FENCE_FILE: &str = "group-cleanup-fence.json";
 const SESSION_RUNTIME_STOP_FENCE_FILE: &str = "runtime-stop-fence.json";
 const WORKER_DELETE_IDENTITIES_DIR: &str = "worker-delete-identities";
 const WORKER_DELETE_IDENTITY_SCHEMA: &str = "main-agent.worker-delete-identity.v1";
+const REQUEST_CHANGES_IDENTITIES_DIR: &str = "request-changes-identities";
+const REQUEST_CHANGES_IDENTITY_SCHEMA: &str = "main-agent.request-changes-identity.v1";
+const WORKER_REENTRY_IDENTITIES_DIR: &str = "worker-reentry-identities";
+const WORKER_REENTRY_IDENTITY_SCHEMA: &str = "main-agent.worker-reentry-identity.v1";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1255,6 +1259,35 @@ pub(crate) struct WorkerDeleteIdentity {
     assignment_revision: u64,
     worker: SessionRef,
     controller: SessionRef,
+    request_digest: String,
+    idempotency_key: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RequestChangesIdentity {
+    schema_version: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    run_id: String,
+    worker: SessionRef,
+    controller: SessionRef,
+    request_digest: String,
+    idempotency_key: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WorkerReentryIdentity {
+    schema_version: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    run_id: String,
+    worker: SessionRef,
+    controller: SessionRef,
+    notification_generation: u64,
     request_digest: String,
     idempotency_key: String,
     created_at: String,
@@ -2593,6 +2626,370 @@ fn validate_worker_delete_identity(identity: &WorkerDeleteIdentity) -> Result<()
         return Err(store_invalid("worker delete identity timestamp is invalid"));
     }
     Ok(())
+}
+
+fn request_changes_identity_path(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<PathBuf, CliError> {
+    validate_slug("request-changes assignment id", assignment_id, 128)?;
+    let root = ensure_orchestration_root(context)?.join(REQUEST_CHANGES_IDENTITIES_DIR);
+    ensure_private_directory(&root)?;
+    Ok(root.join(hex(&Sha256::digest(assignment_id.as_bytes()))))
+}
+
+fn read_request_changes_identity(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<Option<RequestChangesIdentity>, CliError> {
+    validate_slug("request-changes assignment id", assignment_id, 128)?;
+    let root = orchestration_root(context).join(REQUEST_CHANGES_IDENTITIES_DIR);
+    match fs::symlink_metadata(&root) {
+        Ok(_) => ensure_private_directory(&root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(store_unavailable()),
+    }
+    let path = root.join(hex(&Sha256::digest(assignment_id.as_bytes())));
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "request-changes identity permissions are unsafe",
+        "request-changes identity exceeds byte limit",
+        "request-changes identity changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("request-changes identity is invalid"))
+}
+
+fn validate_request_changes_identity(identity: &RequestChangesIdentity) -> Result<(), CliError> {
+    if identity.schema_version != REQUEST_CHANGES_IDENTITY_SCHEMA {
+        return Err(store_invalid("request-changes identity schema is invalid"));
+    }
+    validate_slug(
+        "request-changes assignment id",
+        &identity.assignment_id,
+        128,
+    )?;
+    validate_slug("request-changes run id", &identity.run_id, 128)?;
+    if identity.assignment_revision == 0 {
+        return Err(store_invalid(
+            "request-changes assignment revision is invalid",
+        ));
+    }
+    validate_session_ref(&identity.worker)?;
+    validate_session_ref(&identity.controller)?;
+    if identity.request_digest.len() != 64
+        || !identity
+            .request_digest
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(store_invalid("request-changes request digest is invalid"));
+    }
+    validate_slug(
+        "request-changes idempotency key",
+        &identity.idempotency_key,
+        128,
+    )?;
+    if identity.created_at.trim().is_empty() || identity.created_at.len() > 64 {
+        return Err(store_invalid("request-changes timestamp is invalid"));
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_request_changes_identity(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), CliError> {
+    let worker = assignment.worker.clone().ok_or_else(|| {
+        CliError::data(
+            "worker-session-conflict",
+            "request-changes identity requires the exact assignment worker",
+            None,
+        )
+    })?;
+    let identity = RequestChangesIdentity {
+        schema_version: REQUEST_CHANGES_IDENTITY_SCHEMA.to_string(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_revision: assignment.revision,
+        run_id: assignment.run_id.clone(),
+        worker,
+        controller: assignment.primary_manager.clone(),
+        request_digest: request_digest.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        created_at: crate::coordination::timestamp(crate::coordination::now_epoch()),
+    };
+    validate_request_changes_identity(&identity)?;
+    if let Some(existing) = read_request_changes_identity(context, &assignment.assignment_id)? {
+        validate_request_changes_identity(&existing)?;
+        if existing.assignment_id == identity.assignment_id
+            && existing.assignment_revision == identity.assignment_revision
+            && existing.run_id == identity.run_id
+            && existing.worker == identity.worker
+            && existing.controller == identity.controller
+            && existing.request_digest == identity.request_digest
+            && existing.idempotency_key == identity.idempotency_key
+        {
+            return Ok(());
+        }
+        if existing.assignment_revision >= identity.assignment_revision {
+            return Err(CliError::data(
+                "request-changes-identity-conflict",
+                "request-changes provenance does not match the exact assignment revision",
+                Some(serde_json::json!({
+                    "retryable": true,
+                    "next_action": "replay-original-request-changes",
+                    "recovery": {
+                        "kind": "request-changes-replay",
+                        "owner": "main-agent",
+                        "automatic": false
+                    }
+                })),
+            ));
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&identity)
+        .map_err(|_| store_invalid("request-changes identity is invalid"))?;
+    let path = request_changes_identity_path(context, &assignment.assignment_id)?;
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn request_changes_identity_matches(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<bool, CliError> {
+    let Some(identity) = read_request_changes_identity(context, &assignment.assignment_id)? else {
+        return Ok(false);
+    };
+    validate_request_changes_identity(&identity)?;
+    Ok(identity.assignment_id == assignment.assignment_id
+        && identity.assignment_revision == assignment.revision
+        && identity.run_id == assignment.run_id
+        && assignment.worker.as_ref() == Some(&identity.worker)
+        && identity.controller == assignment.primary_manager)
+}
+
+fn worker_reentry_identity_path(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<PathBuf, CliError> {
+    validate_slug("worker re-entry assignment id", assignment_id, 128)?;
+    let root = ensure_orchestration_root(context)?.join(WORKER_REENTRY_IDENTITIES_DIR);
+    ensure_private_directory(&root)?;
+    Ok(root.join(hex(&Sha256::digest(assignment_id.as_bytes()))))
+}
+
+fn read_worker_reentry_identity(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<Option<WorkerReentryIdentity>, CliError> {
+    validate_slug("worker re-entry assignment id", assignment_id, 128)?;
+    let root = orchestration_root(context).join(WORKER_REENTRY_IDENTITIES_DIR);
+    match fs::symlink_metadata(&root) {
+        Ok(_) => ensure_private_directory(&root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(store_unavailable()),
+    }
+    let path = root.join(hex(&Sha256::digest(assignment_id.as_bytes())));
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "worker re-entry identity permissions are unsafe",
+        "worker re-entry identity exceeds byte limit",
+        "worker re-entry identity changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("worker re-entry identity is invalid"))
+}
+
+fn validate_worker_reentry_identity(identity: &WorkerReentryIdentity) -> Result<(), CliError> {
+    if identity.schema_version != WORKER_REENTRY_IDENTITY_SCHEMA {
+        return Err(store_invalid("worker re-entry identity schema is invalid"));
+    }
+    validate_slug(
+        "worker re-entry assignment id",
+        &identity.assignment_id,
+        128,
+    )?;
+    validate_slug("worker re-entry run id", &identity.run_id, 128)?;
+    if identity.assignment_revision == 0 || identity.notification_generation == 0 {
+        return Err(store_invalid(
+            "worker re-entry identity revision is invalid",
+        ));
+    }
+    validate_session_ref(&identity.worker)?;
+    validate_session_ref(&identity.controller)?;
+    if identity.request_digest.len() != 64
+        || !identity
+            .request_digest
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(store_invalid("worker re-entry request digest is invalid"));
+    }
+    validate_slug(
+        "worker re-entry idempotency key",
+        &identity.idempotency_key,
+        128,
+    )?;
+    if identity.created_at.trim().is_empty() || identity.created_at.len() > 64 {
+        return Err(store_invalid("worker re-entry timestamp is invalid"));
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_worker_reentry_identity(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    notification_generation: u64,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), CliError> {
+    let worker = assignment.worker.clone().ok_or_else(|| {
+        CliError::data(
+            "worker-session-conflict",
+            "worker re-entry identity requires the exact assignment worker",
+            None,
+        )
+    })?;
+    let identity = WorkerReentryIdentity {
+        schema_version: WORKER_REENTRY_IDENTITY_SCHEMA.to_string(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_revision: assignment.revision,
+        run_id: assignment.run_id.clone(),
+        worker,
+        controller: assignment.primary_manager.clone(),
+        notification_generation,
+        request_digest: request_digest.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        created_at: crate::coordination::timestamp(crate::coordination::now_epoch()),
+    };
+    validate_worker_reentry_identity(&identity)?;
+    if let Some(existing) = read_worker_reentry_identity(context, &assignment.assignment_id)? {
+        validate_worker_reentry_identity(&existing)?;
+        if existing.assignment_id == identity.assignment_id
+            && existing.assignment_revision == identity.assignment_revision
+            && existing.run_id == identity.run_id
+            && existing.worker == identity.worker
+            && existing.controller == identity.controller
+            && existing.notification_generation == identity.notification_generation
+            && existing.request_digest == identity.request_digest
+            && existing.idempotency_key == identity.idempotency_key
+        {
+            return Ok(());
+        }
+        return Err(CliError::unavailable(
+            "worker-reentry-in-flight",
+            "assignment mutation is fenced until the original exact worker re-entry completes",
+            Some(serde_json::json!({
+                "retryable": true,
+                "next_action": "replay-original-worker-reenter",
+                "recovery": {
+                    "kind": "worker-reenter-replay",
+                    "owner": "main-agent",
+                    "automatic": false
+                }
+            })),
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(&identity)
+        .map_err(|_| store_invalid("worker re-entry identity is invalid"))?;
+    let path = worker_reentry_identity_path(context, &assignment.assignment_id)?;
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn assignment_worker_reentry_in_progress(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<bool, CliError> {
+    let Some(identity) = read_worker_reentry_identity(context, &assignment.assignment_id)? else {
+        return Ok(false);
+    };
+    validate_worker_reentry_identity(&identity)?;
+    if identity.assignment_id != assignment.assignment_id
+        || identity.assignment_revision != assignment.revision
+        || identity.run_id != assignment.run_id
+        || assignment.worker.as_ref() != Some(&identity.worker)
+        || identity.controller != assignment.primary_manager
+    {
+        return Err(CliError::data(
+            "worker-reentry-identity-conflict",
+            "persistent worker re-entry identity does not match current assignment authority",
+            Some(serde_json::json!({
+                "retryable": false,
+                "next_action": "reconcile-assignment-authority",
+                "recovery": {
+                    "kind": "worker-reentry-authority-reconcile",
+                    "owner": "main-agent",
+                    "automatic": false
+                }
+            })),
+        ));
+    }
+    Ok(true)
+}
+
+pub(crate) fn worker_reentry_identity_matches(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    notification_generation: u64,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<bool, CliError> {
+    let Some(identity) = read_worker_reentry_identity(context, &assignment.assignment_id)? else {
+        return Ok(false);
+    };
+    validate_worker_reentry_identity(&identity)?;
+    Ok(identity.assignment_id == assignment.assignment_id
+        && identity.assignment_revision == assignment.revision
+        && identity.run_id == assignment.run_id
+        && assignment.worker.as_ref() == Some(&identity.worker)
+        && identity.controller == assignment.primary_manager
+        && identity.notification_generation == notification_generation
+        && identity.request_digest == request_digest
+        && identity.idempotency_key == idempotency_key)
+}
+
+pub(crate) fn clear_worker_reentry_identity(
+    context: &CliContext,
+    assignment_id: &str,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), CliError> {
+    let Some(identity) = read_worker_reentry_identity(context, assignment_id)? else {
+        return Ok(());
+    };
+    validate_worker_reentry_identity(&identity)?;
+    if identity.assignment_id != assignment_id
+        || identity.request_digest != request_digest
+        || identity.idempotency_key != idempotency_key
+    {
+        return Err(CliError::data(
+            "worker-reentry-identity-conflict",
+            "persistent worker re-entry identity does not match finalization",
+            Some(serde_json::json!({
+                "retryable": false,
+                "next_action": "replay-original-worker-reenter",
+                "recovery": {
+                    "kind": "worker-reenter-replay",
+                    "owner": "main-agent",
+                    "automatic": false
+                }
+            })),
+        ));
+    }
+    fs::remove_file(worker_reentry_identity_path(context, assignment_id)?)
+        .map_err(|_| store_unavailable())
 }
 
 pub(crate) fn persist_worker_delete_identity(

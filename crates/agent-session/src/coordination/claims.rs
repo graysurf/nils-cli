@@ -360,6 +360,11 @@ fn claim_impl(
     )? {
         return Ok(replay);
     }
+    super::ensure_notification_submission_not_in_progress(
+        &locked.registry,
+        &record.id,
+        &incarnation,
+    )?;
     if let Some(previous_incarnation) = resume_from_incarnation {
         if previous_incarnation == incarnation {
             return Err(CliError::data(
@@ -524,6 +529,11 @@ pub(crate) fn set_declared(
     }
     clean_expired(&mut locked.registry, now);
     ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    super::ensure_notification_submission_not_in_progress(
+        &locked.registry,
+        &record.id,
+        incarnation,
+    )?;
     let existing_index = locked.registry.claims.iter().position(|claim| {
         claim.session_id == record.id
             && claim.session_incarnation == incarnation
@@ -737,6 +747,11 @@ pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<
         return Ok(replay);
     }
     ensure_current_broker(context, &locked.registry, &record.id, &incarnation)?;
+    super::ensure_notification_submission_not_in_progress(
+        &locked.registry,
+        &record.id,
+        &incarnation,
+    )?;
     let claim_index = locked
         .registry
         .claims
@@ -903,6 +918,11 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         return Ok(replay);
     }
     ensure_current_broker(context, &locked.registry, &record.id, &incarnation)?;
+    super::ensure_notification_submission_not_in_progress(
+        &locked.registry,
+        &record.id,
+        &incarnation,
+    )?;
     if locked.registry.operations.iter().any(|lease| {
         lease.session_id == record.id
             && matches!(
@@ -1484,6 +1504,11 @@ pub(crate) fn acquire_main_agent_worker_start_fence(
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
     ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    super::ensure_notification_submission_not_in_progress(
+        &locked.registry,
+        &record.id,
+        incarnation,
+    )?;
     let claim = active_claim(&locked.registry, &record.id, incarnation)?.clone();
     let execution_token = uuid::Uuid::new_v4().to_string();
     if let Some(lease) = locked.registry.operations.iter_mut().find(|lease| {

@@ -940,7 +940,38 @@ main-agent worker request-changes ASSIGNMENT_ID \
 This manager-only transition is revision-fenced and idempotent. It preserves the
 bound worker and private packet, clears stale result and blocker summaries,
 records the review reason as the next action, and changes only `submitted` to
-`working`. The worker must later submit a new exact result.
+`working`. It also records a private typed companion identity for the exact
+request-changes revision; the frozen assignment.v3 record remains compatible
+and the human-readable checkpoint summary is not re-entry authority. The
+worker must later submit a new exact result.
+
+If the exact Codex turn has already completed and its one private review
+message is still unread, inspect `worker diagnose` first for current activity,
+claim/operation, and guidance evidence. Retain the exact
+`notification.generation` from the successful `worker message` result; that
+result is the machine-readable generation fence. If it was not retained, fail
+closed instead of guessing or creating another message. `worker reenter`
+itself authoritatively validates the live worker incarnation, detached idle
+composer, typed request-changes identity, quiescence, and unread guidance:
+
+```bash
+main-agent worker reenter ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --if-notification-generation NOTIFICATION_GENERATION \
+  --idempotency-key worker-reenter-001 \
+  --format json
+```
+
+This action does not create another mailbox message or resend the assignment
+prompt. It re-queues only the named notification generation. A crash-retained
+reservation is revalidated against the current run, manager, typed
+request-changes revision, worker, runtime, idle composer, coordination
+quiescence, and unread guidance before any retry. The notification controller
+still performs the final incarnation, idle-turn, live-runtime,
+detached-session, authoritative-broker, no-claim, and no-operation checks
+immediately before its one fixed body-free prompt and single Enter. An
+unresolved submission outcome fails closed.
 
 Only a `submitted` assignment can be accepted:
 

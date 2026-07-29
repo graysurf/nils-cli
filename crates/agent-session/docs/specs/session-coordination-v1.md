@@ -500,7 +500,10 @@ The durable states are `queued`, `attempting`, `prompt_submitted`,
 input checks plus the `queued -> attempting` generation compare-and-swap happen
 while holding the session lifecycle lock. That registry transition is the
 single provider-side-effect owner even when startup, HTTP, activity, and polling
-wakeups race.
+wakeups race. The controller dispatches distinct recipient generations with
+bounded concurrency so one slow terminal cannot head-of-line block unrelated
+sessions; the per-recipient generation CAS still permits only one side-effect
+owner.
 
 The private persisted receipt retains a content-free compatibility
 `message_id` that encodes only its recipient-key digest and generation. This
@@ -510,22 +513,30 @@ restores the encoded generation and state; an acknowledged generation remains
 submitted, while an in-flight generation becomes `attempt_unknown` rather than
 being retried.
 
-Codex uses the existing app-server prompt-v2 control and counts only an
-acknowledged turn submission. Claude uses the controller-owned private-buffer
-paste plus a separate Enter only after a `Stop` hook has survived a
-no-reactivation debounce, `session_attached == 0`, and an immediate exact
-incarnation recheck. Claude acceptance requires the byte-exact prompt as the
-content of a newer transcript-observed turn. A later provider observation
-reconciles `attempting` or `attempt_unknown`: an exact prompt proves
+App-server Codex uses prompt-v2 control and counts only an acknowledged turn
+submission. Terminal-backed Codex and Claude use the controller-owned
+private-buffer paste plus a separate Enter after exact-incarnation,
+authoritative-idle, detached, live-runtime, authoritative-broker, no-claim, and
+no-operation checks. The short `queued -> attempting` CAS is a per-session
+submission fence: claim and operation admission returns
+`coordination-notification-submission-in-progress` with typed retry guidance
+until the terminal submission boundary completes, while unrelated coordination
+registry work remains available. Claude additionally requires a `Stop` hook
+that survived a no-reactivation debounce. Terminal acceptance requires the
+byte-exact prompt as the content of a newer transcript-observed turn. A later
+provider observation reconciles `attempting` or `attempt_unknown`: an exact prompt proves
 `prompt_submitted`, a current transcript without it safely requeues, and
 unavailable observation leaves the attempt parked.
 
 Busy, attached, rate-limited, controller-unavailable, and provider-not-ready
 targets remain queued with a bounded safe reason. Replaced incarnations,
-coordination-off sessions, Hermes, unmanaged sessions, and unsupported
-providers are explicitly undeliverable. Prompt acceptance never changes message
-state; only authenticated inbox/show/ack operations move unread mail. Show,
-ack, and notification processing do not recursively schedule a notification.
+coordination-off sessions, Hermes, unmanaged sessions, and other unsupported
+providers are explicitly undeliverable. A non-app-server Codex generation
+previously marked `undeliverable` only for `provider-unsupported` may be re-queued by the
+typed manager-owned worker re-entry macro without allocating a new message
+generation. Prompt acceptance never changes message state; only authenticated
+inbox/show/ack operations move unread mail. Show, ack, and notification
+processing do not recursively schedule a notification.
 
 Send and reply results add a content-free `notification` object:
 

@@ -293,6 +293,8 @@ pub(crate) fn session_has_active_claim_or_operation(
 
 pub(crate) struct SessionQuiescenceGuard {
     _locked: LockedRegistry,
+    session_id: String,
+    incarnation: String,
     pub broker_present: bool,
     pub broker_identity_matched: bool,
     pub broker_authoritative: bool,
@@ -309,6 +311,32 @@ pub(crate) struct SessionQuiescenceGuard {
 }
 
 impl SessionQuiescenceGuard {
+    pub(crate) fn begin_notification_attempt(
+        &mut self,
+        candidate: &NotificationCandidate,
+    ) -> Result<bool, CliError> {
+        if candidate.target_session_id != self.session_id
+            || candidate.target_incarnation != self.incarnation
+            || !self.broker_authoritative
+            || self.active_claim
+            || self.active_operation
+            || self.uncertain_operation
+        {
+            return Ok(false);
+        }
+        let attempted_at = jiff::Timestamp::now();
+        let Some(_) = notification::transition_attempt_at(
+            &mut self._locked.registry,
+            candidate,
+            attempted_at.as_second(),
+            attempted_at,
+        ) else {
+            return Ok(false);
+        };
+        self._locked.save()?;
+        Ok(true)
+    }
+
     pub(crate) fn has_active_claim(&self, session_id: &str, incarnation: &str) -> bool {
         self._locked.registry.claims.iter().any(|claim| {
             claim.session_id == session_id
@@ -1700,6 +1728,8 @@ pub(crate) fn lock_session_quiescence(
     });
     Ok(SessionQuiescenceGuard {
         _locked: locked,
+        session_id: session_id.to_string(),
+        incarnation: incarnation.to_string(),
         broker_present,
         broker_identity_matched,
         broker_authoritative,
@@ -1852,11 +1882,35 @@ pub(crate) fn unresolved_notifications(
     notification::unresolved(context)
 }
 
+#[cfg(test)]
 pub(crate) fn begin_notification_attempt(
     context: &CliContext,
     candidate: &NotificationCandidate,
 ) -> Result<bool, CliError> {
     notification::begin_attempt(context, candidate)
+}
+
+pub(crate) fn ensure_notification_submission_not_in_progress(
+    registry: &Registry,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<(), CliError> {
+    if notification::submission_fences_session(registry, session_id, incarnation) {
+        return Err(CliError::unavailable(
+            "coordination-notification-submission-in-progress",
+            "claim or operation admission is fenced during exact terminal notification submission",
+            Some(serde_json::json!({
+                "retryable": true,
+                "next_action": "wait-for-notification-outcome",
+                "recovery": {
+                    "kind": "notification-submission-wait",
+                    "owner": "agent-session-serve",
+                    "automatic": true
+                }
+            })),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn mark_notification_submitted(
@@ -1917,6 +1971,20 @@ pub(crate) fn reconcile_notification_absent(
 
 pub(crate) fn notification_prompt(message_id: &str, session_id: &str) -> String {
     notification::fixed_prompt(message_id, session_id)
+}
+
+pub(crate) fn retry_notification(
+    context: &CliContext,
+    target_session_id: &str,
+    target_incarnation: &str,
+    expected_generation: u64,
+) -> Result<notification::NotificationProjection, CliError> {
+    notification::retry_existing(
+        context,
+        target_session_id,
+        target_incarnation,
+        expected_generation,
+    )
 }
 
 pub(crate) fn coordination_dir(context: &CliContext, session_id: &str) -> PathBuf {

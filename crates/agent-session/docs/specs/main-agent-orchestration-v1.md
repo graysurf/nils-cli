@@ -104,6 +104,7 @@ main-agent worker guidance-quarantine ASSIGNMENT_ID --if-revision N --idempotenc
 main-agent worker account-handoff ASSIGNMENT_ID --account ACCOUNT --if-revision N --authorize-account-change --idempotency-key KEY --format json
 main-agent worker account-handoff-cancel ASSIGNMENT_ID --reservation-id RESERVATION_ID --account ACCOUNT [--intent-id INTENT_ID] --if-revision N --authorize-account-change --idempotency-key KEY --format json
 main-agent worker request-changes ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
+main-agent worker reenter ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --if-notification-generation N --idempotency-key KEY --format json
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
 main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --idempotency-key KEY --format json
@@ -507,10 +508,37 @@ state. `worker request-changes` is the manager-only revision-fenced exception:
 it permits exactly `submitted -> working`, preserves the bound worker and
 private packet, clears stale result and blocker summaries, and records a
 bounded review-revision checkpoint and reason atomically with the new
-assignment revision. Its idempotency receipt is scoped to the authenticated
+assignment revision. A private, typed companion identity binds that exact
+revision, run, manager, and worker without changing the frozen assignment.v3
+record. Checkpoint summary text is display data and never transition authority.
+Its idempotency receipt is scoped to the authenticated
 current Main Agent and exact logical request. Wrong roles, changed
 primary-manager ownership, stale revisions, and every non-submitted source
 state fail closed.
+
+`worker reenter` is the manager-only, idempotent notification retry for an
+already completed Codex `request-changes` turn. It accepts only the exact
+`working` review revision, bound worker incarnation, and existing unread
+notification generation. The runtime must be live and detached; activity must
+show authoritative normal turn completion; the exact broker must be
+authoritative with no worker claim or active/uncertain operation; and unread
+guidance must belong only to that incarnation. The typed request-changes
+companion identity must match the requested current revision. The action
+allocates no message
+generation and resends no assignment content. It durably reserves the retry
+before re-queuing the same generation. A retained reservation is intent, not
+authority: every side-effecting crash replay revalidates the current run,
+manager, assignment revision and provenance, worker incarnation, runtime,
+activity, attachment, broker, claim/operation quiescence, and unread guidance.
+The reservation also installs a private assignment-scoped re-entry authority
+seal. Handoff, state, revision, checkpoint, and other assignment mutations fail
+closed until the exact notification retry and final receipt commit or replay
+completes; the seal is not part of the frozen assignment.v3 record.
+Replay converges when delivery is queued or already acknowledged and fails
+closed while submission outcome is unresolved. The notification controller
+repeats the incarnation, idle-turn, live-runtime, attach, broker, claim, and
+operation fences before sending its fixed body-free mailbox prompt and exactly
+one Enter.
 
 Accept/release are explicit Main Agent transitions. The ordinary successful
 path is `submitted -> accepted -> released`. Once an assignment is `accepted`,

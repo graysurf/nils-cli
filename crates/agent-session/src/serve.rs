@@ -130,6 +130,7 @@ const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250)
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
 const COORDINATION_WAIT_WORKER_LIMIT: usize = 16;
+const COORDINATION_NOTIFICATION_CONCURRENCY: usize = 8;
 const COORDINATION_NOTIFICATION_RETRY: i64 = 1;
 const CLAUDE_NOTIFICATION_STOP_DEBOUNCE: Duration = Duration::from_secs(1);
 const CLAUDE_NOTIFICATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -172,7 +173,7 @@ struct CoordinationNotificationFence {
 }
 
 #[derive(Debug)]
-enum ClaudeNotificationStartError {
+enum TerminalNotificationStartError {
     Known(&'static str),
     Unknown,
 }
@@ -4064,12 +4065,12 @@ async fn submit_structured_prompt_locked(
                 && codex_app_server::runtime_is_supported(&current)
                 && activity::state_for_view(&lock_context, &current)
                     .is_some_and(|state| state.phase == activity::TurnPhase::Waiting);
-            if !eligible
-                || !crate::coordination::begin_notification_attempt(
-                    &lock_context,
-                    &fence.candidate,
-                )?
-            {
+            let mut quiescence = crate::coordination::lock_session_quiescence(
+                &lock_context,
+                &fence.candidate.target_session_id,
+                &fence.candidate.target_incarnation,
+            )?;
+            if !eligible || !quiescence.begin_notification_attempt(&fence.candidate)? {
                 return Err(CliError::data(
                     "coordination-notification-superseded",
                     "notification eligibility changed before locked prompt submission",
@@ -4648,9 +4649,17 @@ async fn drain_coordination_notifications(state: Arc<ServeState>) {
             return;
         }
     };
+    let mut tasks = JoinSet::new();
     for candidate in candidates {
-        dispatch_coordination_notification(state.clone(), candidate).await;
+        while tasks.len() >= COORDINATION_NOTIFICATION_CONCURRENCY {
+            let _ = tasks.join_next().await;
+        }
+        let dispatch_state = state.clone();
+        tasks.spawn(async move {
+            dispatch_coordination_notification(dispatch_state, candidate).await;
+        });
     }
+    while tasks.join_next().await.is_some() {}
 }
 
 async fn reconcile_coordination_notifications(state: Arc<ServeState>) {
@@ -4748,7 +4757,8 @@ async fn dispatch_coordination_notification(
         return;
     }
     if record.agent == AgentKind::Claude.as_str() {
-        dispatch_claude_coordination_notification(state, record, candidate).await;
+        dispatch_terminal_coordination_notification(state, record, candidate, AgentKind::Claude)
+            .await;
         return;
     }
     let waiting = activity::state_for_view(&state.context, &record)
@@ -4764,7 +4774,8 @@ async fn dispatch_coordination_notification(
         return;
     }
     if !codex_app_server::runtime_is_supported(&record) {
-        update_notification_undeliverable(&state, &candidate, "provider-unsupported").await;
+        dispatch_terminal_coordination_notification(state, record, candidate, AgentKind::Codex)
+            .await;
         return;
     }
 
@@ -4805,10 +4816,11 @@ async fn dispatch_coordination_notification(
     }
 }
 
-async fn dispatch_claude_coordination_notification(
+async fn dispatch_terminal_coordination_notification(
     state: Arc<ServeState>,
     record: SessionRecord,
     candidate: crate::coordination::NotificationCandidate,
+    expected_agent: AgentKind,
 ) {
     let Some(source) = ProviderPromptTail::resolve_source(&record) else {
         update_notification_deferred(
@@ -4836,18 +4848,19 @@ async fn dispatch_claude_coordination_notification(
     let start_candidate = candidate.clone();
     let start_prompt = prompt.clone();
     let started = tokio::task::spawn_blocking(move || {
-        start_claude_coordination_notification(
+        start_terminal_coordination_notification(
             &context,
             &tmux,
             &start_candidate,
             &start_prompt,
             tail,
+            expected_agent,
         )
     })
     .await;
     let tail = match started {
         Ok(Ok(tail)) => tail,
-        Ok(Err(ClaudeNotificationStartError::Known(reason))) => {
+        Ok(Err(TerminalNotificationStartError::Known(reason))) => {
             update_notification_deferred(
                 &state,
                 &candidate,
@@ -4857,7 +4870,7 @@ async fn dispatch_claude_coordination_notification(
             .await;
             return;
         }
-        Ok(Err(ClaudeNotificationStartError::Unknown)) | Err(_) => {
+        Ok(Err(TerminalNotificationStartError::Unknown)) | Err(_) => {
             let context = state.context.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 crate::coordination::mark_notification_unknown(
@@ -4872,10 +4885,11 @@ async fn dispatch_claude_coordination_notification(
     };
 
     let observed_prompt = prompt.clone();
-    let observed =
-        tokio::task::spawn_blocking(move || observe_coordination_prompt(tail, &observed_prompt))
-            .await
-            .unwrap_or(false);
+    let observed = tokio::task::spawn_blocking(move || {
+        observe_terminal_coordination_prompt(tail, &observed_prompt)
+    })
+    .await
+    .unwrap_or(false);
     let context = state.context.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if observed {
@@ -4891,22 +4905,27 @@ async fn dispatch_claude_coordination_notification(
     .await;
 }
 
-fn start_claude_coordination_notification(
+fn start_terminal_coordination_notification(
     context: &CliContext,
     tmux_bin: &Path,
     candidate: &crate::coordination::NotificationCandidate,
     prompt: &str,
     tail: ProviderPromptTail,
-) -> Result<ProviderPromptTail, ClaudeNotificationStartError> {
+    expected_agent: AgentKind,
+) -> Result<ProviderPromptTail, TerminalNotificationStartError> {
     let _record_lock = crate::acquire_session_record_lock(context, &candidate.target_session_id)
-        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
+        .map_err(|_| TerminalNotificationStartError::Known("recipient-incarnation-replaced"))?;
     let current = load_session_record(context, &candidate.target_session_id)
-        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
-    if current.agent != AgentKind::Claude.as_str() {
-        return Err(ClaudeNotificationStartError::Known("provider-unsupported"));
+        .map_err(|_| TerminalNotificationStartError::Known("recipient-incarnation-replaced"))?;
+    if current.agent != expected_agent.as_str() {
+        return Err(TerminalNotificationStartError::Known(
+            "provider-unsupported",
+        ));
     }
     if current.coordination_mode == cli::CoordinationMode::Off {
-        return Err(ClaudeNotificationStartError::Known("coordination-disabled"));
+        return Err(TerminalNotificationStartError::Known(
+            "coordination-disabled",
+        ));
     }
     if current
         .runtime
@@ -4914,43 +4933,95 @@ fn start_claude_coordination_notification(
         .map(|runtime| runtime.launch_id.as_str())
         != Some(candidate.target_incarnation.as_str())
     {
-        return Err(ClaudeNotificationStartError::Known(
+        return Err(TerminalNotificationStartError::Known(
             "recipient-incarnation-replaced",
         ));
     }
-    if !activity::claude_notification_waiting(context, &current, CLAUDE_NOTIFICATION_STOP_DEBOUNCE)
-    {
-        return Err(ClaudeNotificationStartError::Known("recipient-working"));
+    if !terminal_notification_waiting(context, &current, expected_agent) {
+        return Err(TerminalNotificationStartError::Known("recipient-working"));
     }
     if crate::live_status(tmux_bin, &current.tmux_session) != "running" {
-        return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+        return Err(TerminalNotificationStartError::Known("provider-not-ready"));
     }
     match tmux_session_attached(tmux_bin, &current.tmux_session) {
         Ok(false) => {}
         Ok(true) => {
-            return Err(ClaudeNotificationStartError::Known("recipient-attached"));
+            return Err(TerminalNotificationStartError::Known("recipient-attached"));
         }
         Err(()) => {
-            return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+            return Err(TerminalNotificationStartError::Known("provider-not-ready"));
         }
     }
 
     let current = load_session_record(context, &candidate.target_session_id)
-        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
+        .map_err(|_| TerminalNotificationStartError::Known("recipient-incarnation-replaced"))?;
     if current
         .runtime
         .as_ref()
         .map(|runtime| runtime.launch_id.as_str())
         != Some(candidate.target_incarnation.as_str())
     {
-        return Err(ClaudeNotificationStartError::Known(
+        return Err(TerminalNotificationStartError::Known(
             "recipient-incarnation-replaced",
         ));
     }
-    if !crate::coordination::begin_notification_attempt(context, candidate)
-        .map_err(|_| ClaudeNotificationStartError::Known("provider-not-ready"))?
+    if current.agent != expected_agent.as_str()
+        || !terminal_notification_waiting(context, &current, expected_agent)
+        || crate::live_status(tmux_bin, &current.tmux_session) != "running"
     {
-        return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+        return Err(TerminalNotificationStartError::Known("recipient-working"));
+    }
+    // Quiescence validation and the durable `attempting` transition occur
+    // under one short registry lock. Claim and operation admission reject that
+    // exact per-session submission fence while terminal I/O runs outside the
+    // global coordination lock.
+    let mut quiescence = crate::coordination::lock_session_quiescence(
+        context,
+        &candidate.target_session_id,
+        &candidate.target_incarnation,
+    )
+    .map_err(|_| TerminalNotificationStartError::Known("provider-not-ready"))?;
+    if !quiescence.broker_authoritative
+        || quiescence.active_claim
+        || quiescence.active_operation
+        || quiescence.uncertain_operation
+    {
+        return Err(TerminalNotificationStartError::Known(
+            "recipient-coordination-not-quiescent",
+        ));
+    }
+    if !quiescence
+        .begin_notification_attempt(candidate)
+        .map_err(|_| TerminalNotificationStartError::Known("provider-not-ready"))?
+    {
+        return Err(TerminalNotificationStartError::Known("provider-not-ready"));
+    }
+    drop(quiescence);
+    if !terminal_notification_waiting(context, &current, expected_agent) {
+        if !crate::coordination::mark_notification_known_failure(
+            context,
+            candidate,
+            "recipient-working",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .map_err(|_| TerminalNotificationStartError::Unknown)?
+        {
+            return Err(TerminalNotificationStartError::Unknown);
+        }
+        return Err(TerminalNotificationStartError::Known("recipient-working"));
+    }
+    if crate::live_status(tmux_bin, &current.tmux_session) != "running" {
+        if !crate::coordination::mark_notification_known_failure(
+            context,
+            candidate,
+            "provider-not-ready",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .map_err(|_| TerminalNotificationStartError::Unknown)?
+        {
+            return Err(TerminalNotificationStartError::Unknown);
+        }
+        return Err(TerminalNotificationStartError::Known("provider-not-ready"));
     }
     match tmux_session_attached(tmux_bin, &current.tmux_session) {
         Ok(false) => {}
@@ -4961,11 +5032,11 @@ fn start_claude_coordination_notification(
                 "recipient-attached",
                 COORDINATION_NOTIFICATION_RETRY,
             )
-            .map_err(|_| ClaudeNotificationStartError::Unknown)?
+            .map_err(|_| TerminalNotificationStartError::Unknown)?
             {
-                return Err(ClaudeNotificationStartError::Unknown);
+                return Err(TerminalNotificationStartError::Unknown);
             }
-            return Err(ClaudeNotificationStartError::Known("recipient-attached"));
+            return Err(TerminalNotificationStartError::Known("recipient-attached"));
         }
         Err(()) => {
             if !crate::coordination::mark_notification_known_failure(
@@ -4974,11 +5045,11 @@ fn start_claude_coordination_notification(
                 "provider-not-ready",
                 COORDINATION_NOTIFICATION_RETRY,
             )
-            .map_err(|_| ClaudeNotificationStartError::Unknown)?
+            .map_err(|_| TerminalNotificationStartError::Unknown)?
             {
-                return Err(ClaudeNotificationStartError::Unknown);
+                return Err(TerminalNotificationStartError::Unknown);
             }
-            return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+            return Err(TerminalNotificationStartError::Known("provider-not-ready"));
         }
     }
     crate::send_input_unlocked(
@@ -4989,8 +5060,32 @@ fn start_claude_coordination_notification(
         tmux_bin,
         None,
     )
-    .map_err(|_| ClaudeNotificationStartError::Unknown)?;
+    .map_err(|_| TerminalNotificationStartError::Unknown)?;
     Ok(tail)
+}
+
+fn terminal_notification_waiting(
+    context: &CliContext,
+    record: &SessionRecord,
+    expected_agent: AgentKind,
+) -> bool {
+    match expected_agent {
+        AgentKind::Claude => activity::claude_notification_waiting(
+            context,
+            record,
+            CLAUDE_NOTIFICATION_STOP_DEBOUNCE,
+        ),
+        AgentKind::Codex => activity::state_for_view(context, record).is_some_and(|turn| {
+            turn.phase == activity::TurnPhase::Waiting
+                && turn.source.confidence == activity::Confidence::Authoritative
+                && turn
+                    .last_turn
+                    .as_ref()
+                    .is_some_and(|last_turn| last_turn.outcome == "completed")
+                && turn.current_turn.is_none()
+        }),
+        AgentKind::Hermes => false,
+    }
 }
 
 fn tmux_session_attached(tmux_bin: &Path, tmux_session: &str) -> Result<bool, ()> {
@@ -5014,7 +5109,7 @@ fn tmux_session_attached(tmux_bin: &Path, tmux_session: &str) -> Result<bool, ()
     Ok(attached != 0)
 }
 
-fn observe_coordination_prompt(mut tail: ProviderPromptTail, prompt: &str) -> bool {
+fn observe_terminal_coordination_prompt(mut tail: ProviderPromptTail, prompt: &str) -> bool {
     let deadline = Instant::now() + CLAUDE_NOTIFICATION_OBSERVATION_TIMEOUT;
     loop {
         match tail.poll() {
@@ -21504,6 +21599,121 @@ exit 0
                 handle,
             },
         );
+
+        let registry_path = tmp.path().join("coordination/registry.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .push(json!({
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "beta",
+                "session_incarnation": launch_id,
+                "claim_id": "app-server-notification-race-claim",
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": [],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [],
+                "summary": "structured notification race fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("write active claim");
+        let claimed_drain = tokio::spawn(drain_coordination_notifications(state.clone()));
+        let claimed_command =
+            tokio::time::timeout(Duration::from_millis(100), commands.recv()).await;
+        if let Ok(Some(codex_app_server::ControlCommand::Prompt { response, .. })) = claimed_command
+        {
+            response
+                .send(Ok("turn-claimed-notification".to_string()))
+                .expect("acknowledge unexpected claimed prompt");
+            panic!("active claim must prevent structured notification submission");
+        }
+        claimed_drain.await.expect("claimed drain");
+
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["claims"] = json!([]);
+        registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification")["next_attempt_at_epoch"] = json!(0);
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "app-server-notification-race-operation",
+                "session_id": "beta",
+                "session_incarnation": launch_id,
+                "claim_id": "app-server-notification-race-claim",
+                "claim_revision": 1,
+                "operation": "test mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": "reconcile_pending",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": 1,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("write uncertain operation");
+        let uncertain_drain = tokio::spawn(drain_coordination_notifications(state.clone()));
+        let uncertain_command =
+            tokio::time::timeout(Duration::from_millis(100), commands.recv()).await;
+        if let Ok(Some(codex_app_server::ControlCommand::Prompt { response, .. })) =
+            uncertain_command
+        {
+            response
+                .send(Ok("turn-uncertain-notification".to_string()))
+                .expect("acknowledge unexpected uncertain prompt");
+            panic!("uncertain operation must prevent structured notification submission");
+        }
+        uncertain_drain.await.expect("uncertain drain");
+
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"] = json!([]);
+        registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification")["next_attempt_at_epoch"] = json!(0);
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("clear uncertain operation");
+
         let responder = tokio::spawn(async move {
             let Some(codex_app_server::ControlCommand::Prompt { message, response }) =
                 commands.recv().await
@@ -21546,6 +21756,349 @@ exit 0
         assert_eq!(notification["notified_generation"], 1);
         assert_eq!(registry["messages"][0]["state"], "unread");
         assert!(!notification.to_string().contains(canary));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordination_notification_reenters_detached_terminal_codex_once() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "terminal-notification-reentry";
+        write_codex_notification_transcript(&transcript, provider_id, &[]);
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_fresh_provider_session(
+            tmp.path(),
+            "beta",
+            "codex",
+            "hs-codex-beta",
+            tmp.path(),
+            Some((provider_id, "codex-explicit-session-id")),
+        );
+        let command_log = tmp.path().join("tmux-commands.log");
+        let captured_prompt = tmp.path().join("captured-prompt");
+        let runtime_race = tmp.path().join("runtime-race");
+        let coordination_registry = tmp.path().join("coordination/registry.json");
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  has-session)
+    if [ -f {} ] && grep -q '"state": "attempting"' {}; then exit 1; fi
+    exit 0
+    ;;
+  display-message) printf '0\n'; exit 0 ;;
+  load-buffer)
+    for value in "$@"; do last="$value"; done
+    cp "$last" {}
+    exit 0
+    ;;
+  paste-buffer|send-keys|delete-buffer) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+                shell_words::quote(&command_log.to_string_lossy()),
+                shell_words::quote(&runtime_race.to_string_lossy()),
+                shell_words::quote(&coordination_registry.to_string_lossy()),
+                shell_words::quote(&captured_prompt.to_string_lossy()),
+            ),
+        )
+        .expect("tmux script");
+        let mut permissions = fs::metadata(&tmux).expect("tmux metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&tmux, permissions).expect("tmux permissions");
+
+        let state = state(tmp.path(), Some(TOKEN), tmux);
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+        crate::activity::activate_runtime(&state.context, &beta).expect("activate beta");
+        let launch_id = beta
+            .runtime
+            .as_ref()
+            .expect("beta runtime")
+            .launch_id
+            .clone();
+        for (event_id, kind) in [
+            ("terminal-notification-turn-start", "turn_started"),
+            ("terminal-notification-turn-complete", "turn_completed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": launch_id,
+                "provider": "codex",
+                "provider_session_id": provider_id,
+                "provider_turn_id": "terminal-notification-idle-turn",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .expect("activity event");
+            crate::activity::ingest_event(&state.context, &beta.id, event).expect("ingest");
+        }
+
+        let canary = "TERMINAL-CODEX-MAILBOX-BODY-MUST-NOT-REACH-PROMPT";
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": canary,
+                    "idempotency_key": "terminal-notification-reentry-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+
+        let candidate = crate::coordination::pending_notifications(&state.context)
+            .expect("pending notification")
+            .pop()
+            .expect("notification candidate");
+        fs::write(&runtime_race, b"stop after attempt\n").expect("runtime race");
+        let prompt = crate::coordination::notification_prompt("", "beta");
+        let guarded_tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            provider_id,
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        assert!(matches!(
+            start_terminal_coordination_notification(
+                &state.context,
+                &state.tmux_bin,
+                &candidate,
+                &prompt,
+                guarded_tail,
+                AgentKind::Codex,
+            ),
+            Err(TerminalNotificationStartError::Known("provider-not-ready"))
+        ));
+        assert!(!captured_prompt.exists());
+        assert_eq!(notification_fixture(tmp.path())["state"], "queued");
+        fs::remove_file(&runtime_race).expect("clear runtime race");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&coordination_registry).expect("registry"))
+                .expect("registry json");
+        registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification")["next_attempt_at_epoch"] = json!(0);
+        fs::write(
+            &coordination_registry,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("reset retry boundary");
+
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&coordination_registry).expect("registry"))
+                .expect("registry json");
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .push(json!({
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "beta",
+                "session_incarnation": beta.runtime.as_ref().expect("runtime").launch_id,
+                "claim_id": "terminal-notification-race-claim",
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": [],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [],
+                "summary": "terminal notification race fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX
+            }));
+        fs::write(
+            &coordination_registry,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("write claim");
+        let guarded_tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            provider_id,
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        assert!(matches!(
+            start_terminal_coordination_notification(
+                &state.context,
+                &state.tmux_bin,
+                &candidate,
+                &prompt,
+                guarded_tail,
+                AgentKind::Codex,
+            ),
+            Err(TerminalNotificationStartError::Known(
+                "recipient-coordination-not-quiescent"
+            ))
+        ));
+        assert!(!captured_prompt.exists());
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&coordination_registry).expect("registry"))
+                .expect("registry json");
+        registry["claims"] = json!([]);
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "terminal-notification-race-operation",
+                "session_id": "beta",
+                "session_incarnation": beta.runtime.as_ref().expect("runtime").launch_id,
+                "claim_id": "terminal-notification-race-claim",
+                "claim_revision": 1,
+                "operation": "test mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": 1,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+        fs::write(
+            &coordination_registry,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("replace claim with operation");
+        let guarded_tail = ProviderPromptTail::open_path(
+            ProviderKind::Codex,
+            provider_id,
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        assert!(matches!(
+            start_terminal_coordination_notification(
+                &state.context,
+                &state.tmux_bin,
+                &candidate,
+                &prompt,
+                guarded_tail,
+                AgentKind::Codex,
+            ),
+            Err(TerminalNotificationStartError::Known(
+                "recipient-coordination-not-quiescent"
+            ))
+        ));
+        assert!(!captured_prompt.exists());
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&coordination_registry).expect("registry"))
+                .expect("registry json");
+        registry["operations"] = json!([]);
+        fs::write(
+            &coordination_registry,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("clear operation");
+
+        let observed_transcript = transcript.clone();
+        let observed_prompt = captured_prompt.clone();
+        let observer = tokio::spawn(async move {
+            for _ in 0..100 {
+                if observed_prompt.exists() {
+                    let prompt =
+                        fs::read_to_string(&observed_prompt).expect("captured notification prompt");
+                    let observed = format!(
+                        "{}\n",
+                        json!({
+                            "type": "event_msg",
+                            "timestamp": "2030-01-01T00:01:41Z",
+                            "payload": {"type": "user_message", "message": prompt}
+                        })
+                    );
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&observed_transcript)
+                        .expect("open transcript")
+                        .write_all(observed.as_bytes())
+                        .expect("append observed prompt");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("notification prompt was not submitted");
+        });
+
+        drain_coordination_notifications(state.clone()).await;
+        observer.await.expect("prompt observer");
+
+        assert_eq!(
+            fs::read_to_string(&captured_prompt).expect("captured prompt"),
+            prompt
+        );
+        assert!(!prompt.contains(canary));
+        let commands = fs::read_to_string(&command_log).expect("command log");
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|line| line.starts_with("send-keys "))
+                .count(),
+            1,
+            "one notification generation must send Enter exactly once"
+        );
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "prompt_submitted");
+        assert_eq!(notification["generation"], 1);
+        assert_eq!(notification["notified_generation"], 1);
+
+        send_notification_fixture(
+            &state,
+            &alpha_capability,
+            "terminal-notification-reentry-timeout-0002",
+        )
+        .await;
+        drain_coordination_notifications(state.clone()).await;
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "attempt_unknown");
+        assert_eq!(notification["generation"], 2);
+        assert_eq!(notification["notified_generation"], 1);
+        let enter_count_after_unknown = fs::read_to_string(&command_log)
+            .expect("command log")
+            .lines()
+            .filter(|line| line.starts_with("send-keys "))
+            .count();
+        assert_eq!(enter_count_after_unknown, 2);
+        drain_coordination_notifications(state.clone()).await;
+        assert_eq!(
+            fs::read_to_string(&command_log)
+                .expect("command log")
+                .lines()
+                .filter(|line| line.starts_with("send-keys "))
+                .count(),
+            enter_count_after_unknown,
+            "an unresolved terminal submission must not send another Enter"
+        );
     }
 
     #[tokio::test]
@@ -21807,14 +22360,15 @@ esac
         .expect("tail");
         let prompt = crate::coordination::notification_prompt("", "beta");
         assert!(matches!(
-            start_claude_coordination_notification(
+            start_terminal_coordination_notification(
                 &state.context,
                 &tmux,
                 &candidate,
                 &prompt,
                 attached_tail,
+                AgentKind::Claude,
             ),
-            Err(ClaudeNotificationStartError::Known("recipient-attached"))
+            Err(TerminalNotificationStartError::Known("recipient-attached"))
         ));
         assert!(!captured_prompt.exists());
 
@@ -21826,12 +22380,13 @@ esac
             Duration::ZERO,
         )
         .expect("tail");
-        let tail = start_claude_coordination_notification(
+        let tail = start_terminal_coordination_notification(
             &state.context,
             &tmux,
             &candidate,
             &prompt,
             tail,
+            AgentKind::Claude,
         )
         .expect("start notification");
         assert_eq!(
@@ -21857,7 +22412,7 @@ esac
             })
         );
         fs::write(&transcript, observed).expect("append observed prompt");
-        assert!(observe_coordination_prompt(tail, &prompt));
+        assert!(observe_terminal_coordination_prompt(tail, &prompt));
         crate::coordination::mark_notification_submitted(&state.context, &candidate)
             .expect("mark submitted");
 
@@ -21963,14 +22518,15 @@ esac
         let prompt = crate::coordination::notification_prompt("", "beta");
 
         assert!(matches!(
-            start_claude_coordination_notification(
+            start_terminal_coordination_notification(
                 &state.context,
                 &tmux,
                 &candidate,
                 &prompt,
                 tail,
+                AgentKind::Claude,
             ),
-            Err(ClaudeNotificationStartError::Known("recipient-attached"))
+            Err(TerminalNotificationStartError::Known("recipient-attached"))
         ));
         assert!(
             !captured_prompt.exists(),

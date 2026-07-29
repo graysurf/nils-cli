@@ -274,6 +274,9 @@ enum WorkerCommand {
     /// Return a submitted assignment to its exact worker for bounded revisions.
     #[command(name = "request-changes")]
     RequestChanges(WorkerRequestChangesArgs),
+    /// Re-enter an exact idle Codex worker through its existing unread
+    /// notification generation without resending assignment content.
+    Reenter(WorkerReenterArgs),
     /// Accept a submitted worker result after Main Agent review.
     Accept(AssignmentMutationArgs),
     /// Mark an accepted assignment terminal before worker deletion.
@@ -470,6 +473,24 @@ struct WorkerRequestChangesArgs {
     /// Bounded durable reason recorded for the exact worker's next revision.
     #[arg(long)]
     reason: String,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerReenterArgs {
+    assignment_id: String,
+    /// Exact worker incarnation currently bound to the assignment.
+    #[arg(long)]
+    worker_incarnation: String,
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
+    if_revision: u64,
+    /// Exact existing mailbox notification generation to retry without
+    /// allocating or sending another message generation.
+    #[arg(long)]
+    if_notification_generation: u64,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -2396,6 +2417,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
             run_worker_account_handoff_cancel(context, args)
         }
         WorkerCommand::RequestChanges(args) => run_worker_request_changes(context, args),
+        WorkerCommand::Reenter(args) => run_worker_reenter(context, args),
         WorkerCommand::Accept(args) => {
             run_assignment_state(context, args, "submitted", "accepted", "worker-accept")
         }
@@ -14479,6 +14501,21 @@ fn ensure_assignment_mutation_admitted(
     assignment: &AssignmentRecord,
     owner: AssignmentMutationOwner,
 ) -> Result<(), CliError> {
+    if orchestration::assignment_worker_reentry_in_progress(context, assignment)? {
+        return Err(CliError::unavailable(
+            "worker-reentry-in-flight",
+            "assignment mutation is fenced until the original exact worker re-entry completes",
+            Some(json!({
+                "retryable": true,
+                "next_action": "replay-original-worker-reenter",
+                "recovery": {
+                    "kind": "worker-reenter-replay",
+                    "owner": "main-agent",
+                    "automatic": false
+                }
+            })),
+        ));
+    }
     if orchestration::assignment_worker_delete_in_progress(context, assignment)? {
         return Err(CliError::unavailable(
             "worker-delete-in-flight",
@@ -14802,6 +14839,12 @@ fn run_worker_request_changes(
         next_action: args.reason,
         updated_at: current.updated_at.clone(),
     });
+    orchestration::persist_request_changes_identity(
+        context,
+        current,
+        &request_digest,
+        &args.idempotency_key,
+    )?;
     let outcome = json!({
         "schema_version": "main-agent.worker-request-changes-result.v1",
         "assignment": public_assignment_view(current)
@@ -14817,6 +14860,602 @@ fn run_worker_request_changes(
     )?;
     locked.save()?;
     Ok(outcome)
+}
+
+fn run_worker_reenter(context: &CliContext, args: WorkerReenterArgs) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let request_digest = crate::coordination::request_digest(
+        "worker-reenter",
+        &json!({
+            "assignment_id": args.assignment_id,
+            "worker_incarnation": args.worker_incarnation,
+            "if_revision": args.if_revision,
+            "if_notification_generation": args.if_notification_generation
+        }),
+    );
+    let (main, main_incarnation) = authenticated_self(context)?;
+    ensure_active_claim(context, &main)?;
+    let registry = orchestration::load_registry_readonly(context)?;
+    let run = require_current_main(&registry, &main, &main_incarnation)?;
+    if let Some(value) = idempotency_replay(
+        &registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-reenter",
+        &request_digest,
+    )? {
+        if value["schema_version"] == "main-agent.worker-reenter-progress.v1"
+            && value["state"] == "reserved"
+        {
+            return finalize_worker_reenter(
+                context,
+                &main,
+                &main_incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &value,
+            );
+        }
+        if value["schema_version"] == "main-agent.worker-reenter-result.v1"
+            && let Some(assignment_id) = value["assignment_id"].as_str()
+        {
+            orchestration::clear_worker_reentry_identity(
+                context,
+                assignment_id,
+                &request_digest,
+                &args.idempotency_key,
+            )?;
+        }
+        return Ok(value);
+    }
+    let assignment = registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
+        .clone();
+    ensure_primary_manager(&assignment, &main, &main_incarnation)?;
+    ensure_revision(args.if_revision, assignment.revision, "assignment")?;
+    if assignment.state != "working"
+        || !orchestration::request_changes_identity_matches(context, &assignment)?
+        || assignment
+            .checkpoint
+            .as_ref()
+            .is_none_or(|checkpoint| checkpoint.revision != assignment.revision)
+    {
+        return Err(CliError::data(
+            "worker-reentry-state-conflict",
+            "worker re-entry requires the exact working request-changes revision",
+            Some(worker_reentry_details(
+                false,
+                "refresh-assignment",
+                "assignment-refresh",
+                json!({
+                    "assignment_id": assignment.assignment_id,
+                    "state": assignment.state,
+                    "revision": assignment.revision
+                }),
+            )),
+        ));
+    }
+    let worker = assignment
+        .worker
+        .as_ref()
+        .filter(|worker| worker.session_incarnation == args.worker_incarnation)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::data(
+                "worker-session-conflict",
+                "assignment worker incarnation does not match the re-entry fence",
+                Some(worker_reentry_details(
+                    false,
+                    "refresh-assignment",
+                    "assignment-refresh",
+                    json!({}),
+                )),
+            )
+        })?;
+    drop(registry);
+    verify_worker_reenter_runtime(context, &worker, &assignment.primary_manager)?;
+
+    let reservation = json!({
+        "schema_version": "main-agent.worker-reenter-progress.v1",
+        "state": "reserved",
+        "run_id": assignment.run_id,
+        "assignment_id": assignment.assignment_id,
+        "assignment_revision": assignment.revision,
+        "worker": worker,
+        "notification_generation": args.if_notification_generation,
+        "idle_composer_proof": "authoritative-turn-completed-and-detached",
+        "message_generation_created": false,
+        "assignment_prompt_resent": false
+    });
+    persist_worker_reenter_receipt(
+        context,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        &request_digest,
+        reservation.clone(),
+    )?;
+    finalize_worker_reenter(
+        context,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        &request_digest,
+        &reservation,
+    )
+}
+
+fn finalize_worker_reenter(
+    context: &CliContext,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    reservation: &Value,
+) -> Result<Value, CliError> {
+    let worker = serde_json::from_value::<SessionRef>(reservation["worker"].clone())
+        .map_err(|_| invalid_input("worker re-entry reservation is invalid"))?;
+    let notification_generation = reservation["notification_generation"]
+        .as_u64()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    let assignment = {
+        let locked = orchestration::lock_registry(context)?;
+        worker_reenter_assignment_for_reservation(
+            context,
+            &locked.registry,
+            main,
+            main_incarnation,
+            idempotency_key,
+            request_digest,
+            false,
+            reservation,
+        )?
+    };
+    // Replay may occur after the exact notification became durably queued but
+    // before the final orchestration receipt. Runtime/quiescence drift cannot
+    // prove that side effect absent, so retain the assignment seal and require
+    // the same exact replay to reconcile it.
+    verify_worker_reenter_runtime(context, &worker, &assignment.primary_manager)?;
+
+    // Revalidate the exact assignment under the mutation lock immediately
+    // before re-queueing. A crash-replayed reservation is intent, never
+    // continuing authority.
+    {
+        let locked = orchestration::lock_registry(context)?;
+        let assignment = worker_reenter_assignment_for_reservation(
+            context,
+            &locked.registry,
+            main,
+            main_incarnation,
+            idempotency_key,
+            request_digest,
+            false,
+            reservation,
+        )?;
+        orchestration::persist_worker_reentry_identity(
+            context,
+            &assignment,
+            notification_generation,
+            request_digest,
+            idempotency_key,
+        )?;
+    }
+    let notification = match crate::coordination::retry_notification(
+        context,
+        &worker.session_id,
+        &worker.session_incarnation,
+        notification_generation,
+    ) {
+        Ok(notification) => notification,
+        Err(error) => {
+            // A coordination-store error can be reported after atomic
+            // replacement made the queued generation visible. Retain the
+            // assignment authority seal until exact replay reconciles that
+            // ambiguous commit. Typed CAS/state rejections happen before
+            // mutation and may safely release the seal.
+            if !matches!(
+                error.code(),
+                "coordination-unavailable" | "coordination-notification-outcome-unknown"
+            ) {
+                let _ = orchestration::clear_worker_reentry_identity(
+                    context,
+                    reservation["assignment_id"].as_str().unwrap_or_default(),
+                    request_digest,
+                    idempotency_key,
+                );
+            }
+            return Err(error);
+        }
+    };
+    let outcome = json!({
+        "schema_version": "main-agent.worker-reenter-result.v1",
+        "assignment_id": reservation["assignment_id"],
+        "assignment_revision": reservation["assignment_revision"],
+        "worker": worker,
+        "notification": notification,
+        "idle_composer_proof": reservation["idle_composer_proof"],
+        "message_generation_created": false,
+        "assignment_prompt_resent": false
+    });
+    let mut locked = orchestration::lock_registry(context)?;
+    worker_reenter_assignment_for_reservation(
+        context,
+        &locked.registry,
+        main,
+        main_incarnation,
+        idempotency_key,
+        request_digest,
+        true,
+        reservation,
+    )?;
+    store_receipt(
+        &mut locked.registry,
+        main,
+        main_incarnation,
+        idempotency_key,
+        "worker-reenter",
+        request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    drop(locked);
+    let assignment_id = reservation["assignment_id"]
+        .as_str()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    orchestration::clear_worker_reentry_identity(
+        context,
+        assignment_id,
+        request_digest,
+        idempotency_key,
+    )?;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_reenter_assignment_for_reservation(
+    context: &CliContext,
+    registry: &orchestration::Registry,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    require_reentry_seal: bool,
+    reservation: &Value,
+) -> Result<AssignmentRecord, CliError> {
+    let run = require_current_main(registry, main, main_incarnation)?;
+    let run_id = reservation["run_id"]
+        .as_str()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    let assignment_id = reservation["assignment_id"]
+        .as_str()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    let assignment_revision = reservation["assignment_revision"]
+        .as_u64()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    let worker = serde_json::from_value::<SessionRef>(reservation["worker"].clone())
+        .map_err(|_| invalid_input("worker re-entry reservation is invalid"))?;
+    if run.run_id != run_id {
+        return Err(CliError::data(
+            "worker-reentry-run-conflict",
+            "worker re-entry reservation no longer belongs to the current Main Agent run",
+            Some(worker_reentry_details(
+                false,
+                "refresh-main-agent-status",
+                "main-agent-status",
+                json!({}),
+            )),
+        ));
+    }
+    let assignment = registry
+        .assignments
+        .get(assignment_id)
+        .filter(|assignment| assignment.run_id == run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, main, main_incarnation)?;
+    ensure_revision(assignment_revision, assignment.revision, "assignment")?;
+    if assignment.state != "working"
+        || !orchestration::request_changes_identity_matches(context, assignment)?
+        || assignment
+            .checkpoint
+            .as_ref()
+            .is_none_or(|checkpoint| checkpoint.revision != assignment.revision)
+    {
+        return Err(CliError::data(
+            "worker-reentry-state-conflict",
+            "worker re-entry requires the exact typed request-changes revision",
+            Some(worker_reentry_details(
+                false,
+                "refresh-assignment",
+                "assignment-refresh",
+                json!({
+                    "assignment_id": assignment.assignment_id,
+                    "state": assignment.state,
+                    "revision": assignment.revision
+                }),
+            )),
+        ));
+    }
+    if assignment.worker.as_ref() != Some(&worker) {
+        return Err(CliError::data(
+            "worker-session-conflict",
+            "assignment worker changed before typed re-entry",
+            Some(worker_reentry_details(
+                false,
+                "refresh-assignment",
+                "assignment-refresh",
+                json!({}),
+            )),
+        ));
+    }
+    let notification_generation = reservation["notification_generation"]
+        .as_u64()
+        .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+    if require_reentry_seal
+        && !orchestration::worker_reentry_identity_matches(
+            context,
+            assignment,
+            notification_generation,
+            request_digest,
+            idempotency_key,
+        )?
+    {
+        return Err(CliError::data(
+            "worker-reentry-identity-conflict",
+            "worker re-entry authority seal does not match the exact reservation",
+            Some(worker_reentry_details(
+                false,
+                "refresh-assignment",
+                "assignment-refresh",
+                json!({}),
+            )),
+        ));
+    }
+    Ok(assignment.clone())
+}
+
+fn persist_worker_reenter_receipt(
+    context: &CliContext,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    outcome: Value,
+) -> Result<(), CliError> {
+    let mut locked = orchestration::lock_registry(context)?;
+    require_current_main(&locked.registry, main, main_incarnation)?;
+    if outcome["schema_version"] == "main-agent.worker-reenter-progress.v1"
+        && outcome["state"] == "reserved"
+    {
+        let assignment = worker_reenter_assignment_for_reservation(
+            context,
+            &locked.registry,
+            main,
+            main_incarnation,
+            idempotency_key,
+            request_digest,
+            false,
+            &outcome,
+        )?;
+        let notification_generation = outcome["notification_generation"]
+            .as_u64()
+            .ok_or_else(|| invalid_input("worker re-entry reservation is invalid"))?;
+        orchestration::persist_worker_reentry_identity(
+            context,
+            &assignment,
+            notification_generation,
+            request_digest,
+            idempotency_key,
+        )?;
+    }
+    store_receipt(
+        &mut locked.registry,
+        main,
+        main_incarnation,
+        idempotency_key,
+        "worker-reenter",
+        request_digest,
+        outcome,
+    )?;
+    locked.save()
+}
+
+fn verify_worker_reenter_runtime(
+    context: &CliContext,
+    worker: &SessionRef,
+    primary_manager: &SessionRef,
+) -> Result<(), CliError> {
+    // Keep the exact session record stable through every runtime observation.
+    let _record_lock = acquire_session_record_lock(context, &worker.session_id)?;
+    let worker_record = load_session_record(context, &worker.session_id)?;
+    let actual_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(worker, &worker_record, actual_incarnation) {
+        return Err(CliError::data(
+            "worker-session-conflict",
+            "assignment worker changed before typed re-entry",
+            Some(worker_reentry_details(
+                false,
+                "refresh-assignment",
+                "assignment-refresh",
+                json!({}),
+            )),
+        ));
+    }
+    if worker_record.agent != AgentKind::Codex.as_str()
+        || worker_record.coordination_mode == CoordinationMode::Off
+        || session_status(&resolve_tmux_bin(None), &worker_record) != "running"
+    {
+        return Err(CliError::data(
+            "worker-reentry-runtime-not-ready",
+            "typed re-entry requires the exact live coordinated Codex worker",
+            Some(worker_reentry_details(
+                true,
+                "diagnose-worker",
+                "worker-diagnose",
+                json!({}),
+            )),
+        ));
+    }
+    let turn = crate::activity::activity_status(context, &worker.session_id)?.turn_state;
+    if turn.phase != crate::activity::TurnPhase::Waiting
+        || turn.source.confidence != crate::activity::Confidence::Authoritative
+        || turn.current_turn.is_some()
+        || turn
+            .last_turn
+            .as_ref()
+            .is_none_or(|last_turn| last_turn.outcome != "completed")
+    {
+        return Err(CliError::data(
+            "worker-reentry-composer-not-idle",
+            "typed re-entry requires authoritative completion at the idle composer",
+            Some(worker_reentry_details(
+                true,
+                "wait-for-idle-turn",
+                "worker-wait",
+                json!({
+                    "phase": turn.phase,
+                    "confidence": turn.source.confidence
+                }),
+            )),
+        ));
+    }
+    if worker_session_attached(&resolve_tmux_bin(None), &worker_record.tmux_session)? {
+        return Err(CliError::data(
+            "worker-reentry-session-attached",
+            "typed re-entry refuses an attached worker session",
+            Some(worker_reentry_details(
+                true,
+                "detach-worker-session",
+                "worker-detach",
+                json!({}),
+            )),
+        ));
+    }
+
+    let quiescence = crate::coordination::lock_session_quiescence(
+        context,
+        &worker.session_id,
+        &worker.session_incarnation,
+    )?;
+    if !quiescence.broker_authoritative
+        || quiescence.active_claim
+        || quiescence.active_operation
+        || quiescence.uncertain_operation
+    {
+        return Err(CliError::data(
+            "worker-reentry-coordination-not-quiescent",
+            "typed re-entry requires authoritative coordination with no claim or operation",
+            Some(worker_reentry_details(
+                true,
+                "diagnose-worker",
+                "worker-diagnose",
+                json!({
+                    "broker_authoritative": quiescence.broker_authoritative,
+                    "claim_active": quiescence.active_claim,
+                    "active_operation": quiescence.active_operation,
+                    "uncertain_operation": quiescence.uncertain_operation
+                }),
+            )),
+        ));
+    }
+    let guidance = quiescence.guidance_summary(
+        &worker.session_id,
+        &worker.session_incarnation,
+        &primary_manager.session_id,
+        &primary_manager.session_incarnation,
+    );
+    if guidance.unread_count == 0 || guidance.stale_incarnation_unread_count != 0 {
+        return Err(CliError::data(
+            "worker-reentry-guidance-conflict",
+            "typed re-entry requires unread guidance for only the exact worker incarnation",
+            Some(worker_reentry_details(
+                false,
+                "refresh-worker-guidance",
+                "worker-diagnose",
+                json!({
+                    "unread_count": guidance.unread_count,
+                    "stale_incarnation_unread_count": guidance.stale_incarnation_unread_count
+                }),
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn worker_reentry_details(
+    retryable: bool,
+    next_action: &str,
+    recovery_kind: &str,
+    observations: Value,
+) -> Value {
+    json!({
+        "retryable": retryable,
+        "next_action": next_action,
+        "recovery": {
+            "kind": recovery_kind,
+            "owner": "main-agent",
+            "automatic": false
+        },
+        "observations": observations
+    })
+}
+
+fn worker_session_attached(tmux_bin: &Path, tmux_session: &str) -> Result<bool, CliError> {
+    let mut command = Command::new(tmux_bin);
+    command
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(format!("{tmux_session}:0.0"))
+        .arg("#{session_attached}");
+    let output =
+        run_output_with_timeout_and_cap(command, Duration::from_secs(2), 1024).map_err(|_| {
+            CliError::runtime(
+                "worker-reentry-attach-observation-unavailable",
+                "worker attachment state could not be observed safely",
+                Some(worker_reentry_details(
+                    true,
+                    "retry-attachment-observation",
+                    "worker-attach-observation",
+                    json!({}),
+                )),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliError::runtime(
+            "worker-reentry-attach-observation-unavailable",
+            "worker attachment state could not be observed safely",
+            Some(worker_reentry_details(
+                true,
+                "retry-attachment-observation",
+                "worker-attach-observation",
+                json!({}),
+            )),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|attached| attached != 0)
+        .ok_or_else(|| {
+            CliError::runtime(
+                "worker-reentry-attach-observation-unavailable",
+                "worker attachment state could not be observed safely",
+                Some(worker_reentry_details(
+                    true,
+                    "retry-attachment-observation",
+                    "worker-attach-observation",
+                    json!({}),
+                )),
+            )
+        })
 }
 
 fn run_worker_delete(
@@ -18944,6 +19583,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::AccountHandoff(_) => "worker-account-handoff",
             WorkerCommand::AccountHandoffCancel(_) => "worker-account-handoff-cancel",
             WorkerCommand::RequestChanges(_) => "worker-request-changes",
+            WorkerCommand::Reenter(_) => "worker-reenter",
             WorkerCommand::Accept(_) => "worker-accept",
             WorkerCommand::Release(_) => "worker-release",
             WorkerCommand::Delete(_) => "worker-delete",
@@ -18999,6 +19639,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::AccountHandoff(args) => args.format,
             WorkerCommand::AccountHandoffCancel(args) => args.format,
             WorkerCommand::RequestChanges(args) => args.format,
+            WorkerCommand::Reenter(args) => args.format,
             WorkerCommand::Accept(args)
             | WorkerCommand::Release(args)
             | WorkerCommand::Delete(args)

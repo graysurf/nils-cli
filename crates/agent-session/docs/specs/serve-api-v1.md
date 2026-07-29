@@ -164,6 +164,16 @@ is no second state model.
   and it exposes no mailbox body, receipt key, capability, incarnation, or
   provider turn identifier. The full state, adapter, and privacy contract is in
   [Session coordination v1](session-coordination-v1.md#notification-ownership).
+  Codex app-server runtimes use acknowledged structured submission.
+  Terminal-backed Codex and Claude runtimes use the same notification-generation CAS
+  plus exact incarnation, idle-turn, live-runtime, and detached-session
+  rechecks before one fixed body-free prompt and a single Enter. The terminal
+  attempt boundary additionally requires an authoritative broker with no
+  active claim or active/uncertain operation. Its durable per-session
+  `attempting` state fences new claim and operation admission through
+  submission without holding the global coordination registry lock across
+  terminal I/O. Transcript observation determines acknowledged versus unknown
+  outcome.
 - Every session view additively includes `auto_resume` using
   `agent-session.auto-resume.v1`. `GET /sessions/{id}/auto-resume` reads that
   status and is open on loopback; `PUT` with `{ "enabled": true|false }` opts a

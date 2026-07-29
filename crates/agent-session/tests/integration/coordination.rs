@@ -741,6 +741,40 @@ fn worker_delete_identity_path(state_dir: &Path, assignment_id: &str) -> PathBuf
     root.join(name)
 }
 
+fn seed_worker_reentry_identity(state_dir: &Path, assignment_id: &str, request_digest: &str) {
+    let root = state_dir.join("orchestration/worker-reentry-identities");
+    fs::create_dir_all(&root).expect("worker re-entry identities");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("worker re-entry identities mode");
+    let name = Sha256::digest(assignment_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    write_private_json(
+        &root.join(name),
+        &json!({
+            "schema_version": "main-agent.worker-reentry-identity.v1",
+            "assignment_id": assignment_id,
+            "assignment_revision": 6,
+            "run_id": "run-request-changes-reenter",
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "controller": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "notification_generation": 1,
+            "request_digest": request_digest,
+            "idempotency_key": "worker-reenter-0001",
+            "created_at": "2030-01-01T00:00:00Z"
+        }),
+    );
+}
+
 fn seed_worker_delete_identity(state_dir: &Path, assignment_id: &str) -> PathBuf {
     let registry = orchestration_registry(state_dir);
     let assignment = &registry["assignments"][assignment_id];
@@ -7021,7 +7055,13 @@ fn main_agent_worker_request_changes_reopens_only_the_submitted_assignment() {
         &args,
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
-    assert_eq!(requested.code, 0, "stderr={}", requested.stderr_text());
+    assert_eq!(
+        requested.code,
+        0,
+        "stdout={} stderr={}",
+        requested.stdout_text(),
+        requested.stderr_text()
+    );
     let assignment = &data(&requested)["assignment"];
     assert_eq!(assignment["state"], "working");
     assert_eq!(assignment["revision"], 6);
@@ -7203,6 +7243,690 @@ fn main_agent_worker_request_changes_reopens_only_the_submitted_assignment() {
         fs::read(state_dir.join("orchestration/registry.json")).expect("registry after overflow"),
         before_overflow,
         "revision overflow must leave the registry byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn main_agent_worker_reenter_retries_only_the_exact_idle_notification_generation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-one",
+        "run-request-changes-reenter",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-review-reenter",
+        "task_summary": "Exercise typed request-changes re-entry",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": checkout,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-review-reenter",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-review-reenter",
+            "run_id": "run-request-changes-reenter",
+            "revision": 5,
+            "state": "submitted",
+            "task_summary": "Exercise typed request-changes re-entry",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": {
+                "revision": 5,
+                "summary": "Initial candidate submitted",
+                "next_action": "Await Main Agent review",
+                "updated_at": "2030-01-01T00:00:02Z"
+            },
+            "result_summary": "Initial result",
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let capability_env = [("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str())];
+    let requested = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "request-changes",
+            "assignment-review-reenter",
+            "--if-revision",
+            "5",
+            "--reason",
+            "Apply the exact bounded review",
+            "--idempotency-key",
+            "request-changes-reenter-0001",
+            "--format",
+            "json",
+        ],
+        &capability_env,
+    );
+    assert_eq!(
+        requested.code,
+        0,
+        "stdout={} stderr={}",
+        requested.stdout_text(),
+        requested.stderr_text()
+    );
+    assert_frozen_base_v3_registry_compatible(&orchestration_registry(&state_dir));
+
+    let body = tmp.path().join("review.txt");
+    fs::write(&body, "private bounded review guidance").expect("review body");
+    let messaged = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "message",
+            "assignment-review-reenter",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--idempotency-key",
+            "message-reenter-0001",
+            "--format",
+            "json",
+        ],
+        &capability_env,
+    );
+    assert_eq!(messaged.code, 0, "stderr={}", messaged.stderr_text());
+    assert_eq!(data(&messaged)["notification"]["generation"], 1);
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .find(|notification| notification["target_session_id"] == "worker-one")
+            .expect("worker notification");
+        notification["state"] = json!("undeliverable");
+        notification["last_reason"] = json!("provider-unsupported");
+    });
+    seed_activity_state(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "review-turn",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:02Z",
+            "outcome": "completed"
+        }),
+    );
+
+    let tmux = tmp.path().join("tmux-reentry");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  display-message) printf '0\\n'; exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .expect("tmux script");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).expect("tmux mode");
+    let tmux_arg = tmux.to_string_lossy().into_owned();
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+    ];
+    let request_changes_identity_path = state_dir
+        .join("orchestration/request-changes-identities")
+        .join(
+            Sha256::digest(b"assignment-review-reenter")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+    let request_changes_identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(&request_changes_identity_path).expect("request-changes identity"),
+    )
+    .expect("request-changes identity json");
+    fs::remove_file(&request_changes_identity_path).expect("remove typed identity");
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-review-reenter"]["checkpoint"]["summary"] =
+            json!("Main Agent requested revisions");
+    });
+    let spoofed_display_checkpoint = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "reenter",
+            "assignment-review-reenter",
+            "--worker-incarnation",
+            "worker-incarnation-one",
+            "--if-revision",
+            "6",
+            "--if-notification-generation",
+            "1",
+            "--idempotency-key",
+            "worker-reenter-spoofed-summary-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(spoofed_display_checkpoint.code, 65);
+    assert_eq!(
+        spoofed_display_checkpoint.stdout_json()["error"]["code"],
+        "worker-reentry-state-conflict"
+    );
+    write_private_json(&request_changes_identity_path, &request_changes_identity);
+
+    let attached_tmux = tmp.path().join("tmux-reentry-attached");
+    fs::write(
+        &attached_tmux,
+        "#!/bin/sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  display-message) printf '1\\n'; exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .expect("attached tmux script");
+    fs::set_permissions(&attached_tmux, fs::Permissions::from_mode(0o700))
+        .expect("attached tmux mode");
+    let attached_tmux_arg = attached_tmux.to_string_lossy().into_owned();
+    let attached = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "reenter",
+            "assignment-review-reenter",
+            "--worker-incarnation",
+            "worker-incarnation-one",
+            "--if-revision",
+            "6",
+            "--if-notification-generation",
+            "1",
+            "--idempotency-key",
+            "worker-reenter-attached-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", attached_tmux_arg.as_str()),
+        ],
+    );
+    assert_eq!(attached.code, 65);
+    assert_eq!(
+        attached.stdout_json()["error"]["code"],
+        "worker-reentry-session-attached"
+    );
+    assert!(attached.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(attached.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(attached.stdout_json()["error"]["details"]["recovery"].is_object());
+    assert_eq!(
+        load_coordination_registry(&state_dir)["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification")["state"],
+        "undeliverable"
+    );
+
+    seed_activity_state(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "review-turn",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:02Z",
+            "outcome": "failed"
+        }),
+    );
+    let failed_turn = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "reenter",
+            "assignment-review-reenter",
+            "--worker-incarnation",
+            "worker-incarnation-one",
+            "--if-revision",
+            "6",
+            "--if-notification-generation",
+            "1",
+            "--idempotency-key",
+            "worker-reenter-failed-turn-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(failed_turn.code, 65);
+    assert_eq!(
+        failed_turn.stdout_json()["error"]["code"],
+        "worker-reentry-composer-not-idle"
+    );
+    assert!(failed_turn.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(failed_turn.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(failed_turn.stdout_json()["error"]["details"]["recovery"].is_object());
+    seed_activity_state(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "review-turn",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:02Z",
+            "outcome": "completed"
+        }),
+    );
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "reenter",
+        "assignment-review-reenter",
+        "--worker-incarnation",
+        "worker-incarnation-one",
+        "--if-revision",
+        "6",
+        "--if-notification-generation",
+        "1",
+        "--idempotency-key",
+        "worker-reenter-0001",
+        "--format",
+        "json",
+    ];
+    let reentered = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(reentered.code, 0, "stderr={}", reentered.stderr_text());
+    assert_eq!(
+        data(&reentered)["schema_version"],
+        "main-agent.worker-reenter-result.v1"
+    );
+    assert_eq!(data(&reentered)["assignment_revision"], 6);
+    assert_eq!(data(&reentered)["notification"]["state"], "queued");
+    assert_eq!(data(&reentered)["notification"]["generation"], 1);
+    assert_eq!(data(&reentered)["notification"]["notified_generation"], 0);
+    assert_eq!(data(&reentered)["message_generation_created"], false);
+    assert_eq!(data(&reentered)["assignment_prompt_resent"], false);
+    let replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), reentered.stdout_text());
+
+    let reentry_request_digest = orchestration_registry(&state_dir)["receipts"]
+        .as_object()
+        .expect("receipts")
+        .values()
+        .find(|receipt| receipt["operation"] == "worker-reenter")
+        .and_then(|receipt| receipt["request_digest"].as_str())
+        .expect("worker re-entry request digest")
+        .to_string();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let receipt = registry["receipts"]
+            .as_object_mut()
+            .expect("receipts")
+            .values_mut()
+            .find(|receipt| receipt["operation"] == "worker-reenter")
+            .expect("worker re-entry receipt");
+        receipt["outcome"] = json!({
+            "schema_version": "main-agent.worker-reenter-progress.v1",
+            "state": "reserved",
+            "run_id": "run-request-changes-reenter",
+            "assignment_id": "assignment-review-reenter",
+            "assignment_revision": 6,
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "notification_generation": 1,
+            "idle_composer_proof": "authoritative-turn-completed-and-detached",
+            "message_generation_created": false,
+            "assignment_prompt_resent": false
+        });
+    });
+    seed_worker_reentry_identity(
+        &state_dir,
+        "assignment-review-reenter",
+        &reentry_request_digest,
+    );
+    let fenced_accept = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "accept",
+            "assignment-review-reenter",
+            "--if-revision",
+            "6",
+            "--idempotency-key",
+            "worker-reenter-fenced-accept-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(fenced_accept.code, 69);
+    assert_eq!(
+        fenced_accept.stdout_json()["error"]["code"],
+        "worker-reentry-in-flight"
+    );
+    assert!(fenced_accept.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(fenced_accept.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(fenced_accept.stdout_json()["error"]["details"]["recovery"].is_object());
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-review-reenter"]["revision"] = json!(7);
+    });
+    let mismatched_seal = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "accept",
+            "assignment-review-reenter",
+            "--if-revision",
+            "7",
+            "--idempotency-key",
+            "worker-reenter-mismatched-seal-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(mismatched_seal.code, 65);
+    assert_eq!(
+        mismatched_seal.stdout_json()["error"]["code"],
+        "worker-reentry-identity-conflict"
+    );
+    assert!(mismatched_seal.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(mismatched_seal.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(mismatched_seal.stdout_json()["error"]["details"]["recovery"].is_object());
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-review-reenter"]["revision"] = json!(6);
+    });
+    seed_active_claim(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "worker-reentry-crash-race-claim",
+    );
+    let replay_with_claim = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(replay_with_claim.code, 65);
+    assert_eq!(
+        replay_with_claim.stdout_json()["error"]["code"],
+        "worker-reentry-coordination-not-quiescent"
+    );
+    let still_fenced = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "accept",
+            "assignment-review-reenter",
+            "--if-revision",
+            "6",
+            "--idempotency-key",
+            "worker-reenter-still-fenced-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(still_fenced.code, 69);
+    assert_eq!(
+        still_fenced.stdout_json()["error"]["code"],
+        "worker-reentry-in-flight"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .retain(|claim| claim["session_id"] != "worker-one");
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .find(|notification| notification["target_session_id"] == "worker-one")
+            .expect("worker notification");
+        notification["state"] = json!("attempting");
+        notification["notified_generation"] = json!(0);
+        notification["attempted_generation"] = json!(1);
+        notification["last_reason"] = json!("notification-attempting");
+    });
+    let attempting_replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(attempting_replay.code, 65);
+    assert_eq!(
+        attempting_replay.stdout_json()["error"]["code"],
+        "coordination-notification-outcome-unknown"
+    );
+    assert!(attempting_replay.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(attempting_replay.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(attempting_replay.stdout_json()["error"]["details"]["recovery"].is_object());
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification");
+        notification["state"] = json!("attempt_unknown");
+        notification["last_reason"] = json!("submission-outcome-unknown");
+    });
+    let unknown_replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(unknown_replay.code, 65);
+    assert_eq!(
+        unknown_replay.stdout_json()["error"]["code"],
+        "coordination-notification-outcome-unknown"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification");
+        notification["state"] = json!("queued");
+        notification["last_reason"] = json!("notification-pending");
+    });
+    let queued_reserved_replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(
+        queued_reserved_replay.code,
+        0,
+        "stderr={}",
+        queued_reserved_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&queued_reserved_replay)["notification"]["state"],
+        "queued"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let receipt = registry["receipts"]
+            .as_object_mut()
+            .expect("receipts")
+            .values_mut()
+            .find(|receipt| receipt["operation"] == "worker-reenter")
+            .expect("worker re-entry receipt");
+        receipt["outcome"]["schema_version"] = json!("main-agent.worker-reenter-progress.v1");
+        receipt["outcome"]["state"] = json!("reserved");
+        receipt["outcome"]["run_id"] = json!("run-request-changes-reenter");
+        receipt["outcome"]["notification_generation"] = json!(1);
+        receipt["outcome"]["idle_composer_proof"] =
+            json!("authoritative-turn-completed-and-detached");
+        receipt["outcome"]["message_generation_created"] = json!(false);
+        receipt["outcome"]["assignment_prompt_resent"] = json!(false);
+    });
+    seed_worker_reentry_identity(
+        &state_dir,
+        "assignment-review-reenter",
+        &reentry_request_digest,
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification");
+        notification["state"] = json!("undeliverable");
+        notification["notified_generation"] = json!(0);
+        notification["last_reason"] = json!("provider-unsupported");
+    });
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-review-reenter"]["revision"] = json!(7);
+    });
+    let stale_reserved_replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(stale_reserved_replay.code, 65);
+    assert_eq!(
+        stale_reserved_replay.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir)["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification")["state"],
+        "undeliverable"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-review-reenter"]["revision"] = json!(6);
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .find(|notification| notification["target_session_id"] == "worker-one")
+            .expect("worker notification");
+        notification["state"] = json!("prompt_submitted");
+        notification["notified_generation"] = json!(1);
+        notification["last_reason"] = json!("prompt-accepted");
+    });
+    let recovered_replay = run_main_agent(&checkout, &args, &envs);
+    assert_eq!(
+        recovered_replay.code,
+        0,
+        "stderr={}",
+        recovered_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&recovered_replay)["notification"]["state"],
+        "prompt_submitted"
+    );
+    assert_eq!(
+        data(&recovered_replay)["notification"]["notified_generation"],
+        1
+    );
+
+    let registry = load_coordination_registry(&state_dir);
+    let notification = registry["notifications"]
+        .as_object()
+        .expect("notifications")
+        .values()
+        .find(|notification| notification["target_session_id"] == "worker-one")
+        .expect("worker notification");
+    assert_eq!(notification["generation"], 1);
+    assert_eq!(notification["state"], "prompt_submitted");
+
+    let wrong_generation = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "reenter",
+            "assignment-review-reenter",
+            "--worker-incarnation",
+            "worker-incarnation-one",
+            "--if-revision",
+            "6",
+            "--if-notification-generation",
+            "2",
+            "--idempotency-key",
+            "worker-reenter-wrong-generation-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(wrong_generation.code, 65);
+    assert_eq!(
+        wrong_generation.stdout_json()["error"]["code"],
+        "coordination-notification-generation-conflict"
+    );
+    assert!(wrong_generation.stdout_json()["error"]["details"]["retryable"].is_boolean());
+    assert!(wrong_generation.stdout_json()["error"]["details"]["next_action"].is_string());
+    assert!(wrong_generation.stdout_json()["error"]["details"]["recovery"].is_object());
+    assert_eq!(
+        load_coordination_registry(&state_dir)["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification")["generation"],
+        1
     );
 }
 

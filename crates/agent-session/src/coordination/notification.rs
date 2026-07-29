@@ -214,6 +214,107 @@ pub(crate) fn projection_for(
         .map(|receipt| projection(receipt, controller_available))
 }
 
+pub(crate) fn retry_existing(
+    context: &CliContext,
+    target_session_id: &str,
+    target_incarnation: &str,
+    expected_generation: u64,
+) -> Result<NotificationProjection, CliError> {
+    let now = now_epoch();
+    let mut locked = super::lock_registry(context)?;
+    normalize_registry(&mut locked.registry, now);
+    let key = receipt_key(target_session_id, target_incarnation);
+    let receipt = locked.registry.notifications.get_mut(&key).ok_or_else(|| {
+        CliError::data(
+            "coordination-notification-not-found",
+            "the exact worker notification generation was not found",
+            None,
+        )
+    })?;
+    if receipt.generation != expected_generation {
+        return Err(CliError::data(
+            "coordination-notification-generation-conflict",
+            "the worker notification generation changed before re-entry",
+            Some(serde_json::json!({
+                "retryable": false,
+                "next_action": "refresh-notification-generation",
+                "recovery": {
+                    "kind": "worker-message-result",
+                    "owner": "main-agent",
+                    "automatic": false
+                },
+                "expected_generation": expected_generation,
+                "current_generation": receipt.generation,
+                "state": receipt.state
+            })),
+        ));
+    }
+    if receipt.generation <= receipt.notified_generation || receipt.state == "prompt_submitted" {
+        return Ok(projection(receipt, false));
+    }
+    match receipt.state.as_str() {
+        "undeliverable" if receipt.last_reason.as_deref() == Some("provider-unsupported") => {}
+        "queued" => {}
+        "attempting" | "attempt_unknown" => {
+            return Err(CliError::data(
+                "coordination-notification-outcome-unknown",
+                "the exact worker notification has an unresolved submission outcome",
+                Some(serde_json::json!({
+                    "retryable": false,
+                    "next_action": "reconcile-notification-outcome",
+                    "recovery": {
+                        "kind": "notification-reconcile",
+                        "owner": "agent-session-serve",
+                        "automatic": true
+                    },
+                    "generation": receipt.generation,
+                    "state": receipt.state
+                })),
+            ));
+        }
+        _ => {
+            return Err(CliError::data(
+                "coordination-notification-not-retryable",
+                "the exact worker notification is not eligible for typed re-entry",
+                Some(serde_json::json!({
+                    "retryable": false,
+                    "next_action": "refresh-worker-guidance",
+                    "recovery": {
+                        "kind": "worker-message-result",
+                        "owner": "main-agent",
+                        "automatic": false
+                    },
+                    "generation": receipt.generation,
+                    "state": receipt.state,
+                    "last_reason": receipt.last_reason
+                })),
+            ));
+        }
+    }
+    receipt.state = "queued".to_string();
+    receipt.next_attempt_at_epoch = now;
+    receipt.updated_at_epoch = now;
+    receipt.last_reason = Some(REASON_PENDING.to_string());
+    let result = projection(receipt, false);
+    locked.save()?;
+    Ok(result)
+}
+
+pub(super) fn submission_fences_session(
+    registry: &Registry,
+    target_session_id: &str,
+    target_incarnation: &str,
+) -> bool {
+    registry
+        .notifications
+        .get(&receipt_key(target_session_id, target_incarnation))
+        .is_some_and(|receipt| {
+            receipt.state == "attempting"
+                && receipt.attempted_generation == receipt.generation
+                && receipt.generation > receipt.notified_generation
+        })
+}
+
 pub(crate) fn pending_candidates(registry: &mut Registry, now: i64) -> Vec<NotificationCandidate> {
     normalize_registry(registry, now);
     registry
@@ -278,6 +379,7 @@ pub(crate) fn unresolved(context: &CliContext) -> Result<Vec<NotificationCandida
     Ok(candidates)
 }
 
+#[cfg(test)]
 pub(crate) fn begin_attempt(
     context: &CliContext,
     candidate: &NotificationCandidate,
@@ -306,7 +408,7 @@ fn transition_attempt(
     transition_attempt_at(registry, candidate, now, attempted_at)
 }
 
-fn transition_attempt_at(
+pub(super) fn transition_attempt_at(
     registry: &mut Registry,
     candidate: &NotificationCandidate,
     now: i64,
@@ -365,7 +467,6 @@ fn transition_submitted(
     true
 }
 
-#[allow(dead_code)]
 fn transition_known_failure(
     registry: &mut Registry,
     candidate: &NotificationCandidate,
@@ -791,6 +892,46 @@ mod tests {
                 controller_available: true,
             }
         );
+    }
+
+    #[test]
+    fn attempting_generation_fences_only_the_exact_session_submission_window() {
+        let mut registry = Registry::default();
+        let scheduled = schedule(&mut registry, "target", "incarnation", 100);
+        let queued = NotificationCandidate {
+            target_session_id: "target".to_string(),
+            target_incarnation: "incarnation".to_string(),
+            generation: scheduled.generation,
+            attempted_at_epoch: 0,
+            attempted_at: None,
+        };
+        assert!(!submission_fences_session(
+            &registry,
+            "target",
+            "incarnation"
+        ));
+        let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
+        assert!(submission_fences_session(
+            &registry,
+            "target",
+            "incarnation"
+        ));
+        assert!(!submission_fences_session(
+            &registry,
+            "other",
+            "incarnation"
+        ));
+        assert!(transition_unknown(
+            &mut registry,
+            &candidate,
+            "submission-outcome-unknown",
+            102
+        ));
+        assert!(!submission_fences_session(
+            &registry,
+            "target",
+            "incarnation"
+        ));
     }
 
     #[test]
