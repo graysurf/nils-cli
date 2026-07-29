@@ -42,6 +42,27 @@ provider-backed dispatch workflow.
 
 ## Storage and locking
 
+Session creation treats `<state-dir>` and `<state-dir>/sessions` as private
+trust ancestors. Each final path component must be a current-user-owned
+directory and must not be a symlink. A newly created or existing safe ancestor
+is opened without following its final component and tightened through that
+directory handle to mode `0700` before any lifecycle-lock mutation. Session
+creation then opens or creates `session-locks` relative to the pinned state
+root and opens the exact lock file with no symlink following. The validated
+state-root, `sessions`, and leaf-session descriptors remain pinned through
+record initialization and provider handoff. Initial prompt, session, activity,
+coordination, and rollback mutations resolve through the pinned descriptors;
+stable device/inode identity checks fence provider transport from a replaced
+pathname. The same-user pathname-replacement limitation below still applies at
+the provider boundary: this contract prevents the CLI from redirecting its own
+storage mutations, but it is not an OS isolation boundary around a later
+provider open.
+Hardening is deliberately non-recursive: existing sessions and unrelated
+state remain unchanged. Symlinked, foreign-owned, non-directory, or
+identity-changing ancestors fail before session or provider side effects with
+`session-state-ancestor-untrusted`; unavailable metadata, creation, open, or
+permission repair fails with `session-state-ancestor-unavailable`.
+
 The private coordination root is `<state-dir>/coordination`, mode 0700. Regular
 files containing coordination state or credentials are mode 0600. The root must
 be owned by the current user, must not be a symlink, and must remain canonically
@@ -239,6 +260,9 @@ exact target. This is semantic coordination for an ordinary provider Write or
 shell redirection, not a race-free filesystem sandbox: preventing an
 adversarial same-user process from replacing a pathname between admission and
 provider open requires an OS isolation boundary outside this contract.
+That hook compatibility for an already-issued checkpoint path does not make a
+new session start accept a symlinked state ancestor; new session creation uses
+the stricter trust contract above.
 
 Authenticated operation reconcile reads
 `agent-session.operation-reconcile-proof.v1` with exact fields

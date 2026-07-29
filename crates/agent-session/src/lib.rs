@@ -20,7 +20,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -1787,6 +1787,10 @@ fn start_session_with_create_guard(
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    if let Err(err) = created.validate_session_storage() {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
 
     let launch_identity = match start_interactive_tmux(
         &tmux_bin,
@@ -1889,6 +1893,17 @@ fn start_session_with_create_guard(
     let mut prompt_delivery_error = None;
     let mut prompt_delivery_observation = None;
     if created.prompt_file.is_some() {
+        if let Err(err) = created.validate_session_storage() {
+            recover_failed_tmux_launch(
+                context,
+                &mut created.record,
+                &tmux_bin,
+                Some(&launch_identity),
+                SessionTerminationOperation::FailedLaunch,
+            )?;
+            cleanup_created_record(context, &created);
+            return Err(err);
+        }
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
@@ -1979,6 +1994,10 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
 
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
+    if let Err(err) = created.validate_session_storage() {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
     let launch_identity = match start_run_tmux(
         &tmux_bin,
         &agent_bin,
@@ -2115,6 +2134,10 @@ pub(crate) fn start_provider_resume_session(
     )?;
 
     advance_owned_startup_stage(context, &mut created.record, "tmux")?;
+    if let Err(err) = created.validate_session_storage() {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
 
     let launch_identity = match start_resume_tmux(
         &tmux_bin,
@@ -2243,13 +2266,117 @@ fn persist_initial_profile_context(
 struct CreatedRecord {
     record: SessionRecord,
     prompt_file: Option<PathBuf>,
-    session_dir: PathBuf,
+    session_storage: PrivateSessionDirGuard,
     _lifecycle_lock: Option<SessionRecordLock>,
 }
 
 impl CreatedRecord {
     fn release_lifecycle_lock(&mut self) {
         self._lifecycle_lock = None;
+    }
+
+    fn validate_session_storage(&self) -> Result<(), CliError> {
+        self.session_storage.validate()
+    }
+}
+
+#[cfg(unix)]
+struct PrivateSessionStateRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
+#[cfg(not(unix))]
+struct PrivateSessionStateRoot;
+
+#[cfg(unix)]
+struct PrivateSessionDirGuard {
+    state_path: PathBuf,
+    sessions_path: PathBuf,
+    session_path: PathBuf,
+    state_directory: fs::File,
+    sessions_directory: fs::File,
+    session_directory: fs::File,
+}
+
+#[cfg(not(unix))]
+struct PrivateSessionDirGuard {
+    session_path: PathBuf,
+}
+
+impl PrivateSessionDirGuard {
+    #[cfg(unix)]
+    fn validate(&self) -> Result<(), CliError> {
+        validate_session_ancestor_path_identity(
+            &self.state_path,
+            &self.state_directory,
+            "state-root",
+        )?;
+        validate_session_ancestor_path_identity(
+            &self.sessions_path,
+            &self.sessions_directory,
+            "sessions",
+        )?;
+        validate_session_ancestor_path_identity(
+            &self.session_path,
+            &self.session_directory,
+            "session",
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn validate(&self) -> Result<(), CliError> {
+        if self.session_path.is_dir() {
+            Ok(())
+        } else {
+            Err(session_ancestor_untrusted("session", "identity-changed"))
+        }
+    }
+
+    fn cleanup_if_current(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let descriptor_path = self.session_descriptor_path();
+            if let Ok(entries) = fs::read_dir(&descriptor_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let result = match entry.file_type() {
+                        Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
+                            fs::remove_dir_all(path)
+                        }
+                        _ => fs::remove_file(path),
+                    };
+                    let _ = result;
+                }
+            }
+            let name = self
+                .session_path
+                .file_name()
+                .expect("validated session path has a final component");
+            let name = std::ffi::CString::new(name.as_bytes())
+                .expect("validated session ID contains no null byte");
+            remove_session_dir_at(&self.sessions_directory, &name);
+        }
+        #[cfg(not(unix))]
+        if self.validate().is_ok() {
+            let _ = fs::remove_dir_all(&self.session_path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn session_descriptor_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        let descriptor_root = Path::new("/proc/self/fd");
+        #[cfg(not(target_os = "linux"))]
+        let descriptor_root = Path::new("/dev/fd");
+        descriptor_root.join(self.session_directory.as_raw_fd().to_string())
+    }
+
+    #[cfg(not(unix))]
+    fn session_descriptor_path(&self) -> PathBuf {
+        self.session_path.clone()
     }
 }
 
@@ -2296,7 +2423,8 @@ fn create_record_with_guard(
         &timestamp,
         title_slug.as_deref(),
     )?;
-    let lifecycle_lock = acquire_session_record_lock(request.context, &id)?;
+    let state_root = private_session_state_root(request.context)?;
+    let lifecycle_lock = acquire_new_session_record_lock(request.context, &state_root, &id)?;
     let tmux_session = format!("hs-{}-{id}", request.agent.as_str());
     let session_dir = session_dir(request.context, &id);
     if session_dir.exists() {
@@ -2309,12 +2437,34 @@ fn create_record_with_guard(
     if let Some(guard) = create_guard.as_mut() {
         guard()?;
     }
-    private_dir(&session_dir)?;
+    let session_storage = private_session_dir(request.context, &state_root, &session_dir)?;
+    if let Err(error) = pause_session_ancestor_for_test("session-dir-created") {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
+    if let Err(error) = session_storage.validate() {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
+    if let Err(error) = pause_session_ancestor_for_test("initialization-authority-validated") {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
 
     let prompt_file = match request.prompt {
         Some(prompt) => {
             let path = session_dir.join("prompt.md");
-            write_private_file(&path, prompt.as_bytes())?;
+            if let Err(error) = write_private_file(
+                &session_storage.session_descriptor_path().join("prompt.md"),
+                prompt.as_bytes(),
+            ) {
+                session_storage.cleanup_if_current();
+                return Err(error);
+            }
+            if let Err(error) = session_storage.validate() {
+                session_storage.cleanup_if_current();
+                return Err(error);
+            }
             Some(path)
         }
         None => None,
@@ -2360,27 +2510,75 @@ fn create_record_with_guard(
         store_startup_projection(&mut record, &starting_projection(&iso, "record"));
     }
 
-    write_session_record(request.context, &record)?;
-    if let Err(err) = activity::activate_runtime(request.context, &record) {
-        let _ = fs::remove_dir_all(&session_dir);
+    if let Err(error) = write_initial_session_record(&session_storage, &record) {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
+    if let Err(error) = session_storage.validate() {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
+    if let Err(err) =
+        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record)
+    {
+        session_storage.cleanup_if_current();
         return Err(err);
     }
-    if let Err(err) = coordination::prepare(request.context, &record) {
-        let _ = fs::remove_dir_all(&session_dir);
+    if let Err(error) = session_storage.validate() {
+        session_storage.cleanup_if_current();
+        return Err(error);
+    }
+    if let Err(err) =
+        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record)
+    {
+        session_storage.cleanup_if_current();
         return Err(err);
+    }
+    if let Err(error) = session_storage.validate() {
+        session_storage.cleanup_if_current();
+        return Err(error);
     }
     Ok(CreatedRecord {
         record,
         prompt_file,
-        session_dir,
+        session_storage,
         _lifecycle_lock: Some(lifecycle_lock),
     })
 }
 
 fn cleanup_created_record(context: &CliContext, created: &CreatedRecord) {
-    let _ = coordination::revoke(context, &created.record);
-    let _ = codex_app_server::cleanup_runtime_files(context, &created.record);
-    let _ = fs::remove_dir_all(&created.session_dir);
+    if created.validate_session_storage().is_ok() {
+        let _ = coordination::revoke(context, &created.record);
+        if created.validate_session_storage().is_ok() {
+            let _ = codex_app_server::cleanup_runtime_files(context, &created.record);
+        }
+    }
+    created.session_storage.cleanup_if_current();
+}
+
+fn write_initial_session_record(
+    storage: &PrivateSessionDirGuard,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
+        CliError::runtime(
+            "session-render-failed",
+            format!("failed to render session json: {err}"),
+            None,
+        )
+    })?;
+    let directory = storage.session_descriptor_path();
+    if let Some(sidecar) = durable_resume_record(record) {
+        let sidecar_bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
+            CliError::runtime(
+                "session-render-failed",
+                format!("failed to render resume json: {err}"),
+                None,
+            )
+        })?;
+        write_private_file(&directory.join(SESSION_RESUME_FILE), &sidecar_bytes)?;
+    }
+    write_private_file(&directory.join("session.json"), &bytes)
 }
 
 #[derive(Debug, Default)]
@@ -5838,6 +6036,70 @@ fn acquire_session_record_lock(
             )
         },
     )
+}
+
+#[cfg(unix)]
+fn acquire_new_session_record_lock(
+    context: &CliContext,
+    state_root: &PrivateSessionStateRoot,
+    id: &str,
+) -> Result<SessionRecordLock, CliError> {
+    use std::os::fd::FromRawFd;
+
+    validate_id(id)?;
+    validate_session_ancestor_path_identity(&state_root.path, &state_root.directory, "state-root")?;
+    let lock_dir_path = context.state_dir.join(SESSION_LOCKS_DIR);
+    let lock_dir_name = c"session-locks";
+    let lock_dir = ensure_private_session_child_ancestor(
+        &state_root.directory,
+        lock_dir_name,
+        &lock_dir_path,
+        "session-locks",
+    )?;
+    validate_session_ancestor_path_identity(&state_root.path, &state_root.directory, "state-root")?;
+    validate_session_ancestor_path_identity(&lock_dir_path, &lock_dir, "session-locks")?;
+
+    let file_name = format!("{id}.lock");
+    let file_name_c = std::ffi::CString::new(file_name.as_bytes())
+        .expect("validated session ID contains no null byte");
+    let path = lock_dir_path.join(file_name);
+    let descriptor = unsafe {
+        libc::openat(
+            lock_dir.as_raw_fd(),
+            file_name_c.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            SECRET_FILE_MODE,
+        )
+    };
+    if descriptor < 0 {
+        return Err(session_io_error(
+            "session-record-lock-open-failed",
+            &path,
+            io::Error::last_os_error(),
+        ));
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    file.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|error| session_io_error("session-record-lock-permission-failed", &path, error))?;
+    validate_session_ancestor_path_identity(&state_root.path, &state_root.directory, "state-root")?;
+    validate_session_ancestor_path_identity(&lock_dir_path, &lock_dir, "session-locks")?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(session_io_error(
+            "session-record-lock-failed",
+            &path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(SessionRecordLock(file))
+}
+
+#[cfg(not(unix))]
+fn acquire_new_session_record_lock(
+    context: &CliContext,
+    _state_root: &PrivateSessionStateRoot,
+    id: &str,
+) -> Result<SessionRecordLock, CliError> {
+    acquire_session_record_lock(context, id)
 }
 
 pub(crate) fn try_acquire_session_record_lock(
@@ -10146,52 +10408,388 @@ fn session_dir(context: &CliContext, id: &str) -> PathBuf {
     context.state_dir.join("sessions").join(id)
 }
 
-fn private_dir(path: &Path) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            CliError::runtime(
-                "directory-create-failed",
-                format!("failed to create {}: {err}", parent.display()),
-                Some(json!({ "path": display_path(parent) })),
-            )
-        })?;
-    }
+#[cfg(unix)]
+fn private_session_state_root(context: &CliContext) -> Result<PrivateSessionStateRoot, CliError> {
+    let directory = ensure_private_session_ancestor(&context.state_dir, "state-root")?;
+    pause_session_ancestor_for_test("state-root-hardened")?;
+    validate_session_ancestor_path_identity(&context.state_dir, &directory, "state-root")?;
+    Ok(PrivateSessionStateRoot {
+        path: context.state_dir.clone(),
+        directory,
+    })
+}
+
+#[cfg(unix)]
+fn private_session_dir(
+    context: &CliContext,
+    state_root: &PrivateSessionStateRoot,
+    path: &Path,
+) -> Result<PrivateSessionDirGuard, CliError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    validate_session_ancestor_path_identity(&state_root.path, &state_root.directory, "state-root")?;
+    let sessions_path = context.state_dir.join("sessions");
+    let sessions_dir = ensure_private_session_child_ancestor(
+        &state_root.directory,
+        c"sessions",
+        &sessions_path,
+        "sessions",
+    )?;
+    validate_session_ancestor_path_identity(&state_root.path, &state_root.directory, "state-root")?;
+    validate_session_ancestor_path_identity(&sessions_path, &sessions_dir, "sessions")?;
+    let name = path
+        .file_name()
+        .expect("validated session path has a final component");
+    let name = std::ffi::CString::new(name.as_bytes())
+        .expect("validated session ID contains no null byte");
     // Create the session dir as an ATOMIC ownership claim (fail if it already
     // exists) rather than create_dir_all. This closes a create/create race:
     // without it, two concurrent creates of the same id both pass the earlier
     // exists() check, both proceed, and the one whose tmux new-session loses the
     // duplicate-name race runs cleanup_created_record -> remove_dir_all on the
     // shared dir, deleting the winner's session.json and orphaning a live agent.
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+    if unsafe { libc::mkdirat(sessions_dir.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::AlreadyExists {
             return Err(CliError::runtime(
                 "session-exists",
                 format!("session already exists: {}", path.display()),
                 Some(json!({ "path": display_path(path) })),
             ));
         }
-        Err(err) => {
-            return Err(CliError::runtime(
-                "directory-create-failed",
-                format!("failed to create {}: {err}", path.display()),
-                Some(json!({ "path": display_path(path) })),
+        return Err(CliError::runtime(
+            "directory-create-failed",
+            format!("failed to create {}: {error}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
+    let session_dir =
+        open_session_ancestor_at(&sessions_dir, &name, "sessions").inspect_err(|_| {
+            remove_session_dir_at(&sessions_dir, &name);
+        })?;
+    if let Err(error) = session_dir.set_permissions(fs::Permissions::from_mode(0o700)) {
+        remove_session_dir_at(&sessions_dir, &name);
+        return Err(CliError::runtime(
+            "directory-permissions-failed",
+            format!("failed to set permissions on {}: {error}", path.display()),
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
+    if let Err(error) = validate_session_ancestor_path_identity(
+        &state_root.path,
+        &state_root.directory,
+        "state-root",
+    )
+    .and_then(|()| {
+        validate_session_ancestor_path_identity(&sessions_path, &sessions_dir, "sessions")
+    }) {
+        remove_session_dir_at(&sessions_dir, &name);
+        return Err(error);
+    }
+    validate_session_ancestor_path_identity(path, &session_dir, "session")?;
+    Ok(PrivateSessionDirGuard {
+        state_path: state_root.path.clone(),
+        sessions_path,
+        session_path: path.to_path_buf(),
+        state_directory: state_root
+            .directory
+            .try_clone()
+            .map_err(|_| session_ancestor_unavailable("state-root", "descriptor-clone-failed"))?,
+        sessions_directory: sessions_dir,
+        session_directory: session_dir,
+    })
+}
+
+#[cfg(unix)]
+fn ensure_private_session_ancestor(
+    path: &Path,
+    ancestor: &'static str,
+) -> Result<fs::File, CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_UNAVAILABLE").as_deref() == Ok(ancestor) {
+        return Err(session_ancestor_unavailable(ancestor, "open-failed"));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_session_ancestor_metadata(&metadata, ancestor)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .map_err(|_| session_ancestor_unavailable(ancestor, "create-failed"))?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+            validate_session_ancestor_metadata(&metadata, ancestor)?;
+        }
+        Err(_) => {
+            return Err(session_ancestor_unavailable(
+                ancestor,
+                "metadata-unavailable",
             ));
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(path, permissions).map_err(|err| {
-            CliError::runtime(
-                "directory-permissions-failed",
-                format!("failed to set permissions on {}: {err}", path.display()),
-                Some(json!({ "path": display_path(path) })),
-            )
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::ELOOP || code == libc::ENOTDIR)
+            {
+                session_ancestor_untrusted(ancestor, "identity-changed")
+            } else {
+                session_ancestor_unavailable(ancestor, "open-failed")
+            }
         })?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+    validate_session_ancestor_metadata(&metadata, ancestor)?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|_| session_ancestor_unavailable(ancestor, "permission-tightening-failed"))?;
+    let hardened = directory
+        .metadata()
+        .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+    validate_session_ancestor_metadata(&hardened, ancestor)?;
+    if hardened.mode() & 0o777 != 0o700 {
+        return Err(session_ancestor_untrusted(
+            ancestor,
+            "permission-tightening-incomplete",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn ensure_private_session_child_ancestor(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    path: &Path,
+    ancestor: &'static str,
+) -> Result<fs::File, CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_session_ancestor_metadata(&metadata, ancestor)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(session_ancestor_unavailable(ancestor, "create-failed"));
+                }
+            }
+        }
+        Err(_) => {
+            return Err(session_ancestor_unavailable(
+                ancestor,
+                "metadata-unavailable",
+            ));
+        }
+    }
+    let directory = open_session_ancestor_at(parent, name, ancestor)?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|_| session_ancestor_unavailable(ancestor, "permission-tightening-failed"))?;
+    let hardened = directory
+        .metadata()
+        .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+    validate_session_ancestor_metadata(&hardened, ancestor)?;
+    if hardened.mode() & 0o777 != 0o700 {
+        return Err(session_ancestor_untrusted(
+            ancestor,
+            "permission-tightening-incomplete",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_session_ancestor_at(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+    ancestor: &'static str,
+) -> Result<fs::File, CliError> {
+    use std::os::fd::FromRawFd;
+
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return Err(
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::ELOOP || code == libc::ENOTDIR)
+            {
+                session_ancestor_untrusted(ancestor, "identity-changed")
+            } else {
+                session_ancestor_unavailable(ancestor, "open-failed")
+            },
+        );
+    }
+    let directory = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = directory
+        .metadata()
+        .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+    validate_session_ancestor_metadata(&metadata, ancestor)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_session_ancestor_path_identity(
+    path: &Path,
+    directory: &fs::File,
+    ancestor: &'static str,
+) -> Result<(), CliError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|_| session_ancestor_untrusted(ancestor, "identity-changed"))?;
+    validate_session_ancestor_metadata(&path_metadata, ancestor)?;
+    let descriptor_metadata = directory
+        .metadata()
+        .map_err(|_| session_ancestor_unavailable(ancestor, "metadata-unavailable"))?;
+    validate_session_ancestor_metadata(&descriptor_metadata, ancestor)?;
+    if path_metadata.dev() != descriptor_metadata.dev()
+        || path_metadata.ino() != descriptor_metadata.ino()
+    {
+        return Err(session_ancestor_untrusted(ancestor, "identity-changed"));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn remove_session_dir_at(parent: &fs::File, name: &std::ffi::CStr) {
+    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+}
+
+fn pause_session_ancestor_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::write(directory.join("ready"), stage).map_err(|_| {
+            CliError::runtime(
+                "session-state-ancestor-test-barrier",
+                "session state ancestor test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "session-state-ancestor-test-barrier",
+                    "session state ancestor test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_session_ancestor_metadata(
+    metadata: &fs::Metadata,
+    ancestor: &'static str,
+) -> Result<(), CliError> {
+    let reason = if metadata.file_type().is_symlink() {
+        Some("symlink")
+    } else if !metadata.is_dir() {
+        Some("not-directory")
+    } else if metadata.uid() != session_effective_uid() {
+        Some("foreign-owner")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(session_ancestor_untrusted(ancestor, reason)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn session_effective_uid() -> u32 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_EFFECTIVE_UID")
+        && let Ok(value) = value.parse::<u32>()
+    {
+        return value;
+    }
+    unsafe { libc::geteuid() }
+}
+
+fn session_ancestor_untrusted(ancestor: &'static str, reason: &'static str) -> CliError {
+    CliError::data(
+        "session-state-ancestor-untrusted",
+        "session state ancestor is unsafe",
+        Some(json!({
+            "ancestor": ancestor,
+            "reason": reason,
+            "retryable": false,
+            "next_action": "repair-session-state-ancestor",
+            "recovery": {
+                "kind": "session-state-permission-repair",
+                "owner": "user",
+                "automatic": false
+            }
+        })),
+    )
+}
+
+fn session_ancestor_unavailable(ancestor: &'static str, reason: &'static str) -> CliError {
+    CliError::unavailable(
+        "session-state-ancestor-unavailable",
+        "session state ancestor could not be prepared safely",
+        Some(json!({
+            "ancestor": ancestor,
+            "reason": reason,
+            "retryable": true,
+            "next_action": "repair-session-state-permissions",
+            "recovery": {
+                "kind": "session-state-permission-repair",
+                "owner": "user",
+                "automatic": false
+            }
+        })),
+    )
+}
+
+#[cfg(not(unix))]
+fn private_session_state_root(_context: &CliContext) -> Result<PrivateSessionStateRoot, CliError> {
+    Ok(PrivateSessionStateRoot)
+}
+
+#[cfg(not(unix))]
+fn private_session_dir(
+    context: &CliContext,
+    _state_root: &PrivateSessionStateRoot,
+    path: &Path,
+) -> Result<PrivateSessionDirGuard, CliError> {
+    fs::create_dir_all(context.state_dir.join("sessions"))
+        .map_err(|_| session_ancestor_unavailable("sessions", "create-failed"))?;
+    fs::create_dir(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            CliError::runtime(
+                "session-exists",
+                format!("session already exists: {}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        } else {
+            CliError::runtime(
+                "directory-create-failed",
+                format!("failed to create {}: {error}", path.display()),
+                Some(json!({ "path": display_path(path) })),
+            )
+        }
+    })?;
+    Ok(PrivateSessionDirGuard {
+        session_path: path.to_path_buf(),
+    })
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), CliError> {

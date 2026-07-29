@@ -249,8 +249,17 @@ absence of claims or active/uncertain operations. With those coordination
 guards still held it revalidates the reserving Main Agent session/incarnation,
 active controller claim, run controller, assignment manager, and exact
 reservation immediately before sending at most one recovery Enter. A
-definitive pre-delivery failure is recorded against that
-reservation. A tmux timeout or wait failure is an unknown external-effect
+definitive pre-delivery failure is recorded against that reservation but is not
+itself an authoritative readiness verdict. The same bounded wait continues: a
+newer authenticated, revision- and incarnation-matched worker checkpoint wins
+even when recovery failed. Otherwise an authoritative completed or failed
+provider turn can terminate the wait early, and the original fixed deadline is
+the final boundary for `readiness_recovery_failed`. After a definitive failure,
+registry/activity polling backs off to the five-second finalizer-renewal
+cadence. At receipt finalization, the runtime holds the registry lock and
+rechecks the exact assignment, worker incarnation, revision, and authenticated
+checkpoint before committing failure; a checkpoint visible in that locked
+snapshot is finalized as ready. A tmux timeout or wait failure is an unknown external-effect
 outcome and preserves the `attempting` reservation plus mutation fences. No
 path may retry input. The runtime keeps waiting inside the original deadline
 and never resends the prompt. The additive
@@ -294,7 +303,8 @@ classification. None of these observations authorizes prompt resend or another
 Enter. Recovery terminal paths retain the same observation:
 `transport_uncertain` means the one recovery Enter has an unknown external
 effect, `readiness_recovery_failed` means that bounded recovery failed
-definitively, and `readiness_recovery_unavailable` means its durable
+definitively and no authenticated checkpoint arrived before the original
+deadline, and `readiness_recovery_unavailable` means its durable
 reservation was refused before input. The wait takes no registry lock, so it
 never blocks the
 worker's own checkpoint; `--await-ready 0` preserves the launch-only

@@ -1739,6 +1739,10 @@ pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<()
     broker::prepare(context, record)
 }
 
+pub(crate) fn prepare_in_dir(session_dir: &Path, _record: &SessionRecord) -> Result<(), CliError> {
+    broker::prepare_in_dir(session_dir)
+}
+
 pub(crate) fn activate_ready(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
     broker::activate_ready(context, record)
 }

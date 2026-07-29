@@ -1331,6 +1331,13 @@ pub(crate) fn activate_runtime(
     context: &CliContext,
     record: &SessionRecord,
 ) -> Result<TurnState, CliError> {
+    activate_runtime_in_dir(&session_dir(context, &record.id), record)
+}
+
+pub(crate) fn activate_runtime_in_dir(
+    dir: &Path,
+    record: &SessionRecord,
+) -> Result<TurnState, CliError> {
     let runtime = record.runtime.as_ref().ok_or_else(|| {
         CliError::data(
             "runtime-id-missing",
@@ -1347,8 +1354,7 @@ pub(crate) fn activate_runtime(
         ));
     }
     let runtime_generation = runtime.generation;
-    let dir = session_dir(context, &record.id);
-    let _lock = acquire_lock(&dir)?;
+    let _lock = acquire_lock(dir)?;
     let path = dir.join(ACTIVITY_FILE);
     let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
     let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
@@ -1371,23 +1377,23 @@ pub(crate) fn activate_runtime(
         && existing.runtime_generation == runtime_generation
     {
         return Ok(
-            match runtime_unhealthy_marker(&dir, runtime_id, runtime_generation) {
+            match runtime_unhealthy_marker(dir, runtime_id, runtime_generation) {
                 RuntimeUnhealthyStatus::Matching(state) => *state,
                 RuntimeUnhealthyStatus::Pending(marked_at) => marker_state_from_snapshot(
-                    &dir,
+                    dir,
                     record,
                     runtime_id,
                     runtime_generation,
                     &marked_at,
                 ),
                 RuntimeUnhealthyStatus::Invalid => marker_state_from_snapshot(
-                    &dir,
+                    dir,
                     record,
                     runtime_id,
                     runtime_generation,
                     &existing.state.phase_changed_at,
                 ),
-                RuntimeUnhealthyStatus::Absent if replay_matches_document(&dir, existing) => {
+                RuntimeUnhealthyStatus::Absent if replay_matches_document(dir, existing) => {
                     existing.state.clone()
                 }
                 RuntimeUnhealthyStatus::Absent => unknown_state(record),
@@ -1454,7 +1460,7 @@ pub(crate) fn activate_runtime(
             .map_or_else(Map::new, |document| document.extra),
     };
     write_document(&path, &document)?;
-    remove_runtime_unhealthy_marker(&dir)?;
+    remove_runtime_unhealthy_marker(dir)?;
     Ok(document.state)
 }
 

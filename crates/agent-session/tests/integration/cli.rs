@@ -3634,6 +3634,567 @@ fn start_creates_session_state_without_printing_prompt() {
 }
 
 #[test]
+fn start_tightens_owned_state_ancestors_before_creating_a_session() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let sessions_dir = state_dir.join("sessions");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&sessions_dir).expect("state ancestors");
+    fs::create_dir(&cwd).expect("repo dir");
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o775))
+        .expect("group-writable state root");
+    fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o775))
+        .expect("group-writable sessions root");
+    let unrelated_session = sessions_dir.join("unrelated-existing-session");
+    fs::create_dir(&unrelated_session).expect("unrelated session");
+    fs::set_permissions(&unrelated_session, fs::Permissions::from_mode(0o775))
+        .expect("unrelated session mode");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "private-state-ancestors",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            tmux_log.to_str().expect("tmux log"),
+        )],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        fs::symlink_metadata(&state_dir)
+            .expect("state root")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(&sessions_dir)
+            .expect("sessions root")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(sessions_dir.join("private-state-ancestors"))
+            .expect("session root")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(&unrelated_session)
+            .expect("unrelated session")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775,
+        "ancestor hardening must not recurse into existing sessions"
+    );
+}
+
+#[test]
+fn start_rejects_unsafe_state_ancestors_without_mutating_targets() {
+    for (case, unsafe_ancestor, reason) in [
+        ("state-root-symlink", "state-root", "symlink"),
+        ("sessions-symlink", "sessions", "symlink"),
+        ("sessions-file", "sessions", "not-directory"),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let sessions_dir = state_dir.join("sessions");
+        let cwd = tmp.path().join("repo");
+        let symlink_target = tmp.path().join("symlink-target");
+        fs::create_dir(&cwd).expect("repo dir");
+
+        match case {
+            "state-root-symlink" => {
+                fs::create_dir(&symlink_target).expect("state target");
+                fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o775))
+                    .expect("state target mode");
+                symlink(&symlink_target, &state_dir).expect("state symlink");
+            }
+            "sessions-symlink" => {
+                fs::create_dir(&state_dir).expect("state root");
+                fs::create_dir(&symlink_target).expect("sessions target");
+                fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o775))
+                    .expect("sessions target mode");
+                symlink(&symlink_target, &sessions_dir).expect("sessions symlink");
+            }
+            "sessions-file" => {
+                fs::create_dir(&state_dir).expect("state root");
+                fs::write(&sessions_dir, b"not a directory").expect("sessions file");
+            }
+            _ => unreachable!("unknown fixture"),
+        }
+
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let codex_bin = fake_agent(tmp.path(), "codex");
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state path"),
+                "start",
+                "--agent",
+                "codex",
+                "--cwd",
+                cwd.to_str().expect("cwd"),
+                "--id",
+                case,
+                "--tmux-bin",
+                tmux_bin.to_str().expect("tmux"),
+                "--agent-bin",
+                codex_bin.to_str().expect("codex"),
+                "--paste-delay-ms",
+                "0",
+                "--format",
+                "json",
+            ],
+            &[(
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            )],
+        );
+
+        assert_eq!(
+            output.code,
+            65,
+            "case={case} stderr={}",
+            output.stderr_text()
+        );
+        let envelope = output.stdout_json();
+        assert_eq!(
+            envelope["error"]["code"], "session-state-ancestor-untrusted",
+            "case={case}"
+        );
+        assert_eq!(
+            envelope["error"]["details"]["ancestor"], unsafe_ancestor,
+            "case={case}"
+        );
+        assert_eq!(
+            envelope["error"]["details"]["reason"], reason,
+            "case={case}"
+        );
+        assert_eq!(envelope["error"]["details"]["retryable"], false);
+        assert_eq!(
+            envelope["error"]["details"]["next_action"],
+            "repair-session-state-ancestor"
+        );
+        assert_eq!(
+            envelope["error"]["details"]["recovery"],
+            json!({
+                "kind": "session-state-permission-repair",
+                "owner": "user",
+                "automatic": false
+            })
+        );
+        assert!(
+            !tmux_log.exists(),
+            "unsafe ancestor must fail before tmux input for case={case}"
+        );
+        if case.ends_with("symlink") {
+            assert_eq!(
+                fs::symlink_metadata(&symlink_target)
+                    .expect("symlink target")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o775,
+                "symlink target must not be tightened for case={case}"
+            );
+            if case == "state-root-symlink" {
+                assert!(
+                    !symlink_target.join("session-locks").exists(),
+                    "state-root rejection must precede lifecycle-lock mutation"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn start_rejects_symlinked_lifecycle_lock_without_mutating_its_target() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let lock_dir = state_dir.join("session-locks");
+    let cwd = tmp.path().join("repo");
+    let lock_target = tmp.path().join("lock-target");
+    fs::create_dir_all(&lock_dir).expect("lock dir");
+    fs::create_dir(&cwd).expect("repo dir");
+    fs::write(&lock_target, b"must remain unchanged").expect("lock target");
+    fs::set_permissions(&lock_target, fs::Permissions::from_mode(0o644)).expect("lock target mode");
+    symlink(&lock_target, lock_dir.join("symlinked-lifecycle-lock.lock")).expect("lock symlink");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "symlinked-lifecycle-lock",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            tmux_log.to_str().expect("tmux log"),
+        )],
+    );
+
+    assert_ne!(output.code, 0, "symlinked lock must fail closed");
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "session-record-lock-open-failed"
+    );
+    assert_eq!(
+        fs::read(&lock_target).expect("lock target"),
+        b"must remain unchanged"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&lock_target)
+            .expect("lock target")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "descriptor-relative lock open must not chmod a symlink target"
+    );
+    assert!(!state_dir.join("sessions").exists());
+    assert!(!tmux_log.exists());
+}
+
+#[test]
+fn start_rejects_foreign_owned_state_ancestor_with_typed_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&state_dir).expect("state root");
+    fs::create_dir(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let foreign_uid = unsafe { libc::geteuid() }.wrapping_add(1).to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "foreign-state-root",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("NILS_AGENT_SESSION_TEST_EFFECTIVE_UID", &foreign_uid),
+        ],
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    let envelope = output.stdout_json();
+    assert_eq!(
+        envelope["error"]["code"],
+        "session-state-ancestor-untrusted"
+    );
+    assert_eq!(envelope["error"]["details"]["ancestor"], "state-root");
+    assert_eq!(envelope["error"]["details"]["reason"], "foreign-owner");
+    assert_eq!(envelope["error"]["details"]["retryable"], false);
+    assert!(!tmux_log.exists());
+}
+
+#[test]
+fn start_reports_unavailable_state_ancestor_with_typed_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&state_dir).expect("state root");
+    fs::create_dir(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "unavailable-state-root",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_UNAVAILABLE",
+                "state-root",
+            ),
+        ],
+    );
+
+    assert_eq!(
+        output.code,
+        69,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    let envelope = output.stdout_json();
+    assert_eq!(
+        envelope["error"]["code"],
+        "session-state-ancestor-unavailable"
+    );
+    assert_eq!(envelope["error"]["details"]["ancestor"], "state-root");
+    assert_eq!(envelope["error"]["details"]["reason"], "open-failed");
+    assert_eq!(envelope["error"]["details"]["retryable"], true);
+    assert_eq!(
+        envelope["error"]["details"]["next_action"],
+        "repair-session-state-permissions"
+    );
+    assert_eq!(
+        envelope["error"]["details"]["recovery"],
+        json!({
+            "kind": "session-state-permission-repair",
+            "owner": "user",
+            "automatic": false
+        })
+    );
+    assert!(!tmux_log.exists());
+}
+
+#[test]
+fn start_rejects_state_root_replacement_before_session_creation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let detached_state = tmp.path().join("detached-state");
+    let replacement_target = tmp.path().join("replacement-target");
+    let cwd = tmp.path().join("repo");
+    let barrier = tmp.path().join("state-ancestor-barrier");
+    fs::create_dir(&state_dir).expect("state root");
+    fs::create_dir(&replacement_target).expect("replacement target");
+    fs::create_dir(&cwd).expect("repo dir");
+    fs::create_dir(&barrier).expect("barrier");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let start = Command::new(nils_test_support::bin::resolve("agent-session"))
+        .current_dir(tmp.path())
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "replaced-state-root",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_STAGE",
+            "state-root-hardened",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "state ancestor barrier timed out"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::rename(&state_dir, &detached_state).expect("detach state root");
+    symlink(&replacement_target, &state_dir).expect("replace state root");
+    fs::write(barrier.join("release"), b"continue").expect("release barrier");
+
+    let output = start.wait_with_output().expect("start output");
+    assert_eq!(output.status.code(), Some(65));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("start json");
+    assert_eq!(
+        envelope["error"]["code"],
+        "session-state-ancestor-untrusted"
+    );
+    assert_eq!(envelope["error"]["details"]["ancestor"], "state-root");
+    assert!(
+        matches!(
+            envelope["error"]["details"]["reason"].as_str(),
+            Some("symlink" | "identity-changed")
+        ),
+        "unexpected envelope: {envelope}"
+    );
+    assert!(
+        !replacement_target.join("sessions").exists(),
+        "replacement target must remain untouched"
+    );
+    assert!(!tmux_log.exists(), "provider transport must not start");
+}
+
+#[test]
+fn start_rejects_sessions_replacement_before_initialization_or_cleanup() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let sessions_dir = state_dir.join("sessions");
+    let detached_sessions = tmp.path().join("detached-sessions");
+    let cwd = tmp.path().join("repo");
+    let barrier = tmp.path().join("state-ancestor-barrier");
+    fs::create_dir_all(&sessions_dir).expect("sessions root");
+    fs::create_dir(&cwd).expect("repo dir");
+    fs::create_dir(&barrier).expect("barrier");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+
+    let start = Command::new(nils_test_support::bin::resolve("agent-session"))
+        .current_dir(tmp.path())
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--id",
+            "replaced-sessions-root",
+            "--prompt",
+            "must not reach replacement",
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux"),
+            "--agent-bin",
+            codex_bin.to_str().expect("codex"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_STAGE",
+            "initialization-authority-validated",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "session ancestor barrier timed out"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::rename(&sessions_dir, &detached_sessions).expect("detach sessions root");
+    fs::create_dir(&sessions_dir).expect("replacement sessions root");
+    fs::write(barrier.join("release"), b"continue").expect("release barrier");
+
+    let output = start.wait_with_output().expect("start output");
+    assert_eq!(output.status.code(), Some(65));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("start json");
+    assert_eq!(
+        envelope["error"]["code"],
+        "session-state-ancestor-untrusted"
+    );
+    assert_eq!(envelope["error"]["details"]["ancestor"], "sessions");
+    assert_eq!(envelope["error"]["details"]["reason"], "identity-changed");
+    assert!(
+        fs::read_dir(&sessions_dir)
+            .expect("replacement sessions")
+            .next()
+            .is_none(),
+        "initialization and rollback must not mutate the replacement sessions root"
+    );
+    let detached_session = detached_sessions.join("replaced-sessions-root");
+    assert!(!detached_session.join("prompt.md").exists());
+    assert!(!detached_session.join("session.json").exists());
+    assert!(!tmux_log.exists(), "provider transport must not start");
+}
+
+#[test]
 fn list_command_and_delete_manage_existing_session() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

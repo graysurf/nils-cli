@@ -281,9 +281,15 @@ on the typed `readiness` result:
   checkpoint. No recovery Enter is sent after that proof.
 - `transport_uncertain`, `readiness_recovery_failed`, and
   `readiness_recovery_unavailable` distinguish an unknown recovery-send
-  effect, a definitive bounded recovery failure, and refusal before recovery
-  input. Keep the accompanying prompt observation and recovery fence; none
-  authorizes additional input.
+  effect, a definitive bounded recovery failure with no authenticated
+  checkpoint before the original deadline, and refusal before recovery input.
+  A definitive recovery-send failure alone does not return a terminal
+  readiness result: a late authenticated checkpoint still wins, while an
+  authoritative terminated provider turn or the fixed original deadline ends
+  the wait. Post-failure polling is coalesced with the finalizer renewal, and
+  the final durable receipt rechecks the authenticated checkpoint under the
+  registry lock before committing failure. Keep the accompanying prompt
+  observation and recovery fence; none authorizes additional input.
 
 For a fresh Codex or Claude launch that remains `starting`, the runtime rechecks
 the exact session incarnation and live tmux status, sends one recovery Enter,

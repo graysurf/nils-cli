@@ -3393,6 +3393,9 @@ fn finish_worker_start_readiness(
             .ok_or_else(|| invalid_input("worker start incarnation is unavailable"))?
             .to_string();
         let worker_record = load_session_record(context, &worker_session_id)?;
+        let starting_revision = outcome["assignment"]["revision"]
+            .as_u64()
+            .ok_or_else(|| invalid_input("worker start revision is unavailable"))?;
         let recovery_continuation = progress
             .get("recovery_continuation")
             .filter(|value| !value.is_null())
@@ -3405,9 +3408,7 @@ fn finish_worker_start_readiness(
                 assignment_id: &assignment_id,
                 timeout,
                 worker: (&worker_record, &worker_incarnation),
-                starting_revision: outcome["assignment"]["revision"]
-                    .as_u64()
-                    .ok_or_else(|| invalid_input("worker start revision is unavailable"))?,
+                starting_revision,
                 submit_key_recovery_eligible,
                 launch_observation: &outcome["launch_observation"],
                 readiness_receipt: WorkerStartReadinessReceipt {
@@ -3420,6 +3421,7 @@ fn finish_worker_start_readiness(
                 recovery_continuation,
             },
         )?;
+        pause_readiness_final_receipt_for_test()?;
         let mut locked = orchestration::lock_registry(context)?;
         let current = idempotency_replay(
             &locked.registry,
@@ -3438,6 +3440,62 @@ fn finish_worker_start_readiness(
             progress = current;
             finalizer_id = None;
             continue;
+        }
+        if outcome["readiness"]["state"] == "readiness_failed"
+            && let Some(assignment) = locked.registry.assignments.get_mut(&assignment_id)
+            && let Some(bound_worker) = assignment.worker.clone()
+            && bound_worker.session_id == worker_session_id
+            && bound_worker.session_incarnation == worker_incarnation
+            && worker_start_readiness_checkpoint(
+                assignment,
+                main,
+                main_incarnation,
+                &bound_worker,
+                starting_revision,
+            )
+        {
+            if let Some(recovery) = assignment.submit_recovery.as_mut()
+                && recovery.session_incarnation == worker_incarnation
+                && recovery.reserved_revision > starting_revision
+                && recovery.state != "reconciled"
+            {
+                recovery.state = "checkpoint_confirmed".to_string();
+                recovery.result = "authenticated worker checkpoint confirmed".to_string();
+                recovery.updated_at = timestamp();
+                assignment.updated_at = recovery.updated_at.clone();
+            }
+            let transport_state = outcome["readiness"]["delivery"]["transport_state"].clone();
+            let recovery_eligible = outcome["readiness"]["submit_key_recovery"]["eligible"]
+                .as_bool()
+                .unwrap_or(false);
+            let recovery_attempted = outcome["readiness"]["submit_key_recovery"]["attempted"]
+                .as_bool()
+                .unwrap_or(false);
+            let recovery_attempt_count =
+                outcome["readiness"]["submit_key_recovery"]["attempt_count"]
+                    .as_u64()
+                    .unwrap_or(0);
+            let assignment_state = assignment.state.clone();
+            outcome["readiness"] = json!({
+                "state": readiness_from_state(&assignment_state),
+                "assignment_state": assignment_state,
+                "worker_launched": true,
+                "delivery": {
+                    "state": "confirmed",
+                    "transport_state": transport_state,
+                    "proof": "authenticated-worker-checkpoint"
+                },
+                "submit_key_recovery": {
+                    "eligible": recovery_eligible,
+                    "attempted": recovery_attempted,
+                    "attempt_count": recovery_attempt_count,
+                    "result": if recovery_attempted {
+                        "checkpoint-confirmed"
+                    } else {
+                        "not-needed"
+                    }
+                }
+            });
         }
         if outcome["readiness"]["state"] == "readiness_failed"
             && outcome["readiness"]["delivery"]["proof"] == "worker-checkpoint-timeout"
@@ -4573,6 +4631,38 @@ fn worker_readiness_checkpoint(
         })
 }
 
+fn worker_start_readiness_checkpoint(
+    assignment: &AssignmentRecord,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    worker: &SessionRef,
+    starting_revision: u64,
+) -> bool {
+    if assignment.submit_recovery.is_some() {
+        return submit_recovery_reservation_from_assignment(assignment)
+            .ok()
+            .is_some_and(|reservation| {
+                reservation.worker == *worker
+                    && matches!(
+                        submit_recovery_checkpoint(
+                            assignment,
+                            main,
+                            main_incarnation,
+                            &reservation,
+                        ),
+                        SubmitRecoveryCheckpoint::Confirmed
+                    )
+            });
+    }
+    worker_readiness_checkpoint(
+        assignment,
+        main,
+        main_incarnation,
+        worker,
+        starting_revision,
+    )
+}
+
 fn worker_submit_key_recovery_eligible(fresh_launch: bool, agent: AgentKind) -> bool {
     fresh_launch && matches!(agent, AgentKind::Codex | AgentKind::Claude)
 }
@@ -4928,6 +5018,34 @@ fn pause_readiness_finalizer_takeover_for_test(finalizer_id: &str) -> Result<(),
     Ok(())
 }
 
+fn pause_readiness_final_receipt_for_test() -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        env::var_os("NILS_AGENT_SESSION_TEST_READINESS_FINAL_RECEIPT_BARRIER_DIR")
+            .map(PathBuf::from)
+    {
+        fs::write(directory.join("ready"), b"ready").map_err(|_| {
+            CliError::runtime(
+                "readiness-final-receipt-test-barrier",
+                "readiness final receipt test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "readiness-final-receipt-test-barrier",
+                    "readiness final receipt test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
 /// Bounded, read-only wait for a freshly launched worker to advance its
 /// assignment past `starting`, returning the typed readiness projection. Mirrors
 /// the `worker wait` poll (no lock, level-triggered) so it never blocks the
@@ -4989,17 +5107,9 @@ fn await_worker_readiness(
             .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
             .clone();
         let state = assignment.state.clone();
-        if matches!(
-            recovery_stage.as_deref(),
-            Some("failed" | "outcome_unknown")
-        ) {
+        if recovery_stage.as_deref() == Some("outcome_unknown") {
             let prompt_observation =
                 worker_prompt_observation(context, worker.0, launch_observation);
-            let classification = if recovery_stage.as_deref() == Some("outcome_unknown") {
-                "transport_uncertain"
-            } else {
-                "readiness_recovery_failed"
-            };
             let result = assignment
                 .submit_recovery
                 .as_ref()
@@ -5012,7 +5122,7 @@ fn await_worker_readiness(
                 .unwrap_or("submit-recovery-send-outcome-unknown");
             return Ok(json!({
                 "state": "readiness_failed",
-                "classification": classification,
+                "classification": "transport_uncertain",
                 "prompt_observation": prompt_observation,
                 "assignment_state": state,
                 "worker_launched": true,
@@ -5055,31 +5165,8 @@ fn await_worker_readiness(
                     )?;
                 }
                 Some("failed" | "reconciled") => {
-                    let prompt_observation =
-                        worker_prompt_observation(context, worker.0, launch_observation);
-                    let result = recovery_record
-                        .map(|current| current.result.as_str())
-                        .unwrap_or("submit-recovery-terminal");
-                    return Ok(json!({
-                        "state": "readiness_failed",
-                        "classification": "readiness_recovery_failed",
-                        "prompt_observation": prompt_observation,
-                        "assignment_state": state,
-                        "worker_launched": true,
-                        "delivery": {
-                            "state": "unverified",
-                            "transport_state": "submit-key-recovery-failed",
-                            "proof": result
-                        },
-                        "submit_key_recovery": {
-                            "eligible": true,
-                            "attempted": true,
-                            "attempt_count": 1,
-                            "result": result
-                        },
-                        "automatic_retry_safe": false,
-                        "safe_state": "the persisted recovery attempt is terminal and no further input is authorized"
-                    }));
+                    recovery_stage = Some("failed".to_string());
+                    recovery_transport_state = "submit-key-recovery-failed";
                 }
                 _ => {
                     let prompt_observation =
@@ -5108,22 +5195,15 @@ fn await_worker_readiness(
             }
         }
         if state != "starting" {
-            let checkpoint_confirmed = if let Some(reservation) = recovery.as_ref() {
-                matches!(
-                    submit_recovery_checkpoint(&assignment, record, incarnation, reservation),
-                    SubmitRecoveryCheckpoint::Confirmed
+            let checkpoint_confirmed = assignment.worker.as_ref().is_some_and(|bound| {
+                worker_start_readiness_checkpoint(
+                    &assignment,
+                    record,
+                    incarnation,
+                    bound,
+                    starting_revision,
                 )
-            } else {
-                assignment.worker.as_ref().is_some_and(|bound| {
-                    worker_readiness_checkpoint(
-                        &assignment,
-                        record,
-                        incarnation,
-                        bound,
-                        starting_revision,
-                    )
-                })
-            };
+            });
             if !checkpoint_confirmed {
                 let prompt_observation =
                     worker_prompt_observation(context, worker.0, launch_observation);
@@ -5379,36 +5459,36 @@ fn await_worker_readiness(
                         )?;
                         result
                     };
-                    let prompt_observation =
-                        worker_prompt_observation(context, worker.0, launch_observation);
-                    return Ok(json!({
-                        "state": "readiness_failed",
-                        "classification": if outcome_unknown {
-                            "transport_uncertain"
-                        } else {
-                            "readiness_recovery_failed"
-                        },
-                        "prompt_observation": prompt_observation,
-                        "assignment_state": state,
-                        "worker_launched": true,
-                        "delivery": {
-                            "state": "unverified",
-                            "transport_state": "submit-key-recovery-failed",
-                            "proof": result
-                        },
-                        "submit_key_recovery": {
-                            "eligible": true,
-                            "attempted": true,
-                            "attempt_count": 1,
-                            "result": result
-                        },
-                        "automatic_retry_safe": false,
-                        "safe_state": if outcome_unknown {
-                            "worker remains bound in `starting`; the tmux send outcome is unknown, so the recovery record and all manager-mutation fences remain active. Never resend Enter; wait for the original sender or a newer worker checkpoint."
-                        } else {
-                            "worker remains bound in `starting`; runtime-owned single-Enter recovery failed before delivery and no further input is allowed. Keep the worker available for typed session diagnostics."
-                        }
-                    }));
+                    recovery_transport_state = "submit-key-recovery-failed";
+                    recovery_stage = Some(if outcome_unknown {
+                        "outcome_unknown".to_string()
+                    } else {
+                        "failed".to_string()
+                    });
+                    if outcome_unknown {
+                        let prompt_observation =
+                            worker_prompt_observation(context, worker.0, launch_observation);
+                        return Ok(json!({
+                            "state": "readiness_failed",
+                            "classification": "transport_uncertain",
+                            "prompt_observation": prompt_observation,
+                            "assignment_state": state,
+                            "worker_launched": true,
+                            "delivery": {
+                                "state": "unverified",
+                                "transport_state": recovery_transport_state,
+                                "proof": result
+                            },
+                            "submit_key_recovery": {
+                                "eligible": true,
+                                "attempted": true,
+                                "attempt_count": 1,
+                                "result": result
+                            },
+                            "automatic_retry_safe": false,
+                            "safe_state": "worker remains bound in `starting`; the tmux send outcome is unknown, so the recovery record and all manager-mutation fences remain active. Never resend Enter; wait for the original sender or a newer worker checkpoint."
+                        }));
+                    }
                 }
             }
             continue;
@@ -5416,12 +5496,24 @@ fn await_worker_readiness(
         if elapsed >= timeout {
             let prompt_observation =
                 worker_prompt_observation(context, worker.0, launch_observation);
-            let classification = if prompt_observation["prompt"]["state"] == "submitted" {
+            let recovery_failed = recovery_stage.as_deref() == Some("failed");
+            let recovery_result = assignment
+                .submit_recovery
+                .as_ref()
+                .filter(|current| {
+                    recovery
+                        .as_ref()
+                        .is_some_and(|reservation| current.attempt_id == reservation.attempt_id)
+                })
+                .map(|current| current.result.as_str());
+            let classification = if recovery_failed {
+                "readiness_recovery_failed"
+            } else if prompt_observation["prompt"]["state"] == "submitted" {
                 "checkpoint_timeout_after_prompt_submission"
             } else {
                 prompt_failure_classification(&prompt_observation)
             };
-            if let Some(reservation) = recovery.as_ref() {
+            if !recovery_failed && let Some(reservation) = recovery.as_ref() {
                 let _ = update_submit_recovery(
                     context,
                     record,
@@ -5440,27 +5532,43 @@ fn await_worker_readiness(
                 "delivery": {
                     "state": "unverified",
                     "transport_state": recovery_transport_state,
-                    "proof": "worker-checkpoint-timeout"
+                    "proof": if recovery_failed {
+                        recovery_result.unwrap_or("submit-recovery-terminal")
+                    } else {
+                        "worker-checkpoint-timeout"
+                    }
                 },
                 "submit_key_recovery": {
                     "eligible": recovery_eligible,
                     "attempted": recovery.is_some(),
                     "attempt_count": usize::from(recovery.is_some()),
-                    "result": if recovery.is_some() {
+                    "result": if recovery_failed {
+                        recovery_result.unwrap_or("submit-recovery-terminal")
+                    } else if recovery.is_some() {
                         "checkpoint-timeout"
                     } else {
                         "not-eligible"
                     }
                 },
                 "automatic_retry_safe": false,
-                "safe_state": if recovery.is_some() {
+                "safe_state": if recovery_failed {
+                    "worker remains launched and bound in `starting`; submit-key recovery failed definitively before input completed, and the original readiness deadline elapsed without an authenticated checkpoint. Do not resend the prompt or inject Enter. Keep the worker available for typed session diagnostics."
+                } else if recovery.is_some() {
                     "worker remains launched and bound in `starting`; runtime-owned single-Enter recovery is exhausted, so do not resend the prompt or inject another Enter. Keep the worker available for typed session diagnostics."
                 } else {
                     "worker remains launched and bound in `starting`; submit-key recovery was not eligible, so do not resend the prompt or inject Enter. Keep the worker available for typed session diagnostics."
                 }
             }));
         }
-        thread::sleep(WORKER_WAIT_POLL_INTERVAL);
+        let poll_interval = if recovery_stage.as_deref() == Some("failed") {
+            WORKER_START_FINALIZER_RENEW_INTERVAL
+        } else {
+            WORKER_WAIT_POLL_INTERVAL
+        };
+        thread::sleep(std::cmp::min(
+            poll_interval,
+            timeout.saturating_sub(started.elapsed()),
+        ));
     }
 }
 

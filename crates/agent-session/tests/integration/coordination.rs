@@ -25420,6 +25420,629 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
 }
 
 #[test]
+fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_id = "assignment-late-bootstrap";
+    let worker_id = "worker-late-bootstrap";
+    let assignment_path = tmp.path().join("assignment-late-bootstrap.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": assignment_id,
+            "task_summary": "Accept authenticated bootstrap after recovery refusal",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/worker-lane"],
+            "durable_refs": []
+        }),
+    );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+    let barrier = tmp.path().join("late-bootstrap-recovery-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+
+    let start = Command::new(bin::resolve("main-agent"))
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "4s",
+            "--idempotency-key",
+            "worker-start-late-bootstrap-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
+            "3",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_DIR",
+            &barrier,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_STAGE",
+            "sending",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn worker start");
+
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "readiness recovery never reached the serialized send boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join(format!("sessions/{worker_id}/session.json")))
+            .expect("worker session"),
+    )
+    .expect("worker session json");
+    let worker_incarnation = worker_record["runtime"]["launch_id"]
+        .as_str()
+        .expect("worker incarnation")
+        .to_string();
+    seed_activity_state(
+        &state_dir,
+        worker_id,
+        &worker_incarnation,
+        "working",
+        json!({
+            "provider_turn_id": "turn-late-bootstrap",
+            "started_at": "2030-01-01T00:00:00Z",
+            "last_progress_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    fs::write(barrier.join("release"), b"continue").expect("release recovery");
+    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let registry = orchestration_registry(&state_dir);
+        let assignment = &registry["assignments"][assignment_id];
+        if assignment["submit_recovery"]["state"] == "failed" {
+            assert_eq!(assignment["state"], "starting");
+            assert_eq!(
+                assignment["submit_recovery"]["result"],
+                "worker-activity-not-authoritative-starting"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < recovery_deadline,
+            "definitive recovery failure was not durably recorded"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let bootstrap_digest = orchestration_request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &json!(assignment_id),
+    );
+    let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
+    let worker_capability = capability(&state_dir, worker_id);
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "bootstrap",
+            "--idempotency-key",
+            &bootstrap_key,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        bootstrapped.code,
+        0,
+        "bootstrap stderr={}",
+        bootstrapped.stderr_text()
+    );
+
+    let output = start.wait_with_output().expect("worker start output");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("worker start json");
+    let readiness = &envelope["data"]["readiness"];
+    assert_eq!(readiness["state"], "ready");
+    assert_eq!(readiness["assignment_state"], "working");
+    assert_eq!(readiness["delivery"]["state"], "confirmed");
+    assert_eq!(
+        readiness["delivery"]["transport_state"],
+        "submit-key-recovery-failed"
+    );
+    assert_eq!(
+        readiness["delivery"]["proof"],
+        "authenticated-worker-checkpoint"
+    );
+    assert_eq!(
+        readiness["submit_key_recovery"]["result"],
+        "checkpoint-confirmed"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_definitive_recovery_failure_converges_at_one_terminal_boundary() {
+    for mode in ["deadline", "final-checkpoint", "takeover"] {
+        exercise_definitive_recovery_failure_boundary(mode);
+    }
+}
+
+fn exercise_definitive_recovery_failure_boundary(mode: &str) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_id = format!("assignment-recovery-failure-{mode}");
+    let worker_id = format!("worker-recovery-failure-{mode}");
+    let assignment_path = tmp.path().join(format!("{assignment_id}.json"));
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": assignment_id,
+            "task_summary": "Resolve definitive recovery failure at one authoritative boundary",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/worker-lane"],
+            "durable_refs": []
+        }),
+    );
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+    let recovery_barrier = tmp.path().join("recovery-barrier");
+    let final_barrier = tmp.path().join("final-receipt-barrier");
+    fs::create_dir(&recovery_barrier).expect("recovery barrier");
+    if mode == "final-checkpoint" {
+        fs::create_dir(&final_barrier).expect("final barrier");
+    }
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let idempotency_key = format!("worker-start-recovery-failure-{mode}-0001");
+
+    let mut command = Command::new(bin::resolve("main-agent"));
+    command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "4s",
+            "--idempotency-key",
+            idempotency_key.as_str(),
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
+            "3",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_DIR",
+            &recovery_barrier,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_STAGE",
+            "sending",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if mode == "final-checkpoint" {
+        command.env(
+            "NILS_AGENT_SESSION_TEST_READINESS_FINAL_RECEIPT_BARRIER_DIR",
+            &final_barrier,
+        );
+    }
+    let started = Instant::now();
+    let mut start = Some(command.spawn().expect("spawn worker start"));
+
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !recovery_barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "recovery barrier timed out for {mode}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join(format!("sessions/{worker_id}/session.json")))
+            .expect("worker session"),
+    )
+    .expect("worker session json");
+    let worker_incarnation = worker_record["runtime"]["launch_id"]
+        .as_str()
+        .expect("worker incarnation")
+        .to_string();
+    seed_activity_state(
+        &state_dir,
+        &worker_id,
+        &worker_incarnation,
+        "working",
+        json!({
+            "provider_turn_id": format!("turn-{mode}"),
+            "started_at": "2030-01-01T00:00:00Z",
+            "last_progress_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    fs::write(recovery_barrier.join("release"), b"continue").expect("release recovery");
+    let failure_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let registry = orchestration_registry(&state_dir);
+        let assignment = &registry["assignments"][&assignment_id];
+        if assignment["submit_recovery"]["state"] == "failed" {
+            assert_eq!(assignment["state"], "starting");
+            assert_eq!(
+                assignment["submit_recovery"]["result"],
+                "worker-activity-not-authoritative-starting"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < failure_deadline,
+            "failed recovery was not durable for {mode}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    if mode == "deadline" {
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            start
+                .as_mut()
+                .expect("worker start")
+                .try_wait()
+                .expect("probe worker start")
+                .is_none(),
+            "definitive recovery refusal must not end readiness before the deadline"
+        );
+    }
+
+    if mode == "takeover" {
+        let mut start = start.take().expect("original readiness finalizer");
+        start.kill().expect("stop original readiness finalizer");
+        let _ = start.wait().expect("reap original readiness finalizer");
+    }
+
+    if mode == "final-checkpoint" {
+        let final_deadline = Instant::now() + Duration::from_secs(10);
+        while !final_barrier.join("ready").is_file() {
+            assert!(
+                Instant::now() < final_deadline,
+                "final receipt barrier timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bootstrap_digest = orchestration_request_digest(
+            "main-agent-worker-bootstrap-idempotency",
+            &json!(assignment_id),
+        );
+        let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
+        let worker_capability = capability(&state_dir, &worker_id);
+        let bootstrapped = run_main_agent(
+            &worker_checkout,
+            &[
+                "--state-dir",
+                state_arg.as_str(),
+                "bootstrap",
+                "--idempotency-key",
+                &bootstrap_key,
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+        );
+        assert_eq!(
+            bootstrapped.code,
+            0,
+            "stderr={}",
+            bootstrapped.stderr_text()
+        );
+        let worker_revision =
+            orchestration_registry(&state_dir)["assignments"][&assignment_id]["revision"]
+                .as_u64()
+                .expect("worker revision");
+        let capability_name = Path::new(&worker_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("worker capability name");
+        let checkpoint_path = Path::new(&worker_capability)
+            .with_file_name(format!("main-agent-checkpoint-{capability_name}.json"));
+        write_private_json(
+            &checkpoint_path,
+            &json!({
+                "schema_version": "main-agent.checkpoint-input.v1",
+                "summary": "Worker submitted before final readiness receipt",
+                "next_action": "Manager acceptance",
+                "state": "submitted",
+                "result_summary": "ready for acceptance",
+                "blocker_summary": null
+            }),
+        );
+        let worker_revision_arg = worker_revision.to_string();
+        let submitted = run_main_agent(
+            &worker_checkout,
+            &[
+                "--state-dir",
+                state_arg.as_str(),
+                "checkpoint",
+                "--file",
+                checkpoint_path.to_str().expect("checkpoint path"),
+                "--if-revision",
+                &worker_revision_arg,
+                "--idempotency-key",
+                "worker-final-receipt-submitted-0001",
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+        );
+        assert_eq!(submitted.code, 0, "stderr={}", submitted.stderr_text());
+        let submitted_revision = data(&submitted)["assignment"]["revision"]
+            .as_u64()
+            .expect("submitted revision");
+        let submitted_revision_arg = submitted_revision.to_string();
+        let accepted = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "accept",
+                &assignment_id,
+                "--if-revision",
+                &submitted_revision_arg,
+                "--idempotency-key",
+                "worker-final-receipt-accepted-0001",
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+        );
+        assert_eq!(accepted.code, 0, "stderr={}", accepted.stderr_text());
+        fs::write(final_barrier.join("release"), b"continue").expect("release final receipt");
+    }
+
+    let output = if mode == "takeover" {
+        let replay = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "4s",
+                "--idempotency-key",
+                idempotency_key.as_str(),
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                (
+                    "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
+                    "3",
+                ),
+            ],
+        );
+        assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+        replay.stdout_json()
+    } else {
+        let output = start
+            .take()
+            .expect("worker start")
+            .wait_with_output()
+            .expect("worker start output");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("worker start json")
+    };
+
+    let readiness = &output["data"]["readiness"];
+    if mode == "final-checkpoint" {
+        assert_eq!(readiness["state"], "ready");
+        assert_eq!(readiness["assignment_state"], "accepted");
+        assert_eq!(readiness["delivery"]["state"], "confirmed");
+        assert_eq!(
+            readiness["delivery"]["proof"],
+            "authenticated-worker-checkpoint"
+        );
+        assert_eq!(
+            readiness["submit_key_recovery"]["result"],
+            "checkpoint-confirmed"
+        );
+        let recovery =
+            orchestration_registry(&state_dir)["assignments"][&assignment_id]["submit_recovery"]
+                .clone();
+        assert_eq!(recovery["state"], "checkpoint_confirmed");
+        assert_eq!(
+            recovery["result"],
+            "authenticated worker checkpoint confirmed"
+        );
+    } else {
+        assert_eq!(readiness["state"], "readiness_failed");
+        assert_eq!(readiness["classification"], "readiness_recovery_failed");
+        assert_eq!(
+            readiness["delivery"]["transport_state"],
+            "submit-key-recovery-failed"
+        );
+        assert_eq!(
+            readiness["delivery"]["proof"],
+            "worker-activity-not-authoritative-starting"
+        );
+        assert_eq!(
+            readiness["submit_key_recovery"]["result"],
+            "worker-activity-not-authoritative-starting"
+        );
+        assert_eq!(readiness["automatic_retry_safe"], false);
+        assert!(
+            readiness["safe_state"]
+                .as_str()
+                .is_some_and(|value| value.contains("original readiness deadline"))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "original deadline or takeover was not bounded"
+        );
+        if mode == "deadline" {
+            assert!(
+                started.elapsed() >= Duration::from_secs(3),
+                "terminal recovery failure returned before the original deadline"
+            );
+        }
+
+        let replay = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                state_arg.as_str(),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "4s",
+                "--idempotency-key",
+                idempotency_key.as_str(),
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                (
+                    "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
+                    "3",
+                ),
+            ],
+        );
+        assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+        assert_eq!(data(&replay), output["data"]);
+    }
+    let enter_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls, 1,
+        "definitive pre-send failure must not inject recovery input for {mode}"
+    );
+}
+
+#[test]
 fn main_agent_worker_start_reports_checkout_preclaim_failure_as_not_ready() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

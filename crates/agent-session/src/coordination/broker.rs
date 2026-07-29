@@ -17,9 +17,9 @@ use crate::{CliContext, CliError, SessionRecord};
 
 use super::{
     BrokerRecord, authenticate_from_file, authenticate_recovery_from_file, capability_path,
-    checkpoint_path_for_state, clean_expired, coordination_dir, digest_bytes,
-    ensure_fingerprint_key, idempotency_replay, incarnation, json_value, lock_registry, now_epoch,
-    read_bounded_json, request_digest, store_receipt, timestamp,
+    checkpoint_path_for_state, clean_expired, digest_bytes, ensure_fingerprint_key,
+    idempotency_replay, incarnation, json_value, lock_registry, now_epoch, read_bounded_json,
+    request_digest, store_receipt, timestamp,
 };
 
 pub(crate) const BROKER_VERSION: &str = "agent-session.coordination-broker.v1";
@@ -97,7 +97,11 @@ struct RecoveryProof {
 }
 
 pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
-    let capability_dir = coordination_dir(context, &record.id);
+    prepare_in_dir(&crate::session_dir(context, &record.id))
+}
+
+pub(crate) fn prepare_in_dir(session_dir: &Path) -> Result<(), CliError> {
+    let capability_dir = session_dir.join("coordination");
     match fs::symlink_metadata(&capability_dir) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink()
