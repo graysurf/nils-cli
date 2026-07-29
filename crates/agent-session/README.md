@@ -72,6 +72,8 @@ main-agent worker account-handoff ASSIGNMENT_ID --account ACCOUNT --if-revision 
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision 2 --timeout 5s --idempotency-key recover-001 --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision 3 --idempotency-key reconcile-001 --format json
 main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation WORKER_INCARNATION --if-revision 3 --idempotency-key stop-001 --format json
+main-agent worker stop-claimed-runtime ASSIGNMENT_ID --worker-incarnation WORKER_INCARNATION --if-revision 3 --idempotency-key stop-claimed-001 --format json
+main-agent worker reconcile-stopped ASSIGNMENT_ID --if-revision 3 --reason "worker runtime stopped after claim acquisition" --idempotency-key reconcile-stopped-001 --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key cancel-001 --format json
 main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key reassign-001 --format json
 main-agent worker list --format json
@@ -228,6 +230,24 @@ ordinary guarded cancel/retire or a distinct reassign then owns
 terminalization. A failed submit-recovery record alone never authorizes the
 stop, and an unknown `attempting` send remains on the stopped-runtime `worker
 reconcile-recovery` path.
+
+For a `working` worker that is authoritatively idle while its exact
+assignment-derived claim remains active, `worker stop-claimed-runtime` is the
+separate post-claim stop-only action. It requires the exact assignment
+revision, worker incarnation, running runtime identity, worker claim,
+authoritative activity boundary, broker/work context, and zero active or
+uncertain operations. It persists a session-owned fence before stopping the
+runtime, so the launch wrapper's clean broker shutdown cannot release the
+claim. A narrow mutation fence holds the exact controller and worker claim
+tuples stable while leaving unrelated coordination available across the
+bounded runtime stop and its post-stop proof. It sends no provider input and preserves the `working` assignment,
+session, worktree, and claim for `worker reconcile-stopped`. Interrupted
+execution is projected as `claimed_runtime_stop_in_progress` in the additive
+v5 diagnose/supervise/recovery-action envelopes and must be resumed only with
+the returned exact argv. If the owning Main dies after the stop completes,
+orphan `adopt` rebinds both persistent stop identities to the successor while
+retaining the original controller and revision lineage, so successor
+`reconcile-stopped` and exact terminal worker deletion remain available.
 
 `main-agent self recover` is the ownership-qualified controller recovery macro.
 It proves the current caller is the exact Main Agent incarnation with an

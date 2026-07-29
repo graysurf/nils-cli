@@ -30,6 +30,7 @@ use crate::{
 };
 
 const REGISTRY_VERSION: &str = "agent-session.coordination-registry.v1";
+const CLAIM_FENCE_REGISTRY_VERSION: &str = "agent-session.coordination-registry.v2";
 const REGISTRY_FILE: &str = "registry.json";
 const REGISTRY_LOCK: &str = "registry.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,6 +42,12 @@ const MAX_RECEIPTS_PER_PRINCIPAL: usize = 4_096;
 const MAX_RECEIPTS_GLOBAL: usize = 32_768;
 const TERMINAL_RETENTION_SECS: i64 = 5 * 60;
 const ACKNOWLEDGED_MESSAGE_RETENTION_SECS: i64 = 24 * 60 * 60;
+const CLAIM_MUTATION_FENCES_DIR: &str = "claim-mutation-fences";
+const CLAIM_MUTATION_FENCE_LOCKS_DIR: &str = "claim-mutation-fence-locks";
+const CLAIM_MUTATION_FENCE_SCHEMA: &str = "agent-session.claim-mutation-fence.v1";
+const MAX_CLAIM_MUTATION_FENCE_FILES: usize = 256;
+const MAX_CLAIM_MUTATION_OPERATION_FILES: usize = 512;
+const MAX_CLAIM_MUTATION_FENCE_BYTES: u64 = 64 * 1024;
 pub(crate) const CAPABILITY_ENV: &str = "AGENT_SESSION_CAPABILITY_FILE";
 pub(crate) const CHECKPOINT_ENV: &str = "AGENT_SESSION_CHECKPOINT_FILE";
 
@@ -60,6 +67,22 @@ pub(crate) struct Registry {
     notifications: BTreeMap<String, notification::NotificationReceipt>,
     advisory_acknowledgements: BTreeMap<String, advisory::AdvisoryAcknowledgement>,
     advisory_observations: BTreeMap<String, advisory::AdvisoryObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ClaimMutationFence {
+    schema_version: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    worker_session_id: String,
+    worker_incarnation: String,
+    worker_claim: ControllerClaimTuple,
+    controller_session_id: String,
+    controller_incarnation: String,
+    controller_claim: ControllerClaimTuple,
+    request_digest: String,
+    lock_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,7 +131,15 @@ impl Drop for LockedRegistry {
 
 impl LockedRegistry {
     pub fn save(&mut self) -> Result<(), CliError> {
-        self.registry.schema_version = REGISTRY_VERSION.to_string();
+        if self.registry.schema_version.is_empty() {
+            self.registry.schema_version = REGISTRY_VERSION.to_string();
+        }
+        if !matches!(
+            self.registry.schema_version.as_str(),
+            REGISTRY_VERSION | CLAIM_FENCE_REGISTRY_VERSION
+        ) {
+            return Err(store_corrupt());
+        }
         let bytes = serde_json::to_vec_pretty(&self.registry).map_err(|_| store_corrupt())?;
         if bytes.len() as u64 > MAX_REGISTRY_BYTES {
             return Err(CliError::data(
@@ -309,7 +340,7 @@ pub(crate) struct GroupCleanupQuiescenceGuard {
     sessions: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ControllerClaimTuple {
     pub(crate) claim_id: String,
     pub(crate) revision: u64,
@@ -327,6 +358,15 @@ pub(crate) struct WorkerClaimRevocationGuard {
 
 pub(crate) struct WorkerRuntimeStopGuard {
     seal: WorkerAuthoritySealGuard,
+}
+
+pub(crate) struct ClaimedWorkerRuntimeStopGuard {
+    seal: WorkerAuthoritySealGuard,
+    worker_claim: ControllerClaimTuple,
+}
+
+pub(crate) struct ClaimMutationFenceOwnerGuard {
+    _owner_lock: File,
 }
 
 struct WorkerAuthoritySealGuard {
@@ -394,6 +434,71 @@ impl WorkerRuntimeStopGuard {
     /// bounded external runtime termination.
     pub(crate) fn seal(&mut self, context: &CliContext) -> Result<(), CliError> {
         self.seal.seal(context)
+    }
+}
+
+impl ClaimedWorkerRuntimeStopGuard {
+    pub(crate) fn worker_claim(&self) -> &ControllerClaimTuple {
+        &self.worker_claim
+    }
+
+    /// Persist an exact claim-mutation fence while this guard still owns the
+    /// observational coordination lock. External runtime termination can then
+    /// proceed without monopolizing the global registry lock.
+    pub(crate) fn persist_claim_mutation_fence(
+        &mut self,
+        context: &CliContext,
+        assignment_id: &str,
+        assignment_revision: u64,
+        request_digest: &str,
+    ) -> Result<ClaimMutationFenceOwnerGuard, CliError> {
+        let lock_id =
+            claim_mutation_fence_lock_id(assignment_id, assignment_revision, request_digest);
+        let fence = ClaimMutationFence {
+            schema_version: CLAIM_MUTATION_FENCE_SCHEMA.to_string(),
+            assignment_id: assignment_id.to_string(),
+            assignment_revision,
+            worker_session_id: self.seal.worker.0.clone(),
+            worker_incarnation: self.seal.worker.1.clone(),
+            worker_claim: self.worker_claim.clone(),
+            controller_session_id: self.seal.controller.0.clone(),
+            controller_incarnation: self.seal.controller.1.clone(),
+            controller_claim: self.seal.controller_claim.clone(),
+            request_digest: request_digest.to_string(),
+            lock_id,
+        };
+        let owner_lock = acquire_claim_mutation_fence_owner(context, &fence.lock_id)?;
+        let persisted = (|| {
+            self.seal.locked.registry.schema_version = CLAIM_FENCE_REGISTRY_VERSION.to_string();
+            self.seal.locked.save()?;
+            pause_claim_mutation_fence_activation_for_test("after_registry_v2")?;
+            persist_claim_mutation_fence_manifest(context, &fence)?;
+            pause_claim_mutation_fence_activation_for_test("after_manifest")?;
+            persist_claim_mutation_fence_sidecar(
+                context,
+                &fence.worker_session_id,
+                &fence.worker_incarnation,
+                &fence.worker_claim,
+                &fence,
+            )?;
+            pause_claim_mutation_fence_activation_for_test("after_worker_sidecar")?;
+            persist_claim_mutation_fence_sidecar(
+                context,
+                &fence.controller_session_id,
+                &fence.controller_incarnation,
+                &fence.controller_claim,
+                &fence,
+            )?;
+            pause_claim_mutation_fence_activation_for_test("after_controller_sidecar")
+        })();
+        if let Err(error) = persisted {
+            drop(owner_lock);
+            let _ = rollback_claim_mutation_fence_files(context, &fence);
+            return Err(error);
+        }
+        Ok(ClaimMutationFenceOwnerGuard {
+            _owner_lock: owner_lock,
+        })
     }
 }
 
@@ -544,6 +649,818 @@ pub(crate) fn lock_worker_runtime_stop(
         false,
     )?;
     Ok(WorkerRuntimeStopGuard { seal })
+}
+
+pub(crate) fn lock_claimed_worker_runtime_stop(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    worker_incarnation: &str,
+    expected_work_context: &context::WorkContextInput,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    authorized_controller_claim: &ControllerClaimTuple,
+) -> Result<ClaimedWorkerRuntimeStopGuard, CliError> {
+    let (seal, worker_claim_observed) = lock_worker_authority_seal(
+        context,
+        &worker_record.id,
+        worker_incarnation,
+        controller_session_id,
+        controller_incarnation,
+        authorized_controller_claim,
+        true,
+        true,
+    )?;
+    if !worker_claim_observed {
+        return Err(CliError::data(
+            "claim-not-active",
+            "claimed runtime stop requires the exact worker claim to remain active",
+            None,
+        ));
+    }
+    match claims::main_agent_worker_claim_match_in_registry(
+        context,
+        &seal.locked.registry,
+        worker_record,
+        worker_incarnation,
+        expected_work_context,
+    )? {
+        Some(true) => {}
+        Some(false) => {
+            return Err(CliError::data(
+                "worker-claim-mismatch",
+                "claimed runtime stop requires the exact assignment-derived worker claim",
+                None,
+            ));
+        }
+        None => {
+            return Err(CliError::data(
+                "claim-not-active",
+                "claimed runtime stop requires the exact worker claim to remain active",
+                None,
+            ));
+        }
+    }
+    let worker_claim = seal
+        .locked
+        .registry
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.session_id == worker_record.id
+                && claim.session_incarnation == worker_incarnation
+                && claim.state == "active"
+        })
+        .map(|claim| ControllerClaimTuple {
+            claim_id: claim.claim_id.clone(),
+            revision: claim.revision,
+            expires_at_epoch: claim.expires_at_epoch,
+        })
+        .ok_or_else(|| {
+            CliError::data(
+                "claim-not-active",
+                "claimed runtime stop requires the exact worker claim to remain active",
+                None,
+            )
+        })?;
+    if worker_claim.expires_at_epoch <= now_epoch() {
+        return Err(CliError::data(
+            "claim-not-active",
+            "claimed runtime stop requires the exact worker claim to remain active",
+            None,
+        ));
+    }
+    Ok(ClaimedWorkerRuntimeStopGuard { seal, worker_claim })
+}
+
+pub(crate) fn exact_claim_active_observational(
+    context: &CliContext,
+    session_id: &str,
+    session_incarnation: &str,
+    expected: &ControllerClaimTuple,
+) -> Result<bool, CliError> {
+    let locked = lock_registry_observational(context)?;
+    let now = now_epoch();
+    Ok(locked.registry.claims.iter().any(|claim| {
+        claim.session_id == session_id
+            && claim.session_incarnation == session_incarnation
+            && claim.claim_id == expected.claim_id
+            && claim.revision == expected.revision
+            && claim.expires_at_epoch == expected.expires_at_epoch
+            && claim.expires_at_epoch > now
+            && claim.state == "active"
+    }))
+}
+
+fn claim_fence_binds_tuple(
+    fence: &ClaimMutationFence,
+    session_id: &str,
+    session_incarnation: &str,
+    claim: &ControllerClaimTuple,
+) -> bool {
+    (fence.worker_session_id == session_id
+        && fence.worker_incarnation == session_incarnation
+        && fence.worker_claim == *claim)
+        || (fence.controller_session_id == session_id
+            && fence.controller_incarnation == session_incarnation
+            && fence.controller_claim == *claim)
+}
+
+fn claim_mutation_fence_same_operation(
+    left: &ClaimMutationFence,
+    right: &ClaimMutationFence,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.assignment_id == right.assignment_id
+        && left.assignment_revision == right.assignment_revision
+        && left.worker_session_id == right.worker_session_id
+        && left.worker_incarnation == right.worker_incarnation
+        && left.worker_claim == right.worker_claim
+        && left.controller_session_id == right.controller_session_id
+        && left.controller_incarnation == right.controller_incarnation
+        && left.controller_claim == right.controller_claim
+        && left.request_digest == right.request_digest
+        && left.lock_id == right.lock_id
+}
+
+fn claim_mutation_fence_directory(context: &CliContext, name: &str) -> Result<PathBuf, CliError> {
+    let root = coordination_root(context)?;
+    let directory = root.join(name);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() } =>
+        {
+            return Err(store_untrusted());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&directory).map_err(|_| store_unavailable())?;
+        }
+        Err(_) => return Err(store_unavailable()),
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| store_unavailable())?;
+    Ok(directory)
+}
+
+fn claim_mutation_fence_sidecar_path(
+    context: &CliContext,
+    session_id: &str,
+    session_incarnation: &str,
+    claim: &ControllerClaimTuple,
+) -> Result<PathBuf, CliError> {
+    let tuple_digest = digest_bytes(
+        format!(
+            "{session_id}\0{session_incarnation}\0{}\0{}\0{}",
+            claim.claim_id, claim.revision, claim.expires_at_epoch
+        )
+        .as_bytes(),
+    );
+    Ok(
+        claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCES_DIR)?
+            .join(tuple_digest.trim_start_matches("sha256:")),
+    )
+}
+
+fn claim_mutation_fence_lock_id(
+    assignment_id: &str,
+    assignment_revision: u64,
+    request_digest: &str,
+) -> String {
+    digest_bytes(format!("{assignment_id}\0{assignment_revision}\0{request_digest}").as_bytes())
+        .trim_start_matches("sha256:")
+        .to_string()
+}
+
+fn claim_mutation_fence_lock_path(
+    context: &CliContext,
+    lock_id: &str,
+) -> Result<PathBuf, CliError> {
+    if lock_id.len() != 64
+        || !lock_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(store_corrupt());
+    }
+    Ok(
+        claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCE_LOCKS_DIR)?
+            .join(format!("{lock_id}.lock")),
+    )
+}
+
+fn claim_mutation_fence_manifest_path(
+    context: &CliContext,
+    lock_id: &str,
+) -> Result<PathBuf, CliError> {
+    claim_mutation_fence_lock_path_from_existing(lock_id)?;
+    Ok(
+        claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCE_LOCKS_DIR)?
+            .join(format!("{lock_id}.json")),
+    )
+}
+
+fn open_claim_mutation_fence_lock(context: &CliContext, lock_id: &str) -> Result<File, CliError> {
+    let path = claim_mutation_fence_lock_path(context, lock_id)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(SECRET_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                store_untrusted()
+            } else {
+                store_unavailable()
+            }
+        })?;
+    lock.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|_| store_unavailable())?;
+    let metadata = lock.metadata().map_err(|_| store_unavailable())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(store_untrusted());
+    }
+    Ok(lock)
+}
+
+fn open_existing_claim_mutation_fence_lock(
+    context: &CliContext,
+    lock_id: &str,
+) -> Result<File, CliError> {
+    let path = claim_mutation_fence_lock_path(context, lock_id)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                store_untrusted()
+            } else {
+                store_unavailable()
+            }
+        })?;
+    let metadata = lock.metadata().map_err(|_| store_unavailable())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(store_untrusted());
+    }
+    Ok(lock)
+}
+
+fn acquire_claim_mutation_fence_owner(
+    context: &CliContext,
+    lock_id: &str,
+) -> Result<File, CliError> {
+    let directory = claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCE_LOCKS_DIR)?;
+    let lock_path = claim_mutation_fence_lock_path(context, lock_id)?;
+    let manifest_path = claim_mutation_fence_manifest_path(context, lock_id)?;
+    if !lock_path.exists() && !manifest_path.exists() {
+        let count = fs::read_dir(&directory)
+            .map_err(|_| store_unavailable())?
+            .take(MAX_CLAIM_MUTATION_OPERATION_FILES.saturating_add(1))
+            .count();
+        if count.saturating_add(2) > MAX_CLAIM_MUTATION_OPERATION_FILES {
+            return Err(CliError::data(
+                "quota-exceeded",
+                "claim-mutation fence operation file limit exceeded",
+                None,
+            ));
+        }
+    }
+    let lock = open_claim_mutation_fence_lock(context, lock_id)?;
+    // SAFETY: flock is called with a valid, owned file descriptor.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(lock);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Err(CliError::unavailable(
+            "claim-mutation-fenced",
+            "the claimed runtime stop mutation fence is already owned",
+            None,
+        ));
+    }
+    Err(store_unavailable())
+}
+
+fn pause_claim_mutation_fence_activation_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if std::env::var("NILS_AGENT_SESSION_TEST_CLAIM_MUTATION_FENCE_BARRIER_STAGE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+        && let Some(directory) =
+            std::env::var_os("NILS_AGENT_SESSION_TEST_CLAIM_MUTATION_FENCE_BARRIER_DIR")
+                .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| store_unavailable())?;
+        fs::write(directory.join("ready"), stage.as_bytes()).map_err(|_| store_unavailable())?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "claim-mutation fence activation test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
+fn read_claim_mutation_fence(path: &Path) -> Result<ClaimMutationFence, CliError> {
+    let bytes = read_private_file(path, MAX_CLAIM_MUTATION_FENCE_BYTES).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            CliError::data(
+                "claim-mutation-fence-conflict",
+                "the exact claim-mutation fence sidecar is missing",
+                None,
+            )
+        } else {
+            store_corrupt()
+        }
+    })?;
+    let fence: ClaimMutationFence = serde_json::from_slice(&bytes).map_err(|_| store_corrupt())?;
+    if fence.schema_version != CLAIM_MUTATION_FENCE_SCHEMA {
+        return Err(store_corrupt());
+    }
+    claim_mutation_fence_lock_path_from_existing(&fence.lock_id)?;
+    Ok(fence)
+}
+
+fn claim_mutation_fence_lock_path_from_existing(lock_id: &str) -> Result<(), CliError> {
+    if lock_id.len() == 64
+        && lock_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(store_corrupt())
+    }
+}
+
+fn persist_claim_mutation_fence_sidecar(
+    context: &CliContext,
+    session_id: &str,
+    session_incarnation: &str,
+    claim: &ControllerClaimTuple,
+    fence: &ClaimMutationFence,
+) -> Result<(), CliError> {
+    if !claim_fence_binds_tuple(fence, session_id, session_incarnation, claim) {
+        return Err(store_corrupt());
+    }
+    let path = claim_mutation_fence_sidecar_path(context, session_id, session_incarnation, claim)?;
+    match read_claim_mutation_fence(&path) {
+        Ok(existing) if !claim_mutation_fence_same_operation(&existing, fence) => {
+            return Err(CliError::unavailable(
+                "claim-mutation-fenced",
+                "the exact claim tuple is fenced by another claimed runtime stop",
+                None,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.code() == "claim-mutation-fence-conflict" => {
+            let directory = claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCES_DIR)?;
+            let count = fs::read_dir(&directory)
+                .map_err(|_| store_unavailable())?
+                .take(MAX_CLAIM_MUTATION_FENCE_FILES.saturating_add(1))
+                .count();
+            if count >= MAX_CLAIM_MUTATION_FENCE_FILES {
+                return Err(CliError::data(
+                    "quota-exceeded",
+                    "claim-mutation fence sidecar limit exceeded",
+                    None,
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec_pretty(fence).map_err(|_| store_corrupt())?;
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+fn persist_claim_mutation_fence_manifest(
+    context: &CliContext,
+    fence: &ClaimMutationFence,
+) -> Result<(), CliError> {
+    let path = claim_mutation_fence_manifest_path(context, &fence.lock_id)?;
+    match read_claim_mutation_fence(&path) {
+        Ok(existing) if !claim_mutation_fence_same_operation(&existing, fence) => {
+            return Err(CliError::unavailable(
+                "claim-mutation-fenced",
+                "the claimed runtime stop operation manifest belongs to another operation",
+                None,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.code() == "claim-mutation-fence-conflict" => {}
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec_pretty(fence).map_err(|_| store_corrupt())?;
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+fn rollback_claim_mutation_fence_files(
+    context: &CliContext,
+    fence: &ClaimMutationFence,
+) -> Result<(), CliError> {
+    let paths = [
+        claim_mutation_fence_sidecar_path(
+            context,
+            &fence.worker_session_id,
+            &fence.worker_incarnation,
+            &fence.worker_claim,
+        )?,
+        claim_mutation_fence_sidecar_path(
+            context,
+            &fence.controller_session_id,
+            &fence.controller_incarnation,
+            &fence.controller_claim,
+        )?,
+        claim_mutation_fence_manifest_path(context, &fence.lock_id)?,
+    ];
+    for path in paths {
+        match read_claim_mutation_fence(&path) {
+            Ok(existing) if claim_mutation_fence_same_operation(&existing, fence) => {
+                fs::remove_file(path).map_err(|_| store_unavailable())?;
+            }
+            Ok(_) => return Err(store_corrupt()),
+            Err(error) if error.code() == "claim-mutation-fence-conflict" => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let lock_path = claim_mutation_fence_lock_path(context, &fence.lock_id)?;
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
+}
+
+fn claim_mutation_fence_owner_active(
+    context: &CliContext,
+    fence: &ClaimMutationFence,
+) -> Result<bool, CliError> {
+    let lock = open_claim_mutation_fence_lock(context, &fence.lock_id)?;
+    // SAFETY: flock is called with a valid, owned file descriptor.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if result == 0 {
+        // SAFETY: the descriptor remains owned by `lock` for this call.
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+        }
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(true);
+    }
+    Err(store_unavailable())
+}
+
+pub(crate) fn sweep_inactive_claim_mutation_fence_orphans(
+    context: &CliContext,
+) -> Result<(), CliError> {
+    let directory = claim_mutation_fence_directory(context, CLAIM_MUTATION_FENCE_LOCKS_DIR)?;
+    let entries = fs::read_dir(&directory)
+        .map_err(|_| store_unavailable())?
+        .take(MAX_CLAIM_MUTATION_OPERATION_FILES.saturating_add(1))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| store_unavailable())?;
+    if entries.len() > MAX_CLAIM_MUTATION_OPERATION_FILES {
+        return Err(CliError::data(
+            "quota-exceeded",
+            "claim-mutation fence operation file limit exceeded",
+            None,
+        ));
+    }
+    for entry in entries {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(lock_id) = name.strip_suffix(".lock") else {
+            continue;
+        };
+        if claim_mutation_fence_lock_path_from_existing(lock_id).is_err() {
+            continue;
+        }
+        let lock = match open_existing_claim_mutation_fence_lock(context, lock_id) {
+            Ok(lock) => lock,
+            Err(_) if !entry.path().exists() => continue,
+            Err(error) => return Err(error),
+        };
+        // SAFETY: flock is called with a valid, owned file descriptor.
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                continue;
+            }
+            return Err(store_unavailable());
+        }
+        let manifest_path = claim_mutation_fence_manifest_path(context, lock_id)?;
+        let fence = match read_claim_mutation_fence(&manifest_path) {
+            Ok(fence) if fence.lock_id == lock_id => Some(fence),
+            Ok(_) => return Err(store_corrupt()),
+            Err(error) if error.code() == "claim-mutation-fence-conflict" => None,
+            Err(error) => return Err(error),
+        };
+        let has_tuple_sidecar = if let Some(fence) = fence.as_ref() {
+            let paths = [
+                claim_mutation_fence_sidecar_path(
+                    context,
+                    &fence.worker_session_id,
+                    &fence.worker_incarnation,
+                    &fence.worker_claim,
+                )?,
+                claim_mutation_fence_sidecar_path(
+                    context,
+                    &fence.controller_session_id,
+                    &fence.controller_incarnation,
+                    &fence.controller_claim,
+                )?,
+            ];
+            let mut present = false;
+            for path in paths {
+                match read_claim_mutation_fence(&path) {
+                    Ok(sidecar) if claim_mutation_fence_same_operation(&sidecar, fence) => {
+                        present = true;
+                    }
+                    Ok(_) => return Err(store_corrupt()),
+                    Err(error) if error.code() == "claim-mutation-fence-conflict" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            present
+        } else {
+            false
+        };
+        if !has_tuple_sidecar {
+            if fence.is_some() {
+                fs::remove_file(manifest_path).map_err(|_| store_unavailable())?;
+            }
+            fs::remove_file(entry.path()).map_err(|_| store_unavailable())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_inactive_claim_mutation_fence_sidecar(
+    context: &CliContext,
+    path: &Path,
+    fence: &ClaimMutationFence,
+) -> Result<(), CliError> {
+    if claim_mutation_fence_owner_active(context, fence)? {
+        return Err(CliError::unavailable(
+            "claim-mutation-fenced",
+            "the exact claim tuple is fenced by an in-flight claimed runtime stop",
+            None,
+        ));
+    }
+    fs::remove_file(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            store_corrupt()
+        } else {
+            store_unavailable()
+        }
+    })?;
+    let worker_path = claim_mutation_fence_sidecar_path(
+        context,
+        &fence.worker_session_id,
+        &fence.worker_incarnation,
+        &fence.worker_claim,
+    )?;
+    let controller_path = claim_mutation_fence_sidecar_path(
+        context,
+        &fence.controller_session_id,
+        &fence.controller_incarnation,
+        &fence.controller_claim,
+    )?;
+    let other_path = if path == worker_path {
+        controller_path
+    } else if path == controller_path {
+        worker_path
+    } else {
+        return Err(store_corrupt());
+    };
+    match read_claim_mutation_fence(&other_path) {
+        Ok(other) if claim_mutation_fence_same_operation(&other, fence) => return Ok(()),
+        Ok(_) => return Err(store_corrupt()),
+        Err(error) if error.code() == "claim-mutation-fence-conflict" => {}
+        Err(error) => return Err(error),
+    }
+    let manifest_path = claim_mutation_fence_manifest_path(context, &fence.lock_id)?;
+    match fs::remove_file(manifest_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(store_unavailable()),
+    }
+    let lock_path = claim_mutation_fence_lock_path(context, &fence.lock_id)?;
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
+}
+
+pub(crate) fn ensure_claim_mutation_not_fenced(
+    context: &CliContext,
+    session_id: &str,
+    session_incarnation: &str,
+    claim: &context::WorkContextRecord,
+) -> Result<(), CliError> {
+    let claim = ControllerClaimTuple {
+        claim_id: claim.claim_id.clone(),
+        revision: claim.revision,
+        expires_at_epoch: claim.expires_at_epoch,
+    };
+    let path = claim_mutation_fence_sidecar_path(context, session_id, session_incarnation, &claim)?;
+    let fence = match read_claim_mutation_fence(&path) {
+        Ok(fence) => fence,
+        Err(error) if error.code() == "claim-mutation-fence-conflict" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !claim_fence_binds_tuple(&fence, session_id, session_incarnation, &claim) {
+        return Err(store_corrupt());
+    }
+    if claim_mutation_fence_owner_active(context, &fence)? {
+        return Err(CliError::unavailable(
+            "claim-mutation-fenced",
+            "the exact claim tuple is fenced by an in-flight claimed runtime stop",
+            None,
+        ));
+    }
+    remove_inactive_claim_mutation_fence_sidecar(context, &path, &fence)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_claimed_worker_runtime_stop_claim_fence(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker_session_id: &str,
+    worker_incarnation: &str,
+    worker_claim: &ControllerClaimTuple,
+    controller_session_id: &str,
+    controller_incarnation: &str,
+    controller_claim: &ControllerClaimTuple,
+    request_digest: &str,
+    require_mutation_fence: bool,
+) -> Result<bool, CliError> {
+    let locked = lock_registry_observational(context)?;
+    let now = now_epoch();
+    let claims_active = controller_claim_matches_admission(
+        &locked.registry,
+        &(
+            controller_session_id.to_string(),
+            controller_incarnation.to_string(),
+        ),
+        controller_claim,
+        now,
+        true,
+    ) && locked.registry.claims.iter().any(|claim| {
+        claim.session_id == worker_session_id
+            && claim.session_incarnation == worker_incarnation
+            && claim.claim_id == worker_claim.claim_id
+            && claim.revision == worker_claim.revision
+            && claim.expires_at_epoch == worker_claim.expires_at_epoch
+            && claim.expires_at_epoch > now
+            && claim.state == "active"
+    });
+    if require_mutation_fence {
+        if locked.registry.schema_version != CLAIM_FENCE_REGISTRY_VERSION {
+            return Err(CliError::data(
+                "coordination-facade-version-skew",
+                "claimed runtime stop requires the fence-aware coordination registry schema",
+                None,
+            ));
+        }
+        let lock_id =
+            claim_mutation_fence_lock_id(assignment_id, assignment_revision, request_digest);
+        let manifest_path = claim_mutation_fence_manifest_path(context, &lock_id)?;
+        let worker_path = claim_mutation_fence_sidecar_path(
+            context,
+            worker_session_id,
+            worker_incarnation,
+            worker_claim,
+        )?;
+        let controller_path = claim_mutation_fence_sidecar_path(
+            context,
+            controller_session_id,
+            controller_incarnation,
+            controller_claim,
+        )?;
+        let manifest = read_claim_mutation_fence(&manifest_path)?;
+        let worker_fence = read_claim_mutation_fence(&worker_path)?;
+        let controller_fence = read_claim_mutation_fence(&controller_path)?;
+        let expected = ClaimMutationFence {
+            schema_version: CLAIM_MUTATION_FENCE_SCHEMA.to_string(),
+            assignment_id: assignment_id.to_string(),
+            assignment_revision,
+            worker_session_id: worker_session_id.to_string(),
+            worker_incarnation: worker_incarnation.to_string(),
+            worker_claim: worker_claim.clone(),
+            controller_session_id: controller_session_id.to_string(),
+            controller_incarnation: controller_incarnation.to_string(),
+            controller_claim: controller_claim.clone(),
+            request_digest: request_digest.to_string(),
+            lock_id,
+        };
+        if !claim_mutation_fence_same_operation(&manifest, &expected)
+            || !claim_mutation_fence_same_operation(&worker_fence, &expected)
+            || !claim_mutation_fence_same_operation(&controller_fence, &expected)
+        {
+            return Err(CliError::data(
+                "claim-mutation-fence-conflict",
+                "claimed runtime stop has no matching exact claim-mutation fence",
+                None,
+            ));
+        }
+    }
+    Ok(claims_active)
+}
+
+pub(crate) fn clear_claimed_worker_runtime_stop_claim_fence(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    request_digest: &str,
+) -> Result<(), CliError> {
+    let _locked = lock_registry_observational(context)?;
+    let lock_id = claim_mutation_fence_lock_id(assignment_id, assignment_revision, request_digest);
+    let manifest_path = claim_mutation_fence_manifest_path(context, &lock_id)?;
+    let fence = match read_claim_mutation_fence(&manifest_path) {
+        Ok(fence) => fence,
+        Err(error) if error.code() == "claim-mutation-fence-conflict" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if fence.assignment_id != assignment_id
+        || fence.assignment_revision != assignment_revision
+        || fence.request_digest != request_digest
+        || fence.lock_id != lock_id
+    {
+        return Err(store_corrupt());
+    }
+    if claim_mutation_fence_owner_active(context, &fence)? {
+        return Err(CliError::unavailable(
+            "claim-mutation-fenced",
+            "the claimed runtime stop mutation fence is still owned",
+            None,
+        ));
+    }
+    let paths = [
+        claim_mutation_fence_sidecar_path(
+            context,
+            &fence.worker_session_id,
+            &fence.worker_incarnation,
+            &fence.worker_claim,
+        )?,
+        claim_mutation_fence_sidecar_path(
+            context,
+            &fence.controller_session_id,
+            &fence.controller_incarnation,
+            &fence.controller_claim,
+        )?,
+    ];
+    for path in paths {
+        match read_claim_mutation_fence(&path) {
+            Ok(sidecar) if claim_mutation_fence_same_operation(&sidecar, &fence) => {
+                fs::remove_file(path).map_err(|_| store_unavailable())?;
+            }
+            Ok(_) => return Err(store_corrupt()),
+            Err(error) if error.code() == "claim-mutation-fence-conflict" => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::remove_file(manifest_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            store_corrupt()
+        } else {
+            store_unavailable()
+        }
+    })?;
+    let lock_path = claim_mutation_fence_lock_path(context, &fence.lock_id)?;
+    match fs::remove_file(lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(store_unavailable()),
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -844,13 +1761,14 @@ pub(crate) fn ensure_recovery_registry_schema(context: &CliContext) -> Result<()
         .get("schema_version")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if found != REGISTRY_VERSION {
+    if !matches!(found, REGISTRY_VERSION | CLAIM_FENCE_REGISTRY_VERSION) {
         return Err(CliError::data(
             "coordination-facade-version-skew",
             "the durable coordination registry requires a matching agent-session/main-agent facade",
             Some(serde_json::json!({
                 "found_schema_version": found,
-                "supported_schema_version": REGISTRY_VERSION,
+                "supported_schema_version": CLAIM_FENCE_REGISTRY_VERSION,
+                "supported_schema_versions": [REGISTRY_VERSION, CLAIM_FENCE_REGISTRY_VERSION],
                 "required_action": "use the agent-session and main-agent binaries matching this durable registry; do not reinterpret the failure as an authorization problem"
             })),
         ));
@@ -1414,7 +2332,12 @@ fn lock_registry_with_maintenance(
     let mut registry = match read_private_file(&path, MAX_REGISTRY_BYTES) {
         Ok(bytes) => {
             let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| store_corrupt())?;
-            if !registry.schema_version.is_empty() && registry.schema_version != REGISTRY_VERSION {
+            if !registry.schema_version.is_empty()
+                && !matches!(
+                    registry.schema_version.as_str(),
+                    REGISTRY_VERSION | CLAIM_FENCE_REGISTRY_VERSION
+                )
+            {
                 return Err(store_corrupt());
             }
             registry
@@ -1432,28 +2355,48 @@ fn lock_registry_with_maintenance(
         false
     };
     if maintenance == RegistryMaintenance::Full {
-        for claim in &mut registry.claims {
+        let Registry {
+            claims, brokers, ..
+        } = &mut registry;
+        for claim in claims {
             if claim.state != "active" || claim.expires_at_epoch > now.saturating_add(15 * 60) {
                 continue;
             }
-            let Some(broker) = registry.brokers.get(&claim.session_id) else {
+            let Some(broker) = brokers.get(&claim.session_id) else {
                 continue;
             };
-            if broker.incarnation == claim.session_incarnation
-                && broker.state == "ready"
-                && broker::capability_available(
-                    context,
-                    &claim.session_id,
-                    &claim.session_incarnation,
-                    &broker.capability_digest,
-                )
-                && broker::heartbeat_fresh(
-                    context,
-                    &claim.session_id,
-                    &claim.session_incarnation,
-                    broker.heartbeat_epoch,
-                )
+            if broker.incarnation != claim.session_incarnation || broker.state != "ready" {
+                continue;
+            }
+            if ensure_claim_mutation_not_fenced(
+                context,
+                &claim.session_id,
+                &claim.session_incarnation,
+                claim,
+            )
+            .is_err()
             {
+                continue;
+            }
+            let Ok(record) = load_session_record(context, &claim.session_id) else {
+                continue;
+            };
+            if crate::orchestration::ensure_session_not_runtime_stop_fenced(context, &record)
+                .is_err()
+            {
+                continue;
+            }
+            if broker::capability_available(
+                context,
+                &claim.session_id,
+                &claim.session_incarnation,
+                &broker.capability_digest,
+            ) && broker::heartbeat_fresh(
+                context,
+                &claim.session_id,
+                &claim.session_incarnation,
+                broker.heartbeat_epoch,
+            ) {
                 claim.expires_at_epoch = now.saturating_add(30 * 60);
                 claim.expires_at = timestamp(claim.expires_at_epoch);
                 renewed = true;
@@ -2197,6 +3140,41 @@ pub(crate) fn read_bounded_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_version_skew_preserves_singular_and_adds_supported_versions() {
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let state_dir = temporary.path().join("state");
+        let coordination = state_dir.join("coordination");
+        fs::create_dir_all(&coordination).expect("coordination directory");
+        write_atomic(
+            &coordination.join(REGISTRY_FILE),
+            br#"{"schema_version":"agent-session.coordination-registry.v999"}"#,
+            SECRET_FILE_MODE,
+        )
+        .expect("unsupported registry");
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let error =
+            ensure_recovery_registry_schema(&context).expect_err("unsupported registry must fail");
+        assert_eq!(error.code(), "coordination-facade-version-skew");
+        let details = error.0.details.as_ref().expect("version-skew details");
+        assert_eq!(
+            details["supported_schema_version"],
+            CLAIM_FENCE_REGISTRY_VERSION
+        );
+        assert_eq!(
+            details["supported_schema_versions"],
+            json!([REGISTRY_VERSION, CLAIM_FENCE_REGISTRY_VERSION])
+        );
+        assert_eq!(
+            details["found_schema_version"],
+            "agent-session.coordination-registry.v999"
+        );
+        assert!(details["required_action"].is_string());
+    }
     use serde_json::json;
 
     #[test]

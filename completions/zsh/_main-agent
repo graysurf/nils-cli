@@ -416,10 +416,53 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':assignment_id:_default' \
 && ret=0
 ;;
+(stop-runtime)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(stop-claimed-runtime)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
 (reconcile-stopped)
 _arguments "${_arguments_options[@]}" : \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
 '--reason=[Bounded durable reason for terminalizing this stopped post-claim assignment]:REASON:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(revoke-claim)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--reason=[Bounded durable reason for fencing this idle worker'\''s authority]:REASON:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -713,7 +756,10 @@ _main-agent__subcmd__worker_commands() {
 'supervise:Repeatable bounded supervision macro with a typed classification and deterministic next action' \
 'submit-recovery:Send at most one guarded recovery Enter from a proven startup state' \
 'reconcile-recovery:Terminalize an unknown recovery without sending input after the exact worker runtime is stopped and coordination state is quiescent' \
+'stop-runtime:Stop the exact live runtime after bounded worker-start readiness is durably exhausted, preserving the assignment, session, and worktree' \
+'stop-claimed-runtime:Stop an authoritative-idle working worker'\''s exact live runtime with an active assignment-derived claim, preserving the claim for reconcile-stopped' \
 'reconcile-stopped:Terminalize a working assignment whose exact worker runtime is durably stopped, revoking only that worker'\''s claim without sending input, deleting the run, or touching its managed worktree' \
+'revoke-claim:Revoke only the exact authoritative-idle worker claim when that worker cannot finish its own release, preserving its session and worktree' \
 'cancel:Terminalize only a proven failed pre-claim assignment' \
 'reassign:Cancel and retire a safely reassignable worker, then start one distinct clean replacement assignment without reusing its prompt or worktree' \
     )
@@ -799,6 +845,11 @@ _main-agent__subcmd__worker__subcmd__retire_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker retire commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__worker__subcmd__revoke-claim_commands] )) ||
+_main-agent__subcmd__worker__subcmd__revoke-claim_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker revoke-claim commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__worker__subcmd__show_commands] )) ||
 _main-agent__subcmd__worker__subcmd__show_commands() {
     local commands; commands=()
@@ -808,6 +859,16 @@ _main-agent__subcmd__worker__subcmd__show_commands() {
 _main-agent__subcmd__worker__subcmd__start_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker start commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__stop-claimed-runtime_commands] )) ||
+_main-agent__subcmd__worker__subcmd__stop-claimed-runtime_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker stop-claimed-runtime commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__stop-runtime_commands] )) ||
+_main-agent__subcmd__worker__subcmd__stop-runtime_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker stop-runtime commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__submit-recovery_commands] )) ||
 _main-agent__subcmd__worker__subcmd__submit-recovery_commands() {

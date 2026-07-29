@@ -107,6 +107,7 @@ main-agent worker request-changes ASSIGNMENT_ID --if-revision N --reason TEXT --
 main-agent worker submit-recovery ASSIGNMENT_ID --if-revision N --timeout D --idempotency-key KEY --format json
 main-agent worker reconcile-recovery ASSIGNMENT_ID --if-revision N --idempotency-key KEY --format json
 main-agent worker stop-runtime ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --idempotency-key KEY --format json
+main-agent worker stop-claimed-runtime ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --idempotency-key KEY --format json
 main-agent worker reconcile-stopped ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker revoke-claim ASSIGNMENT_ID --worker-incarnation INCARNATION --if-revision N --reason TEXT --idempotency-key KEY --format json
 main-agent worker cancel ASSIGNMENT_ID --if-revision N --reason TEXT --idempotency-key KEY --format json
@@ -315,6 +316,16 @@ The closed v3 classification and recovery-action unions remain unchanged.
 `claim_revocation.in_flight` projection and does not reuse the v3-only
 `runtime_stop` projection. Existing v2 and v3 classifications retain their
 exact schema identifiers and top-level projections.
+
+`claimed_runtime_stop_in_progress` uses
+`main-agent.worker-diagnose-result.v5`,
+`main-agent.worker-supervise-result.v5`, and
+`main-agent.worker-recovery-action.v5`. Its diagnosis carries only the
+additive `claimed_runtime_stop.in_flight` projection. Its recovery action kind
+is `exact_claimed_runtime_stop_replay` and contains the original assignment
+revision, exact worker incarnation, and privately retained idempotency key.
+Existing v2, v3, and v4 classifications retain their exact schema identifiers
+and projections.
 
 `worker stop-runtime` MUST authenticate the exact current Main controller and
 its active, unexpired claim; revalidate run ownership, assignment revision,
@@ -543,6 +554,93 @@ when both calls initially observed no receipt.
 
 ### Post-claim stopped-worker terminalization
 
+`worker stop-claimed-runtime` creates the exact live-claim stopped-worker state
+without sending provider input. It is distinct from the pre-claim
+`worker stop-runtime` transition and does not terminalize the assignment or
+release worker authority. The caller MUST be the authenticated current Main
+controller and primary manager with an exact active, unexpired controller
+claim. The assignment MUST be `working` at `--if-revision`; its worker MUST
+match `--worker-incarnation`, have a verified live runtime and authoritative
+idle activity boundary, retain the exact assignment-derived active unexpired
+claim, retain the authoritative broker and work context, and have no active,
+completing, reconcile-pending, or otherwise uncertain operation.
+
+Admission holds the worker lifecycle and activity locks, then an observational
+coordination guard while it binds the exact controller claim, worker claim,
+activity revision, runtime-identity digest, broker, work context, and operation
+quiescence. While that guard is held, the command persists a session-owned
+`agent-session.claimed-runtime-stop-identity.v1` sidecar, the existing
+runtime-stop fence, and then the strict
+`main-agent.worker-stop-claimed-runtime-progress.v1` idempotency receipt. The
+identity binds assignment, revision, exact worker and controller, request
+digest, and the original idempotency key, so even an identity-first
+interruption can project the exact replay without scanning global receipts.
+The existing fence and registry-v3 shapes remain unchanged. Together the
+identity and fence deny competing assignment mutation plus CLI, HTTP,
+maintenance, broker, claim, bootstrap, checkpoint, and operation authority;
+in particular, the held launch wrapper's clean `broker stop` cannot release
+the worker claim after runtime termination. The command releases the
+orchestration registry, then reacquires an observational coordination guard
+that binds the exact controller and worker claim tuples and persists a narrow
+mutation fence for those tuples. It releases the global registry lock before
+stopping the exact tmux/cgroup/process-session/process-group boundary.
+
+The independently versioned sidecars and process-owned mutation-fence lock
+MUST make changes to those exact claim tuples fail closed for the full
+termination interval while unrelated coordination remains available.
+Fence activation first makes a one-way, wire-compatible coordination registry
+marker transition from v1 to fence-aware v2, before publishing any manifest or
+tuple sidecar. Older writers therefore fail closed at every partial activation
+boundary rather than bypassing sidecars they do not understand. Current readers
+accept both markers, and exact replay reconstructs partial v2 activation before
+termination. An interrupted owner releases the OS lock so a later exact replay
+can recover without a wall-clock safety lease. Session-owned
+runtime-stop fencing independently denies every worker claim-changing ingress
+until guarded retirement, including raw claim replacement and advisory
+set/clear. A post-stop observational
+transaction MUST prove the same worker claim ID, revision, expiry, session, and
+incarnation plus the original Main controller claim remain exact, active, and
+unexpired. The worker claim expiry MUST exceed the bounded termination window. The first TTL-window
+check occurs while the initial coordination guard is held and before any
+identity, fence, or progress receipt is persisted; a second check immediately
+before termination catches elapsed-time drift after reservation. If persisted
+runtime evidence already proves this operation stopped the exact runtime,
+replay may finalize under the authenticated current controller without
+repeating termination. Finalization stores
+`main-agent.worker-stop-claimed-runtime-result.v1` without advancing the
+assignment revision, clears the exact claim-mutation fence, then advances the
+session fence to `stopped`. If the
+process fails between those writes, exact completed replay MUST finish the
+fence transition. The result reports `runtime_stopped:true`,
+`worker_claim_active_after:true`, `input_sent:false`, and preserves the
+session and worktree. The identity and fence remain until guarded retirement.
+Competing assignment mutations fail closed from the identity write until the
+fence reaches `stopped`. An interrupted attempt is classified as
+`claimed_runtime_stop_in_progress` and only the exact v5 replay argv may resume
+it; an exact completed replay returns the stored result without another stop.
+If the process was durably stopped but an interruption outlives the worker
+claim TTL, exact replay MUST retire the bounded claim-mutation fence and commit
+the same result schema with `worker_claim_active_after:false` plus
+`proof.interrupted_after_stop_claim_degraded:true`. That truthful degraded
+result is not B2 field-closure evidence, but it restores the typed
+`reconcile-stopped` path without leaving controller or assignment authority
+permanently fenced.
+
+If the Main controller dies after the claimed stop reaches `stopped`,
+authenticated orphan `adopt` MUST rebind both persistent stop identities to
+the successor and adopted assignment revision before the registry ownership
+transition. Both identities retain the original stop revision and controller
+as immutable lineage. A crash after the sidecar rebind but before the registry
+save leaves the old assignment owner in the registry; exact adoption replay
+MUST recognize the partially advanced sidecars and converge without weakening
+the runtime quarantine. If that pending successor also dies, a later
+authenticated successor MAY chain the rebind only when the sidecar remains at
+the pending adopted revision, its immutable origin exactly matches the
+registry source, and the intermediate controller is proven non-live.
+`reconcile-stopped` then advances from the adopted
+revision, and terminal worker deletion MUST accept that rebound lineage rather
+than requiring the dead controller's original revision.
+
 `worker reconcile-stopped` terminalizes a `working` assignment whose exact
 worker runtime is durably stopped. `worker cancel` deliberately refuses that
 state: bootstrap already recorded the `working` checkpoint, so the failure is
@@ -707,6 +805,10 @@ independent of worktree cleanliness. This classification MUST NOT be reported as
 a `working` assignment, so routing it there would publish an unexecutable
 instruction. An unknown or live runtime keeps its ordinary live-worker
 classification rather than becoming terminalizable.
+If persisted process evidence is stopped while the tmux wrapper still appears
+live, the sources conflict and supervision MUST return
+`evidence_unavailable`; a visible wrapper MUST NOT overrule exact stopped
+process evidence into `healthy_progress`.
 
 Worktree staleness uses a durable, privacy-safe material fingerprint scoped to
 the assignment and exact worker incarnation. The bounded input combines
@@ -861,6 +963,16 @@ Composite commands derive bounded, digest-backed child idempotency keys.
 `worker retire` stores top-level progress before release, after release, and
 after delete, so retrying the original key and revision resumes an accepted
 assignment whose release already committed.
+
+The delete stage persists a private
+`main-agent.worker-delete-identity.v1` reservation while holding the
+orchestration registry lock. It binds the assignment revision, exact worker,
+primary controller, request digest, and idempotency key before session
+deletion begins. While present it rejects handoff, adoption, and every
+competing assignment mutation. Only the exact delete replay can finish or
+clear it, and deletion of a runtime-stop-fenced terminal worker additionally
+requires that matching reservation. This prevents a stale assignment clone
+from authorizing session deletion after ownership transfer.
 
 Collaborators and bounded borrowers are visible routing metadata, not write
 authority. Borrow expiry does not change primary ownership. Handoff requires a

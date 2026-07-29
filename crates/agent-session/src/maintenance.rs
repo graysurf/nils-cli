@@ -173,16 +173,34 @@ fn preview_inner(
     let _record_lock = acquire_maintenance_lock(context, &canonical_id, operation)?;
     let record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
-    preview_locked(&record, tmux_bin, operation).map(|prepared| prepared.view)
+    preview_locked(context, &record, tmux_bin, operation).map(|prepared| prepared.view)
 }
 
 fn preview_locked(
+    context: &CliContext,
     record: &SessionRecord,
     tmux_bin: &Path,
     operation: MaintenanceOperation,
 ) -> Result<PreparedPreview, CliError> {
-    let assessment = assess(record, tmux_bin, operation)?;
-    let actions = actions_for(operation, assessment.state == "repairable");
+    let runtime_stop_fenced = operation == MaintenanceOperation::Delete
+        && crate::orchestration::session_runtime_stop_fenced(context, record)?;
+    let assessment = if runtime_stop_fenced {
+        blocked_assessment(
+            "runtime_stop_fenced",
+            "assignment-bound worker delete is required for this runtime-stopped session",
+            "stopped",
+            "none",
+            0,
+            Vec::new(),
+        )
+    } else {
+        assess(record, tmux_bin, operation)?
+    };
+    let actions = if runtime_stop_fenced {
+        Vec::new()
+    } else {
+        actions_for(operation, assessment.state == "repairable")
+    };
     let session_incarnation = record
         .runtime
         .as_ref()
@@ -565,7 +583,7 @@ fn execute_inner(
     let _record_lock = acquire_maintenance_lock(context, &canonical_id, requested_operation)?;
     let mut record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
-    let prepared = preview_locked(&record, tmux_bin, request.operation)?;
+    let prepared = preview_locked(context, &record, tmux_bin, request.operation)?;
     let prepared_runtime_status = prepared.assessment.runtime_status;
     let preview = &prepared.view;
     if preview.session_incarnation != request.expected_session_incarnation
@@ -581,6 +599,15 @@ fn execute_inner(
     ) {
         crate::orchestration::ensure_session_not_quarantined(context, &record)?;
         resume_guard(&record)?;
+    }
+
+    if matches!(
+        request.action,
+        MaintenanceActionId::RetryDelete | MaintenanceActionId::TerminateRuntimeThenDelete
+    ) {
+        crate::orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
+            context, &record, None,
+        )?;
     }
 
     if matches!(

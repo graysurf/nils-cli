@@ -6121,9 +6121,9 @@ fn session_view_from_parts(
     schedule_shadow_sampling: bool,
 ) -> SessionView {
     let resume_blocked_reason =
-        match orchestration::session_authority_is_quarantined(context, record) {
-            Ok(true) => Some("worker-quarantined".to_string()),
-            Ok(false) => None,
+        match orchestration::session_authority_blocked_reason(context, record) {
+            Ok(Some(reason)) => Some(reason.to_string()),
+            Ok(None) => None,
             Err(_) => Some("worker-quarantine-unavailable".to_string()),
         };
     let resumable = is_resumable(record) && resume_blocked_reason.is_none();
@@ -6543,21 +6543,50 @@ fn delete_session(
     id: &str,
     tmux_bin: PathBuf,
 ) -> Result<DeleteResult, CliError> {
-    delete_session_with_timeouts(
+    delete_session_for_terminal_assignment(context, id, tmux_bin, None)
+}
+
+fn delete_session_for_terminal_assignment(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    terminal_assignment: Option<&orchestration::AssignmentRecord>,
+) -> Result<DeleteResult, CliError> {
+    delete_session_with_timeouts_for_terminal_assignment(
         context,
         id,
         tmux_bin,
         PANE_INPUT_COMMAND_TIMEOUT,
         DELETE_TERMINATION_VERIFY_TIMEOUT,
+        terminal_assignment,
     )
 }
 
+#[cfg(test)]
 fn delete_session_with_timeouts(
     context: &CliContext,
     id: &str,
     tmux_bin: PathBuf,
     kill_timeout: Duration,
     verify_timeout: Duration,
+) -> Result<DeleteResult, CliError> {
+    delete_session_with_timeouts_for_terminal_assignment(
+        context,
+        id,
+        tmux_bin,
+        kill_timeout,
+        verify_timeout,
+        None,
+    )
+}
+
+fn delete_session_with_timeouts_for_terminal_assignment(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    kill_timeout: Duration,
+    verify_timeout: Duration,
+    terminal_assignment: Option<&orchestration::AssignmentRecord>,
 ) -> Result<DeleteResult, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
@@ -6566,6 +6595,11 @@ fn delete_session_with_timeouts(
     let record = read_session_record(&resolved.record_path)?;
     ensure_same_session_identity(&observed, &record)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+    orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
+        context,
+        &record,
+        terminal_assignment,
+    )?;
     delete_session_locked_with_timeouts(
         context,
         record,
@@ -11121,6 +11155,64 @@ exit 97
     }
 
     #[test]
+    fn claimed_runtime_stop_identity_alone_blocks_session_resumability_projection() {
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(temporary.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("identity-fenced-worker"),
+        );
+        let record = load_session_record(&context, &id).expect("worker record");
+        let worker = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: record.id.clone(),
+            session_incarnation: record
+                .runtime
+                .as_ref()
+                .expect("worker runtime")
+                .launch_id
+                .clone(),
+            session_created_at: record.created_at.clone(),
+        };
+        let controller = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: "main-one".to_string(),
+            session_incarnation: "main-incarnation-one".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        crate::orchestration::persist_session_claimed_runtime_stop_identity(
+            &context,
+            "assignment-identity-only",
+            3,
+            &worker,
+            &controller,
+            &"a".repeat(64),
+            "identity-only-stop-0001",
+        )
+        .expect("claimed-stop identity");
+        assert!(
+            !session_dir(&context, &id)
+                .join("runtime-stop-fence.json")
+                .exists()
+        );
+
+        let false_bin = super::binary_on_path("false").expect("false executable");
+        let view = session_view(
+            &context,
+            &record,
+            Some("stopped".to_string()),
+            Some(&false_bin),
+        );
+        assert!(!view.resumable);
+        assert_eq!(
+            view.resume_blocked_reason.as_deref(),
+            Some("worker-runtime-stop-fenced")
+        );
+    }
+
+    #[test]
     fn maintenance_resume_actions_reject_a_session_owned_worker_quarantine() {
         let tmp = tempfile::TempDir::new().unwrap();
         let context = test_context(tmp.path());
@@ -11212,6 +11304,79 @@ exit 97
             runtime_before,
             "maintenance must not launch a new runtime generation"
         );
+    }
+
+    #[test]
+    fn maintenance_delete_preview_tracks_runtime_stop_fence_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("maintenance-runtime-stop-fenced-worker"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let false_bin = super::binary_on_path("false").expect("false executable");
+        let before = crate::maintenance::preview(
+            &context,
+            &id,
+            &false_bin,
+            crate::maintenance::MaintenanceOperation::Delete,
+        )
+        .unwrap();
+        let worker = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: record.id.clone(),
+            session_incarnation: record.runtime.as_ref().expect("runtime").launch_id.clone(),
+            session_created_at: record.created_at.clone(),
+        };
+        let controller = crate::orchestration::SessionRef {
+            machine: None,
+            session_id: "maintenance-main".to_string(),
+            session_incarnation: "maintenance-main-incarnation".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        crate::orchestration::persist_session_runtime_stop_fence(
+            &context,
+            "assignment-maintenance-delete-fence",
+            3,
+            &worker,
+            &controller,
+            &"a".repeat(64),
+        )
+        .unwrap();
+
+        let fenced = crate::maintenance::preview(
+            &context,
+            &id,
+            &false_bin,
+            crate::maintenance::MaintenanceOperation::Delete,
+        )
+        .unwrap();
+        let fenced_json = serde_json::to_value(&fenced).unwrap();
+        assert_eq!(fenced_json["state"], "blocked");
+        assert_eq!(fenced_json["issue"]["kind"], "runtime_stop_fenced");
+        assert_eq!(fenced_json["actions"], serde_json::json!([]));
+        assert_ne!(fenced.preview_digest, before.preview_digest);
+
+        let error = crate::maintenance::execute_with_resume_guard(
+            &context,
+            &id,
+            &false_bin,
+            crate::maintenance::MaintenanceActionRequest {
+                operation: crate::maintenance::MaintenanceOperation::Delete,
+                action: crate::maintenance::MaintenanceActionId::RetryDelete,
+                expected_session_incarnation: before.session_incarnation,
+                expected_session_generation: before.session_generation,
+                expected_preview_digest: before.preview_digest,
+                confirmed: true,
+            },
+            |_| Ok(()),
+        )
+        .expect_err("a pre-fence delete preview must become stale");
+        assert_eq!(error.code(), "maintenance-preview-stale");
+        assert!(session_dir(&context, &id).exists());
     }
 
     #[test]

@@ -40,8 +40,9 @@ use crate::orchestration::{
 };
 use crate::{
     CliContext, CliError, PromptDelivery, SessionRecord, SessionRegistryFence,
-    StartFailureDisposition, acquire_session_record_lock, delete_session, load_session_record,
-    resolve_tmux_bin, run_output_with_timeout_and_cap, runtime_is_proven_never_launched,
+    StartFailureDisposition, acquire_session_record_lock, delete_session,
+    delete_session_for_terminal_assignment, load_session_record, resolve_tmux_bin,
+    run_output_with_timeout_and_cap, runtime_is_proven_never_launched,
     send_submit_recovery_input_serialized, session_dir, session_status,
 };
 
@@ -294,6 +295,11 @@ enum WorkerCommand {
     /// durably exhausted, preserving the assignment, session, and worktree.
     #[command(name = "stop-runtime")]
     StopRuntime(WorkerStopRuntimeArgs),
+    /// Stop an authoritative-idle working worker's exact live runtime with an
+    /// active assignment-derived claim, preserving the claim for
+    /// reconcile-stopped.
+    #[command(name = "stop-claimed-runtime")]
+    StopClaimedRuntime(WorkerStopClaimedRuntimeArgs),
     /// Terminalize a working assignment whose exact worker runtime is durably
     /// stopped, revoking only that worker's claim without sending input,
     /// deleting the run, or touching its managed worktree.
@@ -394,6 +400,20 @@ struct WorkerReconcileStoppedArgs {
 
 #[derive(Clone, Debug, Args)]
 struct WorkerStopRuntimeArgs {
+    assignment_id: String,
+    /// Exact worker incarnation currently bound to the assignment.
+    #[arg(long)]
+    worker_incarnation: String,
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
+    if_revision: u64,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerStopClaimedRuntimeArgs {
     assignment_id: String,
     /// Exact worker incarnation currently bound to the assignment.
     #[arg(long)]
@@ -2384,6 +2404,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
         WorkerCommand::SubmitRecovery(args) => run_worker_submit_recovery(context, args),
         WorkerCommand::ReconcileRecovery(args) => run_worker_reconcile_recovery(context, args),
         WorkerCommand::StopRuntime(args) => run_worker_stop_runtime(context, args),
+        WorkerCommand::StopClaimedRuntime(args) => run_worker_stop_claimed_runtime(context, args),
         WorkerCommand::ReconcileStopped(args) => run_worker_reconcile_stopped(context, args),
         WorkerCommand::RevokeClaim(args) => run_worker_revoke_claim(context, args),
         WorkerCommand::Cancel(args) => run_worker_cancel(context, args),
@@ -6161,6 +6182,7 @@ fn run_worker_diagnose(context: &CliContext, args: WorkerDiagnoseArgs) -> Result
 fn run_worker_supervise(context: &CliContext, args: WorkerDiagnoseArgs) -> Result<Value, CliError> {
     let diagnosis = diagnose_worker(context, &args.assignment_id)?;
     let schema_version = match diagnosis["schema_version"].as_str() {
+        Some("main-agent.worker-diagnose-result.v5") => "main-agent.worker-supervise-result.v5",
         Some("main-agent.worker-diagnose-result.v4") => "main-agent.worker-supervise-result.v4",
         Some("main-agent.worker-diagnose-result.v3") => "main-agent.worker-supervise-result.v3",
         _ => "main-agent.worker-supervise-result.v2",
@@ -6502,7 +6524,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     );
     let worker_unreachable =
         assignment.worker.is_some() && matches!(&session_evidence, DiagnosticEvidence::Absent(_));
-    let evidence_unavailable = packet_evidence.is_unavailable_or_mismatched()
+    let mut evidence_unavailable = packet_evidence.is_unavailable_or_mismatched()
         || session_evidence.is_unavailable_or_mismatched()
         || activity_evidence.is_unavailable_or_mismatched()
         || coordination_evidence.is_unavailable_or_mismatched()
@@ -6536,6 +6558,12 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Stopped);
     let durable_runtime_running =
         durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Running);
+    // A visible tmux wrapper cannot overrule exact stopped process evidence.
+    // Treat the contradiction as fail-closed evidence rather than allowing
+    // live-worker classifications such as `healthy_progress`.
+    if durable_runtime_stopped && worker_status == "running" {
+        evidence_unavailable = true;
+    }
     // The B2 fact: bootstrap already recorded the `working` checkpoint, so the
     // worker held its assignment-derived claim before its exact runtime died.
     // `worker_failed_preclaim` deliberately refuses this state, and the claim
@@ -6548,6 +6576,14 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         && !terminal_recovery_reconciled;
     let account_handoff_in_flight = assignment.account_handoff.is_some();
     let runtime_stop_in_flight = assignment.runtime_stop.is_some();
+    let claimed_runtime_stop_fence_in_progress =
+        orchestration::assignment_runtime_stop_fence_in_progress(context, &assignment)?;
+    let claimed_runtime_stop_replay = if claimed_runtime_stop_fence_in_progress {
+        claimed_runtime_stop_replay_for_assignment(context, &assignment)?
+    } else {
+        None
+    };
+    let claimed_runtime_stop_in_flight = claimed_runtime_stop_replay.is_some();
     let claim_revocation_in_flight = assignment.claim_revocation.is_some();
     let readiness_stop_required = assignment.state == "starting"
         && assignment.worker.as_ref().is_some_and(|worker| {
@@ -6637,6 +6673,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         active_or_uncertain_operation: active_operations > 0 || uncertain_operations > 0,
         post_claim_runtime_gone,
         runtime_stop_in_flight,
+        claimed_runtime_stop_in_flight,
         claim_revocation_in_flight,
         account_handoff_in_flight,
         readiness_stop_required,
@@ -6665,8 +6702,13 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         reassignment_safe: new_assignment_safe,
     };
     let (classification, next_action, automatic_retry_safe) = classify_worker_diagnosis(facts);
-    let recovery_action =
-        worker_recovery_action(classification, &assignment, claim_id, claim_revision);
+    let recovery_action = worker_recovery_action(
+        classification,
+        &assignment,
+        claim_id,
+        claim_revision,
+        claimed_runtime_stop_replay.as_ref(),
+    );
 
     let activity_view = activity.map(|state| {
         json!({
@@ -6677,7 +6719,9 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
             "attention_kind": attention_kind
         })
     });
-    let diagnosis_schema = if matches!(
+    let diagnosis_schema = if classification == "claimed_runtime_stop_in_progress" {
+        "main-agent.worker-diagnose-result.v5"
+    } else if matches!(
         classification,
         "idle_claim_revocation_required" | "idle_claim_revocation_in_progress"
     ) {
@@ -6781,7 +6825,11 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
             }
         }
     });
-    if diagnosis_schema == "main-agent.worker-diagnose-result.v3" {
+    if diagnosis_schema == "main-agent.worker-diagnose-result.v5" {
+        diagnosis["claimed_runtime_stop"] = json!({
+            "in_flight": claimed_runtime_stop_in_flight
+        });
+    } else if diagnosis_schema == "main-agent.worker-diagnose-result.v3" {
         diagnosis["runtime_stop"] = json!({
             "in_flight": runtime_stop_in_flight
         });
@@ -6798,6 +6846,7 @@ fn worker_recovery_action(
     assignment: &AssignmentRecord,
     claim_id: Option<&str>,
     claim_revision: Option<u64>,
+    claimed_runtime_stop_replay: Option<&ClaimedRuntimeStopReplay>,
 ) -> Value {
     let main_owner = json!({
         "role": "main",
@@ -6880,6 +6929,26 @@ fn worker_recovery_action(
                 reservation.reserved_revision.to_string(),
                 "--idempotency-key",
                 reservation.idempotency_key,
+                "--format",
+                "json"
+            ]);
+        }
+        "claimed_runtime_stop_in_progress" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v5");
+            action["kind"] = json!("exact_claimed_runtime_stop_replay");
+            let replay = claimed_runtime_stop_replay
+                .expect("claimed runtime stop in-progress classification requires a receipt");
+            action["argv"] = json!([
+                "main-agent",
+                "worker",
+                "stop-claimed-runtime",
+                assignment.assignment_id,
+                "--worker-incarnation",
+                replay.worker.session_incarnation,
+                "--if-revision",
+                replay.assignment_revision.to_string(),
+                "--idempotency-key",
+                replay.idempotency_key,
                 "--format",
                 "json"
             ]);
@@ -7162,6 +7231,9 @@ struct WorkerDiagnosisFacts {
     /// The exact assignment is already fenced by an admitted runtime stop.
     /// Competing mutations must wait for completion or exact replay.
     runtime_stop_in_flight: bool,
+    /// A post-claim stop-only reservation owns the exact worker until its
+    /// stopped-runtime and still-active claim result commits.
+    claimed_runtime_stop_in_flight: bool,
     /// An exact worker claim revocation owns the assignment until its durable
     /// receipt is replayed and finalization clears the reservation.
     claim_revocation_in_flight: bool,
@@ -7203,7 +7275,13 @@ struct WorkerDiagnosisFacts {
 }
 
 fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'static str, bool) {
-    if facts.claim_revocation_in_flight {
+    if facts.claimed_runtime_stop_in_flight {
+        (
+            "claimed_runtime_stop_in_progress",
+            "preserve the exact worker and replay only the projected revision- and incarnation-fenced `main-agent worker stop-claimed-runtime` request with its original idempotency key",
+            false,
+        )
+    } else if facts.claim_revocation_in_flight {
         (
             "idle_claim_revocation_in_progress",
             "preserve the exact worker and replay only the projected revision- and incarnation-fenced `main-agent worker revoke-claim` request with its original idempotency key",
@@ -9480,6 +9558,7 @@ fn assignment_worker_work_context(
     context: &CliContext,
     registry: &orchestration::Registry,
     assignment: &AssignmentRecord,
+    missing_repository_message: &'static str,
 ) -> Result<WorkContextInput, CliError> {
     let packet_value = orchestration::read_packet(context, &assignment.private_packet_digest)?;
     let packet: AssignmentInput = serde_json::from_value(packet_value)
@@ -9490,17 +9569,14 @@ fn assignment_worker_work_context(
         .get(&assignment.run_id)
         .map(|run| run.tier.clone())
         .ok_or_else(|| not_found("run-not-found", "orchestration run was not found"))?;
-    assignment_worker_work_context_from_packet(
-        &packet,
-        tier,
-        "worker claim revocation requires the packet repository",
-    )
+    assignment_worker_work_context_from_packet(&packet, tier, missing_repository_message)
 }
 
-fn current_revoke_claim_live_evidence(
+fn current_authoritative_idle_live_evidence(
     context: &CliContext,
     worker_record: &SessionRecord,
     assignment: &AssignmentRecord,
+    operation: &str,
 ) -> Result<(u64, String), CliError> {
     let activity = crate::activity::activity_status_for_record(context, worker_record)?.turn_state;
     let authoritative_idle = activity.phase == crate::activity::TurnPhase::Waiting
@@ -9510,7 +9586,7 @@ fn current_revoke_claim_live_evidence(
     if !authoritative_idle {
         return Err(CliError::data(
             "worker-turn-not-idle",
-            "worker revoke-claim requires an authoritatively completed provider turn",
+            format!("{operation} requires an authoritatively completed provider turn"),
             Some(json!({
                 "assignment_id": assignment.assignment_id,
                 "activity_revision": activity.revision
@@ -9520,7 +9596,7 @@ fn current_revoke_claim_live_evidence(
     let worker = assignment.worker.as_ref().ok_or_else(|| {
         CliError::data(
             "worker-incarnation-changed",
-            "assignment has no bound worker claim to revoke",
+            "assignment has no bound worker runtime",
             None,
         )
     })?;
@@ -9531,7 +9607,9 @@ fn current_revoke_claim_live_evidence(
         }
         crate::CoordinationRuntimeStatus::Stopped => Err(CliError::data(
             "worker-runtime-stopped",
-            "worker revoke-claim requires the exact worker runtime to still be running; use worker reconcile-stopped for a durably stopped post-claim worker",
+            format!(
+                "{operation} requires the exact worker runtime to still be running; use worker reconcile-stopped for a durably stopped post-claim worker"
+            ),
             Some(json!({
                 "assignment_id": assignment.assignment_id,
                 "worker_incarnation": worker.session_incarnation
@@ -9539,7 +9617,7 @@ fn current_revoke_claim_live_evidence(
         )),
         crate::CoordinationRuntimeStatus::Unknown => Err(CliError::runtime(
             "coordination-runtime-unverified",
-            "worker revoke-claim cannot prove the exact worker runtime is still running",
+            format!("{operation} cannot prove the exact worker runtime is still running"),
             Some(json!({
                 "assignment_id": assignment.assignment_id,
                 "worker_incarnation": worker.session_incarnation
@@ -9754,8 +9832,12 @@ fn run_worker_revoke_claim(
                 reason: args.reason.clone(),
             }
         };
-        let expected_work_context =
-            assignment_worker_work_context(context, &registry, &assignment)?;
+        let expected_work_context = assignment_worker_work_context(
+            context,
+            &registry,
+            &assignment,
+            "worker claim revocation requires the packet repository",
+        )?;
         (assignment, expected_work_context, progress)
     };
 
@@ -9837,7 +9919,12 @@ fn run_worker_revoke_claim(
     let progress = if is_resumed {
         if !quarantine_matches {
             let (activity_revision, runtime_identity_digest) =
-                current_revoke_claim_live_evidence(context, &worker_record, &assignment)?;
+                current_authoritative_idle_live_evidence(
+                    context,
+                    &worker_record,
+                    &assignment,
+                    "worker revoke-claim",
+                )?;
             if activity_revision != progress.activity_revision
                 || runtime_identity_digest != progress.runtime_identity_digest
             {
@@ -9854,7 +9941,12 @@ fn run_worker_revoke_claim(
         progress
     } else {
         let (activity_revision, runtime_identity_digest) =
-            current_revoke_claim_live_evidence(context, &worker_record, &assignment)?;
+            current_authoritative_idle_live_evidence(
+                context,
+                &worker_record,
+                &assignment,
+                "worker revoke-claim",
+            )?;
         RevokeClaimProgressReceipt {
             activity_revision,
             runtime_identity_digest,
@@ -10148,6 +10240,812 @@ fn run_worker_revoke_claim(
     drop(locked);
     drop(worker_lifecycle);
     Ok(outcome)
+}
+
+const STOP_CLAIMED_RUNTIME_RESULT_SCHEMA: &str = "main-agent.worker-stop-claimed-runtime-result.v1";
+const STOP_CLAIMED_RUNTIME_PROGRESS_SCHEMA: &str =
+    "main-agent.worker-stop-claimed-runtime-progress.v1";
+
+fn pause_stop_claimed_runtime_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE").as_deref()
+        == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR")
+                .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker claimed runtime stop test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(
+            directory.join("ready"),
+            format!("{stage}:{}", std::process::id()),
+        )
+        .map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker claimed runtime stop test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "worker claimed runtime stop test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StopClaimedRuntimeProgressReceipt {
+    schema_version: String,
+    state: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    worker: SessionRef,
+    activity_revision: u64,
+    runtime_identity_digest: String,
+    worker_claim_id: String,
+    worker_claim_revision: u64,
+    worker_claim_expires_at_epoch: i64,
+    controller_claim_id: String,
+    controller_claim_revision: u64,
+    controller_claim_expires_at_epoch: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClaimedRuntimeStopReceiptStage {
+    InProgress(Box<StopClaimedRuntimeProgressReceipt>),
+    Completed(Value),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaimedRuntimeStopReplay {
+    idempotency_key: String,
+    worker: SessionRef,
+    assignment_revision: u64,
+}
+
+fn parse_stop_claimed_runtime_progress(
+    value: Value,
+    assignment_id: &str,
+) -> Result<StopClaimedRuntimeProgressReceipt, CliError> {
+    let progress: StopClaimedRuntimeProgressReceipt =
+        serde_json::from_value(value).map_err(|_| {
+            CliError::data(
+                "orchestration-store-invalid",
+                "worker claimed runtime stop progress receipt is invalid",
+                None,
+            )
+        })?;
+    if progress.schema_version != STOP_CLAIMED_RUNTIME_PROGRESS_SCHEMA
+        || progress.state != "in_progress"
+        || progress.assignment_id != assignment_id
+        || progress.assignment_revision == 0
+        || progress.worker.session_id.is_empty()
+        || progress.worker.session_incarnation.is_empty()
+        || progress.activity_revision == 0
+        || progress.runtime_identity_digest.len() != 64
+        || !progress
+            .runtime_identity_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || progress.worker_claim_id.is_empty()
+        || progress.worker_claim_revision == 0
+        || progress.worker_claim_expires_at_epoch <= 0
+        || progress.controller_claim_id.is_empty()
+        || progress.controller_claim_revision == 0
+        || progress.controller_claim_expires_at_epoch <= 0
+    {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker claimed runtime stop progress receipt is invalid",
+            None,
+        ));
+    }
+    Ok(progress)
+}
+
+fn claimed_runtime_stop_receipt_stage(
+    value: Value,
+    assignment_id: &str,
+) -> Result<ClaimedRuntimeStopReceiptStage, CliError> {
+    if value["schema_version"] == STOP_CLAIMED_RUNTIME_RESULT_SCHEMA {
+        return Ok(ClaimedRuntimeStopReceiptStage::Completed(value));
+    }
+    parse_stop_claimed_runtime_progress(value, assignment_id)
+        .map(Box::new)
+        .map(ClaimedRuntimeStopReceiptStage::InProgress)
+}
+
+fn claimed_runtime_stop_replay_for_assignment(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<Option<ClaimedRuntimeStopReplay>, CliError> {
+    orchestration::assignment_claimed_runtime_stop_identity(context, assignment).map(|identity| {
+        identity.map(|identity| ClaimedRuntimeStopReplay {
+            idempotency_key: identity.idempotency_key,
+            worker: identity.worker,
+            assignment_revision: identity.assignment_revision,
+        })
+    })
+}
+
+fn require_claimed_runtime_stop_assignment(
+    context: &CliContext,
+    registry: &orchestration::Registry,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    args: &WorkerStopClaimedRuntimeArgs,
+) -> Result<(String, AssignmentRecord, SessionRef), CliError> {
+    let run = require_current_main(registry, main, main_incarnation)?;
+    let assignment = registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, main, main_incarnation)?;
+    ensure_revision(args.if_revision, assignment.revision, "assignment")?;
+    ensure_submit_recovery_not_in_flight(assignment)?;
+    ensure_assignment_mutation_admitted(
+        context,
+        assignment,
+        AssignmentMutationOwner::ClaimedRuntimeStop,
+    )?;
+    if assignment.state != "working" {
+        return Err(CliError::data(
+            "assignment-state-conflict",
+            "worker claimed runtime stop requires a working post-claim assignment",
+            Some(json!({
+                "state": assignment.state,
+                "revision": assignment.revision
+            })),
+        ));
+    }
+    let worker = assignment.worker.clone().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "assignment has no bound worker runtime to stop",
+            None,
+        )
+    })?;
+    if worker.session_incarnation != args.worker_incarnation {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker incarnation does not match --worker-incarnation",
+            None,
+        ));
+    }
+    Ok((run.run_id.clone(), assignment.clone(), worker))
+}
+
+fn replay_completed_claimed_runtime_stop(
+    context: &CliContext,
+    registry: &orchestration::Registry,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    args: &WorkerStopClaimedRuntimeArgs,
+    request_digest: &str,
+    value: Value,
+) -> Result<Value, CliError> {
+    let run = require_current_main(registry, main, main_incarnation)?;
+    let assignment = registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, main, main_incarnation)?;
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "assignment has no bound worker for completed claimed runtime stop replay",
+            None,
+        )
+    })?;
+    if worker.session_incarnation != args.worker_incarnation {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker incarnation does not match --worker-incarnation",
+            None,
+        ));
+    }
+    if !orchestration::session_claimed_runtime_stop_fence_matches(
+        context,
+        &assignment.assignment_id,
+        args.if_revision,
+        worker,
+        &assignment.primary_manager,
+        request_digest,
+    )? {
+        return Err(CliError::data(
+            "worker-runtime-stop-fence-conflict",
+            "completed worker claimed runtime stop has no matching session authority fence",
+            None,
+        ));
+    }
+    crate::coordination::clear_claimed_worker_runtime_stop_claim_fence(
+        context,
+        &assignment.assignment_id,
+        args.if_revision,
+        request_digest,
+    )?;
+    orchestration::mark_session_runtime_stop_fence_stopped(
+        context,
+        &assignment.assignment_id,
+        args.if_revision,
+        worker,
+        &assignment.primary_manager,
+        request_digest,
+    )?;
+    Ok(value)
+}
+
+fn run_worker_stop_claimed_runtime(
+    context: &CliContext,
+    args: WorkerStopClaimedRuntimeArgs,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
+        return Err(invalid_input("worker incarnation is invalid"));
+    }
+    let (main, main_incarnation, controller_claim) =
+        crate::coordination::authenticate_any_from_file_with_active_claim_observational(
+            context, None,
+        )?;
+    let request_digest = crate::coordination::request_digest(
+        "worker-stop-claimed-runtime",
+        &json!({
+            "assignment_id": args.assignment_id,
+            "worker_incarnation": args.worker_incarnation,
+            "if_revision": args.if_revision
+        }),
+    );
+    let registry = orchestration::load_registry_readonly(context)?;
+    let replay = idempotency_replay(
+        &registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-stop-claimed-runtime",
+        &request_digest,
+    )?;
+    let mut replay_progress = match replay
+        .map(|value| claimed_runtime_stop_receipt_stage(value, &args.assignment_id))
+        .transpose()?
+    {
+        Some(ClaimedRuntimeStopReceiptStage::Completed(value)) => {
+            return replay_completed_claimed_runtime_stop(
+                context,
+                &registry,
+                &main,
+                &main_incarnation,
+                &args,
+                &request_digest,
+                value,
+            );
+        }
+        Some(ClaimedRuntimeStopReceiptStage::InProgress(progress)) => Some(*progress),
+        None => None,
+    };
+    let (run_id, assignment, worker) = require_claimed_runtime_stop_assignment(
+        context,
+        &registry,
+        &main,
+        &main_incarnation,
+        &args,
+    )?;
+    if claimed_runtime_stop_replay_for_assignment(context, &assignment)?
+        .is_some_and(|existing| existing.idempotency_key != args.idempotency_key)
+        && orchestration::assignment_runtime_stop_fence_in_progress(context, &assignment)?
+    {
+        return Err(CliError::unavailable(
+            "worker-claimed-runtime-stop-in-flight",
+            "assignment mutation is fenced until the original exact claimed runtime stop is replayed",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "revision": assignment.revision
+            })),
+        ));
+    }
+    let expected_work_context = assignment_worker_work_context(
+        context,
+        &registry,
+        &assignment,
+        "worker stop-claimed-runtime requires the packet repository",
+    )?;
+    if replay_progress
+        .as_ref()
+        .is_some_and(|progress| progress.worker != worker)
+    {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker claimed runtime stop progress no longer matches the assignment",
+            None,
+        ));
+    }
+    drop(registry);
+
+    crate::coordination::sweep_inactive_claim_mutation_fence_orphans(context)?;
+    pause_stop_claimed_runtime_for_test("before_lifecycle_lock")?;
+    let _worker_lifecycle = acquire_session_record_lock(context, &worker.session_id)?;
+    let mut worker_record = load_session_record(context, &worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&worker, &worker_record, record_incarnation) {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker identity changed before claimed runtime stop",
+            None,
+        ));
+    }
+    if replay_progress.is_none() {
+        let after_lifecycle = orchestration::load_registry_readonly(context)?;
+        if let Some(stage) = idempotency_replay(
+            &after_lifecycle,
+            &main,
+            &main_incarnation,
+            &args.idempotency_key,
+            "worker-stop-claimed-runtime",
+            &request_digest,
+        )?
+        .map(|value| claimed_runtime_stop_receipt_stage(value, &args.assignment_id))
+        .transpose()?
+        {
+            match stage {
+                ClaimedRuntimeStopReceiptStage::Completed(value) => {
+                    return replay_completed_claimed_runtime_stop(
+                        context,
+                        &after_lifecycle,
+                        &main,
+                        &main_incarnation,
+                        &args,
+                        &request_digest,
+                        value,
+                    );
+                }
+                ClaimedRuntimeStopReceiptStage::InProgress(observed) => {
+                    let observed = *observed;
+                    let (observed_run_id, observed_assignment, observed_worker) =
+                        require_claimed_runtime_stop_assignment(
+                            context,
+                            &after_lifecycle,
+                            &main,
+                            &main_incarnation,
+                            &args,
+                        )?;
+                    if observed_run_id != run_id
+                        || observed_worker != worker
+                        || observed_assignment.revision != observed.assignment_revision
+                    {
+                        return Err(CliError::data(
+                            "orchestration-store-invalid",
+                            "concurrent worker claimed runtime stop progress no longer matches the assignment",
+                            None,
+                        ));
+                    }
+                    replay_progress = Some(observed);
+                }
+            }
+        }
+    }
+    let _activity_lock =
+        crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let tmux_status = session_status(&resolve_tmux_bin(None), &worker_record);
+    // An interrupted stop can leave a stale tmux wrapper visible after the
+    // exact recorded process identity is durably stopped. The receipt plus the
+    // session-owned fence makes that state attributable to this operation, so
+    // replay must finalize without issuing a second runtime stop.
+    let runtime_already_stopped = replay_progress.is_some()
+        && runtime_evidence.status == crate::CoordinationRuntimeStatus::Stopped;
+
+    let progress = if let Some(progress) = replay_progress {
+        if !orchestration::session_claimed_runtime_stop_fence_matches(
+            context,
+            &assignment.assignment_id,
+            args.if_revision,
+            &worker,
+            &assignment.primary_manager,
+            &request_digest,
+        )? {
+            return Err(CliError::data(
+                "worker-runtime-stop-fence-conflict",
+                "worker claimed runtime stop has no matching session authority fence",
+                None,
+            ));
+        }
+        if !runtime_already_stopped
+            && (runtime_evidence.status != crate::CoordinationRuntimeStatus::Running
+                || tmux_status != "running")
+        {
+            return Err(CliError::runtime(
+                "coordination-runtime-unverified",
+                "worker claimed runtime stop cannot re-establish the exact runtime state",
+                None,
+            ));
+        }
+        progress
+    } else {
+        if runtime_evidence.status != crate::CoordinationRuntimeStatus::Running
+            || tmux_status != "running"
+        {
+            return Err(CliError::data(
+                "worker-runtime-not-live",
+                "worker claimed runtime stop requires the exact bound runtime to be live",
+                None,
+            ));
+        }
+        let (activity_revision, runtime_identity_digest) =
+            current_authoritative_idle_live_evidence(
+                context,
+                &worker_record,
+                &assignment,
+                "worker stop-claimed-runtime",
+            )?;
+        let claimed_guard = crate::coordination::lock_claimed_worker_runtime_stop(
+            context,
+            &worker_record,
+            &worker.session_incarnation,
+            &expected_work_context,
+            &main.id,
+            &main_incarnation,
+            &controller_claim,
+        )?;
+        let worker_claim = claimed_guard.worker_claim().clone();
+        let minimum_expiry = crate::coordination::now_epoch()
+            .saturating_add(claimed_runtime_stop_termination_margin_secs());
+        if worker_claim.expires_at_epoch <= minimum_expiry {
+            return Err(CliError::data(
+                "worker-claim-ttl-insufficient",
+                "worker claimed runtime stop requires the exact claim TTL to exceed the bounded termination window",
+                None,
+            ));
+        }
+        if controller_claim.expires_at_epoch <= minimum_expiry {
+            return Err(CliError::data(
+                "controller-claim-ttl-insufficient",
+                "worker claimed runtime stop requires the exact Main claim TTL to exceed the bounded termination window",
+                None,
+            ));
+        }
+        let progress = StopClaimedRuntimeProgressReceipt {
+            schema_version: STOP_CLAIMED_RUNTIME_PROGRESS_SCHEMA.to_string(),
+            state: "in_progress".to_string(),
+            assignment_id: assignment.assignment_id.clone(),
+            assignment_revision: args.if_revision,
+            worker: worker.clone(),
+            activity_revision,
+            runtime_identity_digest,
+            worker_claim_id: worker_claim.claim_id.clone(),
+            worker_claim_revision: worker_claim.revision,
+            worker_claim_expires_at_epoch: worker_claim.expires_at_epoch,
+            controller_claim_id: controller_claim.claim_id.clone(),
+            controller_claim_revision: controller_claim.revision,
+            controller_claim_expires_at_epoch: controller_claim.expires_at_epoch,
+        };
+        let mut locked = orchestration::lock_registry(context)?;
+        let (locked_run_id, current, locked_worker) = require_claimed_runtime_stop_assignment(
+            context,
+            &locked.registry,
+            &main,
+            &main_incarnation,
+            &args,
+        )?;
+        if locked_run_id != run_id || locked_worker != worker {
+            return Err(CliError::data(
+                "worker-claimed-runtime-stop-conflict",
+                "assignment identity changed before claimed runtime stop admission",
+                None,
+            ));
+        }
+        orchestration::persist_session_claimed_runtime_stop_identity(
+            context,
+            &current.assignment_id,
+            args.if_revision,
+            &worker,
+            &current.primary_manager,
+            &request_digest,
+            &args.idempotency_key,
+        )?;
+        pause_stop_claimed_runtime_for_test("after_identity")?;
+        orchestration::persist_session_runtime_stop_fence(
+            context,
+            &current.assignment_id,
+            args.if_revision,
+            &worker,
+            &current.primary_manager,
+            &request_digest,
+        )?;
+        store_receipt(
+            &mut locked.registry,
+            &main,
+            &main_incarnation,
+            &args.idempotency_key,
+            "worker-stop-claimed-runtime",
+            &request_digest,
+            serde_json::to_value(&progress).map_err(|_| {
+                CliError::data(
+                    "orchestration-store-invalid",
+                    "worker claimed runtime stop progress receipt is invalid",
+                    None,
+                )
+            })?,
+        )?;
+        locked.save()?;
+        drop(locked);
+        drop(claimed_guard);
+        pause_stop_claimed_runtime_for_test("after_reservation")?;
+        progress
+    };
+
+    let worker_claim = crate::coordination::ControllerClaimTuple {
+        claim_id: progress.worker_claim_id.clone(),
+        revision: progress.worker_claim_revision,
+        expires_at_epoch: progress.worker_claim_expires_at_epoch,
+    };
+    let controller_claim = crate::coordination::ControllerClaimTuple {
+        claim_id: progress.controller_claim_id.clone(),
+        revision: progress.controller_claim_revision,
+        expires_at_epoch: progress.controller_claim_expires_at_epoch,
+    };
+    if !runtime_already_stopped
+        && !crate::coordination::exact_claim_active_observational(
+            context,
+            &main.id,
+            &main_incarnation,
+            &controller_claim,
+        )?
+    {
+        return Err(CliError::data(
+            "controller-claim-not-preserved",
+            "worker claimed runtime stop requires the exact admitted Main claim before runtime termination",
+            None,
+        ));
+    }
+    let minimum_expiry = crate::coordination::now_epoch()
+        .saturating_add(claimed_runtime_stop_termination_margin_secs());
+    if !runtime_already_stopped && worker_claim.expires_at_epoch <= minimum_expiry {
+        return Err(CliError::data(
+            "worker-claim-ttl-insufficient",
+            "worker claimed runtime stop requires the exact claim TTL to exceed the bounded termination window",
+            None,
+        ));
+    }
+    if !runtime_already_stopped && controller_claim.expires_at_epoch <= minimum_expiry {
+        return Err(CliError::data(
+            "controller-claim-ttl-insufficient",
+            "worker claimed runtime stop requires the exact Main claim TTL to exceed the bounded termination window",
+            None,
+        ));
+    }
+    let mutation_fence_owner = if !runtime_already_stopped {
+        let mut guard = crate::coordination::lock_claimed_worker_runtime_stop(
+            context,
+            &worker_record,
+            &worker.session_incarnation,
+            &expected_work_context,
+            &main.id,
+            &main_incarnation,
+            &controller_claim,
+        )?;
+        if guard.worker_claim() != &worker_claim {
+            return Err(CliError::data(
+                "worker-claim-not-preserved",
+                "worker claimed runtime stop requires the exact claim to remain active on TTL",
+                None,
+            ));
+        }
+        let owner = guard.persist_claim_mutation_fence(
+            context,
+            &assignment.assignment_id,
+            args.if_revision,
+            &request_digest,
+        )?;
+        drop(guard);
+        Some(owner)
+    } else {
+        None
+    };
+    if !runtime_already_stopped {
+        pause_stop_claimed_runtime_for_test("before_runtime_stop")?;
+        let pre_stop_minimum_expiry = crate::coordination::now_epoch()
+            .saturating_add(claimed_runtime_stop_termination_margin_secs());
+        let exact_claims_active_before_stop =
+            crate::coordination::verify_claimed_worker_runtime_stop_claim_fence(
+                context,
+                &assignment.assignment_id,
+                args.if_revision,
+                &worker.session_id,
+                &worker.session_incarnation,
+                &worker_claim,
+                &main.id,
+                &main_incarnation,
+                &controller_claim,
+                &request_digest,
+                true,
+            )?;
+        if !exact_claims_active_before_stop
+            || worker_claim.expires_at_epoch <= pre_stop_minimum_expiry
+            || controller_claim.expires_at_epoch <= pre_stop_minimum_expiry
+        {
+            return Err(CliError::data(
+                "claim-ttl-insufficient-before-runtime-stop",
+                "worker claimed runtime stop requires both exact claims to remain active beyond the full bounded termination window",
+                None,
+            ));
+        }
+        crate::stop_session_runtime_locked(context, &mut worker_record, &resolve_tmux_bin(None))?;
+    }
+    let stopped_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    if stopped_evidence.status != crate::CoordinationRuntimeStatus::Stopped {
+        return Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "worker claimed runtime stop did not establish exact stopped-runtime evidence",
+            None,
+        ));
+    }
+    let exact_claims_active_after =
+        crate::coordination::verify_claimed_worker_runtime_stop_claim_fence(
+            context,
+            &assignment.assignment_id,
+            args.if_revision,
+            &worker.session_id,
+            &worker.session_incarnation,
+            &worker_claim,
+            &main.id,
+            &main_incarnation,
+            &controller_claim,
+            &request_digest,
+            mutation_fence_owner.is_some(),
+        )?;
+    drop(mutation_fence_owner);
+    if !exact_claims_active_after && !runtime_already_stopped {
+        return Err(CliError::data(
+            "worker-claim-not-preserved",
+            "worker claimed runtime stop could not prove the exact claim remained active on TTL",
+            None,
+        ));
+    }
+    if !runtime_already_stopped {
+        pause_stop_claimed_runtime_for_test("after_runtime_stopped")?;
+    }
+
+    let mut locked = orchestration::lock_registry(context)?;
+    let replay_stage = idempotency_replay(
+        &locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-stop-claimed-runtime",
+        &request_digest,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "orchestration-store-invalid",
+            "worker claimed runtime stop progress receipt is missing",
+            None,
+        )
+    })
+    .and_then(|value| claimed_runtime_stop_receipt_stage(value, &args.assignment_id))?;
+    let committed_progress = match replay_stage {
+        ClaimedRuntimeStopReceiptStage::Completed(value) => return Ok(value),
+        ClaimedRuntimeStopReceiptStage::InProgress(progress) => *progress,
+    };
+    if committed_progress != progress {
+        return Err(CliError::data(
+            "orchestration-store-invalid",
+            "worker claimed runtime stop progress changed before finalization",
+            None,
+        ));
+    }
+    let run = require_current_main(&locked.registry, &main, &main_incarnation)?.clone();
+    let current = locked
+        .registry
+        .assignments
+        .get_mut(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(current, &main, &main_incarnation)?;
+    ensure_revision(args.if_revision, current.revision, "assignment")?;
+    if current.state != "working" || current.worker.as_ref() != Some(&worker) {
+        return Err(CliError::data(
+            "worker-claimed-runtime-stop-conflict",
+            "assignment changed before claimed runtime stop finalization",
+            None,
+        ));
+    }
+    let assignment_view = public_assignment_view(current);
+    let outcome = json!({
+        "schema_version": STOP_CLAIMED_RUNTIME_RESULT_SCHEMA,
+        "assignment": assignment_view,
+        "runtime_stopped": true,
+        "worker_claim_active_after": exact_claims_active_after,
+        "input_sent": false,
+        "session_state_preserved": true,
+        "worktree_preserved": true,
+        "automatic_retry_safe": false,
+        "proof": {
+            "worker_turn": "authoritative_idle",
+            "activity_revision": progress.activity_revision,
+            "worker_runtime": "stopped",
+            "runtime_identity_digest": progress.runtime_identity_digest,
+            "worker_claim": {
+                "claim_id": progress.worker_claim_id,
+                "revision": progress.worker_claim_revision,
+                "expires_at_epoch": progress.worker_claim_expires_at_epoch,
+                "active_on_ttl": exact_claims_active_after
+            },
+            "interrupted_after_stop_claim_degraded": !exact_claims_active_after,
+            "runtime_stop_fence": "session-owned-until-retire",
+            "operation_quiescent": true
+        },
+        "next_action": format!(
+            "main-agent worker reconcile-stopped {} --if-revision {} --reason <REASON> --idempotency-key <KEY> --format json",
+            current.assignment_id, current.revision
+        )
+    });
+    store_receipt(
+        &mut locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        "worker-stop-claimed-runtime",
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    drop(locked);
+    pause_stop_claimed_runtime_for_test("after_final_receipt")?;
+    crate::coordination::clear_claimed_worker_runtime_stop_claim_fence(
+        context,
+        &assignment.assignment_id,
+        args.if_revision,
+        &request_digest,
+    )?;
+    orchestration::mark_session_runtime_stop_fence_stopped(
+        context,
+        &assignment.assignment_id,
+        args.if_revision,
+        &worker,
+        &assignment.primary_manager,
+        &request_digest,
+    )?;
+    Ok(outcome)
+}
+
+fn claimed_runtime_stop_termination_margin_secs() -> i64 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS")
+        .as_deref()
+        .map(str::parse::<i64>)
+        && let Ok(value) = value
+        && value > 0
+    {
+        return value;
+    }
+    i64::try_from(
+        crate::PANE_INPUT_COMMAND_TIMEOUT
+            .saturating_add(crate::DELETE_TERMINATION_VERIFY_TIMEOUT)
+            .saturating_add(Duration::from_secs(2))
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 fn has_exhausted_worker_start_readiness(
@@ -13223,6 +14121,7 @@ enum AssignmentMutationOwner {
     Ordinary,
     AccountHandoff,
     RuntimeStop,
+    ClaimedRuntimeStop,
     ClaimRevocation,
 }
 
@@ -13231,14 +14130,28 @@ fn ensure_assignment_mutation_admitted(
     assignment: &AssignmentRecord,
     owner: AssignmentMutationOwner,
 ) -> Result<(), CliError> {
+    if orchestration::assignment_worker_delete_in_progress(context, assignment)? {
+        return Err(CliError::unavailable(
+            "worker-delete-in-flight",
+            "assignment mutation is fenced until the original exact worker delete completes",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "revision": assignment.revision
+            })),
+        ));
+    }
     if owner != AssignmentMutationOwner::AccountHandoff {
         ensure_account_handoff_not_in_flight(assignment)?;
     }
     if owner != AssignmentMutationOwner::RuntimeStop {
         ensure_worker_runtime_stop_not_in_flight(assignment)?;
-        if orchestration::assignment_runtime_stop_fence_in_progress(context, assignment)? {
-            return Err(worker_runtime_stop_in_flight(assignment));
-        }
+    }
+    if !matches!(
+        owner,
+        AssignmentMutationOwner::RuntimeStop | AssignmentMutationOwner::ClaimedRuntimeStop
+    ) && orchestration::assignment_runtime_stop_fence_in_progress(context, assignment)?
+    {
+        return Err(worker_runtime_stop_in_flight(assignment));
     }
     if owner != AssignmentMutationOwner::ClaimRevocation {
         ensure_worker_claim_revocation_not_in_flight(assignment)?;
@@ -13581,7 +14494,15 @@ fn run_worker_delete(
             serde_json::from_value::<SessionRef>(value["worker"].clone())
                 .map_err(|_| invalid_input("pending worker delete receipt is invalid"))?,
         ),
-        Some(value) => return Ok(value),
+        Some(value) => {
+            orchestration::clear_worker_delete_identity(
+                context,
+                &args.assignment_id,
+                &request_digest,
+                &args.idempotency_key,
+            )?;
+            return Ok(value);
+        }
         None => None,
     };
     let run = require_current_main(&locked.registry, &record, &incarnation)?;
@@ -13710,7 +14631,12 @@ fn run_worker_delete(
             &worker,
         )?;
     }
-    let deleted = delete_session(context, &worker.session_id, resolve_tmux_bin(None))?;
+    let deleted = delete_session_for_terminal_assignment(
+        context,
+        &worker.session_id,
+        resolve_tmux_bin(None),
+        Some(&assignment),
+    )?;
     finalize_worker_delete(
         context,
         &args,
@@ -13724,6 +14650,46 @@ fn run_worker_delete(
 
 fn worker_delete_is_pending(value: &Value) -> bool {
     value["schema_version"] == "main-agent.worker-delete-pending.v1"
+}
+
+fn pause_worker_delete_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker delete test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(
+            directory.join("ready"),
+            format!("{stage}:{}", std::process::id()),
+        )
+        .map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "worker delete test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "worker delete test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
 }
 
 fn reserve_worker_delete(
@@ -13768,9 +14734,17 @@ fn reserve_worker_delete(
             None,
         ));
     }
+    orchestration::persist_worker_delete_identity(
+        context,
+        current,
+        request_digest,
+        &args.idempotency_key,
+    )?;
+    pause_worker_delete_for_test("after_identity")?;
     let pending = json!({
         "schema_version": "main-agent.worker-delete-pending.v1",
         "assignment_id": args.assignment_id,
+        "assignment_revision": args.if_revision,
         "worker": worker
     });
     store_receipt(
@@ -13782,7 +14756,9 @@ fn reserve_worker_delete(
         request_digest,
         pending,
     )?;
-    locked.save()
+    locked.save()?;
+    drop(locked);
+    pause_worker_delete_for_test("after_reservation")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13841,6 +14817,14 @@ fn finalize_worker_delete(
         outcome.clone(),
     )?;
     locked.save()?;
+    drop(locked);
+    pause_worker_delete_for_test("after_final_receipt")?;
+    orchestration::clear_worker_delete_identity(
+        context,
+        &args.assignment_id,
+        request_digest,
+        &args.idempotency_key,
+    )?;
     Ok(outcome)
 }
 
@@ -14168,8 +15152,12 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         REVOKE_CLAIM_QUARANTINE_REASON,
         &format!("sha256:{}", reservation.runtime_identity_digest),
     )? {
-        let expected_work_context =
-            assignment_worker_work_context(context, &locked.registry, &snapshot)?;
+        let expected_work_context = assignment_worker_work_context(
+            context,
+            &locked.registry,
+            &snapshot,
+            "worker claim revocation requires the packet repository",
+        )?;
         let reservation = reservation.clone();
         let progress = progress.clone();
         drop(locked);
@@ -14235,6 +15223,21 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         )?;
     }
 
+    let claimed_stop_rebind =
+        if snapshot.runtime_stop.is_none() && snapshot.claim_revocation.is_none() {
+            let rebound = orchestration::rebind_stopped_claimed_runtime_stop_for_adopt(
+                context,
+                &snapshot,
+                &run.controller,
+                adopted_revision,
+            )?;
+            if rebound {
+                pause_runtime_stop_adopt_for_test("after_claimed_stop_rebind")?;
+            }
+            rebound
+        } else {
+            false
+        };
     let (runtime_stop_rebind, claim_revocation_rebind) = if let Some(reservation) =
         snapshot.runtime_stop.as_ref()
     {
@@ -14365,6 +15368,8 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
                 successor_replay.is_none(),
             )),
         )
+    } else if claimed_stop_rebind {
+        (None, None)
     } else {
         ensure_assignment_mutation_admitted(context, &snapshot, AssignmentMutationOwner::Ordinary)?;
         (None, None)
@@ -17599,6 +18604,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::SubmitRecovery(_) => "worker-submit-recovery",
             WorkerCommand::ReconcileRecovery(_) => "worker-reconcile-recovery",
             WorkerCommand::StopRuntime(_) => "worker-stop-runtime",
+            WorkerCommand::StopClaimedRuntime(_) => "worker-stop-claimed-runtime",
             WorkerCommand::ReconcileStopped(_) => "worker-reconcile-stopped",
             WorkerCommand::RevokeClaim(_) => "worker-revoke-claim",
             WorkerCommand::Cancel(_) => "worker-cancel",
@@ -17651,6 +18657,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::SubmitRecovery(args) => args.format,
             WorkerCommand::ReconcileRecovery(args) => args.format,
             WorkerCommand::StopRuntime(args) => args.format,
+            WorkerCommand::StopClaimedRuntime(args) => args.format,
             WorkerCommand::ReconcileStopped(args) => args.format,
             WorkerCommand::RevokeClaim(args) => args.format,
             WorkerCommand::Cancel(args) => args.format,
@@ -23771,6 +24778,7 @@ mod tests {
             active_or_uncertain_operation: false,
             post_claim_runtime_gone: false,
             runtime_stop_in_flight: false,
+            claimed_runtime_stop_in_flight: false,
             claim_revocation_in_flight: false,
             account_handoff_in_flight: false,
             readiness_stop_required: false,
@@ -24109,6 +25117,86 @@ mod tests {
     }
 
     #[test]
+    fn claimed_runtime_stop_identity_lookup_is_assignment_local() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let worker_a = SessionRef {
+            machine: None,
+            session_id: "worker-a".to_string(),
+            session_incarnation: "worker-a-inc".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let worker_b = SessionRef {
+            machine: None,
+            session_id: "worker-b".to_string(),
+            session_incarnation: "worker-b-inc".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let mut assignment_a = dep_assignment("assignment-a", "run", "working");
+        assignment_a.worker = Some(worker_a.clone());
+        let mut assignment_b = dep_assignment("assignment-b", "run", "working");
+        assignment_b.worker = Some(worker_b);
+        let request_digest = crate::coordination::request_digest(
+            "worker-stop-claimed-runtime",
+            &json!({
+                "assignment_id": assignment_a.assignment_id,
+                "worker_incarnation": worker_a.session_incarnation,
+                "if_revision": assignment_a.revision
+            }),
+        );
+        fs::create_dir_all(crate::session_dir(&context, "worker-a")).unwrap();
+        orchestration::persist_session_claimed_runtime_stop_identity(
+            &context,
+            &assignment_a.assignment_id,
+            assignment_a.revision,
+            &worker_a,
+            &assignment_a.primary_manager,
+            &request_digest,
+            "claimed-stop-a",
+        )
+        .expect("persist assignment-local identity");
+        assert!(
+            claimed_runtime_stop_replay_for_assignment(&context, &assignment_b)
+                .expect("unrelated identity lookup")
+                .is_none()
+        );
+        let replay = claimed_runtime_stop_replay_for_assignment(&context, &assignment_a)
+            .expect("matching identity lookup")
+            .expect("matching identity");
+        assert_eq!(replay.idempotency_key, "claimed-stop-a");
+        assert_eq!(replay.assignment_revision, 1);
+        orchestration::persist_session_runtime_stop_fence(
+            &context,
+            &assignment_a.assignment_id,
+            assignment_a.revision,
+            &worker_a,
+            &assignment_a.primary_manager,
+            &request_digest,
+        )
+        .expect("persist matching runtime stop fence");
+        orchestration::mark_session_runtime_stop_fence_stopped(
+            &context,
+            &assignment_a.assignment_id,
+            assignment_a.revision,
+            &worker_a,
+            &assignment_a.primary_manager,
+            &request_digest,
+        )
+        .expect("complete matching runtime stop fence");
+        assignment_a.revision = 2;
+        assignment_a.primary_manager.session_id = "successor".to_string();
+        assert!(
+            claimed_runtime_stop_replay_for_assignment(&context, &assignment_a)
+                .expect("historical stopped identity lookup")
+                .is_none(),
+            "an exact stopped historical identity must not poison later revision or handoff"
+        );
+    }
+
+    #[test]
     fn worker_stop_runtime_replay_binds_private_reservation_identity() {
         let controller = SessionRef {
             machine: None,
@@ -24223,6 +25311,7 @@ mod tests {
         for owner in [
             AssignmentMutationOwner::Ordinary,
             AssignmentMutationOwner::RuntimeStop,
+            AssignmentMutationOwner::ClaimedRuntimeStop,
             AssignmentMutationOwner::ClaimRevocation,
         ] {
             assert_eq!(
@@ -24259,6 +25348,7 @@ mod tests {
         for owner in [
             AssignmentMutationOwner::Ordinary,
             AssignmentMutationOwner::AccountHandoff,
+            AssignmentMutationOwner::ClaimedRuntimeStop,
             AssignmentMutationOwner::ClaimRevocation,
         ] {
             assert_eq!(
@@ -24297,6 +25387,7 @@ mod tests {
             AssignmentMutationOwner::Ordinary,
             AssignmentMutationOwner::AccountHandoff,
             AssignmentMutationOwner::RuntimeStop,
+            AssignmentMutationOwner::ClaimedRuntimeStop,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &revocation_owned, owner)
@@ -24578,6 +25669,7 @@ mod tests {
                 &assignment,
                 Some("worker-claim-one"),
                 Some(7),
+                None,
             );
             let expected_schema = if matches!(
                 classification,
@@ -24616,7 +25708,7 @@ mod tests {
             }
         }
         let runtime_stop =
-            worker_recovery_action("readiness_stop_required", &assignment, None, None);
+            worker_recovery_action("readiness_stop_required", &assignment, None, None, None);
         assert_eq!(runtime_stop["kind"], "exact_worker_runtime_stop");
         assert_eq!(runtime_stop["owner"]["role"], "main");
         assert_eq!(runtime_stop["executable"], true);
@@ -24629,8 +25721,13 @@ mod tests {
                 .iter()
                 .all(|part| part != "<idempotency-key>")
         );
-        let claim_revocation =
-            worker_recovery_action("idle_claim_revocation_required", &assignment, None, None);
+        let claim_revocation = worker_recovery_action(
+            "idle_claim_revocation_required",
+            &assignment,
+            None,
+            None,
+            None,
+        );
         assert_eq!(claim_revocation["kind"], "exact_worker_claim_revocation");
         assert_eq!(claim_revocation["owner"]["role"], "main");
         assert_eq!(claim_revocation["executable"], true);
@@ -24649,6 +25746,7 @@ mod tests {
             &assignment,
             Some("worker-claim-one"),
             Some(7),
+            None,
         );
         assert_eq!(renewal["owner"]["session_id"], "worker-one");
         assert_eq!(renewal["claim_id"], "worker-claim-one");

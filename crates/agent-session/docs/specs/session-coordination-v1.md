@@ -693,6 +693,55 @@ original progress receipt; the worker, request digest, idempotency key, and
 reserved fence revision remain immutable across successive orphan transfers.
 Only the assignment ownership revision advances monotonically.
 
+## Main-owned post-claim runtime stop guard
+
+The post-claim stop-only guard admits an exact `working` worker only when its
+assignment-derived claim is active and unexpired. It binds the exact worker
+session/incarnation, work context, runtime identity, authoritative idle
+activity revision, authoritative broker, zero active or uncertain operations,
+and the exact active, unexpired Main controller claim. Unlike the pre-claim
+guard, it MUST preserve the worker claim and broker record rather than sealing
+them.
+
+While the observational coordination guard is held, orchestration persists a
+session-owned claimed-stop identity, the existing runtime-stop fence, and an
+exact progress idempotency receipt. The identity binds assignment, revision,
+worker, controller, request digest, and original idempotency key; it is an
+independent v1 sidecar, so registry-v3 and runtime-fence-v1 wire shapes remain
+unchanged. Identity-first interruption is sufficient for O(1) exact replay
+projection and blocks competing assignment mutation. The fence blocks every
+authority-restoration ingress, including `broker stop`; therefore a clean
+held-launch exit cannot revoke the broker or release the claim while the
+Main-owned stop is in progress. Global registry locks are released before
+exact runtime termination. Observational reads before and after termination
+MUST prove the same worker claim tuple remains active and unexpired. Immediately
+before termination, the original Main controller claim MUST also remain exact,
+active, and unexpired, and both exact claim TTLs MUST still exceed the full
+bounded termination window. Before releasing the observational coordination guard,
+the command MUST persist independently versioned sidecars for both exact claim
+tuples and acquire the sidecars' shared process-owned OS lock. Every exact
+claim mutation ingress MUST consult its O(1) sidecar and fail closed while the
+exclusive owner lock remains held. The owner lock spans external termination
+and the post-stop claim proof; it has no wall-clock expiry. Because neither the
+sidecars nor their lock live in the coordination registry, an older registry
+writer cannot silently discard the safety fence. The first durable activation
+write upgrades the registry marker from
+`agent-session.coordination-registry.v1` to the wire-compatible but
+fence-aware `agent-session.coordination-registry.v2`; the transition is
+one-way so older claim writers fail closed instead of bypassing the sidecar
+protocol before any manifest or tuple sidecar can be partially published.
+Current projection readers accept both markers, while every v2 writer MUST
+consult the exact-tuple sidecars. A crash after the marker transition but
+before complete sidecar publication is safe for exact replay to reconstruct,
+and no runtime stop may begin until the manifest and both sidecars verify.
+Owner death releases the OS
+lock, after which exact replay may reacquire it and stale sidecars may be
+retired under the coordination lock. An already-stopped replay may finalize under the
+authenticated current controller without repeating termination. The
+identity and session fence remain after the progress receipt becomes terminal
+so only `worker reconcile-stopped` may seal and release the retained worker
+authority before guarded retirement.
+
 ## Public list and glance additions
 
 List and glance may add only:

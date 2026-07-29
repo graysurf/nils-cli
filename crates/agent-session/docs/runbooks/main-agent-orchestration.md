@@ -388,8 +388,10 @@ progress. Existing classifications use
 `readiness_stop_in_progress` classifications use the corresponding closed v3
 envelopes. `idle_claim_revocation_required` and
 `idle_claim_revocation_in_progress` use the v4 envelopes with an explicit
-`claim_revocation.in_flight` projection. Branch on `classification`, never on
-prose:
+`claim_revocation.in_flight` projection.
+`claimed_runtime_stop_in_progress` uses the v5 envelopes with an explicit
+`claimed_runtime_stop.in_flight` projection. Branch on `classification`, never
+on prose:
 
 | Classification | Deterministic action |
 | --- | --- |
@@ -402,6 +404,7 @@ prose:
 | `account_handoff_in_flight` | Complete the reserved account handoff or execute its typed `worker account-handoff-cancel` action before any readiness stop. |
 | `readiness_stop_required` | Execute the returned Main-owned exact argv for `worker stop-runtime`. It sends no provider input and preserves state; then re-supervise and use guarded pre-claim cancellation. |
 | `readiness_stop_in_progress` | Execute the returned exact replay argv. It contains the original privately retained idempotency key and cannot send provider input. |
+| `claimed_runtime_stop_in_progress` | Replay only the returned v5 exact `worker stop-claimed-runtime` argv. It retains the original revision, exact incarnation, and idempotency key and cannot send provider input. |
 | `idle_claim_revocation_required` | Execute the returned Main-owned exact argv for `worker revoke-claim`. It fences only a durably running, authoritative-idle exact worker and sends no provider input. |
 | `idle_claim_revocation_in_progress` | Replay only the returned exact argv and original idempotency key. Its assignment reservation blocks every competing lifecycle mutation. |
 | `uncertain_mutation` | Preserve the exact worker and reconcile the operation. Do not cancel, retire, or reassign. |
@@ -725,8 +728,51 @@ lifecycle lock; a waiter that initially saw no receipt adopts the winner's
 progress, while a waiter behind finalization returns the one terminal receipt.
 
 If instead the worker already reached `working` — bootstrap acquired its
-assignment-derived claim — and then its exact runtime died, supervision returns
-`post_claim_failure`. Do not reach for `worker cancel`, `worker reassign`, or
+assignment-derived claim — and its exact runtime is still live at an
+authoritative idle boundary, the typed post-claim stop-only action can create
+the stopped-with-live-claim state without provider input:
+
+```bash
+main-agent worker stop-claimed-runtime ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key stop-claimed-runtime-001 \
+  --format json
+```
+
+Use it only when current supervision and broker reads prove the exact worker is
+authoritative-idle, running, operation-quiescent, and still carries its exact
+assignment-derived active claim. It first persists an assignment-, revision-,
+incarnation-, request-, and idempotency-bound session identity, then the
+existing runtime fence and progress receipt before stopping the verified
+runtime. Identity-first interruption still projects the exact replay without a
+global receipt scan. The fence makes the launch wrapper's clean broker stop
+fail closed, so the action can prove `worker_claim_active_after:true`. It
+persists a narrow exact-claim mutation fence, releases the global coordination
+lock for the bounded runtime stop, then reacquires it for the post-stop proof.
+Unrelated broker heartbeats and claim mutations remain available. It preserves
+the `working` assignment at the same
+revision, the session, and the managed
+worktree, and returns `input_sent:false`. If interrupted, run only the exact v5
+replay argv projected by `claimed_runtime_stop_in_progress`.
+If a post-stop interruption outlives the claim TTL, exact replay returns a
+truthful degraded result with `worker_claim_active_after:false` and restores
+the `reconcile-stopped` route. Do not count that recovery as B2 field closure;
+only `true` plus reconcile stage-1 `observed_at_stage1:true` qualifies.
+If the Main controller dies after the typed stop completes, an active
+successor may `adopt` the orphan assignment. Adoption rebinds both persistent
+stop identities and records their original controller/revision lineage before
+the assignment revision advances; an interrupted adoption is replayed with
+the same successor command. If that pending successor also dies before the
+registry save, another active Main may recover only the same origin-consistent
+adopted revision after proving the intermediate controller non-live. The
+successor then runs `reconcile-stopped` at the
+adopted revision and may delete the terminal exact worker normally.
+
+Once the exact runtime is stopped, supervision returns
+`post_claim_failure`. A process-stopped/tmux-live contradiction instead returns
+`evidence_unavailable`; never treat it as healthy progress. Do not reach for
+`worker cancel`, `worker reassign`, or
 Agent Console force group cleanup: the first two refuse a post-claim assignment
 and the third deletes the Main Agent session that would have to run it. Use the
 guarded post-claim transition:
@@ -914,10 +960,16 @@ main-agent worker delete ASSIGNMENT_ID \
 ```
 
 The command delegates to guarded `agent-session` deletion and verifies the
-exact worker session identity. Retry an ambiguous result exactly as described
-below. `cleanup_pending: true` means the logical deletion succeeded but the
-retained physical cleanup record still needs the ordinary session-maintenance
-path; it does not restore the worker card or assignment to a live state.
+exact worker session identity. Before leaving the orchestration lock it stores
+an assignment-revision-, worker-, controller-, request-, and
+idempotency-bound delete reservation. That reservation fences handoff,
+adoption, and every competing assignment mutation until the exact delete
+replay finishes; a runtime-stop-fenced session is deletable only through the
+matching terminal assignment and reservation. Retry an ambiguous result
+exactly as described below. `cleanup_pending: true` means the logical deletion
+succeeded but the retained physical cleanup record still needs the ordinary
+session-maintenance path; it does not restore the worker card or assignment to
+a live state.
 
 ### 7. Close the run and converge cards
 

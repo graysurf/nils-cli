@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub const REGISTRY_VERSION: &str = "agent-session.coordination-registry.v1";
+pub const CLAIM_FENCE_REGISTRY_VERSION: &str = "agent-session.coordination-registry.v2";
 pub const CLAIM_VERSION: &str = "agent-session.work-context.v1";
 /// Canonical whole-registry byte cap, shared by this projection reader and the
 /// agent-session coordination read/write path (which references this constant).
@@ -115,8 +116,10 @@ pub fn load(state_dir: &Path) -> Result<Option<RegistryProjection>, ReadError> {
     };
     let projection: RegistryProjection =
         serde_json::from_slice(&bytes).map_err(|_| ReadError::Invalid)?;
-    if projection.schema_version != REGISTRY_VERSION
-        || projection.fingerprint_epoch == 0
+    if !matches!(
+        projection.schema_version.as_str(),
+        REGISTRY_VERSION | CLAIM_FENCE_REGISTRY_VERSION
+    ) || projection.fingerprint_epoch == 0
         || projection.fingerprint_key.len() < 32
         || projection
             .claims
@@ -282,6 +285,33 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_reader_accepts_legacy_and_fence_aware_registry_markers() {
+        for schema_version in [REGISTRY_VERSION, CLAIM_FENCE_REGISTRY_VERSION] {
+            let temporary = tempfile::TempDir::new().expect("temporary state");
+            let coordination = temporary.path().join("coordination");
+            fs::create_dir_all(&coordination).expect("coordination directory");
+            let registry = serde_json::json!({
+                "schema_version": schema_version,
+                "fingerprint_epoch": 1,
+                "fingerprint_key": "k".repeat(32),
+                "brokers": {},
+                "claims": []
+            });
+            let path = coordination.join("registry.json");
+            fs::write(&path, serde_json::to_vec(&registry).expect("registry JSON"))
+                .expect("registry");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure registry");
+
+            assert!(
+                load(temporary.path())
+                    .expect("supported registry marker")
+                    .is_some(),
+                "schema_version={schema_version}"
+            );
+        }
+    }
 
     #[test]
     fn heartbeat_age_is_exact_incarnation_private_and_preserves_hard_freshness() {

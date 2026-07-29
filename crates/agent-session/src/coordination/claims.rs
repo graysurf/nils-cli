@@ -385,6 +385,18 @@ fn claim_impl(
         {
             return Err(operation_in_progress());
         }
+        for claim in
+            locked.registry.claims.iter().filter(|claim| {
+                stale_claim_ids.contains(&claim.claim_id) && claim.state == "active"
+            })
+        {
+            super::ensure_claim_mutation_not_fenced(
+                context,
+                &claim.session_id,
+                &claim.session_incarnation,
+                claim,
+            )?;
+        }
         for claim in &mut locked.registry.claims {
             if stale_claim_ids.contains(&claim.claim_id) {
                 claim.state = "released".to_string();
@@ -403,6 +415,12 @@ fn claim_impl(
         if has_nonterminal_operation(&locked.registry, &existing_claim_id) {
             return Err(operation_in_progress());
         }
+        super::ensure_claim_mutation_not_fenced(
+            context,
+            &record.id,
+            &incarnation,
+            &locked.registry.claims[existing_index],
+        )?;
         let existing = &mut locked.registry.claims[existing_index];
         if args.if_revision != Some(existing.revision) {
             return Err(revision_conflict("claim-revision-conflict"));
@@ -489,6 +507,7 @@ pub(crate) fn set_declared(
     let mut candidate = candidate.validate_and_canonicalize()?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_runtime_stop_fenced(context, record)?;
     ensure_fingerprint_key(&mut locked.registry);
     let checkout = checkout_root(std::path::Path::new(&record.cwd))?;
     let checkout_fingerprint = worktree_fingerprint(&locked.registry, &checkout)?;
@@ -539,6 +558,12 @@ pub(crate) fn set_declared(
         if has_nonterminal_operation(&locked.registry, &existing.claim_id) {
             return Err(operation_in_progress());
         }
+        super::ensure_claim_mutation_not_fenced(
+            context,
+            &record.id,
+            incarnation,
+            &locked.registry.claims[index],
+        )?;
         let existing = &mut locked.registry.claims[index];
         existing.state = "released".to_string();
         existing.revision = existing.revision.saturating_add(1);
@@ -590,6 +615,7 @@ pub(crate) fn clear_declared(
 ) -> Result<Value, CliError> {
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_runtime_stop_fenced(context, record)?;
     clean_expired(&mut locked.registry, now);
     ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
     let Some(index) = locked.registry.claims.iter().position(|claim| {
@@ -606,6 +632,12 @@ pub(crate) fn clear_declared(
     if has_nonterminal_operation(&locked.registry, &claim_id) {
         return Err(operation_in_progress());
     }
+    super::ensure_claim_mutation_not_fenced(
+        context,
+        &record.id,
+        incarnation,
+        &locked.registry.claims[index],
+    )?;
     let claim = &mut locked.registry.claims[index];
     claim.state = "released".to_string();
     claim.revision = claim.revision.saturating_add(1);
@@ -691,6 +723,7 @@ pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_runtime_stop_fenced(context, &record)?;
     crate::orchestration::ensure_session_not_authority_quarantined(context, &record)?;
     clean_expired(&mut locked.registry, now);
     if let Some(replay) = idempotency_replay(
@@ -704,20 +737,27 @@ pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<
         return Ok(replay);
     }
     ensure_current_broker(context, &locked.registry, &record.id, &incarnation)?;
-    let claim = locked
+    let claim_index = locked
         .registry
         .claims
-        .iter_mut()
-        .find(|claim| {
+        .iter()
+        .position(|claim| {
             claim.session_id == record.id
                 && claim.session_incarnation == incarnation
                 && claim.claim_id == args.claim
                 && claim.state == "active"
         })
         .ok_or_else(claim_unavailable)?;
-    if claim.revision != args.if_revision {
+    if locked.registry.claims[claim_index].revision != args.if_revision {
         return Err(revision_conflict("claim-revision-conflict"));
     }
+    super::ensure_claim_mutation_not_fenced(
+        context,
+        &record.id,
+        &incarnation,
+        &locked.registry.claims[claim_index],
+    )?;
+    let claim = &mut locked.registry.claims[claim_index];
     claim.revision = claim.revision.saturating_add(1);
     claim.updated_at = timestamp(now);
     claim.expires_at_epoch = now.saturating_add(CLAIM_TTL_SECS);
@@ -752,6 +792,7 @@ pub(crate) fn release(
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    crate::orchestration::ensure_session_not_runtime_stop_fenced(context, &record)?;
     if clean_expired(&mut locked.registry, now) {
         locked.save()?;
     }
@@ -779,6 +820,12 @@ pub(crate) fn release(
     if has_nonterminal_operation(&locked.registry, &args.claim) {
         return Err(operation_in_progress());
     }
+    super::ensure_claim_mutation_not_fenced(
+        context,
+        &record.id,
+        &incarnation,
+        &locked.registry.claims[claim_index],
+    )?;
     let claim = &mut locked.registry.claims[claim_index];
     if claim.revision != args.if_revision {
         return Err(revision_conflict("claim-revision-conflict"));

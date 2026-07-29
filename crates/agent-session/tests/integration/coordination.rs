@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -732,6 +732,39 @@ fn seed_active_claim(state_dir: &Path, session_id: &str, incarnation: &str, clai
     });
 }
 
+fn worker_delete_identity_path(state_dir: &Path, assignment_id: &str) -> PathBuf {
+    let root = state_dir.join("orchestration/worker-delete-identities");
+    let name = Sha256::digest(assignment_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    root.join(name)
+}
+
+fn seed_worker_delete_identity(state_dir: &Path, assignment_id: &str) -> PathBuf {
+    let registry = orchestration_registry(state_dir);
+    let assignment = &registry["assignments"][assignment_id];
+    let root = state_dir.join("orchestration/worker-delete-identities");
+    fs::create_dir_all(&root).expect("worker delete identity directory");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("worker delete identity directory mode");
+    let path = worker_delete_identity_path(state_dir, assignment_id);
+    write_private_json(
+        &path,
+        &json!({
+            "schema_version": "main-agent.worker-delete-identity.v1",
+            "assignment_id": assignment_id,
+            "assignment_revision": assignment["revision"],
+            "worker": assignment["worker"],
+            "controller": assignment["primary_manager"],
+            "request_digest": "a".repeat(64),
+            "idempotency_key": "worker-delete-race-0001",
+            "created_at": "2030-01-01T00:00:00Z"
+        }),
+    );
+    path
+}
+
 fn seed_operation(
     state_dir: &Path,
     session_id: &str,
@@ -795,6 +828,29 @@ fn load_coordination_registry(state_dir: &Path) -> serde_json::Value {
         &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
     )
     .expect("coordination registry json")
+}
+
+fn released_v1_claim_renew_fixture(state_dir: &Path, session_id: &str) -> Result<(), &'static str> {
+    let path = state_dir.join("coordination/registry.json");
+    let bytes = fs::read(&path).map_err(|_| "unavailable")?;
+    let mut registry: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "invalid")?;
+    if registry["schema_version"] != "agent-session.coordination-registry.v1" {
+        return Err("coordination-facade-version-skew");
+    }
+    let claim = registry["claims"]
+        .as_array_mut()
+        .ok_or("invalid")?
+        .iter_mut()
+        .find(|claim| claim["session_id"] == session_id && claim["state"] == "active")
+        .ok_or("claim-unavailable")?;
+    claim["revision"] = json!(
+        claim["revision"]
+            .as_u64()
+            .ok_or("invalid")?
+            .saturating_add(1)
+    );
+    write_private_json(&path, &registry);
+    Ok(())
 }
 
 fn coordination_authority_snapshot(
@@ -9809,7 +9865,10 @@ struct StoppedPostClaimFixture {
     state_dir: PathBuf,
     checkout: PathBuf,
     main_capability: String,
+    successor_capability: String,
+    second_successor_capability: String,
     worker_capability: String,
+    unrelated_capability: String,
     tmux_bin: PathBuf,
     tmux_log: PathBuf,
 }
@@ -9820,11 +9879,16 @@ impl StoppedPostClaimFixture {
         let state_dir = tmp.path().join("state");
         let checkout = tmp.path().join("main-checkout");
         let worker_checkout = tmp.path().join("worker-checkout");
+        let unrelated_checkout = tmp.path().join("unrelated-checkout");
         fs::create_dir(&state_dir).expect("state");
         init_checkout(&checkout, "https://example.invalid/example/repository.git");
         init_checkout(
             &worker_checkout,
             "https://example.invalid/example/repository.git",
+        );
+        init_checkout(
+            &unrelated_checkout,
+            "https://example.invalid/example/unrelated.git",
         );
         seed_brokers_at(
             &state_dir,
@@ -9837,16 +9901,67 @@ impl StoppedPostClaimFixture {
                     Some("enforce"),
                 ),
                 (
+                    "main-two",
+                    "main-incarnation-two",
+                    "main-successor-capability-postclaim-focused",
+                    checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
+                    "main-three",
+                    "main-incarnation-three",
+                    "main-second-successor-capability-postclaim-focused",
+                    checkout.as_path(),
+                    Some("enforce"),
+                ),
+                (
                     "worker-stopped",
                     "worker-stopped-incarnation",
                     "worker-private-capability-postclaim-focused",
                     worker_checkout.as_path(),
                     Some("enforce"),
                 ),
+                (
+                    "unrelated-one",
+                    "unrelated-incarnation-one",
+                    "unrelated-private-capability-postclaim-focused",
+                    unrelated_checkout.as_path(),
+                    Some("enforce"),
+                ),
             ],
         );
         let main_capability =
             init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+        let successor_capability = capability(&state_dir, "main-two");
+        let second_successor_capability = capability(&state_dir, "main-three");
+        seed_active_claim(
+            &state_dir,
+            "main-two",
+            "main-incarnation-two",
+            "main-two-postclaim-focused-claim",
+        );
+        seed_active_claim(
+            &state_dir,
+            "main-three",
+            "main-incarnation-three",
+            "main-three-postclaim-focused-claim",
+        );
+        rewrite_orchestration_registry(&state_dir, |registry| {
+            let mut run_two = registry["runs"]["run-one"].clone();
+            run_two["run_id"] = json!("run-two");
+            run_two["revision"] = json!(1);
+            run_two["objective_summary"] = json!("Post-claim successor controller");
+            run_two["controller"]["session_id"] = json!("main-two");
+            run_two["controller"]["session_incarnation"] = json!("main-incarnation-two");
+            registry["runs"]["run-two"] = run_two;
+            let mut run_three = registry["runs"]["run-one"].clone();
+            run_three["run_id"] = json!("run-three");
+            run_three["revision"] = json!(1);
+            run_three["objective_summary"] = json!("Second post-claim successor controller");
+            run_three["controller"]["session_id"] = json!("main-three");
+            run_three["controller"]["session_incarnation"] = json!("main-incarnation-three");
+            registry["runs"]["run-three"] = run_three;
+        });
         let packet = json!({
             "schema_version": "main-agent.assignment-input.v1",
             "assignment_id": "assignment-stopped",
@@ -9903,6 +10018,13 @@ impl StoppedPostClaimFixture {
             &packet,
         );
         let worker_capability = capability(&state_dir, "worker-stopped");
+        let unrelated_capability = capability(&state_dir, "unrelated-one");
+        seed_active_claim(
+            &state_dir,
+            "unrelated-one",
+            "unrelated-incarnation-one",
+            "unrelated-claim-one",
+        );
         let bootstrapped = run_main_agent(
             &worker_checkout,
             &[
@@ -9940,7 +10062,10 @@ impl StoppedPostClaimFixture {
             state_dir,
             checkout,
             main_capability,
+            successor_capability,
+            second_successor_capability,
             worker_capability,
+            unrelated_capability,
             tmux_bin,
             tmux_log,
         }
@@ -9993,6 +10118,152 @@ impl StoppedPostClaimFixture {
         run_main_agent(&self.checkout, &self.reconcile_args(), &env)
     }
 
+    fn run_claimed_runtime_stop(
+        &self,
+        runtime: &TestProcessGroup,
+        idempotency_key: &str,
+    ) -> CmdOutput {
+        let runtime_pid = runtime.pid().to_string();
+        let state_runtime = self.state_dir.to_string_lossy().into_owned();
+        run_main_agent(
+            &self.checkout,
+            &[
+                "--state-dir",
+                self.state_dir.to_str().expect("state dir"),
+                "worker",
+                "stop-claimed-runtime",
+                "assignment-stopped",
+                "--worker-incarnation",
+                "worker-stopped-incarnation",
+                "--if-revision",
+                "3",
+                "--idempotency-key",
+                idempotency_key,
+                "--format",
+                "json",
+            ],
+            &[
+                (
+                    "AGENT_SESSION_CAPABILITY_FILE",
+                    self.main_capability.as_str(),
+                ),
+                (
+                    "AGENT_SESSION_TMUX_BIN",
+                    self.tmux_bin.to_str().expect("tmux bin"),
+                ),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_LOG",
+                    self.tmux_log.to_str().expect("tmux log"),
+                ),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+                    runtime_pid.as_str(),
+                ),
+                ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+                ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+                ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+                ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+                    "worker-stopped-incarnation",
+                ),
+                (
+                    "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+                    "120",
+                ),
+            ],
+        )
+    }
+
+    fn spawn_claimed_runtime_stop_at_barrier(
+        &self,
+        runtime: &TestProcessGroup,
+        idempotency_key: &str,
+        stage: &str,
+        barrier: &Path,
+    ) -> Child {
+        self.spawn_claimed_runtime_stop_with_barrier(
+            runtime,
+            idempotency_key,
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            stage,
+            barrier,
+        )
+    }
+
+    fn spawn_claimed_runtime_stop_at_fence_activation_barrier(
+        &self,
+        runtime: &TestProcessGroup,
+        idempotency_key: &str,
+        stage: &str,
+        barrier: &Path,
+    ) -> Child {
+        self.spawn_claimed_runtime_stop_with_barrier(
+            runtime,
+            idempotency_key,
+            "NILS_AGENT_SESSION_TEST_CLAIM_MUTATION_FENCE_BARRIER_STAGE",
+            "NILS_AGENT_SESSION_TEST_CLAIM_MUTATION_FENCE_BARRIER_DIR",
+            stage,
+            barrier,
+        )
+    }
+
+    fn spawn_claimed_runtime_stop_with_barrier(
+        &self,
+        runtime: &TestProcessGroup,
+        idempotency_key: &str,
+        barrier_stage_env: &str,
+        barrier_dir_env: &str,
+        stage: &str,
+        barrier: &Path,
+    ) -> Child {
+        let runtime_pid = runtime.pid().to_string();
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&self.checkout)
+            .args([
+                "--state-dir",
+                self.state_dir.to_str().expect("state dir"),
+                "worker",
+                "stop-claimed-runtime",
+                "assignment-stopped",
+                "--worker-incarnation",
+                "worker-stopped-incarnation",
+                "--if-revision",
+                "3",
+                "--idempotency-key",
+                idempotency_key,
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &self.main_capability)
+            .env("AGENT_SESSION_TMUX_BIN", &self.tmux_bin)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &self.tmux_log)
+            .env("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid)
+            .env("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid)
+            .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+            .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
+            .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
+            .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
+            .env("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &self.state_dir)
+            .env(
+                "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+                "worker-stopped-incarnation",
+            )
+            .env(
+                "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+                "1",
+            )
+            .env(barrier_stage_env, stage)
+            .env(barrier_dir_env, barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("spawn claimed runtime stop")
+    }
+
     fn spawn_reconcile_at_barrier(&self, barrier: &Path, stage: &str) -> Child {
         let mut command = Command::new(bin::resolve("main-agent"));
         command
@@ -10011,6 +10282,2581 @@ impl StoppedPostClaimFixture {
             .stderr(Stdio::piped());
         command.spawn().expect("spawn reconcile-stopped")
     }
+}
+
+fn assert_claimed_runtime_stop_rejected_without_mutation(
+    fixture: &StoppedPostClaimFixture,
+    runtime: &TestProcessGroup,
+    idempotency_key: &str,
+    expected_code: &str,
+) {
+    let orchestration_before = fs::read(fixture.state_dir.join("orchestration/registry.json"))
+        .expect("orchestration before rejection");
+    let coordination_before = fs::read(fixture.state_dir.join("coordination/registry.json"))
+        .expect("coordination before rejection");
+    let session_before = fs::read(
+        fixture
+            .state_dir
+            .join("sessions/worker-stopped/session.json"),
+    )
+    .expect("session before rejection");
+    let rejected = fixture.run_claimed_runtime_stop(runtime, idempotency_key);
+    assert_eq!(
+        rejected.code,
+        65,
+        "stdout={} stderr={}",
+        rejected.stdout_text(),
+        rejected.stderr_text()
+    );
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        expected_code,
+        "idempotency_key={idempotency_key}"
+    );
+    assert!(
+        runtime.is_running(),
+        "a rejected stop must leave runtime live"
+    );
+    assert_eq!(
+        fs::read(fixture.state_dir.join("orchestration/registry.json"))
+            .expect("orchestration after rejection"),
+        orchestration_before
+    );
+    assert_eq!(
+        fs::read(fixture.state_dir.join("coordination/registry.json"))
+            .expect("coordination after rejection"),
+        coordination_before
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .state_dir
+                .join("sessions/worker-stopped/session.json")
+        )
+        .expect("session after rejection"),
+        session_before
+    );
+    assert!(
+        !fixture
+            .state_dir
+            .join("sessions/worker-stopped/runtime-stop-fence.json")
+            .exists(),
+        "a rejected stop must not persist an authority fence"
+    );
+    assert!(
+        !fixture
+            .state_dir
+            .join("sessions/worker-stopped/claimed-runtime-stop.json")
+            .exists(),
+        "a rejected stop must not persist a replay identity"
+    );
+    assert!(
+        !fs::read_to_string(&fixture.tmux_log)
+            .unwrap_or_default()
+            .contains("kill-session"),
+        "a rejected stop must not reach the runtime boundary"
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_rejects_nonidle_or_unowned_claims_without_mutation() {
+    let active_turn = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &active_turn.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "claimed-stop-active-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "last_progress_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let active_turn_runtime = seed_live_runtime_identity(
+        &active_turn.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    assert_claimed_runtime_stop_rejected_without_mutation(
+        &active_turn,
+        &active_turn_runtime,
+        "claimed-stop-active-turn-0001",
+        "worker-turn-not-idle",
+    );
+
+    for (state, key) in [
+        ("active", "claimed-stop-active-operation-0001"),
+        ("completing", "claimed-stop-completing-operation-0001"),
+        (
+            "reconcile_pending",
+            "claimed-stop-reconcile-pending-operation-0001",
+        ),
+    ] {
+        let fixture = StoppedPostClaimFixture::new();
+        seed_activity_state(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            "waiting",
+            serde_json::Value::Null,
+            json!({
+                "provider_turn_id": format!("claimed-stop-{state}"),
+                "started_at": "2030-01-01T00:00:00Z",
+                "completed_at": "2030-01-01T00:00:01Z",
+                "outcome": "completed"
+            }),
+        );
+        seed_operation(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            &format!("claimed-stop-{state}-lease"),
+            state,
+        );
+        let runtime = seed_live_runtime_identity(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            91,
+        );
+        assert_claimed_runtime_stop_rejected_without_mutation(
+            &fixture,
+            &runtime,
+            key,
+            "worker-not-quiescent",
+        );
+    }
+
+    for (case, expected_code) in [
+        ("absent", "claim-not-active"),
+        ("mismatched", "worker-claim-mismatch"),
+        ("expired", "claim-not-active"),
+    ] {
+        let fixture = StoppedPostClaimFixture::new();
+        seed_activity_state(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            "waiting",
+            serde_json::Value::Null,
+            json!({
+                "provider_turn_id": format!("claimed-stop-{case}"),
+                "started_at": "2030-01-01T00:00:00Z",
+                "completed_at": "2030-01-01T00:00:01Z",
+                "outcome": "completed"
+            }),
+        );
+        rewrite_registry(&fixture.state_dir, |registry| {
+            let claims = registry["claims"].as_array_mut().expect("claims");
+            let claim = claims.iter_mut().find(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            });
+            match case {
+                "absent" => claims.retain(|claim| {
+                    claim["session_id"] != "worker-stopped"
+                        || claim["session_incarnation"] != "worker-stopped-incarnation"
+                }),
+                "mismatched" => {
+                    claim.expect("worker claim")["summary"] =
+                        json!("different assignment-derived claim");
+                }
+                "expired" => {
+                    let claim = claim.expect("worker claim");
+                    claim["expires_at"] = json!("2000-01-01T00:00:00Z");
+                    claim["expires_at_epoch"] = json!(1);
+                }
+                _ => unreachable!(),
+            }
+        });
+        let runtime = seed_live_runtime_identity(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            91,
+        );
+        assert_claimed_runtime_stop_rejected_without_mutation(
+            &fixture,
+            &runtime,
+            &format!("claimed-stop-{case}-claim-0001"),
+            expected_code,
+        );
+    }
+}
+
+#[test]
+fn claimed_runtime_stop_rejects_insufficient_worker_claim_ttl_before_reservation() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-short-ttl",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let near_expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 60;
+    rewrite_registry(&fixture.state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            })
+            .expect("worker claim");
+        claim["expires_at_epoch"] = json!(near_expiry);
+    });
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+
+    assert_claimed_runtime_stop_rejected_without_mutation(
+        &fixture,
+        &runtime,
+        "claimed-stop-short-ttl-0001",
+        "worker-claim-ttl-insufficient",
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_rejects_insufficient_controller_claim_ttl_before_reservation() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-short-controller-ttl",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let boundary_expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 120;
+    rewrite_registry(&fixture.state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == "main-incarnation-one"
+                    && claim["state"] == "active"
+            })
+            .expect("controller claim");
+        claim["expires_at_epoch"] = json!(boundary_expiry);
+    });
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+
+    assert_claimed_runtime_stop_rejected_without_mutation(
+        &fixture,
+        &runtime,
+        "claimed-stop-short-controller-ttl-0001",
+        "controller-claim-ttl-insufficient",
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_identity_only_interruption_projects_exact_replay() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-identity-only",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+    ];
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-claimed-runtime",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "stop-claimed-runtime-identity-only",
+        "--format",
+        "json",
+    ];
+    let barrier = fixture._tmp.path().join("claimed-stop-after-identity");
+    let mut interrupted = Command::new(bin::resolve("main-agent"));
+    interrupted
+        .current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "after_identity",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let interrupted = interrupted.spawn().expect("spawn identity-only stop");
+    wait_for_barrier(&barrier);
+    terminate_at_barrier(interrupted, "identity-only interruption");
+    assert!(runtime.is_running());
+    assert!(
+        fixture
+            .state_dir
+            .join("sessions/worker-stopped/claimed-runtime-stop.json")
+            .is_file()
+    );
+    assert!(
+        !fixture
+            .state_dir
+            .join("sessions/worker-stopped/runtime-stop-fence.json")
+            .exists()
+    );
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "claimed_runtime_stop_in_progress"
+    );
+    assert_eq!(
+        data(&supervised)["recovery_action"]["argv"][9],
+        "stop-claimed-runtime-identity-only"
+    );
+    let broker_stop = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "broker",
+            "stop",
+            "--session",
+            "worker-stopped",
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        broker_stop.code,
+        65,
+        "outcome={}",
+        broker_stop.stdout_text()
+    );
+    assert_eq!(
+        broker_stop.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    assert!(
+        load_coordination_registry(&fixture.state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            })
+    );
+    let competing = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-competing-identity");
+    assert_eq!(competing.code, 69, "outcome={}", competing.stdout_text());
+    assert_eq!(
+        competing.stdout_json()["error"]["code"],
+        "worker-claimed-runtime-stop-in-flight"
+    );
+    let replayed = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(
+        replayed.code,
+        0,
+        "stdout={} stderr={}",
+        replayed.stdout_text(),
+        replayed.stderr_text()
+    );
+    assert_eq!(
+        data(&replayed)["schema_version"],
+        "main-agent.worker-stop-claimed-runtime-result.v1"
+    );
+    assert!(!runtime.is_running());
+}
+
+#[test]
+fn claimed_runtime_stop_refuses_controller_claim_drift_before_runtime_stop() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-controller-drift-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+    ];
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-claimed-runtime",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "claimed-stop-controller-drift-0001",
+        "--format",
+        "json",
+    ];
+    let barrier = fixture._tmp.path().join("claimed-stop-controller-drift");
+    let mut interrupted = Command::new(bin::resolve("main-agent"));
+    interrupted
+        .current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let interrupted = interrupted.spawn().expect("spawn claimed runtime stop");
+    wait_for_barrier(&barrier);
+    let before = load_coordination_registry(&fixture.state_dir);
+    let controller_claim = before["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("controller claim");
+    let controller_claim_id = controller_claim["claim_id"]
+        .as_str()
+        .expect("controller claim id");
+    let controller_claim_revision = controller_claim["revision"]
+        .as_u64()
+        .expect("controller claim revision")
+        .to_string();
+    let worker_claim_before = before["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "worker-stopped")
+        .expect("worker claim")
+        .clone();
+    let renewed = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "renew",
+            "--session",
+            "main-one",
+            "--claim",
+            controller_claim_id,
+            "--if-revision",
+            &controller_claim_revision,
+            "--capability-file",
+            fixture.main_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-controller-renew-0001",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(renewed.code, 0, "outcome={}", renewed.stdout_text());
+    terminate_at_barrier(interrupted, "controller-drift claimed runtime stop");
+    let replay = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(replay.code, 65, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        replay.stdout_json()["error"]["code"],
+        "controller-claim-not-preserved"
+    );
+    assert!(
+        runtime.is_running(),
+        "controller drift must precede any stop"
+    );
+    let after = load_coordination_registry(&fixture.state_dir);
+    assert_eq!(
+        after["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .find(|claim| claim["session_id"] == "worker-stopped")
+            .expect("worker claim"),
+        &worker_claim_before,
+        "controller drift refusal must preserve the worker claim"
+    );
+    assert!(
+        fs::read_to_string(&fixture.tmux_log)
+            .unwrap_or_default()
+            .lines()
+            .all(|line| !line.contains("kill-session")),
+        "controller drift refusal must not send a runtime stop"
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_coordination() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-controller-serialized-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+    ];
+    let coordination = load_coordination_registry(&fixture.state_dir);
+    let controller_claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("controller claim");
+    let controller_claim_id = controller_claim["claim_id"]
+        .as_str()
+        .expect("controller claim id");
+    let controller_claim_revision = controller_claim["revision"]
+        .as_u64()
+        .expect("controller claim revision")
+        .to_string();
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-claimed-runtime",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "claimed-stop-controller-serialized-0001",
+        "--format",
+        "json",
+    ];
+    let barrier = fixture
+        ._tmp
+        .path()
+        .join("claimed-stop-controller-serialized");
+    let mut stop = Command::new(bin::resolve("main-agent"));
+    stop.current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "before_runtime_stop",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let stop = stop.spawn().expect("spawn claimed runtime stop");
+    wait_for_barrier(&barrier);
+    std::thread::sleep(Duration::from_millis(2_200));
+
+    let mut controller_renew = Command::new(bin::resolve("agent-session"));
+    controller_renew
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "renew",
+            "--session",
+            "main-one",
+            "--claim",
+            controller_claim_id,
+            "--if-revision",
+            &controller_claim_revision,
+            "--capability-file",
+            fixture.main_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-controller-serialized-renew-0001",
+            "--format",
+            "json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let controller_renew = controller_renew
+        .spawn()
+        .expect("spawn controller claim renewal")
+        .wait_with_output()
+        .expect("wait controller claim renewal");
+    assert!(
+        !controller_renew.status.success(),
+        "the exact controller claim mutation must be fenced"
+    );
+    let controller_renew_json: serde_json::Value =
+        serde_json::from_slice(&controller_renew.stdout).expect("controller renewal JSON");
+    assert_eq!(
+        controller_renew_json["error"]["code"],
+        "claim-mutation-fenced"
+    );
+    let unrelated_renew = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "renew",
+            "--session",
+            "unrelated-one",
+            "--claim",
+            "unrelated-claim-one",
+            "--if-revision",
+            "1",
+            "--capability-file",
+            fixture.unrelated_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-unrelated-renew-0001",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        unrelated_renew.code,
+        0,
+        "an unrelated coordination mutation must remain available: {}",
+        unrelated_renew.stdout_text()
+    );
+
+    fs::write(barrier.join("release"), b"release").expect("release runtime stop");
+    let stop = stop.wait_with_output().expect("wait claimed runtime stop");
+    assert!(
+        stop.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let stopped: serde_json::Value =
+        serde_json::from_slice(&stop.stdout).expect("claimed stop JSON");
+    assert_eq!(stopped["data"]["runtime_stopped"], true);
+    assert!(!runtime.is_running());
+    assert_eq!(
+        fs::read_to_string(&fixture.tmux_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("kill-session"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_v2_activation_is_fail_closed_at_every_crash_boundary() {
+    for stage in [
+        "after_registry_v2",
+        "after_manifest",
+        "after_worker_sidecar",
+        "after_controller_sidecar",
+    ] {
+        let fixture = StoppedPostClaimFixture::new();
+        seed_activity_state(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            "waiting",
+            serde_json::Value::Null,
+            json!({
+                "provider_turn_id": format!("claimed-stop-v2-{stage}"),
+                "started_at": "2030-01-01T00:00:00Z",
+                "completed_at": "2030-01-01T00:00:01Z",
+                "outcome": "completed"
+            }),
+        );
+        let runtime = seed_live_runtime_identity(
+            &fixture.state_dir,
+            "worker-stopped",
+            "worker-stopped-incarnation",
+            91,
+        );
+        let barrier = fixture._tmp.path().join(format!("claimed-stop-v2-{stage}"));
+        let idempotency_key = format!("claimed-stop-v2-{stage}-0001");
+        let interrupted = fixture.spawn_claimed_runtime_stop_at_fence_activation_barrier(
+            &runtime,
+            &idempotency_key,
+            stage,
+            &barrier,
+        );
+        wait_for_barrier(&barrier);
+        let registry_path = fixture.state_dir.join("coordination/registry.json");
+        let registry_before = fs::read(&registry_path).expect("fence-aware registry");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&registry_before)
+                .expect("fence-aware registry JSON")["schema_version"],
+            "agent-session.coordination-registry.v2",
+            "stage={stage}"
+        );
+        let sidecar_dir = fixture.state_dir.join("coordination/claim-mutation-fences");
+        let sidecars_before = if sidecar_dir.is_dir() {
+            fs::read_dir(&sidecar_dir)
+                .expect("sidecar directory")
+                .map(|entry| {
+                    let path = entry.expect("sidecar entry").path();
+                    (
+                        path.file_name().expect("sidecar name").to_os_string(),
+                        fs::read(path).expect("sidecar bytes"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        assert_eq!(
+            released_v1_claim_renew_fixture(&fixture.state_dir, "worker-stopped"),
+            Err("coordination-facade-version-skew"),
+            "stage={stage}"
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after v1 attempt"),
+            registry_before,
+            "released v1 rejection must preserve the registry; stage={stage}"
+        );
+        let sidecars_after = if sidecar_dir.is_dir() {
+            fs::read_dir(&sidecar_dir)
+                .expect("sidecar directory")
+                .map(|entry| {
+                    let path = entry.expect("sidecar entry").path();
+                    (
+                        path.file_name().expect("sidecar name").to_os_string(),
+                        fs::read(path).expect("sidecar bytes"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        assert_eq!(
+            sidecars_after, sidecars_before,
+            "released v1 rejection must preserve sidecars; stage={stage}"
+        );
+        terminate_at_barrier(interrupted, "v2 activation crash boundary");
+        assert!(runtime.is_running(), "stage={stage}");
+
+        let replay = fixture.run_claimed_runtime_stop(&runtime, &idempotency_key);
+        assert_eq!(replay.code, 0, "stage={stage}; {}", replay.stdout_text());
+        assert_eq!(data(&replay)["worker_claim_active_after"], true);
+        assert!(!runtime.is_running(), "stage={stage}");
+    }
+}
+
+#[test]
+fn claimed_runtime_stop_reacquires_process_owned_fence_after_owner_crash() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-owner-crash-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let barrier = fixture._tmp.path().join("claimed-stop-owner-crash");
+    let interrupted = fixture.spawn_claimed_runtime_stop_at_barrier(
+        &runtime,
+        "claimed-stop-owner-crash-0001",
+        "before_runtime_stop",
+        &barrier,
+    );
+    wait_for_barrier(&barrier);
+    let fenced_registry = load_coordination_registry(&fixture.state_dir);
+    assert_eq!(
+        fenced_registry["schema_version"], "agent-session.coordination-registry.v2",
+        "activating a claimed-stop fence must make old registry writers fail closed"
+    );
+    assert!(
+        fenced_registry.get("claim_mutation_fences").is_none(),
+        "the fence records must remain outside the coordination registry"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.state_dir.join("coordination/claim-mutation-fences"))
+            .expect("claim mutation fence sidecars")
+            .count(),
+        2,
+        "the exact worker and controller tuples need independent sidecars"
+    );
+    let operation_dir = fixture
+        .state_dir
+        .join("coordination/claim-mutation-fence-locks");
+    let manifest_path = fs::read_dir(&operation_dir)
+        .expect("operation directory")
+        .map(|entry| entry.expect("operation entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("operation manifest");
+    let mut orphan_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).expect("read operation manifest"))
+            .expect("operation manifest JSON");
+    let orphan_manifest_id = "a".repeat(64);
+    orphan_manifest["lock_id"] = json!(orphan_manifest_id);
+    orphan_manifest["worker_session_id"] = json!("orphan-worker");
+    orphan_manifest["controller_session_id"] = json!("orphan-controller");
+    write_private_json(
+        &operation_dir.join(format!("{}.json", "a".repeat(64))),
+        &orphan_manifest,
+    );
+    for orphan_id in ["a".repeat(64), "b".repeat(64)] {
+        let orphan_lock = operation_dir.join(format!("{orphan_id}.lock"));
+        fs::write(&orphan_lock, b"").expect("write orphan owner lock");
+        fs::set_permissions(&orphan_lock, fs::Permissions::from_mode(0o600))
+            .expect("secure orphan owner lock");
+    }
+    terminate_at_barrier(interrupted, "claimed runtime stop owner crash");
+    assert!(
+        runtime.is_running(),
+        "the interrupted owner must not reach runtime termination"
+    );
+
+    let replay = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-owner-crash-0001");
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay)["worker_claim_active_after"], true);
+    assert!(!runtime.is_running());
+    assert!(
+        fs::read_dir(fixture.state_dir.join("coordination/claim-mutation-fences"))
+            .expect("claim mutation fence sidecars")
+            .next()
+            .is_none(),
+        "terminal replay must retire both exact sidecars"
+    );
+    assert!(
+        fs::read_dir(
+            fixture
+                .state_dir
+                .join("coordination/claim-mutation-fence-locks")
+        )
+        .expect("claim mutation fence operation files")
+        .next()
+        .is_none(),
+        "terminal replay must retire the operation manifest and owner lock"
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_refuses_expired_authority_at_termination_boundary() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-expired-boundary-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let expires_at_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 4;
+    rewrite_registry(&fixture.state_dir, |registry| {
+        for claim in registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .filter(|claim| {
+                matches!(
+                    claim["session_id"].as_str(),
+                    Some("main-one" | "worker-stopped")
+                )
+            })
+        {
+            claim["expires_at_epoch"] = json!(expires_at_epoch);
+        }
+    });
+    let barrier = fixture._tmp.path().join("claimed-stop-expired-boundary");
+    let stop = fixture.spawn_claimed_runtime_stop_at_barrier(
+        &runtime,
+        "claimed-stop-expired-boundary-0001",
+        "before_runtime_stop",
+        &barrier,
+    );
+    wait_for_barrier(&barrier);
+    while SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        <= expires_at_epoch
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::write(barrier.join("release"), b"release").expect("release expired boundary");
+    let stopped = stop.wait_with_output().expect("wait expired boundary");
+    assert_eq!(
+        stopped.status.code(),
+        Some(65),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let stopped_json: serde_json::Value =
+        serde_json::from_slice(&stopped.stdout).expect("expired boundary JSON");
+    assert_eq!(
+        stopped_json["error"]["code"],
+        "claim-ttl-insufficient-before-runtime-stop"
+    );
+    assert!(
+        runtime.is_running(),
+        "expired authority must not reach runtime termination"
+    );
+    assert!(
+        fs::read_to_string(&fixture.tmux_log)
+            .unwrap_or_default()
+            .lines()
+            .all(|line| !line.contains("kill-session")),
+        "expired authority must not issue kill-session"
+    );
+}
+
+#[test]
+fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-terminal-waiter-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+    ];
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-claimed-runtime",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "claimed-stop-terminal-waiter-0001",
+        "--format",
+        "json",
+    ];
+    let barrier = fixture._tmp.path().join("claimed-stop-terminal-waiter");
+    let mut waiter = Command::new(bin::resolve("main-agent"));
+    waiter
+        .current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "before_lifecycle_lock",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let waiter = waiter.spawn().expect("spawn terminal replay waiter");
+    wait_for_barrier(&barrier);
+
+    let owner = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(owner.code, 0, "outcome={}", owner.stdout_text());
+    rewrite_orchestration_registry(&fixture.state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-stopped"];
+        assignment["state"] = json!("cancelled");
+        assignment["revision"] = json!(4);
+    });
+    fs::write(barrier.join("release"), b"release").expect("release terminal replay waiter");
+    let waiter = waiter.wait_with_output().expect("wait terminal replay");
+    assert!(
+        waiter.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&waiter.stdout),
+        String::from_utf8_lossy(&waiter.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&waiter.stdout),
+        owner.stdout_text(),
+        "a caller that initially saw no receipt must return the byte-stable terminal result"
+    );
+    assert!(!runtime.is_running());
+}
+
+#[test]
+fn claimed_runtime_stop_replay_degrades_safely_after_stopped_claim_expires() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-expired-replay-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let barrier = fixture._tmp.path().join("claimed-stop-expired-replay");
+    let interrupted = fixture.spawn_claimed_runtime_stop_at_barrier(
+        &runtime,
+        "claimed-stop-expired-replay-0001",
+        "after_runtime_stopped",
+        &barrier,
+    );
+    wait_for_barrier(&barrier);
+    assert!(!runtime.is_running());
+    terminate_at_barrier(interrupted, "post-stop pre-receipt interruption");
+
+    rewrite_registry(&fixture.state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            })
+            .expect("worker claim");
+        claim["expires_at"] = json!("2000-01-01T00:00:00Z");
+        claim["expires_at_epoch"] = json!(1);
+        claim["state"] = json!("expired");
+        claim["revision"] = json!(
+            claim["revision"]
+                .as_u64()
+                .expect("worker claim revision")
+                .saturating_add(1)
+        );
+        claim["terminal_at_epoch"] = json!(1);
+    });
+    let maintenance = run(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "show",
+            "--session",
+            "unrelated-one",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(maintenance.code, 0, "outcome={}", maintenance.stdout_text());
+    assert!(
+        load_coordination_registry(&fixture.state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "expired"
+            }),
+        "the interrupted stopped claim must be terminal before degraded replay"
+    );
+
+    let replay = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-expired-replay-0001");
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay)["runtime_stopped"], true);
+    assert_eq!(data(&replay)["worker_claim_active_after"], false);
+    assert_eq!(
+        data(&replay)["proof"]["interrupted_after_stop_claim_degraded"],
+        true
+    );
+    assert!(
+        fs::read_dir(fixture.state_dir.join("coordination/claim-mutation-fences"))
+            .expect("claim mutation fence sidecars")
+            .next()
+            .is_none(),
+        "degraded replay must retire the exact claim-mutation fence"
+    );
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(
+        data(&reconciled)["proof"]["worker_claim"]["observed_at_stage1"],
+        false
+    );
+    assert_eq!(data(&reconciled)["worker_claim_active_after"], false);
+}
+
+fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-successor-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let stopped = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-successor-stop-0001");
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert_eq!(data(&stopped)["worker_claim_active_after"], true);
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-one"),
+        fixture.state_dir.join("stale-main-one"),
+    )
+    .expect("make original claimed-stop controller unavailable");
+    let successor_env = [(
+        "AGENT_SESSION_CAPABILITY_FILE",
+        fixture.successor_capability.as_str(),
+    )];
+    let adopt_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "adopt",
+        "assignment-stopped",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "claimed-stop-successor-adopt-0001",
+        "--format",
+        "json",
+    ];
+    let committed_successor = stage == "after_registry_save";
+    if committed_successor {
+        let adopted = run_main_agent(&fixture.checkout, &adopt_args, &successor_env);
+        assert_eq!(adopted.code, 0, "outcome={}", adopted.stdout_text());
+        assert_eq!(data(&adopted)["assignment"]["revision"], 4);
+    } else {
+        let (stage_env, directory_env) = if stage == "after_identity" {
+            (
+                "NILS_AGENT_SESSION_TEST_CLAIMED_STOP_ADOPT_REBIND_BARRIER_STAGE",
+                "NILS_AGENT_SESSION_TEST_CLAIMED_STOP_ADOPT_REBIND_BARRIER_DIR",
+            )
+        } else {
+            (
+                "NILS_AGENT_SESSION_TEST_RUNTIME_STOP_ADOPT_BARRIER_STAGE",
+                "NILS_AGENT_SESSION_TEST_RUNTIME_STOP_ADOPT_BARRIER_DIR",
+            )
+        };
+        let adopt_barrier = fixture
+            ._tmp
+            .path()
+            .join(format!("claimed-stop-successor-{stage}"));
+        let mut interrupted_adopt = Command::new(bin::resolve("main-agent"));
+        interrupted_adopt
+            .current_dir(&fixture.checkout)
+            .args(adopt_args)
+            .envs(successor_env)
+            .env(stage_env, stage)
+            .env(directory_env, &adopt_barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let interrupted_adopt = interrupted_adopt
+            .spawn()
+            .expect("spawn claimed-stop successor adopt");
+        wait_for_barrier(&adopt_barrier);
+        assert_eq!(
+            orchestration_registry(&fixture.state_dir)["assignments"]["assignment-stopped"]["revision"],
+            3,
+            "persistent stop identities must rebind before the assignment revision"
+        );
+        let rebound_identity: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .state_dir
+                    .join("sessions/worker-stopped/claimed-runtime-stop.json"),
+            )
+            .expect("rebound claimed-stop identity"),
+        )
+        .expect("claimed-stop identity JSON");
+        assert_eq!(rebound_identity["assignment_revision"], 4);
+        assert_eq!(rebound_identity["controller"]["session_id"], "main-two");
+        assert_eq!(rebound_identity["origin_assignment_revision"], 3);
+        let observed_marker: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .state_dir
+                    .join("sessions/worker-stopped/runtime-stop-fence.json"),
+            )
+            .expect("rebound runtime-stop marker"),
+        )
+        .expect("runtime-stop marker JSON");
+        let expected_marker_revision = if stage == "after_identity" { 3 } else { 4 };
+        assert_eq!(
+            observed_marker["assignment_revision"],
+            expected_marker_revision
+        );
+        terminate_at_barrier(
+            interrupted_adopt,
+            "claimed-stop successor adoption before registry save",
+        );
+    }
+
+    fs::rename(
+        fixture.state_dir.join("sessions/main-two"),
+        fixture.state_dir.join("stale-main-two"),
+    )
+    .expect("make interrupted claimed-stop successor unavailable");
+    let second_successor_env = [(
+        "AGENT_SESSION_CAPABILITY_FILE",
+        fixture.second_successor_capability.as_str(),
+    )];
+    let source_revision = if committed_successor { "4" } else { "3" };
+    let adopted_revision = if committed_successor { 5 } else { 4 };
+    let adopted_revision_arg = adopted_revision.to_string();
+    let adopted = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "adopt",
+            "assignment-stopped",
+            "--if-revision",
+            source_revision,
+            "--idempotency-key",
+            "claimed-stop-final-successor-adopt-0001",
+            "--format",
+            "json",
+        ],
+        &second_successor_env,
+    );
+    assert_eq!(adopted.code, 0, "outcome={}", adopted.stdout_text());
+    assert_eq!(data(&adopted)["assignment"]["revision"], adopted_revision);
+    assert_eq!(
+        data(&adopted)["assignment"]["primary_manager"]["session_id"],
+        "main-three"
+    );
+    for name in ["claimed-runtime-stop.json", "runtime-stop-fence.json"] {
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.state_dir.join("sessions/worker-stopped").join(name))
+                .expect("twice-rebound claimed-stop sidecar"),
+        )
+        .expect("claimed-stop sidecar JSON");
+        assert_eq!(sidecar["assignment_revision"], adopted_revision);
+        assert_eq!(sidecar["controller"]["session_id"], "main-three");
+        assert_eq!(sidecar["origin_assignment_revision"], 3);
+        assert_eq!(sidecar["origin_controller"]["session_id"], "main-one");
+    }
+
+    let reconciled = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "reconcile-stopped",
+            "assignment-stopped",
+            "--if-revision",
+            &adopted_revision_arg,
+            "--reason",
+            "successor reconciles exact stopped worker",
+            "--idempotency-key",
+            "claimed-stop-successor-reconcile-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                fixture.second_successor_capability.as_str(),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                fixture.tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                fixture.tmux_log.to_str().expect("tmux log"),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+            ("AGENT_SESSION_CODEX_BIN", "/bin/false"),
+        ],
+    );
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(
+        data(&reconciled)["proof"]["worker_claim"]["observed_at_stage1"],
+        true
+    );
+    let terminal_revision = adopted_revision + 1;
+    assert_eq!(
+        data(&reconciled)["assignment"]["revision"],
+        terminal_revision
+    );
+    let terminal_revision_arg = terminal_revision.to_string();
+
+    let deleted = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "delete",
+            "assignment-stopped",
+            "--if-revision",
+            &terminal_revision_arg,
+            "--idempotency-key",
+            "claimed-stop-successor-delete-0001",
+            "--format",
+            "json",
+        ],
+        &second_successor_env,
+    );
+    assert_eq!(
+        deleted.code,
+        0,
+        "stdout={} stderr={}",
+        deleted.stdout_text(),
+        deleted.stderr_text()
+    );
+    assert_eq!(data(&deleted)["deleted"], true);
+    assert!(!fixture.state_dir.join("sessions/worker-stopped").exists());
+}
+
+#[test]
+fn claimed_runtime_stop_successor_adopt_reconcile_and_delete_preserve_lineage() {
+    for stage in [
+        "after_identity",
+        "after_claimed_stop_rebind",
+        "after_registry_save",
+    ] {
+        assert_claimed_runtime_stop_pending_successor_loss(stage);
+    }
+}
+
+#[test]
+fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+    ];
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-claimed-runtime",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "stop-claimed-runtime-0001",
+        "--format",
+        "json",
+    ];
+    let wrong_revision = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-claimed-runtime",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "stop-claimed-runtime-wrong-revision",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(wrong_revision.code, 65);
+    assert_eq!(
+        wrong_revision.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    let wrong_incarnation = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-claimed-runtime",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "different-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "stop-claimed-runtime-wrong-incarnation",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(wrong_incarnation.code, 65);
+    assert_eq!(
+        wrong_incarnation.stdout_json()["error"]["code"],
+        "worker-incarnation-changed"
+    );
+    let broker_race_barrier = fixture._tmp.path().join("broker-stop-after-fence-check");
+    let mut racing_broker_stop = Command::new(bin::resolve("agent-session"));
+    racing_broker_stop
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "broker",
+            "stop",
+            "--session",
+            "worker-stopped",
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--format",
+            "json",
+        ])
+        .env(
+            "NILS_AGENT_SESSION_TEST_BROKER_STOP_BARRIER_DIR",
+            &broker_race_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let racing_broker_stop = racing_broker_stop
+        .spawn()
+        .expect("spawn racing broker stop");
+    wait_for_barrier(&broker_race_barrier);
+    let near_expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 10 * 60;
+    rewrite_registry(&fixture.state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+            })
+            .expect("worker claim");
+        claim["expires_at_epoch"] = json!(near_expiry);
+    });
+    let barrier = fixture
+        ._tmp
+        .path()
+        .join("claimed-runtime-stop-after-reservation");
+    let mut interrupted = Command::new(bin::resolve("main-agent"));
+    interrupted
+        .current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let interrupted = interrupted
+        .spawn()
+        .expect("spawn interrupted claimed runtime stop");
+    wait_for_barrier(&barrier);
+    fs::write(broker_race_barrier.join("release"), b"release").expect("release racing broker stop");
+    let racing_broker_stop = racing_broker_stop
+        .wait_with_output()
+        .expect("wait for racing broker stop");
+    assert_eq!(
+        racing_broker_stop.status.code(),
+        Some(65),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&racing_broker_stop.stdout),
+        String::from_utf8_lossy(&racing_broker_stop.stderr)
+    );
+    let racing_broker_stop_json: serde_json::Value =
+        serde_json::from_slice(&racing_broker_stop.stdout).expect("racing broker stop JSON");
+    assert_eq!(
+        racing_broker_stop_json["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    let fenced_claim = load_coordination_registry(&fixture.state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| {
+            claim["session_id"] == "worker-stopped"
+                && claim["session_incarnation"] == "worker-stopped-incarnation"
+                && claim["state"] == "active"
+        })
+        .expect("fenced worker claim")
+        .clone();
+    let fenced_claim_id = fenced_claim["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_string();
+    let fenced_claim_revision = fenced_claim["revision"].as_u64().expect("claim revision");
+    let fenced_claim_expiry = fenced_claim["expires_at_epoch"]
+        .as_i64()
+        .expect("claim expiry");
+    assert_eq!(
+        fenced_claim_expiry, near_expiry,
+        "automatic maintenance must not renew a fenced claim"
+    );
+    let before_renew = load_coordination_registry(&fixture.state_dir);
+    let renewed = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "renew",
+            "--session",
+            "worker-stopped",
+            "--claim",
+            &fenced_claim_id,
+            "--if-revision",
+            &fenced_claim_revision.to_string(),
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-worker-renew-0001",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(renewed.code, 65, "outcome={}", renewed.stdout_text());
+    assert_eq!(
+        renewed.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    assert_eq!(
+        load_coordination_registry(&fixture.state_dir),
+        before_renew,
+        "rejected renew must not mutate the coordination registry"
+    );
+    let before_release = load_coordination_registry(&fixture.state_dir);
+    let released = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "release",
+            "--session",
+            "worker-stopped",
+            "--claim",
+            &fenced_claim_id,
+            "--if-revision",
+            &fenced_claim_revision.to_string(),
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-worker-release-0001",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(released.code, 65, "outcome={}", released.stdout_text());
+    assert_eq!(
+        released.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    assert_eq!(
+        load_coordination_registry(&fixture.state_dir),
+        before_release,
+        "rejected release must not mutate the coordination registry"
+    );
+    terminate_at_barrier(interrupted, "interrupted claimed runtime stop");
+    let deleted = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "delete",
+            "worker-stopped",
+            "--tmux-bin",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(deleted.code, 65, "outcome={}", deleted.stdout_text());
+    assert_eq!(
+        deleted.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    let protected_claim = load_coordination_registry(&fixture.state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| {
+            claim["session_id"] == "worker-stopped"
+                && claim["session_incarnation"] == "worker-stopped-incarnation"
+                && claim["state"] == "active"
+        })
+        .expect("protected worker claim")
+        .clone();
+    assert_eq!(protected_claim["claim_id"], fenced_claim["claim_id"]);
+    assert_eq!(protected_claim["revision"], fenced_claim["revision"]);
+    assert_eq!(
+        protected_claim["expires_at_epoch"], fenced_claim["expires_at_epoch"],
+        "automatic maintenance must not renew a fenced claim"
+    );
+    assert!(runtime.is_running(), "raw delete must not stop the runtime");
+
+    let in_progress = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(in_progress.code, 0, "outcome={}", in_progress.stdout_text());
+    assert_eq!(
+        data(&in_progress)["schema_version"],
+        "main-agent.worker-supervise-result.v5"
+    );
+    assert_eq!(
+        data(&in_progress)["classification"],
+        "claimed_runtime_stop_in_progress"
+    );
+    assert_eq!(
+        data(&in_progress)["recovery_action"]["argv"][9],
+        "stop-claimed-runtime-0001"
+    );
+    let competing_key = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-claimed-runtime",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "stop-claimed-runtime-competing-key",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        competing_key.code,
+        69,
+        "outcome={}",
+        competing_key.stdout_text()
+    );
+    assert_eq!(
+        competing_key.stdout_json()["error"]["code"],
+        "worker-claimed-runtime-stop-in-flight"
+    );
+    let broker_stop = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "broker",
+            "stop",
+            "--session",
+            "worker-stopped",
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        broker_stop.code,
+        65,
+        "outcome={}",
+        broker_stop.stdout_text()
+    );
+    assert_eq!(
+        broker_stop.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    let fenced_coordination = load_coordination_registry(&fixture.state_dir);
+    assert!(
+        fenced_coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            }),
+        "a fenced broker stop must not release the worker claim"
+    );
+
+    let after_runtime_barrier = fixture
+        ._tmp
+        .path()
+        .join("claimed-runtime-stop-after-runtime-stopped");
+    let mut after_runtime = Command::new(bin::resolve("main-agent"));
+    after_runtime
+        .current_dir(&fixture.checkout)
+        .args(stop_args)
+        .envs(live_env)
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+            "after_runtime_stopped",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+            &after_runtime_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let after_runtime = after_runtime
+        .spawn()
+        .expect("spawn post-runtime-stop interruption");
+    wait_for_barrier(&after_runtime_barrier);
+    assert!(!runtime.is_running());
+    let stop_count = fs::read_to_string(&fixture.tmux_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("kill-session"))
+        .count();
+    assert_eq!(stop_count, 1, "the exact runtime must be stopped once");
+    let heartbeat = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "broker",
+            "heartbeat",
+            "--session",
+            "worker-stopped",
+            "--incarnation",
+            "worker-stopped-incarnation",
+            "--generation",
+            "1",
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(heartbeat.code, 0, "outcome={}", heartbeat.stdout_text());
+    let after_heartbeat = load_coordination_registry(&fixture.state_dir);
+    assert!(
+        after_heartbeat["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            }),
+        "the heartbeat sidecar must not revoke a claim protected by the runtime stop fence"
+    );
+    let after_receipt_barrier = fixture
+        ._tmp
+        .path()
+        .join("claimed-runtime-stop-after-final-receipt");
+    let spawn_receipt_waiter = || {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&fixture.checkout)
+            .args(stop_args)
+            .envs(live_env)
+            .env(
+                "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_STAGE",
+                "after_final_receipt",
+            )
+            .env(
+                "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_BARRIER_DIR",
+                &after_receipt_barrier,
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("spawn final-receipt waiter")
+    };
+    let mut receipt_waiter_a = spawn_receipt_waiter();
+    let mut receipt_waiter_b = spawn_receipt_waiter();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        receipt_waiter_a
+            .try_wait()
+            .expect("poll receipt waiter A")
+            .is_none()
+            && receipt_waiter_b
+                .try_wait()
+                .expect("poll receipt waiter B")
+                .is_none(),
+        "both exact replay contenders must wait for the lifecycle lock"
+    );
+    terminate_at_barrier(after_runtime, "post-runtime-stop interruption");
+    wait_for_barrier(&after_receipt_barrier);
+    let receipt_in_progress = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        receipt_in_progress.code,
+        0,
+        "outcome={}",
+        receipt_in_progress.stdout_text()
+    );
+    assert_eq!(
+        data(&receipt_in_progress)["classification"],
+        "claimed_runtime_stop_in_progress"
+    );
+    assert_eq!(
+        data(&receipt_in_progress)["recovery_action"]["argv"][9],
+        "stop-claimed-runtime-0001"
+    );
+    let barrier_owner_pid = fs::read_to_string(after_receipt_barrier.join("ready"))
+        .expect("final receipt barrier owner")
+        .rsplit_once(':')
+        .expect("barrier owner format")
+        .1
+        .parse::<u32>()
+        .expect("barrier owner pid");
+    let (receipt_owner, lifecycle_waiter) = if receipt_waiter_a.id() == barrier_owner_pid {
+        (receipt_waiter_a, receipt_waiter_b)
+    } else {
+        assert_eq!(receipt_waiter_b.id(), barrier_owner_pid);
+        (receipt_waiter_b, receipt_waiter_a)
+    };
+    terminate_at_barrier(receipt_owner, "post-final-receipt interruption");
+    let lifecycle_waiter = lifecycle_waiter
+        .wait_with_output()
+        .expect("wait for lifecycle-lock replay");
+    assert_eq!(
+        lifecycle_waiter.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&lifecycle_waiter.stdout),
+        String::from_utf8_lossy(&lifecycle_waiter.stderr)
+    );
+    let lifecycle_waiter_json: serde_json::Value =
+        serde_json::from_slice(&lifecycle_waiter.stdout).expect("lifecycle waiter JSON");
+    assert_eq!(
+        lifecycle_waiter_json["data"]["schema_version"],
+        "main-agent.worker-stop-claimed-runtime-result.v1"
+    );
+
+    let stopped = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(
+        stopped.code,
+        0,
+        "stdout={} stderr={}",
+        stopped.stdout_text(),
+        stopped.stderr_text()
+    );
+    assert_eq!(
+        data(&stopped)["schema_version"],
+        "main-agent.worker-stop-claimed-runtime-result.v1"
+    );
+    assert_eq!(data(&stopped)["runtime_stopped"], true);
+    assert_eq!(data(&stopped)["worker_claim_active_after"], true);
+    assert_eq!(data(&stopped)["input_sent"], false);
+    assert_eq!(data(&stopped)["assignment"]["state"], "working");
+    assert_eq!(data(&stopped)["assignment"]["revision"], 3);
+    assert!(!runtime.is_running());
+    let post_stop_claim_before = load_coordination_registry(&fixture.state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| {
+            claim["session_id"] == "worker-stopped"
+                && claim["session_incarnation"] == "worker-stopped-incarnation"
+        })
+        .expect("post-stop worker claim")
+        .clone();
+    let replacement_context = fixture._tmp.path().join("post-stop-replacement.json");
+    candidate(
+        &replacement_context,
+        "docs/post-stop-replacement/",
+        "post-stop replacement must remain fenced",
+    );
+    let replacement = run(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "work-context",
+            "claim",
+            "--session",
+            "worker-stopped",
+            "--file",
+            replacement_context.to_str().expect("replacement context"),
+            "--capability-file",
+            fixture.worker_capability.as_str(),
+            "--idempotency-key",
+            "claimed-stop-worker-replacement-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        replacement.code,
+        65,
+        "outcome={}",
+        replacement.stdout_text()
+    );
+    assert_eq!(
+        replacement.stdout_json()["error"]["code"],
+        "worker-runtime-stop-fenced"
+    );
+    let worker_state = fixture.state_dir.to_string_lossy();
+    let worker_env = [
+        ("AGENT_SESSION_ID", "worker-stopped"),
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.worker_capability.as_str(),
+        ),
+        ("AGENT_SESSION_STATE_DIR", worker_state.as_ref()),
+    ];
+    for args in [
+        vec![
+            "work-context",
+            "set",
+            "--summary",
+            "post-stop declaration",
+            "--format",
+            "json",
+        ],
+        vec!["work-context", "clear", "--format", "json"],
+    ] {
+        let mutation = run_with_env(&fixture.checkout, &args, &worker_env);
+        assert_eq!(mutation.code, 65, "outcome={}", mutation.stdout_text());
+        assert_eq!(
+            mutation.stdout_json()["error"]["code"],
+            "worker-runtime-stop-fenced"
+        );
+    }
+    assert_eq!(
+        load_coordination_registry(&fixture.state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .find(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+            })
+            .expect("post-stop worker claim"),
+        &post_stop_claim_before,
+        "every post-stop claim-changing ingress must preserve the exact tuple"
+    );
+    let replay_stop_count = fs::read_to_string(&fixture.tmux_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("kill-session"))
+        .count();
+    assert_eq!(
+        replay_stop_count, stop_count,
+        "interrupted replay must not stop the exact runtime twice"
+    );
+    let coordination = load_coordination_registry(&fixture.state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            }),
+        "the exact assignment-derived claim must remain active on TTL"
+    );
+    let replay = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        replay.stdout_text(),
+        stopped.stdout_text(),
+        "an exact replay must return the committed result without another stop"
+    );
+    let terminal_replay_stop_count = fs::read_to_string(&fixture.tmux_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("kill-session"))
+        .count();
+    assert_eq!(
+        terminal_replay_stop_count, stop_count,
+        "terminal replay must not stop the exact runtime twice"
+    );
+
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(data(&supervised)["classification"], "post_claim_failure");
+    assert_eq!(
+        data(&supervised)["last_proven_safe_state"]["coordination"]["claim_active"],
+        true
+    );
+
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(
+        reconciled.code,
+        0,
+        "stdout={} stderr={}",
+        reconciled.stdout_text(),
+        reconciled.stderr_text()
+    );
+    assert_eq!(
+        data(&reconciled)["proof"]["worker_claim"]["observed_at_stage1"],
+        true
+    );
+    assert_eq!(data(&reconciled)["worker_claim_active_after"], false);
+    let post_reconcile_stop_replay = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    assert_eq!(
+        post_reconcile_stop_replay.code,
+        0,
+        "outcome={}",
+        post_reconcile_stop_replay.stdout_text()
+    );
+    assert_eq!(
+        post_reconcile_stop_replay.stdout_text(),
+        stopped.stdout_text(),
+        "completed claimed runtime stop replay must survive the reconcile revision advance"
+    );
+    let post_reconcile_supervision = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(
+        post_reconcile_supervision.code,
+        0,
+        "outcome={}",
+        post_reconcile_supervision.stdout_text()
+    );
+    assert_ne!(
+        data(&post_reconcile_supervision)["classification"],
+        "claimed_runtime_stop_in_progress"
+    );
+    let reconciled_revision = data(&reconciled)["assignment"]["revision"]
+        .as_u64()
+        .expect("reconciled assignment revision")
+        .to_string();
+    let delete_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "delete",
+        "assignment-stopped",
+        "--if-revision",
+        &reconciled_revision,
+        "--idempotency-key",
+        "focused-postclaim-delete-0001",
+        "--format",
+        "json",
+    ];
+    let spawn_delete_at_barrier = |stage: &str, barrier: &Path| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&fixture.checkout)
+            .args(delete_args)
+            .envs(fixture.envs())
+            .env("NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_STAGE", stage)
+            .env("NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_DIR", barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("spawn worker delete")
+    };
+    let identity_barrier = fixture._tmp.path().join("worker-delete-identity");
+    let identity_owner = spawn_delete_at_barrier("after_identity", &identity_barrier);
+    wait_for_barrier(&identity_barrier);
+    let delete_identity = worker_delete_identity_path(&fixture.state_dir, "assignment-stopped");
+    let reserved: serde_json::Value = serde_json::from_slice(
+        &fs::read(&delete_identity).expect("reserved worker delete identity"),
+    )
+    .expect("worker delete identity JSON");
+    assert_eq!(
+        reserved["schema_version"],
+        "main-agent.worker-delete-identity.v1"
+    );
+    assert_eq!(reserved["idempotency_key"], "focused-postclaim-delete-0001");
+    assert!(
+        orchestration_registry(&fixture.state_dir)["receipts"]
+            ["main-one:main-incarnation-one:focused-postclaim-delete-0001"]
+            .is_null(),
+        "an identity-first interruption must precede the pending receipt"
+    );
+    terminate_at_barrier(identity_owner, "worker delete identity-only interruption");
+    let competing = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "delete",
+            "assignment-stopped",
+            "--if-revision",
+            &reconciled_revision,
+            "--idempotency-key",
+            "focused-postclaim-delete-competing-0001",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(competing.code, 69, "outcome={}", competing.stdout_text());
+    assert_eq!(
+        competing.stdout_json()["error"]["code"],
+        "worker-delete-in-flight"
+    );
+    let reservation_barrier = fixture._tmp.path().join("worker-delete-reservation");
+    let reservation_owner = spawn_delete_at_barrier("after_reservation", &reservation_barrier);
+    wait_for_barrier(&reservation_barrier);
+    assert!(
+        fixture.state_dir.join("sessions/worker-stopped").is_dir(),
+        "the pending-receipt boundary must precede exact session deletion"
+    );
+    assert!(
+        delete_identity.exists(),
+        "the pending receipt must retain the matching delete identity"
+    );
+    let pending_receipt = orchestration_registry(&fixture.state_dir)["receipts"]
+        ["main-one:main-incarnation-one:focused-postclaim-delete-0001"]["outcome"]
+        .clone();
+    assert_eq!(
+        pending_receipt["schema_version"],
+        "main-agent.worker-delete-pending.v1"
+    );
+    terminate_at_barrier(
+        reservation_owner,
+        "worker delete post-reservation interruption",
+    );
+    let competing_after_reservation = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "delete",
+            "assignment-stopped",
+            "--if-revision",
+            &reconciled_revision,
+            "--idempotency-key",
+            "focused-postclaim-delete-competing-after-reservation-0001",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_eq!(
+        competing_after_reservation.code,
+        69,
+        "outcome={}",
+        competing_after_reservation.stdout_text()
+    );
+    assert_eq!(
+        competing_after_reservation.stdout_json()["error"]["code"],
+        "worker-delete-in-flight"
+    );
+    let receipt_barrier = fixture._tmp.path().join("worker-delete-final-receipt");
+    let receipt_owner = spawn_delete_at_barrier("after_final_receipt", &receipt_barrier);
+    wait_for_barrier(&receipt_barrier);
+    assert!(
+        !fixture.state_dir.join("sessions/worker-stopped").exists(),
+        "the terminal-receipt boundary follows exact session deletion"
+    );
+    assert!(
+        delete_identity.exists(),
+        "the terminal receipt must commit before the delete identity is cleared"
+    );
+    let terminal_receipt = orchestration_registry(&fixture.state_dir)["receipts"]
+        ["main-one:main-incarnation-one:focused-postclaim-delete-0001"]["outcome"]
+        .clone();
+    assert_eq!(
+        terminal_receipt["schema_version"],
+        "main-agent.worker-delete-result.v1"
+    );
+    terminate_at_barrier(receipt_owner, "worker delete terminal-receipt interruption");
+    let replay = run_main_agent(&fixture.checkout, &delete_args, &fixture.envs());
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(data(&replay), terminal_receipt);
+    assert!(
+        !delete_identity.exists(),
+        "terminal replay must clear the retained durable reservation"
+    );
+    assert!(!fixture.state_dir.join("sessions/worker-stopped").exists());
+}
+
+#[test]
+fn stopped_process_with_live_tmux_is_never_healthy_progress() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "ambiguous-stop-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let live_tmux_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+    ];
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_tmux_env,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "evidence_unavailable",
+        "stopped process evidence conflicting with a live tmux wrapper must fail closed"
+    );
+    assert_eq!(data(&supervised)["automatic_retry_safe"], false);
 }
 
 fn wait_for_barrier(barrier: &Path) {
@@ -16851,17 +19697,18 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
         "main-two-claim",
     );
     let main_two_capability = capability(&state_dir, "main-two");
-    let mut orchestration_registry: serde_json::Value = serde_json::from_slice(
+    let mut seeded_orchestration_registry: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
     )
     .expect("registry json");
-    let main_one_controller = orchestration_registry["runs"]["run-one"]["controller"].clone();
+    let main_one_controller =
+        seeded_orchestration_registry["runs"]["run-one"]["controller"].clone();
     let mut main_two_controller = main_one_controller.clone();
     main_two_controller["session_id"] = json!("main-two");
     main_two_controller["session_incarnation"] = json!("main-incarnation-two");
     let objective_digest =
-        orchestration_registry["runs"]["run-one"]["objective_packet_digest"].clone();
-    orchestration_registry["runs"]["run-two"] = json!({
+        seeded_orchestration_registry["runs"]["run-one"]["objective_packet_digest"].clone();
+    seeded_orchestration_registry["runs"]["run-two"] = json!({
         "schema_version": "agent-session.orchestration-run.v1",
         "run_id": "run-two",
         "revision": 1,
@@ -16877,7 +19724,7 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
     });
     write_private_json(
         &state_dir.join("orchestration/registry.json"),
-        &orchestration_registry,
+        &seeded_orchestration_registry,
     );
     let private_packet = json!({
         "schema_version": "main-agent.assignment-input.v1",
@@ -17006,6 +19853,41 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
     rewrite_registry(&state_dir, |registry| {
         registry["operations"] = json!([]);
     });
+    let worker_delete_identity = seed_worker_delete_identity(&state_dir, "handoff-one");
+    let delete_fenced_handoff = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "handoff-one",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "handoff-delete-fenced-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(
+        delete_fenced_handoff.code,
+        69,
+        "outcome={}",
+        delete_fenced_handoff.stdout_text()
+    );
+    assert_eq!(
+        delete_fenced_handoff.stdout_json()["error"]["code"],
+        "worker-delete-in-flight"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["handoff-one"]["primary_manager"]["session_id"],
+        "main-one",
+        "pending worker deletion must fence ownership handoff"
+    );
+    fs::remove_file(worker_delete_identity).expect("clear worker delete identity");
     seed_active_claim(
         &state_dir,
         "worker-account-race",
