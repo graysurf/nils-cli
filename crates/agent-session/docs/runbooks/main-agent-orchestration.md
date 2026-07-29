@@ -263,10 +263,27 @@ on the typed `readiness` result:
   deterministic failure to prove delivery after any eligible recovery is
   exhausted. Do not resend the prompt or inject another Enter; retain the
   bound worker for typed session-transport diagnostics.
-- `classification: "submitted_or_waiting_without_checkpoint"` with
-  `proof: "authoritative-provider-turn-terminated"` returns before the outer
-  timeout when an authoritative provider turn completed or failed without a
-  checkpoint. No recovery Enter is sent after this proof.
+- Read `prompt_observation.prompt.state` and
+  `prompt_observation.composer.state` together. The former is an exact match
+  against the bound provider transcript after worker creation; the latter is a
+  content-free pane-digest comparison between paste and first Enter. The full
+  exact-prompt observation has a fixed 500 ms allowance and pane observation has a
+  one-second command bound; timeout or admission pressure reports
+  `unavailable`.
+- `classification: "composer_not_ready"` means the paste was not visible in
+  that pane projection and the exact prompt was absent from the transcript.
+  `prompt_not_present` means the pane changed but the exact prompt was absent.
+  `prompt_observation_unavailable` preserves transport uncertainty.
+- `checkpoint_timeout_after_prompt_submission` proves exact prompt submission
+  but not bootstrap. `bootstrap_failure` additionally has
+  `proof: "authoritative-provider-turn-terminated"` and returns before the
+  outer timeout when the provider turn ends without an authenticated
+  checkpoint. No recovery Enter is sent after that proof.
+- `transport_uncertain`, `readiness_recovery_failed`, and
+  `readiness_recovery_unavailable` distinguish an unknown recovery-send
+  effect, a definitive bounded recovery failure, and refusal before recovery
+  input. Keep the accompanying prompt observation and recovery fence; none
+  authorizes additional input.
 
 For a fresh Codex or Claude launch that remains `starting`, the runtime rechecks
 the exact session incarnation and live tmux status, sends one recovery Enter,

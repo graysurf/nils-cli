@@ -99,6 +99,8 @@ const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const PANE_OBSERVATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+const PANE_OBSERVATION_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const SUBMIT_RECOVERY_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const POST_PASTE_KEY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const PANE_PASTE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1452,6 +1454,7 @@ struct SessionView {
 struct StartView {
     format: OutputFormat,
     result: SessionView,
+    prompt_delivery_observation: Option<PromptDeliveryObservation>,
 }
 
 pub(crate) struct ProviderResumeImportArgs {
@@ -1690,6 +1693,18 @@ enum PromptDelivery {
     ManagedWorkerExactlyOnce,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PromptDeliveryObservation {
+    schema_version: &'static str,
+    composer: PromptComposerObservation,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PromptComposerObservation {
+    state: &'static str,
+    proof: &'static str,
+}
+
 fn start_session(
     context: &CliContext,
     args: cli::StartArgs,
@@ -1830,6 +1845,7 @@ fn start_session_with_create_guard(
                 Some(result) => Ok(StartView {
                     format: args.format,
                     result,
+                    prompt_delivery_observation: None,
                 }),
                 None => Err(err),
             };
@@ -1871,25 +1887,29 @@ fn start_session_with_create_guard(
     }
     let _ = advance_owned_startup_stage(context, &mut created.record, "runtime");
     let mut prompt_delivery_error = None;
+    let mut prompt_delivery_observation = None;
     if created.prompt_file.is_some() {
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
-        if let Err(err) = paste_prompt(&tmux_bin, &created.record, prompt_delivery) {
-            if prompt_delivery == PromptDelivery::ManagedWorkerExactlyOnce
-                && err.code() == "managed-worker-prompt-delivery-outcome-unknown"
-            {
-                prompt_delivery_error = Some(err);
-            } else {
-                recover_failed_tmux_launch(
-                    context,
-                    &mut created.record,
-                    &tmux_bin,
-                    Some(&launch_identity),
-                    SessionTerminationOperation::FailedLaunch,
-                )?;
-                cleanup_created_record(context, &created);
-                return Err(err);
+        match paste_prompt(&tmux_bin, &created.record, prompt_delivery) {
+            Ok(observation) => prompt_delivery_observation = Some(observation),
+            Err(err) => {
+                if prompt_delivery == PromptDelivery::ManagedWorkerExactlyOnce
+                    && err.code() == "managed-worker-prompt-delivery-outcome-unknown"
+                {
+                    prompt_delivery_error = Some(err);
+                } else {
+                    recover_failed_tmux_launch(
+                        context,
+                        &mut created.record,
+                        &tmux_bin,
+                        Some(&launch_identity),
+                        SessionTerminationOperation::FailedLaunch,
+                    )?;
+                    cleanup_created_record(context, &created);
+                    return Err(err);
+                }
             }
         }
     }
@@ -1922,6 +1942,7 @@ fn start_session_with_create_guard(
         None => Ok(StartView {
             format: args.format,
             result,
+            prompt_delivery_observation,
         }),
     }
 }
@@ -2028,6 +2049,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
     Ok(StartView {
         format: args.format,
         result,
+        prompt_delivery_observation: None,
     })
 }
 
@@ -2161,6 +2183,7 @@ pub(crate) fn start_provider_resume_session(
     Ok(StartView {
         format: args.format,
         result,
+        prompt_delivery_observation: None,
     })
 }
 
@@ -3257,7 +3280,7 @@ fn paste_prompt(
     tmux_bin: &Path,
     record: &SessionRecord,
     delivery: PromptDelivery,
-) -> Result<(), CliError> {
+) -> Result<PromptDeliveryObservation, CliError> {
     let prompt_file = record.prompt_file.as_ref().ok_or_else(|| {
         CliError::runtime(
             "missing-prompt-file",
@@ -3281,9 +3304,7 @@ fn paste_prompt(
     // ignored and retry it while no submit key has been sent. Managed workers
     // deliberately skip this probe because their private assignment prompt is
     // exactly-once transport and later recovery may only send one guarded Enter.
-    let before = (delivery == PromptDelivery::ResilientBeforeSubmit)
-        .then(|| capture_pane_digest(tmux_bin, &target))
-        .flatten();
+    let before = capture_pane_digest(tmux_bin, &target);
     load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
         .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
 
@@ -3293,9 +3314,16 @@ fn paste_prompt(
     // immediately adjacent Enter arrives. Keep the key a separate command and
     // give both Codex and Claude one bounded settle interval first.
     thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
-    if delivery == PromptDelivery::ResilientBeforeSubmit
-        && pane_ignored_paste(before, capture_pane_digest(tmux_bin, &target))
-    {
+    let after = capture_pane_digest(tmux_bin, &target);
+    let composer = PromptComposerObservation {
+        state: match (before, after) {
+            (Some(before), Some(after)) if before == after => "unchanged_after_paste",
+            (Some(_), Some(_)) => "changed_after_paste",
+            _ => "unavailable",
+        },
+        proof: "tmux-pane-digest-before-submit",
+    };
+    if delivery == PromptDelivery::ResilientBeforeSubmit && pane_ignored_paste(before, after) {
         load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
             .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
         thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
@@ -3308,6 +3336,10 @@ fn paste_prompt(
         } else {
             error
         }
+    })?;
+    Ok(PromptDeliveryObservation {
+        schema_version: "agent-session.prompt-delivery-observation.v1",
+        composer,
     })
 }
 
@@ -3361,13 +3393,14 @@ fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str) {
 /// start reacted to a paste. `None` when tmux cannot answer, which must not be
 /// read as "unchanged".
 fn capture_pane_digest(tmux_bin: &Path, target: &str) -> Option<u64> {
-    let output = ProcessCommand::new(tmux_bin)
-        .arg("capture-pane")
-        .arg("-p")
-        .arg("-t")
-        .arg(target)
-        .output()
-        .ok()?;
+    let mut command = ProcessCommand::new(tmux_bin);
+    command.arg("capture-pane").arg("-p").arg("-t").arg(target);
+    let output = run_output_with_timeout_and_cap(
+        command,
+        PANE_OBSERVATION_COMMAND_TIMEOUT,
+        PANE_OBSERVATION_MAX_OUTPUT_BYTES,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

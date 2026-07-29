@@ -22467,10 +22467,13 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
         }),
     );
     let codex_home = tmp.path().join("codex-home");
+    let codex_session = codex_home.join("sessions/2026/07/29/session.jsonl");
     write_trusted_codex_config(&codex_home, &[&checkout]);
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_session_arg = codex_session.to_string_lossy().into_owned();
+    let checkout_arg = checkout.to_string_lossy().into_owned();
     let explicit_hook = tmp.path().join("explicit-recovery-contender");
     let explicit_hook_output = tmp.path().join("explicit-recovery-contender.json");
     fs::write(
@@ -22512,6 +22515,15 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
             ("AGENT_SESSION_CODEX_BIN", &codex_arg),
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg),
+            (
+                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+                "codex-await-ready-resume",
+            ),
+            ("AGENT_SESSION_FAKE_CODEX_CWD", &checkout_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
+            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
+            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &explicit_hook_arg),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
             ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT", "2"),
@@ -22522,6 +22534,21 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = data(&started)["readiness"].clone();
     assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(readiness["classification"], "composer_not_ready");
+    assert_eq!(
+        readiness["prompt_observation"],
+        json!({
+            "schema_version": "main-agent.worker-prompt-observation.v1",
+            "prompt": {
+                "state": "not_present",
+                "proof": "provider-transcript-exact-match"
+            },
+            "composer": {
+                "state": "unchanged_after_paste",
+                "proof": "tmux-pane-digest-before-submit"
+            }
+        })
+    );
     assert_eq!(readiness["assignment_state"], "starting");
     assert_eq!(readiness["worker_launched"], true);
     assert_eq!(readiness["delivery"]["state"], "unverified");
@@ -22765,6 +22792,159 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
         enter_calls_after_explicit, 2,
         "automatic and explicit recovery share one durable attempt"
     );
+}
+
+#[test]
+fn main_agent_worker_start_timeout_reports_exact_submitted_prompt() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let worker_id = "worker-exact-prompt-timeout";
+    let assignment_path = tmp.path().join("assignment-exact-prompt-timeout.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-exact-prompt-timeout",
+            "task_summary": "Prove exact prompt submission before checkpoint timeout",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/exact-prompt-timeout"],
+            "durable_refs": []
+        }),
+    );
+    let codex_home = tmp.path().join("codex-home");
+    let codex_session = codex_home.join("sessions/2026/07/29/session.jsonl");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let checkout_arg = checkout.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_session_arg = codex_session.to_string_lossy().into_owned();
+    let started_at = Instant::now();
+    let start = Command::new(bin::resolve("main-agent"))
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "12s",
+            "--idempotency-key",
+            "worker-start-exact-prompt-timeout-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("CODEX_HOME", &codex_home)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg)
+        .env(
+            "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+            "codex-exact-prompt-timeout",
+        )
+        .env("AGENT_SESSION_FAKE_CODEX_CWD", &checkout_arg)
+        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250")
+        .env("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10")
+        .env("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40")
+        .env("AGENT_SESSION_FAKE_TMUX_CAPTURE_SLEEP", "5")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn worker start");
+
+    let prompt_path = state_dir.join(format!("sessions/{worker_id}/prompt.md"));
+    let wait_deadline = Instant::now() + Duration::from_secs(10);
+    while (!prompt_path.is_file() || !codex_session.is_file()) && Instant::now() < wait_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let prompt = fs::read_to_string(&prompt_path).expect("generated worker prompt");
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(&codex_session)
+        .expect("bound Codex transcript");
+    writeln!(
+        transcript,
+        "{}",
+        json!({
+            "timestamp": "2099-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": prompt,
+                "images": [],
+                "local_images": [],
+                "text_elements": []
+            }
+        })
+    )
+    .expect("append exact generated prompt");
+    drop(transcript);
+
+    let output = start.wait_with_output().expect("worker start output");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(18),
+        "hanging pane observation must stay bounded before the 12s readiness deadline"
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("worker start json");
+    let readiness = &envelope["data"]["readiness"];
+    assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(
+        readiness["classification"],
+        "checkpoint_timeout_after_prompt_submission"
+    );
+    assert_eq!(
+        readiness["prompt_observation"]["prompt"]["state"],
+        "submitted"
+    );
+    assert_eq!(
+        readiness["prompt_observation"]["prompt"]["proof"],
+        "provider-transcript-exact-match"
+    );
+    assert_eq!(
+        readiness["prompt_observation"]["composer"]["state"],
+        "unavailable"
+    );
+    assert_eq!(readiness["delivery"]["proof"], "worker-checkpoint-timeout");
+    assert_eq!(readiness["automatic_retry_safe"], false);
 }
 
 #[test]
@@ -23108,6 +23288,14 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
         );
         let successor: serde_json::Value =
             serde_json::from_slice(&successor.stdout).expect("successor json");
+        assert!(
+            successor["data"]["readiness"]["classification"].is_string(),
+            "every terminal readiness takeover branch must remain classified: {crash_stage}"
+        );
+        assert!(
+            successor["data"]["readiness"]["prompt_observation"].is_object(),
+            "every terminal readiness takeover branch must retain typed prompt evidence: {crash_stage}"
+        );
         assert_eq!(
             successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"], 1,
             "successor must resume the persisted recovery reservation"
@@ -24770,12 +24958,15 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         }),
     );
     let codex_home = tmp.path().join("codex-home");
+    let codex_session = codex_home.join("sessions/2026/07/29/session.jsonl");
     write_trusted_codex_config(&codex_home, &[&worker_checkout]);
 
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_session_arg = codex_session.to_string_lossy().into_owned();
+    let worker_checkout_arg = worker_checkout.to_string_lossy().into_owned();
     let start = Command::new(bin::resolve("main-agent"))
         .current_dir(&checkout)
         .args([
@@ -24797,6 +24988,15 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
         .env("CODEX_HOME", &codex_home)
         .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg)
+        .env(
+            "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+            "codex-authoritative-terminal",
+        )
+        .env("AGENT_SESSION_FAKE_CODEX_CWD", &worker_checkout_arg)
+        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250")
+        .env("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10")
+        .env("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -24804,7 +25004,9 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
 
     let worker_record_path = state_dir.join(format!("sessions/{worker_id}/session.json"));
     let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !worker_record_path.is_file() && Instant::now() < wait_deadline {
+    while (!worker_record_path.is_file() || !codex_session.is_file())
+        && Instant::now() < wait_deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     let worker_record: serde_json::Value =
@@ -24813,12 +25015,34 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
     let runtime_id = worker_record["runtime"]["launch_id"]
         .as_str()
         .expect("worker runtime id");
+    let prompt = fs::read_to_string(state_dir.join(format!("sessions/{worker_id}/prompt.md")))
+        .expect("generated worker prompt");
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(&codex_session)
+        .expect("bound Codex transcript");
+    writeln!(
+        transcript,
+        "{}",
+        json!({
+            "timestamp": "2099-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": prompt,
+                "images": [],
+                "local_images": [],
+                "text_elements": []
+            }
+        })
+    )
+    .expect("append exact generated prompt");
     let event = json!({
         "schema_version": "agent-session.turn-event.v1",
         "event_id": "worker-authoritative-complete-event",
         "runtime_id": runtime_id,
         "provider": "codex",
-        "provider_session_id": "provider-session",
+        "provider_session_id": "codex-authoritative-terminal",
         "kind": kind,
         "confidence": "authoritative"
     })
@@ -24871,9 +25095,10 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         serde_json::from_slice(&output.stdout).expect("worker start json");
     let readiness = &envelope["data"]["readiness"];
     assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(readiness["classification"], "bootstrap_failure");
     assert_eq!(
-        readiness["classification"],
-        "submitted_or_waiting_without_checkpoint"
+        readiness["prompt_observation"]["prompt"]["state"],
+        "submitted"
     );
     assert_eq!(
         readiness["delivery"]["proof"],

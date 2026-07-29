@@ -185,6 +185,9 @@ if [ "$1" = "show-environment" ]; then
 fi
 
 if [ "$1" = "capture-pane" ]; then
+  if [ -n "${AGENT_SESSION_FAKE_TMUX_CAPTURE_SLEEP:-}" ]; then
+    sleep "$AGENT_SESSION_FAKE_TMUX_CAPTURE_SLEEP"
+  fi
   if [ "${AGENT_SESSION_FAKE_TMUX_CAPTURE+x}" = "x" ]; then
     printf '%s' "$AGENT_SESSION_FAKE_TMUX_CAPTURE"
     exit 0

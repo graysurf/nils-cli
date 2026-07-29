@@ -59,6 +59,11 @@ static IDEMPOTENCY_RECEIPT_CAPACITY_FOR_TEST: AtomicUsize =
     AtomicUsize::new(MAX_IDEMPOTENCY_RECEIPTS);
 const WORKER_START_RUN_REVISION_HELP: &str = "Optional expected run revision. Omit to launch without a run-revision fence: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.";
 const QUICK_IDEMPOTENCY_KEY_HELP: &str = "Optional for the fast-path: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.";
+const WORKER_PROMPT_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(500);
+const WORKER_PROMPT_OBSERVATION_MAX_READERS: usize = 4;
+static ACTIVE_WORKER_PROMPT_OBSERVATION_READERS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
 const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start --await-ready -> worker bootstrap\n  worker supervise -> accept -> retire -> close\n\nMACRO-FIRST RECOVERY:\n  Use worker supervise for repeatable diagnosis. Use self recover only for this\n  exact Main Agent controller's stale broker. Guidance continuity and managed\n  account handoff use their typed worker actions. Use worker reassign only when\n  supervision proves safe reassignment. If a macro stops, continue from its\n  last_proven_safe_state with worker diagnose, submit-recovery, cancel,\n  account-handoff-cancel, or retire. Account handoff cancellation requires the\n  current assignment revision and --authorize-account-change.\n  never resend a prompt or inject an unbounded/manual Enter.\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent self recover --idempotency-key controller-recover-001 --format json\n  main-agent worker start --assignment-file assignment.json --await-ready 5m --idempotency-key start-001 --format json\n  main-agent worker supervise ASSIGNMENT_ID --format json\n  main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason \"pre-claim bootstrap failure\" --idempotency-key reassign-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
@@ -2868,10 +2873,10 @@ fn run_worker_start_single_input(
     };
     let fresh_launch = existing.is_none();
     let mut worker_start_fence = None;
-    let (worker_record, worker_status) = if let Some(worker) = existing {
+    let (worker_record, worker_status, launch_observation) = if let Some(worker) = existing {
         ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
         let status = session_status(&resolve_tmux_bin(None), &worker);
-        (worker, status)
+        (worker, status, None)
     } else {
         let mut create_guard = || {
             pause_batch_lane_for_test("before_session_create")?;
@@ -2959,6 +2964,12 @@ fn run_worker_start_single_input(
                 return Err(error);
             }
         };
+        let launch_observation = started
+            .prompt_delivery_observation
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| invalid_input("worker launch observation is invalid"))?;
         let worker = match load_session_record(context, &started.result.id) {
             Ok(worker) => worker,
             Err(error) => {
@@ -2968,7 +2979,7 @@ fn run_worker_start_single_input(
                 return Err(error);
             }
         };
-        (worker, started.result.status)
+        (worker, started.result.status, launch_observation)
     };
     let worker_incarnation = match worker_record
         .runtime
@@ -3145,6 +3156,7 @@ fn run_worker_start_single_input(
                 "state": "pending-worker-checkpoint",
                 "transport_only": true
             },
+            "launch_observation": launch_observation,
             "polling": worker_start_polling_evidence(await_ready)
         });
         let receipt_outcome = await_ready.map_or_else(
@@ -3397,6 +3409,7 @@ fn finish_worker_start_readiness(
                     .as_u64()
                     .ok_or_else(|| invalid_input("worker start revision is unavailable"))?,
                 submit_key_recovery_eligible,
+                launch_observation: &outcome["launch_observation"],
                 readiness_receipt: WorkerStartReadinessReceipt {
                     idempotency_key,
                     request_digest,
@@ -4570,6 +4583,7 @@ struct WorkerReadinessRequest<'a> {
     worker: (&'a SessionRecord, &'a str),
     starting_revision: u64,
     submit_key_recovery_eligible: bool,
+    launch_observation: &'a Value,
     readiness_receipt: WorkerStartReadinessReceipt<'a>,
     recovery_continuation: Option<Value>,
 }
@@ -4589,6 +4603,183 @@ fn worker_start_recovery_continuation(
         "stage": stage,
         "reservation": submit_recovery_progress(reservation)["reservation"]
     })
+}
+
+fn worker_prompt_observation(
+    context: &CliContext,
+    worker: &SessionRecord,
+    launch_observation: &Value,
+) -> Value {
+    let prompt_state = worker_prompt_observed(context, worker);
+    let composer_state = launch_observation
+        .get("composer")
+        .and_then(|composer| composer.get("state"))
+        .and_then(Value::as_str)
+        .filter(|state| {
+            matches!(
+                *state,
+                "changed_after_paste" | "unchanged_after_paste" | "unavailable"
+            )
+        })
+        .unwrap_or("unavailable");
+    json!({
+        "schema_version": "main-agent.worker-prompt-observation.v1",
+        "prompt": {
+            "state": match prompt_state {
+                Some(true) => "submitted",
+                Some(false) => "not_present",
+                None => "unavailable",
+            },
+            "proof": if prompt_state.is_some() {
+                "provider-transcript-exact-match"
+            } else {
+                "provider-transcript-unavailable"
+            }
+        },
+        "composer": {
+            "state": composer_state,
+            "proof": "tmux-pane-digest-before-submit"
+        }
+    })
+}
+
+fn worker_prompt_observed(context: &CliContext, worker: &SessionRecord) -> Option<bool> {
+    worker_prompt_observed_with_timeout(
+        context.clone(),
+        worker.clone(),
+        WORKER_PROMPT_OBSERVATION_TIMEOUT,
+    )
+}
+
+fn worker_prompt_observed_inner(context: &CliContext, worker: &SessionRecord) -> Option<bool> {
+    let expected_directory = session_dir(context, &worker.id);
+    let expected_prompt = expected_directory.join("prompt.md");
+    if Path::new(worker.prompt_file.as_deref()?) != expected_prompt {
+        return None;
+    }
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(expected_directory)
+        .ok()?;
+    let directory_metadata = directory.metadata().ok()?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != unsafe { libc::geteuid() }
+        || directory_metadata.mode() & 0o077 != 0
+    {
+        return None;
+    }
+    let name = CString::new("prompt.md").ok()?;
+    // SAFETY: `directory` is a validated private session directory, `name` is
+    // fixed and contains no separators, and the returned descriptor is owned
+    // by `prompt_file`.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return None;
+    }
+    // SAFETY: `openat` returned a newly owned descriptor.
+    let mut prompt_file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = prompt_file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > crate::provider_prompt::MAX_PROVIDER_PROMPT_BYTES as u64
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(
+        metadata
+            .len()
+            .min(crate::provider_prompt::MAX_PROVIDER_PROMPT_BYTES as u64 + 1) as usize,
+    );
+    Read::by_ref(&mut prompt_file)
+        .take(crate::provider_prompt::MAX_PROVIDER_PROMPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > crate::provider_prompt::MAX_PROVIDER_PROMPT_BYTES {
+        return None;
+    }
+    let prompt = String::from_utf8(bytes).ok()?;
+    let attempted_at = worker.created_at.parse::<jiff::Timestamp>().ok()?;
+    let source = crate::provider_prompt::ProviderPromptTail::resolve_source(worker)?;
+    crate::provider_prompt::prompt_observed_after(&source, &prompt, &attempted_at)
+}
+
+struct WorkerPromptObservationReaderPermit;
+
+impl WorkerPromptObservationReaderPermit {
+    fn acquire() -> Option<Self> {
+        let mut active = ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.load(Ordering::Acquire);
+        loop {
+            if active >= WORKER_PROMPT_OBSERVATION_MAX_READERS {
+                return None;
+            }
+            match ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+impl Drop for WorkerPromptObservationReaderPermit {
+    fn drop(&mut self) {
+        ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn worker_prompt_observed_with_timeout(
+    context: CliContext,
+    worker: SessionRecord,
+    timeout: Duration,
+) -> Option<bool> {
+    let started = Instant::now();
+    let permit = WorkerPromptObservationReaderPermit::acquire()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("worker-prompt-observation-reader".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            {
+                let stall =
+                    WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST.swap(0, Ordering::AcqRel);
+                if stall > 0 {
+                    thread::sleep(Duration::from_millis(stall as u64));
+                }
+            }
+            let result = worker_prompt_observed_inner(&context, &worker);
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    receiver
+        .recv_timeout(timeout.checked_sub(started.elapsed())?)
+        .ok()?
+}
+
+fn prompt_failure_classification(observation: &Value) -> &'static str {
+    if observation["prompt"]["state"] == "not_present"
+        && observation["composer"]["state"] == "unchanged_after_paste"
+    {
+        "composer_not_ready"
+    } else if observation["prompt"]["state"] == "not_present"
+        && observation["composer"]["state"] == "changed_after_paste"
+    {
+        "prompt_not_present"
+    } else {
+        "prompt_observation_unavailable"
+    }
 }
 
 fn worker_start_recovery_from_continuation(
@@ -4753,6 +4944,7 @@ fn await_worker_readiness(
         worker,
         starting_revision,
         submit_key_recovery_eligible,
+        launch_observation,
         readiness_receipt,
         recovery_continuation,
     } = request;
@@ -4801,6 +4993,13 @@ fn await_worker_readiness(
             recovery_stage.as_deref(),
             Some("failed" | "outcome_unknown")
         ) {
+            let prompt_observation =
+                worker_prompt_observation(context, worker.0, launch_observation);
+            let classification = if recovery_stage.as_deref() == Some("outcome_unknown") {
+                "transport_uncertain"
+            } else {
+                "readiness_recovery_failed"
+            };
             let result = assignment
                 .submit_recovery
                 .as_ref()
@@ -4813,6 +5012,8 @@ fn await_worker_readiness(
                 .unwrap_or("submit-recovery-send-outcome-unknown");
             return Ok(json!({
                 "state": "readiness_failed",
+                "classification": classification,
+                "prompt_observation": prompt_observation,
                 "assignment_state": state,
                 "worker_launched": true,
                 "delivery": {
@@ -4854,11 +5055,15 @@ fn await_worker_readiness(
                     )?;
                 }
                 Some("failed" | "reconciled") => {
+                    let prompt_observation =
+                        worker_prompt_observation(context, worker.0, launch_observation);
                     let result = recovery_record
                         .map(|current| current.result.as_str())
                         .unwrap_or("submit-recovery-terminal");
                     return Ok(json!({
                         "state": "readiness_failed",
+                        "classification": "readiness_recovery_failed",
+                        "prompt_observation": prompt_observation,
                         "assignment_state": state,
                         "worker_launched": true,
                         "delivery": {
@@ -4877,8 +5082,12 @@ fn await_worker_readiness(
                     }));
                 }
                 _ => {
+                    let prompt_observation =
+                        worker_prompt_observation(context, worker.0, launch_observation);
                     return Ok(json!({
                         "state": "readiness_failed",
+                        "classification": "transport_uncertain",
+                        "prompt_observation": prompt_observation,
                         "assignment_state": state,
                         "worker_launched": true,
                         "delivery": {
@@ -4916,6 +5125,8 @@ fn await_worker_readiness(
                 })
             };
             if !checkpoint_confirmed {
+                let prompt_observation =
+                    worker_prompt_observation(context, worker.0, launch_observation);
                 let result = if let Some(reservation) = recovery.as_ref() {
                     match submit_recovery_checkpoint(&assignment, record, incarnation, reservation)
                     {
@@ -4940,6 +5151,7 @@ fn await_worker_readiness(
                 return Ok(json!({
                     "state": "readiness_failed",
                     "classification": "checkpoint_proof_failed",
+                    "prompt_observation": prompt_observation,
                     "assignment_state": state,
                     "worker_launched": true,
                     "delivery": {
@@ -4995,6 +5207,13 @@ fn await_worker_readiness(
         if should_check_activity
             && authoritative_worker_turn_terminated(context, worker.0, worker.1)
         {
+            let prompt_observation =
+                worker_prompt_observation(context, worker.0, launch_observation);
+            let classification = if prompt_observation["prompt"]["state"] == "submitted" {
+                "bootstrap_failure"
+            } else {
+                prompt_failure_classification(&prompt_observation)
+            };
             if let Some(reservation) = recovery.as_ref() {
                 let _ = update_submit_recovery(
                     context,
@@ -5007,7 +5226,8 @@ fn await_worker_readiness(
             }
             return Ok(json!({
                 "state": "readiness_failed",
-                "classification": "submitted_or_waiting_without_checkpoint",
+                "classification": classification,
+                "prompt_observation": prompt_observation,
                 "assignment_state": state,
                 "worker_launched": true,
                 "delivery": {
@@ -5051,9 +5271,13 @@ fn await_worker_readiness(
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {
+                    let prompt_observation =
+                        worker_prompt_observation(context, worker.0, launch_observation);
                     let result = error.code().to_string();
                     return Ok(json!({
                         "state": "readiness_failed",
+                        "classification": "readiness_recovery_unavailable",
+                        "prompt_observation": prompt_observation,
                         "assignment_state": state,
                         "worker_launched": true,
                         "delivery": {
@@ -5155,8 +5379,16 @@ fn await_worker_readiness(
                         )?;
                         result
                     };
+                    let prompt_observation =
+                        worker_prompt_observation(context, worker.0, launch_observation);
                     return Ok(json!({
                         "state": "readiness_failed",
+                        "classification": if outcome_unknown {
+                            "transport_uncertain"
+                        } else {
+                            "readiness_recovery_failed"
+                        },
+                        "prompt_observation": prompt_observation,
                         "assignment_state": state,
                         "worker_launched": true,
                         "delivery": {
@@ -5182,6 +5414,13 @@ fn await_worker_readiness(
             continue;
         }
         if elapsed >= timeout {
+            let prompt_observation =
+                worker_prompt_observation(context, worker.0, launch_observation);
+            let classification = if prompt_observation["prompt"]["state"] == "submitted" {
+                "checkpoint_timeout_after_prompt_submission"
+            } else {
+                prompt_failure_classification(&prompt_observation)
+            };
             if let Some(reservation) = recovery.as_ref() {
                 let _ = update_submit_recovery(
                     context,
@@ -5194,6 +5433,8 @@ fn await_worker_readiness(
             }
             return Ok(json!({
                 "state": "readiness_failed",
+                "classification": classification,
+                "prompt_observation": prompt_observation,
                 "assignment_state": state,
                 "worker_launched": true,
                 "delivery": {
@@ -23497,6 +23738,128 @@ mod tests {
         assert_eq!(readiness_from_state("submitted"), "ready");
         assert_eq!(readiness_from_state("accepted"), "ready");
         assert_eq!(readiness_from_state("released"), "ready");
+    }
+
+    #[test]
+    fn prompt_failure_classification_requires_exact_transcript_truth() {
+        let observation = |prompt, composer| {
+            json!({
+                "prompt": {"state": prompt},
+                "composer": {"state": composer}
+            })
+        };
+        assert_eq!(
+            prompt_failure_classification(&observation("not_present", "unchanged_after_paste")),
+            "composer_not_ready"
+        );
+        assert_eq!(
+            prompt_failure_classification(&observation("not_present", "changed_after_paste")),
+            "prompt_not_present"
+        );
+        assert_eq!(
+            prompt_failure_classification(&observation("unavailable", "unchanged_after_paste")),
+            "prompt_observation_unavailable"
+        );
+        assert_eq!(
+            prompt_failure_classification(&observation("not_present", "unavailable")),
+            "prompt_observation_unavailable"
+        );
+        assert_eq!(
+            prompt_failure_classification(&observation("unavailable", "unavailable")),
+            "prompt_observation_unavailable"
+        );
+    }
+
+    #[test]
+    fn worker_prompt_observation_rejects_oversize_and_linked_prompt_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let context = CliContext {
+            state_dir: temporary.path().join("state"),
+            host: None,
+        };
+        let mut worker = cleanup_test_session("prompt-observer-worker", "prompt-incarnation");
+        let directory = session_dir(&context, &worker.id);
+        fs::create_dir_all(&directory).expect("session directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("private session directory");
+        let prompt_path = directory.join("prompt.md");
+        worker.prompt_file = Some(prompt_path.to_string_lossy().into_owned());
+
+        fs::write(
+            &prompt_path,
+            vec![b'x'; crate::provider_prompt::MAX_PROVIDER_PROMPT_BYTES + 1],
+        )
+        .expect("oversize prompt");
+        fs::set_permissions(&prompt_path, fs::Permissions::from_mode(0o600))
+            .expect("private prompt");
+        assert_eq!(worker_prompt_observed(&context, &worker), None);
+        assert_eq!(
+            worker_prompt_observation(
+                &context,
+                &worker,
+                &json!({
+                    "composer": {
+                        "state": "changed_after_paste",
+                        "proof": "untrusted-proof",
+                        "content": "must-not-escape"
+                    }
+                })
+            )["composer"],
+            json!({
+                "state": "changed_after_paste",
+                "proof": "tmux-pane-digest-before-submit"
+            })
+        );
+
+        fs::remove_file(&prompt_path).expect("remove oversize prompt");
+        let foreign = temporary.path().join("foreign-prompt");
+        fs::write(&foreign, b"foreign prompt").expect("foreign prompt");
+        symlink(&foreign, &prompt_path).expect("linked prompt");
+        assert_eq!(worker_prompt_observed(&context, &worker), None);
+    }
+
+    #[test]
+    fn worker_prompt_observation_has_a_fixed_time_and_admission_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let context = CliContext {
+            state_dir: temporary.path().join("state"),
+            host: None,
+        };
+        let mut worker = cleanup_test_session("bounded-prompt-worker", "prompt-incarnation");
+        let directory = session_dir(&context, &worker.id);
+        fs::create_dir_all(&directory).expect("session directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("private session directory");
+        let prompt_path = directory.join("prompt.md");
+        fs::write(&prompt_path, b"worker prompt").expect("worker prompt");
+        fs::set_permissions(&prompt_path, fs::Permissions::from_mode(0o600))
+            .expect("private prompt");
+        worker.prompt_file = Some(prompt_path.to_string_lossy().into_owned());
+        WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST.store(100, Ordering::Release);
+        let started = Instant::now();
+        assert_eq!(
+            worker_prompt_observed_with_timeout(context, worker, Duration::from_millis(10),),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(75),
+            "the caller must not wait for the blocked transcript reader"
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.load(Ordering::Acquire) != 0
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.load(Ordering::Acquire),
+            0,
+            "the detached reader must release its admission permit"
+        );
     }
 
     #[test]

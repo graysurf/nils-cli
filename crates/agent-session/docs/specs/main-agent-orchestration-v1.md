@@ -264,13 +264,39 @@ sessions, Hermes, stopped or replaced sessions, and any second recovery
 keypress are ineligible. A final timeout reports `delivery.state: unverified`,
 `automatic_retry_safe: false`, and explicitly forbids duplicate prompt or
 further Enter injection. A successful terminal submit command alone is not
-provider acceptance. When privacy-safe activity proves that an authoritative
-provider turn completed or failed while the assignment still lacks a
-checkpoint, readiness returns immediately with
-`classification: submitted_or_waiting_without_checkpoint` and
+provider acceptance. Terminal readiness failure includes the additive,
+content-free `prompt_observation` projection. Its `prompt` member compares the
+private generated worker prompt with only the exact bound provider transcript
+after the worker's creation time and reports `submitted`, `not_present`, or
+`unavailable`. The complete exact-prompt observation, including the private
+prompt read and provider-source resolution, has a fixed 500 ms allowance with
+bounded reader admission; an expired or saturated observation degrades to
+`unavailable` without delaying the readiness contract indefinitely. Its
+`composer` member reports whether the tmux pane digest
+changed between paste and the first Enter; it never includes pane or prompt
+content. Persisted composer data is allowlisted to the three documented states
+and reconstructed with the fixed proof label before output. Each pane
+observation has a one-second command bound. `composer_not_ready` means the
+paste was not visible in that bounded
+pane projection and the exact prompt was not present in the authoritative
+transcript. `prompt_not_present` means the exact prompt was absent even though
+the pane changed. `prompt_observation_unavailable` preserves uncertainty when
+either provider source binding or pane observation cannot prove more.
+`checkpoint_timeout_after_prompt_submission` means the exact prompt reached
+the bound provider transcript but no authenticated checkpoint followed before
+the deadline. When privacy-safe activity also proves that the authoritative
+provider turn completed or failed after exact prompt submission, readiness
+returns `bootstrap_failure` immediately with
 `proof: authoritative-provider-turn-terminated`; it never waits for the outer
-deadline or sends a recovery Enter after that proof. The wait takes no registry
-lock, so it never blocks the
+deadline or sends a recovery Enter after that proof. A terminated turn without
+exact prompt proof retains the applicable prompt/composer uncertainty
+classification. None of these observations authorizes prompt resend or another
+Enter. Recovery terminal paths retain the same observation:
+`transport_uncertain` means the one recovery Enter has an unknown external
+effect, `readiness_recovery_failed` means that bounded recovery failed
+definitively, and `readiness_recovery_unavailable` means its durable
+reservation was refused before input. The wait takes no registry lock, so it
+never blocks the
 worker's own checkpoint; `--await-ready 0` preserves the launch-only
 `pending-worker-checkpoint` result. `worker retire ID` is the teardown macro: it
 composes release -> delete and reports the worker's absence in one call,
