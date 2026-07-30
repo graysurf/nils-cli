@@ -29,6 +29,8 @@ const MAX_EXECUTABLE_CAPABILITIES: usize = 17;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
 const RULE_CHILD_DEADLINE: Duration = HANDLER_TIMEOUT;
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
+pub(crate) const ACTIVITY_STOP_RECONCILIATION_REQUIRED: &str =
+    "activity-stop-reconciliation-required";
 const SESSION_COORDINATION_TIMEOUT: Duration = RULE_CHILD_DEADLINE;
 
 #[derive(Debug)]
@@ -527,8 +529,15 @@ fn evaluate_capability(
             simple(outcome.action, &outcome.reason_code)
         }
         Capability::SessionActivity { reason_code } => {
-            run_session_activity(request, raw, execution_budget)?;
-            simple(DecisionAction::Allow, reason_code)
+            match run_session_activity(request, raw, execution_budget) {
+                Ok(()) => simple(DecisionAction::Allow, reason_code),
+                Err(error) => {
+                    match terminal_activity_failure_decision(capability, request.event.as_str()) {
+                        Some((action, code)) => simple(action, code),
+                        None => return Err(error),
+                    }
+                }
+            }
         }
         Capability::SessionCoordination { .. } => {
             unreachable!("session coordination is evaluated after aggregate policy")
@@ -544,6 +553,14 @@ fn evaluate_capability(
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?
         }
     })
+}
+
+pub(crate) fn terminal_activity_failure_decision(
+    capability: &Capability,
+    event: &str,
+) -> Option<(DecisionAction, &'static str)> {
+    (event == "Stop" && matches!(capability, Capability::SessionActivity { .. }))
+        .then_some((DecisionAction::Warn, ACTIVITY_STOP_RECONCILIATION_REQUIRED))
 }
 
 pub fn apply_session_coordination(

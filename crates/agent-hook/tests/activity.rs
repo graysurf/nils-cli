@@ -122,6 +122,46 @@ override_class = "locked"
 capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
 "#;
 
+const FAILURE_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "session.activity"
+products = ["codex", "claude"]
+events = ["PreToolUse", "Stop"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+"#;
+
+const FAILURE_COORDINATION_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "session.activity"
+products = ["codex"]
+events = ["Stop"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+
+[[rules]]
+id = "session.coordination"
+products = ["codex"]
+events = ["Stop"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
+"#;
+
 #[test]
 fn claude_prompt_id_is_correlated_as_the_provider_turn_id() {
     let fixture = Fixture::new(STOP_POLICY);
@@ -188,5 +228,129 @@ fn claude_prompt_id_is_correlated_as_the_provider_turn_id() {
     assert_ne!(
         explicit_json["provider_turn_id"], stop_json["provider_turn_id"],
         "turn_id must not be shadowed by prompt_id"
+    );
+}
+
+#[test]
+fn failed_stop_activity_is_terminally_degraded_without_weakening_pre_tool_admission() {
+    let fixture = Fixture::new(FAILURE_POLICY);
+    let fake = fixture.root.join("agent-session-failing");
+    fs::write(&fake, "#!/bin/sh\nexit 65\n").expect("fake agent-session");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("fake mode");
+    let envs = [
+        ("AGENT_SESSION_BIN", fake.to_str().expect("fake path")),
+        ("AGENT_SESSION_ID", "managed-session"),
+        ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+    ];
+
+    for product in ["codex", "claude"] {
+        let stop = fixture.run_with_env(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(r#"{"hook_event_name":"Stop"}"#),
+            &envs,
+        );
+        assert_eq!(
+            stop.code,
+            0,
+            "{product} failed terminal activity observation must not create an infinite Stop loop: stdout={} stderr={}",
+            stop.stdout_text(),
+            stop.stderr_text()
+        );
+        assert_eq!(stop.stdout_json()["data"]["action"], "warn");
+        assert_eq!(
+            stop.stdout_json()["data"]["reasons"][0]["code"],
+            "activity-stop-reconciliation-required"
+        );
+
+        let provider = fixture.run_with_env(
+            &["dispatch", "--product", product, "--format", "provider"],
+            Some(r#"{"hook_event_name":"Stop"}"#),
+            &envs,
+        );
+        assert_eq!(
+            provider.code,
+            0,
+            "{product} provider rendering must preserve terminal admission: stdout={} stderr={}",
+            provider.stdout_text(),
+            provider.stderr_text()
+        );
+        if product == "codex" {
+            assert_eq!(
+                provider.stdout_json(),
+                serde_json::json!({}),
+                "Codex Stop does not support additionalContext"
+            );
+        } else {
+            assert_eq!(
+                provider.stdout_json()["hookSpecificOutput"]["hookEventName"],
+                "Stop"
+            );
+            assert_eq!(
+                provider.stdout_json()["hookSpecificOutput"]["additionalContext"],
+                "activity-stop-reconciliation-required"
+            );
+        }
+    }
+
+    let pre_tool = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"true"}}"#),
+        &envs,
+    );
+    assert_eq!(
+        pre_tool.code, 1,
+        "ordinary tool admission must remain fail closed when activity recording fails"
+    );
+    assert_eq!(pre_tool.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        pre_tool.stdout_json()["data"]["reasons"][0]["code"],
+        "session.activity:capability-failure-closed"
+    );
+}
+
+#[test]
+fn failed_stop_activity_does_not_override_authoritative_coordination_block() {
+    let fixture = Fixture::new(FAILURE_COORDINATION_POLICY);
+    let fake = fixture.root.join("agent-session-failing");
+    fs::write(&fake, "#!/bin/sh\nexit 65\n").expect("fake agent-session");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("fake mode");
+
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hook directory");
+    let handler = hooks.join("session-coordination-guard.py");
+    fs::write(
+        &handler,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"decision\":\"block\",\"reason\":\"claim-conflict\"}'\n",
+    )
+    .expect("coordination handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+
+    let blocked = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(r#"{"hook_event_name":"Stop"}"#),
+        &[
+            ("AGENT_SESSION_BIN", fake.to_str().expect("fake path")),
+            ("AGENT_SESSION_ID", "managed-session"),
+            ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+        ],
+    );
+    assert_eq!(blocked.code, 1, "stderr={}", blocked.stderr_text());
+    let decision = blocked.stdout_json();
+    assert_eq!(decision["data"]["action"], "block");
+    let reasons = decision["data"]["reasons"]
+        .as_array()
+        .expect("decision reasons");
+    assert!(
+        reasons.iter().any(|reason| {
+            reason["code"] == "activity-stop-reconciliation-required"
+                && reason["disposition"] == "warn"
+        }),
+        "missing activity warning: {decision}"
+    );
+    assert!(
+        reasons.iter().any(|reason| {
+            reason["code"] == "coordination-admitted" && reason["disposition"] == "block"
+        }),
+        "missing coordination block: {decision}"
     );
 }

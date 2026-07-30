@@ -1940,10 +1940,19 @@ pub(crate) fn operator_reconcile_provider_turn_locked(
         .diagnostic
         .as_ref()
         .is_some_and(|diagnostic| diagnostic.reason == "completion_evidence_pending");
+    let provider_turn_matches = document.last_provider_event_turn_id.as_deref()
+        == Some(input.provider_turn_id)
+        || (document.last_provider_event_turn_id.is_none()
+            && pre_selector_journal_tail_matches_provider_turn(
+                &dir.join(ACTIVITY_JOURNAL_FILE),
+                &document,
+                input.provider,
+                input.provider_turn_id,
+            ));
     let exact_stop_is_latest = document.last_provider_event_kind
         == Some(TurnEventKind::StopObserved)
         && document.last_provider_event_provider.as_deref() == Some(input.provider)
-        && document.last_provider_event_turn_id.as_deref() == Some(input.provider_turn_id)
+        && provider_turn_matches
         && document.last_semantic_event_at == document.last_provider_event_at
         && document.pending_journal.is_none();
     let attention_is_empty = document.pending_attention.is_empty()
@@ -2031,6 +2040,70 @@ pub(crate) fn operator_reconcile_provider_turn_locked(
         });
     write_document(&path, &mut document)?;
     Ok(result)
+}
+
+fn pre_selector_journal_tail_matches_provider_turn(
+    path: &Path,
+    document: &ActivityDocument,
+    provider: &str,
+    provider_turn_id: &str,
+) -> bool {
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_JOURNAL_BYTES as u64 {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if (&mut file)
+        .take(MAX_JOURNAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.is_empty()
+        || bytes.len() > MAX_JOURNAL_BYTES
+        || bytes.last() != Some(&b'\n')
+    {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let mut last = None;
+    let mut count = 0_usize;
+    for line in contents.lines() {
+        if line.is_empty() || count >= MAX_JOURNAL_EVENTS {
+            return false;
+        }
+        let Ok(entry) = serde_json::from_str::<JournalEntry>(line) else {
+            return false;
+        };
+        count = count.saturating_add(1);
+        last = Some(entry);
+    }
+    let Some(last) = last else {
+        return false;
+    };
+    last.received_at
+        == document
+            .last_provider_event_at
+            .as_deref()
+            .unwrap_or_default()
+        && document.last_event_at.as_deref() == Some(last.received_at.as_str())
+        && document.last_semantic_event_at.as_deref() == Some(last.received_at.as_str())
+        && last.event.runtime_id == document.runtime_id
+        && last.event.provider == provider
+        && last.event.provider_turn_id.as_deref() == Some(provider_turn_id)
+        && last.event.kind == TurnEventKind::StopObserved
+        && last.event.source_kind == SourceKind::ProviderHook
+        && document.provider_session_id == last.event.provider_session_id
+        && document.last_semantic_event.as_deref() == Some(semantic_event_key(&last.event).as_str())
 }
 
 fn operator_provider_turn_result(
@@ -4587,6 +4660,135 @@ mod tests {
                 provenance: "server_operator".to_string(),
             },
             expires_at_epoch,
+        }
+    }
+
+    #[test]
+    fn operator_reconcile_recovers_pre_selector_snapshot_from_exact_journal_tail() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+        let path = session_dir(&context, &created.record.id).join(ACTIVITY_FILE);
+        let mut pre_selector_document: Value =
+            serde_json::from_slice(&fs::read(&path).expect("activity bytes"))
+                .expect("activity document");
+        pre_selector_document
+            .as_object_mut()
+            .expect("activity object")
+            .remove("last_provider_event_turn_id");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&pre_selector_document)
+                .expect("pre-selector activity document"),
+        )
+        .expect("seed pre-selector activity");
+
+        let result = reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            revision,
+            "operator-provider-turn-pre-selector",
+        )
+        .expect("exact journal tail should recover the absent selector");
+
+        assert_eq!(
+            result["provider_turn_reconciliation"]["state"],
+            json!("operator_reconciled")
+        );
+    }
+
+    #[test]
+    fn operator_reconcile_pre_selector_rejections_are_independently_fail_closed() {
+        for case in [
+            "present-mismatch",
+            "tail-timestamp-mismatch",
+            "malformed-middle",
+            "missing-final-newline",
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+            let dir = session_dir(&context, &created.record.id);
+            let path = dir.join(ACTIVITY_FILE);
+            let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+            let mut activity: Value =
+                serde_json::from_slice(&fs::read(&path).expect("activity bytes"))
+                    .expect("activity document");
+            let activity_object = activity.as_object_mut().expect("activity object");
+            if case == "present-mismatch" {
+                activity_object.insert(
+                    "last_provider_event_turn_id".to_string(),
+                    json!("local:v1:present-but-different"),
+                );
+            } else {
+                activity_object.remove("last_provider_event_turn_id");
+            }
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&activity).expect("pre-selector activity document"),
+            )
+            .expect("seed activity");
+
+            match case {
+                "tail-timestamp-mismatch" => {
+                    let journal = fs::read_to_string(&journal_path).expect("journal");
+                    let mut entries = journal
+                        .lines()
+                        .map(|line| serde_json::from_str::<JournalEntry>(line).expect("entry"))
+                        .collect::<Vec<_>>();
+                    entries.last_mut().expect("exact journal tail").received_at =
+                        "2030-01-01T00:00:00Z".to_string();
+                    let mut changed = Vec::new();
+                    for entry in entries {
+                        serde_json::to_writer(&mut changed, &entry).expect("render entry");
+                        changed.push(b'\n');
+                    }
+                    fs::write(&journal_path, changed).expect("seed timestamp-mismatched tail");
+                }
+                "malformed-middle" => {
+                    let journal = fs::read_to_string(&journal_path).expect("journal");
+                    let mut lines = journal.lines().collect::<Vec<_>>();
+                    let exact_tail = lines.pop().expect("exact journal tail");
+                    let mut malformed = lines.join("\n");
+                    malformed.push_str("\n{not-valid-json}\n");
+                    malformed.push_str(exact_tail);
+                    malformed.push('\n');
+                    fs::write(&journal_path, malformed).expect("seed malformed journal");
+                }
+                "missing-final-newline" => {
+                    let mut journal = fs::read(&journal_path).expect("journal");
+                    assert_eq!(journal.pop(), Some(b'\n'));
+                    fs::write(&journal_path, journal).expect("seed truncated journal");
+                }
+                "present-mismatch" => {}
+                _ => unreachable!("bounded rejection case"),
+            }
+            let activity_before = fs::read(&path).expect("activity before rejection");
+            let journal_before = fs::read(&journal_path).expect("journal before rejection");
+
+            let error = reconcile_operator_turn(
+                &context,
+                &created.record,
+                &runtime_id,
+                revision,
+                &format!("operator-provider-turn-pre-selector-{case}"),
+            )
+            .expect_err("pre-selector boundary must reject");
+
+            assert_eq!(
+                error.code(),
+                "operator-provider-turn-reconcile-not-admissible",
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("activity after rejection"),
+                activity_before,
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(&journal_path).expect("journal after rejection"),
+                journal_before,
+                "{case}"
+            );
         }
     }
 

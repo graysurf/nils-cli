@@ -589,6 +589,10 @@ fn emergency_decision<'a>(
         }
         let (candidate, code) = if grant.rules.contains(&rule.id) {
             (DecisionAction::Allow, "recovery-exact-bypass")
+        } else if let Some(outcome) =
+            evaluator::terminal_activity_failure_decision(&rule.capability, &request.event)
+        {
+            outcome
         } else {
             match &rule.capability {
                 Capability::Allow { .. } => (DecisionAction::Allow, "recovery-manifest-allow"),

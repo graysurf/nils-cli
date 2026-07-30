@@ -77,6 +77,56 @@ override_class = "locked"
 capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
 "#;
 
+const ACTIVITY_RECOVERY_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.2"
+
+[[rules]]
+id = "runtime.locked-block"
+products = ["codex"]
+events = ["PreToolUse"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "locked-block", message = "blocked" }
+
+[[rules]]
+id = "session.activity"
+products = ["codex"]
+events = ["PreToolUse"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+"#;
+
+const STOP_ACTIVITY_RECOVERY_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.2"
+
+[[rules]]
+id = "runtime.stop-recovery-anchor"
+products = ["codex"]
+events = ["Stop"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "stop-anchor", message = "blocked" }
+
+[[rules]]
+id = "session.activity"
+products = ["codex"]
+events = ["Stop"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+"#;
+
 struct Authorized {
     payload: String,
     command: String,
@@ -204,6 +254,79 @@ fn dispatch(
         Some(&authorized.payload),
         envs,
     )
+}
+
+fn authorize_stop(fixture: &Fixture, name: &str) -> Authorized {
+    let payload = r#"{"hook_event_name":"Stop"}"#.to_string();
+    let target = sha256(b"target-unavailable");
+    let command = sha256(b"command-unavailable");
+    let snapshot = sha256(payload.as_bytes());
+    let challenge_file = fixture.root.join(format!("{name}-challenge.json"));
+    let capability_file = fixture.root.join(format!("{name}-capability.json"));
+    let challenge = fixture.run(
+        &[
+            "recovery",
+            "challenge",
+            "--product",
+            "codex",
+            "--event",
+            "Stop",
+            "--target-digest",
+            &target,
+            "--command-digest",
+            &command,
+            "--snapshot-digest",
+            &snapshot,
+            "--scope",
+            "one-shot",
+            "--ttl-seconds",
+            "300",
+            "--rule",
+            "runtime.stop-recovery-anchor",
+            "--out",
+            challenge_file.to_str().expect("challenge path"),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        challenge.code,
+        0,
+        "stdout={} stderr={}",
+        challenge.stdout_text(),
+        challenge.stderr_text()
+    );
+    let challenge_digest = challenge.stdout_json()["data"]["challenge_digest"]
+        .as_str()
+        .expect("challenge digest")
+        .to_string();
+    let authorized = fixture.run(
+        &[
+            "recovery",
+            "authorize",
+            "--challenge-file",
+            challenge_file.to_str().expect("challenge path"),
+            "--expected-challenge-digest",
+            &challenge_digest,
+            "--out",
+            capability_file.to_str().expect("capability path"),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(authorized.code, 0, "stderr={}", authorized.stderr_text());
+    Authorized {
+        payload,
+        command,
+        snapshot,
+        capability_file,
+        capability_id: authorized.stdout_json()["data"]["capability_id"]
+            .as_str()
+            .expect("capability id")
+            .to_string(),
+    }
 }
 
 #[test]
@@ -359,6 +482,39 @@ fn emergency_recovery_preserves_ungranted_rules_and_rejects_unknown_ids() {
     assert_eq!(
         challenge.stdout_json()["error"]["code"],
         "recovery-rule-unknown"
+    );
+}
+
+#[test]
+fn emergency_recovery_degrades_only_terminal_activity_unavailability() {
+    let stop_fixture = Fixture::new(STOP_ACTIVITY_RECOVERY_POLICY);
+    let stop_authorized = authorize_stop(&stop_fixture, "stop-activity");
+    fs::write(&stop_fixture.config, "not valid toml = [").expect("break config");
+
+    let stopped = dispatch(&stop_fixture, &stop_authorized, &[]);
+    assert_eq!(stopped.code, 0, "stderr={}", stopped.stderr_text());
+    assert_eq!(stopped.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        stopped.stdout_json()["data"]["reasons"][1]["code"],
+        "activity-stop-reconciliation-required"
+    );
+
+    let pre_tool_fixture = Fixture::new(ACTIVITY_RECOVERY_POLICY);
+    let pre_tool_authorized = authorize(
+        &pre_tool_fixture,
+        "pre-tool-activity",
+        "one-shot",
+        "300",
+        &[],
+    );
+    fs::write(&pre_tool_fixture.config, "not valid toml = [").expect("break config");
+
+    let blocked = dispatch(&pre_tool_fixture, &pre_tool_authorized, &[]);
+    assert_eq!(blocked.code, 1, "stderr={}", blocked.stderr_text());
+    assert_eq!(blocked.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        blocked.stdout_json()["data"]["reasons"][1]["code"],
+        "recovery-manifest-failure-closed"
     );
 }
 

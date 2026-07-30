@@ -304,6 +304,20 @@ limit. Identical replacements coalesce. Different replacements are an explicit
 posture is typed per rule (`open`, `warn`, or `closed`), while locked privacy,
 writer, transaction, and recovery rules must be `closed`.
 
+`agent-session.activity.v1` retains one terminal-only degradation boundary.
+Failure to record a `Stop` observation returns the stable warning
+`activity-stop-reconciliation-required` instead of denying provider
+termination. This prevents a missing, stale, or temporarily unavailable
+activity store from creating a non-terminating Stop-hook loop. The same
+capability remains fail-closed for `UserPromptSubmit`, `PreToolUse`, and every
+other non-terminal event, and the terminal warning does not release or alter
+claims, leases, operations, brokers, worktrees, or session state. Any retained
+activity uncertainty therefore remains visible for typed external
+reconciliation after the provider runner exits. Codex `Stop` renders this
+normalized warning as the provider-native neutral `{}` response because that
+event does not support additional context; Claude `Stop` retains its supported
+warning context.
+
 Rule modes are `enforce`, `shadow`, and `disabled`. Shadow evaluation records
 only a redacted observation: it cannot affect exit status/output authority,
 rewrite input, mutate capability/rule/session state, perform reclaim/adoption,

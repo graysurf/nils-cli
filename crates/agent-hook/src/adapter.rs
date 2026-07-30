@@ -183,6 +183,9 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
             &decision.event,
             decision.replacement.as_ref(),
         ),
+        DecisionAction::Warn if decision.product == Product::Codex && decision.event == "Stop" => {
+            json!({})
+        }
         DecisionAction::Context | DecisionAction::Warn => json!({
             "hookSpecificOutput": {
                 "hookEventName": decision.event,

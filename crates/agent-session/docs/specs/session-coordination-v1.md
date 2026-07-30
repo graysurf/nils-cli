@@ -326,6 +326,15 @@ activity commit. Admission requires:
   `completion_evidence_pending`, and whose pending journal is empty; and
 - no exact, conservative, overflow, or current-turn attention.
 
+An earlier activity snapshot written before `last_provider_event_turn_id` existed
+may recover only that missing selector from the bounded journal's final entry.
+The journal must be a no-follow regular file within the size/event limits,
+strictly parse in full, end on a complete record, and have a final provider-hook
+event whose runtime, provider session, provider, turn, kind, semantic digest,
+and received timestamp exactly match the unchanged snapshot. A present but
+different snapshot selector, any malformed/truncated journal, or any later or
+different tail rejects without mutation.
+
 A provider completion, failure, attention request, progress/turn-start event,
 stop event with a missing/different turn id, queued journal entry, replacement
 runtime, broker mismatch, or operation activity observed before admission wins

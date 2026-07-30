@@ -310,7 +310,13 @@ reconciliation provenance is owned by that matching `last_turn`; a later turn
 or runtime activation cannot expose it as unrelated top-level state, and an
 id-less completion never inherits it without exact same-turn identity. Provider
 completion, replacement runtime, queued/newer provider evidence, or attention
-wins before admission and leaves the activity document unchanged. The complete
+wins before admission and leaves the activity document unchanged.
+
+For snapshots created before the latest-provider turn selector was persisted,
+the operator path may recover only that absent selector from a strictly parsed,
+bounded, exact-matching final provider-hook journal entry. It never overrides a
+present selector, skips malformed records, or accepts a mismatched/newer tail.
+The complete
 request/result schemas, fence ordering, admission and preservation rules,
 receipt contract, idempotency, and stable failures are normative in
 [Session Coordination V1](specs/session-coordination-v1.md#operator-provider-turn-reconciliation).
