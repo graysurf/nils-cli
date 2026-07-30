@@ -669,6 +669,88 @@ fn init_main_run(
     capability_file
 }
 
+fn init_main_with_closed_historical_run() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-active-run-selection",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-one",
+        "zz-current-active-run",
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut historical = registry["runs"]["zz-current-active-run"].clone();
+        historical["run_id"] = json!("aa-closed-historical-run");
+        historical["revision"] = json!(41);
+        historical["state"] = json!("closed");
+        historical["objective_summary"] = json!("Closed historical objective");
+        historical["updated_at"] = json!("2029-12-31T23:59:59Z");
+        registry["runs"]["aa-closed-historical-run"] = historical;
+    });
+    (tmp, state_dir, checkout, capability_file)
+}
+
+fn rotate_main_incarnation(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+    capability_material: &str,
+) -> String {
+    let session_path = state_dir.join(format!("sessions/{session_id}/session.json"));
+    let mut session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_path).expect("session record"))
+            .expect("session json");
+    session["runtime"]["launch_id"] = json!(incarnation);
+    write_private_json(&session_path, &session);
+
+    let coordination_dir = state_dir.join(format!("sessions/{session_id}/coordination"));
+    let capability_file = coordination_dir.join(format!("capability-{}", digest(incarnation)));
+    fs::write(&capability_file, capability_material).expect("new capability");
+    fs::set_permissions(&capability_file, fs::Permissions::from_mode(0o600))
+        .expect("new capability mode");
+    let checkpoint_file = coordination_dir.join(format!(
+        "main-agent-checkpoint-{}.json",
+        digest(incarnation)
+    ));
+    fs::write(&checkpoint_file, []).expect("new checkpoint");
+    fs::set_permissions(&checkpoint_file, fs::Permissions::from_mode(0o600))
+        .expect("new checkpoint mode");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        coordination_dir.join("heartbeat"),
+        format!("{incarnation}:{now}\n"),
+    )
+    .expect("new heartbeat");
+    rewrite_registry(state_dir, |registry| {
+        registry["brokers"][session_id]["incarnation"] = json!(incarnation);
+        registry["brokers"][session_id]["capability_digest"] = json!(digest(capability_material));
+        registry["brokers"][session_id]["heartbeat_epoch"] = json!(now);
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            if claim["session_id"] == session_id && claim["state"] == "active" {
+                claim["state"] = json!("released");
+            }
+        }
+    });
+    capability_file.to_string_lossy().into_owned()
+}
+
 fn insert_orchestration_assignment(
     state_dir: &Path,
     assignment_id: &str,
@@ -1247,6 +1329,15 @@ fn main_agent_self_recover_is_exact_controller_macro_first_and_claim_preserving(
         )],
     );
     let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut historical = registry["runs"]["run-one"].clone();
+        historical["run_id"] = json!("aa-closed-controller-history");
+        historical["revision"] = json!(37);
+        historical["state"] = json!("closed");
+        historical["objective_summary"] = json!("Closed controller recovery history");
+        historical["updated_at"] = json!("2029-12-31T23:59:59Z");
+        registry["runs"]["aa-closed-controller-history"] = historical;
+    });
     let mut runtime_process = Command::new("sleep");
     runtime_process.arg("30").stdin(Stdio::null());
     // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
@@ -1339,6 +1430,56 @@ fn main_agent_self_recover_is_exact_controller_macro_first_and_claim_preserving(
         .and_then(|claim| claim["claim_id"].as_str())
         .expect("main claim")
         .to_string();
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["runs"]["run-one"]["state"] = json!("closed");
+    });
+    let closed_coordination_bytes =
+        fs::read(state_dir.join("coordination/registry.json")).expect("coordination bytes");
+    let closed_orchestration_bytes =
+        fs::read(state_dir.join("orchestration/registry.json")).expect("orchestration bytes");
+    let closed_replay = recover("controller-recover-healthy-0001");
+    assert_eq!(
+        closed_replay.code,
+        0,
+        "stdout={} stderr={}",
+        closed_replay.stdout_text(),
+        closed_replay.stderr_text()
+    );
+    assert_eq!(
+        data(&closed_replay),
+        data(&healthy),
+        "a committed controller recovery must replay after the selected run closes"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json")).unwrap(),
+        closed_coordination_bytes,
+        "closed-run replay must not mutate coordination state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json")).unwrap(),
+        closed_orchestration_bytes,
+        "closed-run replay must not mutate orchestration state"
+    );
+    let closed_unreplayed = recover("controller-recover-closed-unreplayed-0001");
+    assert_eq!(closed_unreplayed.code, 65);
+    assert_eq!(
+        closed_unreplayed.stdout_json()["error"]["code"],
+        "controller-recovery-incarnation-conflict"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json")).unwrap(),
+        closed_coordination_bytes,
+        "closed-only recovery rejection must not mutate coordination state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json")).unwrap(),
+        closed_orchestration_bytes,
+        "closed-only recovery rejection must not mutate orchestration state"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        *registry = baseline_orchestration.clone();
+    });
 
     fs::remove_file(&heartbeat_path).expect("remove heartbeat before replay");
     rewrite_registry(&state_dir, |registry| {
@@ -3181,6 +3322,204 @@ fn checkout_bound_shell_is_covered_by_the_claim_worktree() {
     );
     assert_eq!(data(&admitted)["operation"], "shell");
     assert_eq!(data(&admitted)["targets"][0]["kind"], "repository");
+
+    let unavailable_checkout = tmp.path().join("checkout-unavailable");
+    fs::rename(&checkout, &unavailable_checkout).expect("make admitted checkout unavailable");
+    let replayed = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        replayed.code,
+        0,
+        "stdout={} stderr={}",
+        replayed.stdout_text(),
+        replayed.stderr_text()
+    );
+    assert_eq!(replayed.stdout_json(), admitted.stdout_json());
+
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "provider_refs": [],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": tmp.path().join("missing-checkout")
+            }]
+        }),
+    );
+    let reused = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(reused.code, 0);
+    assert_eq!(
+        reused.stdout_json()["error"]["code"],
+        "idempotency-key-reused"
+    );
+
+    rewrite_registry(&state_dir, |registry| {
+        let receipt = registry["receipts"]
+            .as_object_mut()
+            .expect("receipts")
+            .values_mut()
+            .find(|receipt| {
+                receipt["principal"] == "alpha"
+                    && receipt["incarnation"] == "incarnation-alpha"
+                    && receipt["operation"] == "work-context-admit"
+            })
+            .expect("admission receipt");
+        receipt["expires_at_epoch"] = json!(1);
+    });
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "provider_refs": [],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": checkout
+            }]
+        }),
+    );
+    let expired_exact = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(expired_exact.code, 0);
+    assert_eq!(
+        expired_exact.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "repository",
+                "repository": "example/repository",
+                "value": "."
+            }],
+            "provider_refs": [],
+            "checkouts": [{
+                "repository": "example/repository",
+                "path": tmp.path().join("missing-checkout")
+            }]
+        }),
+    );
+    let expired_reused = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "admit",
+            "--session",
+            "alpha",
+            "--claim",
+            claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "shell",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "admit-checkout-shell-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(expired_reused.code, 0);
+    assert_eq!(
+        expired_reused.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
 }
 
 #[test]
@@ -5398,6 +5737,8 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
         }
     });
     let new_capability_arg = new_capability_file.to_string_lossy().into_owned();
+    let coordination_before_rejected_rebind = load_coordination_registry(&state_dir);
+    let orchestration_before_rejected_rebind = orchestration_registry(&state_dir);
 
     let unfenced_rebind = run_main_agent(
         tmp.path(),
@@ -5419,6 +5760,84 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
     assert_eq!(
         unfenced_rebind.stdout_json()["error"]["code"],
         "orchestration-revision-required"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_rejected_rebind
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        orchestration_before_rejected_rebind
+    );
+
+    let stale_rebind = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "main-rebind-stale-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &new_capability_arg)],
+    );
+    assert_eq!(stale_rebind.code, 65);
+    assert_eq!(
+        stale_rebind.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_rejected_rebind
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        orchestration_before_rejected_rebind
+    );
+
+    let mismatched_objective = tmp.path().join("mismatched-objective.json");
+    let mut mismatched_packet: serde_json::Value =
+        serde_json::from_slice(&fs::read(&objective_path).expect("objective packet"))
+            .expect("objective packet json");
+    mismatched_packet["objective_summary"] = json!("Different private objective");
+    write_private_json(&mismatched_objective, &mismatched_packet);
+    let mismatched_rebind = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            mismatched_objective.to_str().expect("objective path"),
+            "--if-absent",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "main-rebind-objective-mismatch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &new_capability_arg)],
+    );
+    assert_eq!(mismatched_rebind.code, 65);
+    assert_eq!(
+        mismatched_rebind.stdout_json()["error"]["code"],
+        "run-objective-conflict"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_rejected_rebind
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir),
+        orchestration_before_rejected_rebind
     );
 
     let rebound = run_main_agent(
@@ -5463,6 +5882,1514 @@ fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idem
             .unwrap_or(false),
         "Main Agent controller rebind must not mint a worker checkout-shell grant"
     );
+}
+
+#[test]
+fn main_agent_same_controller_history_does_not_shadow_active_run_mutations() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let checkpoint_path = tmp.path().join("current-run-checkpoint.json");
+    write_private_json(
+        &checkpoint_path,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Current active run selected",
+            "next_action": "Close the current active run"
+        }),
+    );
+
+    let checkpoint = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "active-run-checkpoint-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        checkpoint.code,
+        0,
+        "stdout={} stderr={}",
+        checkpoint.stdout_text(),
+        checkpoint.stderr_text()
+    );
+    assert_eq!(data(&checkpoint)["run"]["run_id"], "zz-current-active-run");
+
+    let close = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "close",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "active-run-close-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        close.code,
+        0,
+        "stdout={} stderr={}",
+        close.stdout_text(),
+        close.stderr_text()
+    );
+    assert_eq!(data(&close)["run"]["run_id"], "zz-current-active-run");
+    assert_eq!(data(&close)["run"]["state"], "closed");
+
+    let historical_checkpoint = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "41",
+            "--idempotency-key",
+            "historical-run-checkpoint-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(historical_checkpoint.code, 65);
+    assert_eq!(
+        historical_checkpoint.stdout_json()["error"]["code"],
+        "controller-rebind-required"
+    );
+
+    let registry = orchestration_registry(&state_dir);
+    assert_eq!(registry["runs"]["zz-current-active-run"]["revision"], 3);
+    assert_eq!(registry["runs"]["zz-current-active-run"]["state"], "closed");
+    assert_eq!(registry["runs"]["aa-closed-historical-run"]["revision"], 41);
+}
+
+#[test]
+fn main_agent_rebind_selects_and_fences_the_exact_active_run_before_claiming() {
+    let (_tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let historical_before =
+        orchestration_registry(&state_dir)["runs"]["aa-closed-historical-run"].clone();
+
+    let same_incarnation = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "active-run-rebind-same-incarnation-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        same_incarnation.code,
+        0,
+        "stdout={} stderr={}",
+        same_incarnation.stdout_text(),
+        same_incarnation.stderr_text()
+    );
+    assert_eq!(
+        data(&same_incarnation)["run"]["run_id"],
+        "zz-current-active-run"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["aa-closed-historical-run"],
+        historical_before
+    );
+
+    let successor_incarnation = "main-incarnation-successor";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-successor",
+    );
+    let coordination_before_stale = load_coordination_registry(&state_dir);
+    let stale = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "99",
+            "--idempotency-key",
+            "active-run-rebind-stale-0001",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(stale.code, 65);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_before_stale,
+        "a rejected rebind must not mint successor claim authority"
+    );
+
+    let rebound = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "active-run-rebind-successor-0001",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(
+        rebound.code,
+        0,
+        "stdout={} stderr={}",
+        rebound.stdout_text(),
+        rebound.stderr_text()
+    );
+    assert_eq!(data(&rebound)["run"]["run_id"], "zz-current-active-run");
+    assert_eq!(data(&rebound)["run"]["revision"], 2);
+    assert_eq!(
+        data(&rebound)["run"]["controller"]["session_incarnation"],
+        successor_incarnation
+    );
+    let registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        registry["runs"]["aa-closed-historical-run"],
+        historical_before
+    );
+    assert_eq!(
+        registry["runs"]["zz-current-active-run"]["controller"]["session_incarnation"],
+        successor_incarnation
+    );
+}
+
+#[test]
+fn main_agent_same_incarnation_rebind_fences_revision_before_claim_acquisition() {
+    let (_tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    rewrite_registry(&state_dir, |registry| {
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            if claim["session_id"] == "main-one" && claim["state"] == "active" {
+                claim["state"] = json!("released");
+                claim["revision"] = json!(claim["revision"].as_u64().expect("claim revision") + 1);
+            }
+        }
+    });
+    let coordination_before = load_coordination_registry(&state_dir);
+    let orchestration_before = orchestration_registry(&state_dir);
+
+    let stale = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "99",
+            "--idempotency-key",
+            "same-incarnation-stale-rebind-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(stale.code, 65);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert_eq!(load_coordination_registry(&state_dir), coordination_before);
+    assert_eq!(orchestration_registry(&state_dir), orchestration_before);
+}
+
+#[test]
+fn main_agent_rebind_rejects_an_unrelated_active_claim_without_mutation() {
+    let (_tmp, state_dir, checkout, _capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let successor_incarnation = "main-incarnation-unrelated-claim";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-unrelated-claim",
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let mut unrelated = registry["claims"][0].clone();
+        unrelated["claim_id"] = json!("unrelated-successor-claim");
+        unrelated["session_incarnation"] = json!(successor_incarnation);
+        unrelated["revision"] = json!(1);
+        unrelated["state"] = json!("active");
+        unrelated["scopes"] = json!([{
+            "kind": "path-prefix",
+            "repository": "example/repository",
+            "value": "unrelated/path"
+        }]);
+        unrelated["terminal_at_epoch"] = serde_json::Value::Null;
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .push(unrelated);
+    });
+    let coordination_before = load_coordination_registry(&state_dir);
+    let orchestration_before = orchestration_registry(&state_dir);
+
+    let rejected = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "rebind-unrelated-active-claim-0001",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(rejected.code, 65);
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "controller-rebind-claim-mismatch"
+    );
+    assert_eq!(load_coordination_registry(&state_dir), coordination_before);
+    assert_eq!(orchestration_registry(&state_dir), orchestration_before);
+}
+
+#[test]
+fn main_agent_rebind_rolls_back_new_claim_when_orchestration_persistence_fails() {
+    let (_tmp, state_dir, checkout, _capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let successor_incarnation = "main-incarnation-save-failure";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-save-failure",
+    );
+    let rebind_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "rebind",
+        "--if-revision",
+        "1",
+        "--idempotency-key",
+        "rebind-save-failure-0001",
+        "--format",
+        "json",
+    ];
+
+    let failed = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                successor_capability.as_str(),
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+                "before_orchestration_save",
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1);
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "rebind-test-persistence-failure"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        !coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == successor_incarnation
+                    && claim["state"] == "active"
+            })
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["zz-current-active-run"]["revision"],
+        1
+    );
+
+    for attempt in 2..=8 {
+        let failed_again = run_main_agent(
+            &checkout,
+            &rebind_args,
+            &[
+                (
+                    "AGENT_SESSION_CAPABILITY_FILE",
+                    successor_capability.as_str(),
+                ),
+                (
+                    "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+                    "before_orchestration_save",
+                ),
+            ],
+        );
+        assert_eq!(failed_again.code, 1, "attempt={attempt}");
+        assert_eq!(
+            failed_again.stdout_json()["error"]["code"],
+            "rebind-test-persistence-failure",
+            "attempt={attempt}"
+        );
+        assert!(
+            failed_again.stdout_json()["error"]["details"]["claim_rollback_error"].is_null(),
+            "attempt={attempt} must not be augmented by a rollback conflict"
+        );
+        assert!(
+            !load_coordination_registry(&state_dir)["claims"]
+                .as_array()
+                .expect("claims")
+                .iter()
+                .any(|claim| {
+                    claim["session_id"] == "main-one"
+                        && claim["session_incarnation"] == successor_incarnation
+                        && claim["state"] == "active"
+                }),
+            "attempt={attempt}"
+        );
+        assert_eq!(
+            orchestration_registry(&state_dir)["runs"]["zz-current-active-run"]["revision"],
+            1,
+            "attempt={attempt}"
+        );
+    }
+
+    let retry = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(
+        retry.code,
+        0,
+        "stdout={} stderr={}",
+        retry.stdout_text(),
+        retry.stderr_text()
+    );
+    assert_eq!(data(&retry)["run"]["run_id"], "zz-current-active-run");
+    assert_eq!(data(&retry)["run"]["revision"], 2);
+    assert_eq!(
+        data(&retry)["run"]["controller"]["session_incarnation"],
+        successor_incarnation
+    );
+    let coordination_after_retry = load_coordination_registry(&state_dir);
+    assert_eq!(
+        coordination_after_retry["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .filter(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == successor_incarnation
+                    && claim["state"] == "active"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["zz-current-active-run"]["revision"],
+        2
+    );
+
+    let replay = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay), data(&retry));
+    assert_eq!(
+        load_coordination_registry(&state_dir),
+        coordination_after_retry
+    );
+}
+
+#[test]
+fn main_agent_rebind_serializes_concurrent_exact_retries_through_rollback() {
+    let (tmp, state_dir, checkout, _capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let successor_incarnation = "main-incarnation-concurrent-rebind";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-concurrent-rebind",
+    );
+    let rebind_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "rebind",
+        "--if-revision",
+        "1",
+        "--idempotency-key",
+        "rebind-concurrent-exact-retry-0001",
+        "--format",
+        "json",
+    ];
+    let barrier = tmp.path().join("rebind-before-rollback");
+    fs::create_dir(&barrier).expect("rebind barrier");
+    let retry_trace = tmp.path().join("rebind-retry-lock-trace");
+    fs::create_dir(&retry_trace).expect("rebind retry trace");
+    let checkpoint_file = state_dir
+        .join("sessions/main-one/coordination")
+        .join(format!(
+            "main-agent-checkpoint-{}.json",
+            digest(successor_incarnation)
+        ));
+
+    let mut failing = Command::new(bin::resolve("main-agent"));
+    failing
+        .current_dir(&checkout)
+        .args(rebind_args)
+        .env(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_file)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+            "before_orchestration_save",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REBIND_BARRIER_STAGE",
+            "before_rollback",
+        )
+        .env("NILS_AGENT_SESSION_TEST_REBIND_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut failing = failing.spawn().expect("spawn failing rebind");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        if failing.try_wait().expect("probe failing rebind").is_some() {
+            let output = failing
+                .wait_with_output()
+                .expect("read early failing rebind");
+            panic!(
+                "failing rebind exited before barrier: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rebind did not reach rollback barrier"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut retrying = Command::new(bin::resolve("main-agent"));
+    retrying
+        .current_dir(&checkout)
+        .args(rebind_args)
+        .env(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_file)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REBIND_LOCK_TRACE_DIR",
+            &retry_trace,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let retrying = retrying.spawn().expect("spawn retrying rebind");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !retry_trace.join("before_authority_lock").is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "retrying rebind did not reach the authority-lock boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !retry_trace.join("after_authority_lock").is_file(),
+        "the retry must not acquire authority while rollback ownership is unsettled"
+    );
+    fs::write(barrier.join("release"), b"release").expect("release failing rebind");
+
+    let failed = failing.wait_with_output().expect("wait failing rebind");
+    let retried = retrying.wait_with_output().expect("wait retrying rebind");
+    assert!(
+        retry_trace.join("after_authority_lock").is_file(),
+        "the retry must acquire authority after rollback ownership settles"
+    );
+    assert!(
+        !failed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let failed_json: serde_json::Value =
+        serde_json::from_slice(&failed.stdout).expect("failed rebind json");
+    assert_eq!(
+        failed_json["error"]["code"],
+        "rebind-test-persistence-failure"
+    );
+    assert!(
+        retried.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let retried_json: serde_json::Value =
+        serde_json::from_slice(&retried.stdout).expect("retried rebind json");
+    assert_eq!(
+        retried_json["data"]["run"]["controller"]["session_incarnation"],
+        successor_incarnation
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["zz-current-active-run"]["revision"],
+        2
+    );
+    assert_eq!(
+        load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .filter(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == successor_incarnation
+                    && claim["state"] == "active"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn main_agent_rebind_serializes_direct_claim_mutations_through_rollback() {
+    let (tmp, state_dir, checkout, _capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let successor_incarnation = "main-incarnation-claim-mutation-race";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-claim-mutation-race",
+    );
+    let checkpoint_file = state_dir
+        .join("sessions/main-one/coordination")
+        .join(format!(
+            "main-agent-checkpoint-{}.json",
+            digest(successor_incarnation)
+        ));
+    let barrier = tmp.path().join("rebind-claim-mutation-rollback");
+    fs::create_dir(&barrier).expect("rebind barrier");
+
+    let mut failing = Command::new(bin::resolve("main-agent"));
+    failing
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "rebind",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "rebind-claim-mutation-race-0001",
+            "--format",
+            "json",
+        ])
+        .env(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_file)
+        .env(
+            "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+            "before_orchestration_save",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_REBIND_BARRIER_STAGE",
+            "before_rollback",
+        )
+        .env("NILS_AGENT_SESSION_TEST_REBIND_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let failing = failing.spawn().expect("spawn failing rebind");
+    wait_for_barrier(&barrier);
+    let active_claim = load_coordination_registry(&state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| {
+            claim["session_id"] == "main-one"
+                && claim["session_incarnation"] == successor_incarnation
+                && claim["state"] == "active"
+        })
+        .expect("active successor claim")
+        .clone();
+    let claim_id = active_claim["claim_id"].as_str().expect("claim id");
+    let claim_revision = active_claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+
+    let spawn_mutation = |operation: &str, key: &str, trace: &Path| {
+        fs::create_dir(trace).expect("claim lock trace");
+        let mut command = Command::new(bin::resolve("agent-session"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_arg.as_str(),
+                "work-context",
+                operation,
+                "--session",
+                "main-one",
+                "--claim",
+                claim_id,
+                "--if-revision",
+                claim_revision.as_str(),
+                "--capability-file",
+                successor_capability.as_str(),
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ])
+            .env("NILS_AGENT_SESSION_TEST_CLAIM_LOCK_TRACE_DIR", trace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn claim mutation")
+    };
+    let renew_trace = tmp.path().join("renew-lock-trace");
+    let release_trace = tmp.path().join("release-lock-trace");
+    let renewing = spawn_mutation("renew", "rebind-racing-renew-0001", renew_trace.as_path());
+    let releasing = spawn_mutation(
+        "release",
+        "rebind-racing-release-0001",
+        release_trace.as_path(),
+    );
+    let admit_targets = tmp.path().join("admit-targets.json");
+    fs::write(
+        &admit_targets,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "crates/agent-session/src/main_agent.rs"
+            }]
+        }))
+        .expect("admit targets"),
+    )
+    .expect("write admit targets");
+    let execution_token = tmp.path().join("admit-execution-token");
+    fs::write(&execution_token, "rebind-racing-admit-execution-token")
+        .expect("write execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+    let admit_trace = tmp.path().join("admit-lock-trace");
+    fs::create_dir(&admit_trace).expect("admit lock trace");
+    let mut admitting = Command::new(bin::resolve("agent-session"));
+    admitting
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "work-context",
+            "admit",
+            "--session",
+            "main-one",
+            "--claim",
+            claim_id,
+            "--if-revision",
+            claim_revision.as_str(),
+            "--targets-file",
+            admit_targets.to_str().expect("admit targets path"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token path"),
+            "--capability-file",
+            successor_capability.as_str(),
+            "--idempotency-key",
+            "rebind-racing-admit-0001",
+            "--format",
+            "json",
+        ])
+        .env("NILS_AGENT_SESSION_TEST_CLAIM_LOCK_TRACE_DIR", &admit_trace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let admitting = admitting.spawn().expect("spawn claim admission");
+    for trace in [&renew_trace, &release_trace, &admit_trace] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !trace.join("before_authority_lock").is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "claim mutation did not reach the authority-lock boundary"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !trace.join("after_authority_lock").is_file(),
+            "claim mutation must not cross the rebind authority fence"
+        );
+    }
+    fs::write(barrier.join("release"), b"release").expect("release failing rebind");
+
+    let failed = failing.wait_with_output().expect("wait failing rebind");
+    assert!(!failed.status.success());
+    for (operation, trace, child) in [
+        ("renew", renew_trace, renewing),
+        ("release", release_trace, releasing),
+        ("admit", admit_trace, admitting),
+    ] {
+        let output = child.wait_with_output().expect("wait claim mutation");
+        assert!(
+            trace.join("after_authority_lock").is_file(),
+            "{operation} must cross the authority lock after rollback"
+        );
+        assert!(
+            !output.status.success(),
+            "{operation} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("claim mutation json");
+        assert_eq!(output["error"]["code"], "claim-not-active");
+    }
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["zz-current-active-run"]["revision"],
+        1
+    );
+    assert!(
+        !load_coordination_registry(&state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == successor_incarnation
+                    && claim["state"] == "active"
+            })
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["operations"]
+            .as_array()
+            .expect("operations")
+            .is_empty()
+    );
+}
+
+#[test]
+fn work_context_admit_revalidates_the_authenticated_capability_after_preparation() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    seed_activity_state(
+        &state_dir,
+        "main-one",
+        "main-incarnation-one",
+        "working",
+        json!({
+            "provider_turn_id": "turn-admit-capability-rotation",
+            "started_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let _runtime = seed_live_runtime_identity(&state_dir, "main-one", "main-incarnation-one", 197);
+    let active_claim = load_coordination_registry(&state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("active main claim")
+        .clone();
+    let targets = tmp.path().join("capability-rotation-targets.json");
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "crates/agent-session/src/main_agent.rs"
+            }]
+        }),
+    );
+    let execution_token = tmp.path().join("capability-rotation-execution-token");
+    fs::write(&execution_token, "capability-rotation-execution-token").expect("execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+    let barrier = tmp.path().join("admit-capability-rotation-barrier");
+    fs::create_dir(&barrier).expect("admit barrier");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let claim_revision = active_claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+    let mut admitting = Command::new(bin::resolve("agent-session"));
+    admitting
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "work-context",
+            "admit",
+            "--session",
+            "main-one",
+            "--claim",
+            active_claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            claim_revision.as_str(),
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            capability_file.as_str(),
+            "--idempotency-key",
+            "admit-capability-rotation-0001",
+            "--format",
+            "json",
+        ])
+        .env(
+            "NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_STAGE",
+            "before_final_authority_lock",
+        )
+        .env("NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let admitting = admitting.spawn().expect("spawn admission");
+    wait_for_barrier(&barrier);
+
+    let rotated_capability = "rotated-main-capability-material-after-admission-preparation";
+    fs::write(&capability_file, rotated_capability).expect("rotate capability file");
+    fs::set_permissions(&capability_file, fs::Permissions::from_mode(0o600))
+        .expect("rotated capability mode");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["main-one"]["capability_digest"] = json!(digest(rotated_capability));
+    });
+    let authorized = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "work-context",
+            "admit",
+            "--session",
+            "main-one",
+            "--claim",
+            active_claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            claim_revision.as_str(),
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            capability_file.as_str(),
+            "--idempotency-key",
+            "admit-capability-rotation-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        authorized.code,
+        0,
+        "stdout={} stderr={}",
+        authorized.stdout_text(),
+        authorized.stderr_text()
+    );
+    fs::write(barrier.join("release"), b"release").expect("release admit barrier");
+
+    let output = admitting.wait_with_output().expect("wait admission");
+    assert!(!output.status.success());
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).expect("admission json");
+    assert_eq!(output["error"]["code"], "coordination-unauthorized");
+    assert_eq!(
+        load_coordination_registry(&state_dir)["operations"]
+            .as_array()
+            .expect("operations")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn work_context_admit_renews_live_claim_at_final_commit_after_preparation() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    seed_activity_state(
+        &state_dir,
+        "main-one",
+        "main-incarnation-one",
+        "working",
+        json!({
+            "provider_turn_id": "turn-admit-claim-expiry",
+            "started_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let _runtime = seed_live_runtime_identity(&state_dir, "main-one", "main-incarnation-one", 198);
+    let active_claim = load_coordination_registry(&state_dir)["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("active main claim")
+        .clone();
+    let targets = tmp.path().join("claim-expiry-targets.json");
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "crates/agent-session/src/main_agent.rs"
+            }]
+        }),
+    );
+    let execution_token = tmp.path().join("claim-expiry-execution-token");
+    fs::write(&execution_token, "claim-expiry-execution-token").expect("execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+    let barrier = tmp.path().join("admit-claim-expiry-barrier");
+    fs::create_dir(&barrier).expect("admit barrier");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let claim_revision = active_claim["revision"]
+        .as_u64()
+        .expect("claim revision")
+        .to_string();
+    let mut admitting = Command::new(bin::resolve("agent-session"));
+    admitting
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "work-context",
+            "admit",
+            "--session",
+            "main-one",
+            "--claim",
+            active_claim["claim_id"].as_str().expect("claim id"),
+            "--if-revision",
+            claim_revision.as_str(),
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            capability_file.as_str(),
+            "--idempotency-key",
+            "admit-claim-expiry-0001",
+            "--format",
+            "json",
+        ])
+        .env(
+            "NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_STAGE",
+            "before_final_authority_lock",
+        )
+        .env("NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let admitting = admitting.spawn().expect("spawn admission");
+    wait_for_barrier(&barrier);
+    let expires_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 1;
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+            .expect("active main claim");
+        claim["expires_at_epoch"] = json!(expires_at_epoch);
+        claim["expires_at"] = json!("1970-01-01T00:00:01Z");
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    fs::write(barrier.join("release"), b"release").expect("release admit barrier");
+
+    let output = admitting.wait_with_output().expect("wait admission");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = load_coordination_registry(&state_dir);
+    assert_eq!(
+        registry["operations"].as_array().expect("operations").len(),
+        1
+    );
+    let renewed_claim = registry["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["claim_id"] == active_claim["claim_id"])
+        .expect("renewed claim");
+    assert_eq!(renewed_claim["state"], "active");
+    assert_eq!(renewed_claim["revision"], active_claim["revision"]);
+    assert_ne!(renewed_claim["expires_at"], "1970-01-01T00:00:01Z");
+    assert!(
+        renewed_claim["expires_at_epoch"]
+            .as_i64()
+            .expect("renewed expiry")
+            > expires_at_epoch
+    );
+}
+
+#[test]
+fn main_agent_rebind_does_not_adopt_a_renewed_claim_receipt_for_rollback() {
+    let (_tmp, state_dir, checkout, _capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let successor_incarnation = "main-incarnation-renewed-claim";
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        successor_incarnation,
+        "main-private-capability-material-renewed-claim",
+    );
+    let rebind_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "rebind",
+        "--if-revision",
+        "1",
+        "--idempotency-key",
+        "rebind-renewed-claim-receipt-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                successor_capability.as_str(),
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+                "before_orchestration_save",
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1);
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| {
+                claim["session_id"] == "main-one"
+                    && claim["session_incarnation"] == successor_incarnation
+            })
+            .expect("successor claim");
+        claim["state"] = json!("active");
+        claim["revision"] = json!(2);
+        claim["terminal_at_epoch"] = serde_json::Value::Null;
+    });
+    let coordination_before = load_coordination_registry(&state_dir);
+    let orchestration_before = orchestration_registry(&state_dir);
+
+    let rejected = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                successor_capability.as_str(),
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE",
+                "before_orchestration_save",
+            ),
+        ],
+    );
+    assert_eq!(rejected.code, 1);
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "rebind-test-persistence-failure"
+    );
+    assert_eq!(load_coordination_registry(&state_dir), coordination_before);
+    assert_eq!(orchestration_registry(&state_dir), orchestration_before);
+}
+
+#[test]
+fn main_agent_rebind_exact_replay_survives_close_but_rejects_a_new_active_run() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let rebind_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "rebind",
+        "--if-revision",
+        "1",
+        "--idempotency-key",
+        "rebind-replay-after-close-0001",
+        "--format",
+        "json",
+    ];
+    let rebound = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(rebound.code, 0, "stderr={}", rebound.stderr_text());
+
+    let close = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "close",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "rebind-replay-close-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(close.code, 0, "stderr={}", close.stderr_text());
+    let closed_coordination = load_coordination_registry(&state_dir);
+    let closed_orchestration = orchestration_registry(&state_dir);
+
+    let replay = run_main_agent(
+        &checkout,
+        &rebind_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay), data(&rebound));
+    assert_eq!(load_coordination_registry(&state_dir), closed_coordination);
+    assert_eq!(orchestration_registry(&state_dir), closed_orchestration);
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut next = registry["runs"]["zz-current-active-run"].clone();
+        next["run_id"] = json!("next-active-run");
+        next["revision"] = json!(1);
+        next["state"] = json!("active");
+        next["objective_summary"] = json!("Distinct next active run");
+        registry["runs"]["next-active-run"] = next;
+    });
+    let conflict = run_main_agent(
+        tmp.path(),
+        &rebind_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(conflict.code, 65);
+    assert_eq!(
+        conflict.stdout_json()["error"]["code"],
+        "idempotency-conflict"
+    );
+}
+
+#[test]
+fn main_agent_duplicate_active_controller_runs_fail_consistently() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let objective_path = tmp.path().join("objective-main-one.json");
+    let objective_arg = objective_path.to_string_lossy().into_owned();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut duplicate = registry["runs"]["zz-current-active-run"].clone();
+        duplicate["run_id"] = json!("duplicate-active-run");
+        registry["runs"]["duplicate-active-run"] = duplicate;
+    });
+    let checkpoint_path = tmp.path().join("ambiguous-run-checkpoint.json");
+    write_private_json(
+        &checkpoint_path,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Must not select an ambiguous run",
+            "next_action": "Reject the malformed registry"
+        }),
+    );
+
+    for args in [
+        vec!["--state-dir", &state_arg, "status", "--format", "json"],
+        vec![
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "ambiguous-active-checkpoint-0001",
+            "--format",
+            "json",
+        ],
+        vec![
+            "--state-dir",
+            &state_arg,
+            "rebind",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "ambiguous-active-rebind-0001",
+            "--format",
+            "json",
+        ],
+        vec![
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            &objective_arg,
+            "--if-absent",
+            "--idempotency-key",
+            "ambiguous-active-init-0001",
+            "--format",
+            "json",
+        ],
+    ] {
+        let coordination_before = load_coordination_registry(&state_dir);
+        let orchestration_before = orchestration_registry(&state_dir);
+        let output = run_main_agent(
+            &checkout,
+            &args,
+            &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+        );
+        assert_eq!(output.code, 65, "args={args:?}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "main-agent-run-conflict",
+            "args={args:?}"
+        );
+        assert_eq!(load_coordination_registry(&state_dir), coordination_before);
+        assert_eq!(orchestration_registry(&state_dir), orchestration_before);
+    }
+
+    let successor_capability = rotate_main_incarnation(
+        &state_dir,
+        "main-one",
+        "main-incarnation-ambiguous-init",
+        "main-private-capability-material-ambiguous-init",
+    );
+    let coordination_before = load_coordination_registry(&state_dir);
+    let orchestration_before = orchestration_registry(&state_dir);
+    let claimless_init = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            &objective_arg,
+            "--if-absent",
+            "--idempotency-key",
+            "ambiguous-active-claimless-init-0001",
+            "--format",
+            "json",
+        ],
+        &[(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            successor_capability.as_str(),
+        )],
+    );
+    assert_eq!(claimless_init.code, 65);
+    assert_eq!(
+        claimless_init.stdout_json()["error"]["code"],
+        "main-agent-run-conflict"
+    );
+    assert_eq!(load_coordination_registry(&state_dir), coordination_before);
+    assert_eq!(orchestration_registry(&state_dir), orchestration_before);
+}
+
+#[test]
+fn main_agent_status_and_rehydrate_prefer_active_run_then_deterministic_history() {
+    let (_tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let read_run_id = |command: &str| {
+        let output = run_main_agent(
+            &checkout,
+            &["--state-dir", &state_arg, command, "--format", "json"],
+            &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "command={command} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        if command == "rehydrate" {
+            data(&output)["durable"]["run"]["record"]["run_id"].clone()
+        } else {
+            data(&output)["run"]["run_id"].clone()
+        }
+    };
+
+    assert_eq!(read_run_id("status"), "zz-current-active-run");
+    assert_eq!(read_run_id("rehydrate"), "zz-current-active-run");
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["runs"]["zz-current-active-run"]["state"] = json!("closed");
+    });
+
+    assert_eq!(read_run_id("status"), "aa-closed-historical-run");
+    assert_eq!(read_run_id("rehydrate"), "aa-closed-historical-run");
+}
+
+#[test]
+fn main_agent_current_worker_role_precedes_closed_main_history() {
+    let (tmp, state_dir, checkout, capability_file) = init_main_with_closed_historical_run();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["runs"]["zz-current-active-run"]["state"] = json!("closed");
+    });
+    let assignment_id = "current-worker-after-closed-main";
+    let assignment_input = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": assignment_id,
+        "task_summary": "Prefer the current worker relationship",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "main-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": checkout,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        assignment_id,
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": assignment_id,
+            "run_id": "zz-current-active-run",
+            "revision": 7,
+            "state": "working",
+            "task_summary": "Prefer the current worker relationship",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "other-main",
+                "session_incarnation": "other-main-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "depends_on": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:01Z"
+        }),
+        &assignment_input,
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let mut terminal = registry["assignments"][assignment_id].clone();
+        terminal["assignment_id"] = json!("aa-terminal-worker-history");
+        terminal["state"] = json!("released");
+        terminal["revision"] = json!(19);
+        registry["assignments"]["aa-terminal-worker-history"] = terminal;
+    });
+
+    for command in [&["self", "show"][..], &["status"][..], &["rehydrate"][..]] {
+        let mut args = vec!["--state-dir", state_arg.as_str()];
+        args.extend_from_slice(command);
+        args.extend_from_slice(&["--format", "json"]);
+        let output = run_main_agent(
+            tmp.path(),
+            &args,
+            &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "command={command:?} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        let role = if command == ["rehydrate"] {
+            &data(&output)["durable"]["role"]
+        } else {
+            &data(&output)["role"]
+        };
+        assert_eq!(role, "worker", "command={command:?}");
+        let selected_assignment = if command == ["status"] {
+            &data(&output)["assignment"]["assignment_id"]
+        } else if command == ["rehydrate"] {
+            &data(&output)["durable"]["assignment"]["record"]["assignment_id"]
+        } else {
+            &data(&output)["assignment"]["record"]["assignment_id"]
+        };
+        assert_eq!(
+            selected_assignment, assignment_id,
+            "command={command:?} must select the current assignment"
+        );
+    }
 }
 
 #[test]

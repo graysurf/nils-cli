@@ -2379,7 +2379,9 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
     lock_registry_with_maintenance(context, RegistryMaintenance::Full)
 }
 
-fn lock_registry_observational(context: &CliContext) -> Result<LockedRegistry, CliError> {
+pub(crate) fn lock_registry_observational(
+    context: &CliContext,
+) -> Result<LockedRegistry, CliError> {
     lock_registry_with_maintenance(context, RegistryMaintenance::Observational)
 }
 
@@ -2823,6 +2825,9 @@ pub(crate) fn idempotency_replay(
     let Some(receipt) = registry.receipts.get(&receipt_key) else {
         return Ok(None);
     };
+    if receipt.expires_at_epoch <= now_epoch() {
+        return Ok(None);
+    }
     if receipt.principal == principal
         && receipt.incarnation == incarnation
         && receipt.operation == operation

@@ -1240,16 +1240,23 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
     )?;
     validate_objective_packet(&packet)?;
     let (record, incarnation) = authenticated_self(context)?;
+    let session_authority = crate::lock_exact_session_authority(context, &record.id)?
+        .ok_or_else(|| not_found("session-not-found", "authenticated session was not found"))?;
+    let locked_incarnation = session_authority
+        .record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if session_authority.record.created_at != record.created_at || locked_incarnation != incarnation
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "authenticated session identity changed before Main Agent init",
+            None,
+        ));
+    }
     ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
-    ensure_or_acquire_claim(
-        context,
-        &record,
-        &packet.work_context,
-        &args.idempotency_key,
-        None,
-        false,
-    )?;
-
     let packet_value =
         serde_json::to_value(&packet).map_err(|_| invalid_input("objective packet is invalid"))?;
     let packet_digest = orchestration::packet_digest(&packet_value)?;
@@ -1257,9 +1264,9 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
         "main-agent-init",
         &json!({ "packet": packet, "if_revision": args.if_revision }),
     );
-    let mut locked = orchestration::lock_registry(context)?;
+    let registry = orchestration::load_registry_readonly(context)?;
     if let Some(value) = idempotency_replay(
-        &locked.registry,
+        &registry,
         &record,
         &incarnation,
         &args.idempotency_key,
@@ -1268,108 +1275,189 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
     )? {
         return Ok(value);
     }
+    let selected_run = select_active_controller_run_optional(&registry, &record)?.cloned();
+    if let Some(existing) = selected_run.as_ref() {
+        validate_init_candidate(
+            context,
+            existing,
+            &record,
+            &incarnation,
+            &packet_digest,
+            args.if_revision,
+        )?;
+    }
+    drop(registry);
 
-    if let Some(existing) = locked.registry.runs.values_mut().find(|run| {
-        run_is_live(run)
-            && run.controller.session_id == record.id
-            && run.controller.session_created_at == record.created_at
-    }) {
-        if existing.objective_packet_digest != packet_digest {
-            return Err(CliError::data(
-                "run-objective-conflict",
-                "existing run is bound to a different private objective packet",
-                Some(json!({ "run_id": existing.run_id, "current_revision": existing.revision })),
-            ));
-        }
-        let rebound = existing.controller.session_incarnation != incarnation;
-        if rebound {
-            let expected = args.if_revision.ok_or_else(|| {
-                CliError::data(
-                    "orchestration-revision-required",
-                    "continuity rebind requires --if-revision",
-                    Some(
-                        json!({ "run_id": existing.run_id, "current_revision": existing.revision }),
-                    ),
-                )
-            })?;
-            ensure_revision(expected, existing.revision, "run")?;
-            if orchestration::session_ref_is_live(context, &existing.controller) {
-                return Err(CliError::data(
-                    "controller-incarnation-still-live",
-                    "prior controller incarnation is still live; continuity rebind refused",
-                    Some(
-                        json!({ "run_id": existing.run_id, "current_revision": existing.revision }),
-                    ),
-                ));
-            }
-            existing.controller = session_ref(context, &record, &incarnation);
-            existing.revision = existing.revision.saturating_add(1);
-            existing.updated_at = timestamp();
-        }
-        let outcome = run_outcome(existing, rebound);
-        store_receipt(
-            &mut locked.registry,
+    let acquired_claim = ensure_or_acquire_claim_tracked(
+        context,
+        &record,
+        &packet.work_context,
+        &args.idempotency_key,
+        &session_authority,
+    )?;
+    let mutation = (|| {
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(value) = idempotency_replay(
+            &locked.registry,
             &record,
             &incarnation,
             &args.idempotency_key,
             "init",
             &request_digest,
-            outcome.clone(),
-        )?;
-        locked.save()?;
-        return Ok(outcome);
+        )? {
+            return Ok(value);
+        }
+        let current_run_id = select_active_controller_run_optional(&locked.registry, &record)?
+            .map(|run| run.run_id.clone());
+        match (selected_run.as_ref(), current_run_id) {
+            (Some(selected), Some(current_run_id)) if selected.run_id == current_run_id => {
+                let existing = locked
+                    .registry
+                    .runs
+                    .get_mut(&current_run_id)
+                    .ok_or_else(|| not_found("run-not-found", "Main Agent run was not found"))?;
+                let rebound = validate_init_candidate(
+                    context,
+                    existing,
+                    &record,
+                    &incarnation,
+                    &packet_digest,
+                    args.if_revision,
+                )?;
+                if rebound {
+                    existing.controller = session_ref(context, &record, &incarnation);
+                    existing.revision = existing.revision.saturating_add(1);
+                    existing.updated_at = timestamp();
+                }
+                let outcome = run_outcome(existing, rebound);
+                store_receipt(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    "init",
+                    &request_digest,
+                    outcome.clone(),
+                )?;
+                locked.save()?;
+                Ok(outcome)
+            }
+            (Some(_), _) | (None, Some(_)) => Err(CliError::data(
+                "main-agent-run-conflict",
+                "selected active Main Agent run changed before init could commit",
+                None,
+            )),
+            (None, None) => {
+                let packet_digest = orchestration::store_packet(context, &packet_value)?;
+                let run_id = packet
+                    .run_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                orchestration::validate_slug("run id", &run_id, 128)?;
+                if locked.registry.runs.contains_key(&run_id) {
+                    return Err(CliError::data(
+                        "run-exists",
+                        "orchestration run already exists",
+                        Some(json!({ "run_id": run_id })),
+                    ));
+                }
+                let now = timestamp();
+                let run = RunRecord {
+                    schema_version: orchestration::RUN_SCHEMA.to_string(),
+                    run_id: run_id.clone(),
+                    revision: 1,
+                    state: "active".to_string(),
+                    tier: packet.tier.clone(),
+                    objective_summary: packet.objective_summary.clone(),
+                    objective_packet_digest: packet_digest,
+                    controller: session_ref(context, &record, &incarnation),
+                    durable_refs: packet.durable_refs.clone(),
+                    ephemeral: false,
+                    checkpoint: packet
+                        .next_action
+                        .as_ref()
+                        .map(|next_action| RunCheckpoint {
+                            revision: 1,
+                            summary: "Run initialized".to_string(),
+                            next_action: next_action.clone(),
+                            updated_at: now.clone(),
+                        }),
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                let outcome = run_outcome(&run, false);
+                locked.registry.runs.insert(run_id, run);
+                store_receipt(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    "init",
+                    &request_digest,
+                    outcome.clone(),
+                )?;
+                locked.save()?;
+                Ok(outcome)
+            }
+        }
+    })();
+    match mutation {
+        Ok(value) => Ok(value),
+        Err(error) => Err(rollback_rebind_claim_after_error(
+            context,
+            &record,
+            acquired_claim.as_ref(),
+            &args.idempotency_key,
+            &session_authority,
+            error,
+        )),
     }
+}
 
-    let packet_digest = orchestration::store_packet(context, &packet_value)?;
-    let run_id = packet
-        .run_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    orchestration::validate_slug("run id", &run_id, 128)?;
-    if locked.registry.runs.contains_key(&run_id) {
+fn validate_init_candidate(
+    context: &CliContext,
+    run: &RunRecord,
+    record: &SessionRecord,
+    incarnation: &str,
+    packet_digest: &str,
+    if_revision: Option<u64>,
+) -> Result<bool, CliError> {
+    if run.state != "active"
+        || run.controller.session_id != record.id
+        || run.controller.session_created_at != record.created_at
+    {
         return Err(CliError::data(
-            "run-exists",
-            "orchestration run already exists",
-            Some(json!({ "run_id": run_id })),
+            "main-agent-run-conflict",
+            "selected Main Agent run is no longer the active continuity relationship",
+            None,
         ));
     }
-    let now = timestamp();
-    let run = RunRecord {
-        schema_version: orchestration::RUN_SCHEMA.to_string(),
-        run_id: run_id.clone(),
-        revision: 1,
-        state: "active".to_string(),
-        tier: packet.tier.clone(),
-        objective_summary: packet.objective_summary.clone(),
-        objective_packet_digest: packet_digest,
-        controller: session_ref(context, &record, &incarnation),
-        durable_refs: packet.durable_refs.clone(),
-        ephemeral: false,
-        checkpoint: packet
-            .next_action
-            .as_ref()
-            .map(|next_action| RunCheckpoint {
-                revision: 1,
-                summary: "Run initialized".to_string(),
-                next_action: next_action.clone(),
-                updated_at: now.clone(),
-            }),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let outcome = run_outcome(&run, false);
-    locked.registry.runs.insert(run_id, run);
-    store_receipt(
-        &mut locked.registry,
-        &record,
-        &incarnation,
-        &args.idempotency_key,
-        "init",
-        &request_digest,
-        outcome.clone(),
-    )?;
-    locked.save()?;
-    Ok(outcome)
+    if run.objective_packet_digest != packet_digest {
+        return Err(CliError::data(
+            "run-objective-conflict",
+            "existing run is bound to a different private objective packet",
+            Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+        ));
+    }
+    let rebound = run.controller.session_incarnation != incarnation;
+    if rebound {
+        let expected = if_revision.ok_or_else(|| {
+            CliError::data(
+                "orchestration-revision-required",
+                "continuity rebind requires --if-revision",
+                Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+            )
+        })?;
+        ensure_revision(expected, run.revision, "run")?;
+        if orchestration::session_ref_is_live(context, &run.controller) {
+            return Err(CliError::data(
+                "controller-incarnation-still-live",
+                "prior controller incarnation is still live; continuity rebind refused",
+                Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+            ));
+        }
+    }
+    Ok(rebound)
 }
 
 /// Re-bind an existing run to the caller's current session incarnation after a
@@ -1380,94 +1468,362 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
 fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
     let (record, incarnation) = authenticated_self(context)?;
+    signal_rebind_authority_lock_for_test("before_authority_lock")?;
+    let rebind_authority = crate::lock_exact_session_authority(context, &record.id)?
+        .ok_or_else(|| not_found("session-not-found", "authenticated session was not found"))?;
+    signal_rebind_authority_lock_for_test("after_authority_lock")?;
+    let locked_incarnation = rebind_authority
+        .record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if rebind_authority.record.created_at != record.created_at || locked_incarnation != incarnation
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "authenticated session identity changed before continuity rebind",
+            None,
+        ));
+    }
     ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
 
-    // Recover the run's stored objective packet (read-only) so the work-context
-    // claim can be re-acquired without the caller re-supplying the packet file.
-    let packet_digest = {
-        let registry = orchestration::load_registry_readonly(context)?;
-        let existing = registry
-            .runs
-            .values()
-            .find(|run| {
-                run.controller.session_id == record.id
-                    && run.controller.session_created_at == record.created_at
-            })
-            .ok_or_else(|| {
-                not_found(
-                    "orchestration-self-not-found",
-                    "authenticated session has no orchestration relationship",
-                )
-            })?;
-        existing.objective_packet_digest.clone()
-    };
+    // Select and validate one exact active continuity run before its stored
+    // objective packet can authorize a new claim side effect.
+    let registry = orchestration::load_registry_readonly(context)?;
+    if let Some(value) = rebind_idempotency_replay(
+        &registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        args.if_revision,
+    )? {
+        return Ok(value);
+    }
+    let existing = select_active_controller_run(&registry, &record)?;
+    validate_rebind_candidate(context, existing, &record, &incarnation, args.if_revision)?;
+    let run_id = existing.run_id.clone();
+    let packet_digest = existing.objective_packet_digest.clone();
+    drop(registry);
     let packet_value = orchestration::read_packet(context, &packet_digest)?;
     let packet: ObjectivePacket = serde_json::from_value(packet_value)
         .map_err(|_| invalid_input("stored objective packet is invalid"))?;
-    ensure_or_acquire_claim(
+    let acquired_claim = ensure_or_acquire_claim_tracked(
         context,
         &record,
         &packet.work_context,
         &args.idempotency_key,
-        None,
-        false,
+        &rebind_authority,
     )?;
 
-    let request_digest = crate::coordination::request_digest(
-        "main-agent-rebind",
-        &json!({ "if_revision": args.if_revision }),
-    );
-    let mut locked = orchestration::lock_registry(context)?;
-    if let Some(value) = idempotency_replay(
-        &locked.registry,
-        &record,
-        &incarnation,
-        &args.idempotency_key,
-        "rebind",
-        &request_digest,
-    )? {
-        return Ok(value);
-    }
-    let existing = locked
-        .registry
-        .runs
-        .values_mut()
-        .find(|run| {
-            run.controller.session_id == record.id
-                && run.controller.session_created_at == record.created_at
-        })
-        .ok_or_else(|| {
-            not_found(
-                "orchestration-self-not-found",
-                "authenticated session has no orchestration relationship",
+    let mutation = (|| {
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(value) = rebind_idempotency_replay(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            args.if_revision,
+        )? {
+            return Ok(value);
+        }
+
+        let existing = locked.registry.runs.get(&run_id).ok_or_else(|| {
+            CliError::data(
+                "main-agent-run-conflict",
+                "selected active Main Agent run changed before continuity rebind",
+                None,
             )
         })?;
-    let rebound = existing.controller.session_incarnation != incarnation;
-    if rebound {
-        ensure_revision(args.if_revision, existing.revision, "run")?;
-        if orchestration::session_ref_is_live(context, &existing.controller) {
+        if existing.objective_packet_digest != packet_digest {
             return Err(CliError::data(
-                "controller-incarnation-still-live",
-                "prior controller incarnation is still live; continuity rebind refused",
-                Some(json!({ "run_id": existing.run_id, "current_revision": existing.revision })),
+                "main-agent-run-conflict",
+                "selected active Main Agent run packet changed before continuity rebind",
+                None,
             ));
         }
-        existing.controller = session_ref(context, &record, &incarnation);
-        existing.revision = existing.revision.saturating_add(1);
-        existing.updated_at = timestamp();
+        let rebound =
+            validate_rebind_candidate(context, existing, &record, &incarnation, args.if_revision)?;
+        let existing = locked
+            .registry
+            .runs
+            .get_mut(&run_id)
+            .expect("selected run was revalidated");
+        if rebound {
+            existing.controller = session_ref(context, &record, &incarnation);
+            existing.revision = existing.revision.saturating_add(1);
+            existing.updated_at = timestamp();
+        }
+        let outcome = run_outcome(existing, rebound);
+        let request_digest = rebind_request_digest(args.if_revision, &run_id);
+        store_receipt(
+            &mut locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            "rebind",
+            &request_digest,
+            outcome.clone(),
+        )?;
+        #[cfg(debug_assertions)]
+        if env::var("NILS_AGENT_SESSION_TEST_REBIND_FAIL_STAGE").as_deref()
+            == Ok("before_orchestration_save")
+        {
+            return Err(CliError::runtime(
+                "rebind-test-persistence-failure",
+                "injected rebind orchestration persistence failure",
+                None,
+            ));
+        }
+        locked.save()?;
+        Ok(outcome)
+    })();
+    match mutation {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let error = match pause_rebind_for_test("before_rollback") {
+                Ok(()) => error,
+                Err(barrier_error) => barrier_error,
+            };
+            Err(rollback_rebind_claim_after_error(
+                context,
+                &record,
+                acquired_claim.as_ref(),
+                &args.idempotency_key,
+                &rebind_authority,
+                error,
+            ))
+        }
     }
-    let outcome = run_outcome(existing, rebound);
-    store_receipt(
-        &mut locked.registry,
-        &record,
-        &incarnation,
-        &args.idempotency_key,
-        "rebind",
-        &request_digest,
-        outcome.clone(),
+}
+
+fn signal_rebind_authority_lock_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        env::var_os("NILS_AGENT_SESSION_TEST_REBIND_LOCK_TRACE_DIR").map(PathBuf::from)
+    {
+        fs::write(directory.join(stage), stage).map_err(|_| {
+            CliError::runtime(
+                "rebind-test-barrier",
+                "rebind authority-lock trace could not be signalled",
+                None,
+            )
+        })?;
+    }
+    let _ = stage;
+    Ok(())
+}
+
+fn pause_rebind_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_REBIND_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_REBIND_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::write(directory.join("ready"), stage).map_err(|_| {
+            CliError::runtime(
+                "rebind-test-barrier",
+                "rebind test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "rebind-test-barrier",
+                    "rebind test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
+fn rebind_request_digest(if_revision: u64, run_id: &str) -> String {
+    crate::coordination::request_digest(
+        "main-agent-rebind",
+        &json!({ "if_revision": if_revision, "run_id": run_id }),
+    )
+}
+
+fn rebind_idempotency_replay(
+    registry: &orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    if_revision: u64,
+) -> Result<Option<Value>, CliError> {
+    let key = receipt_key(&record.id, incarnation, idempotency_key);
+    let Some(receipt) = registry.receipts.get(&key) else {
+        return Ok(None);
+    };
+    if receipt.operation != "rebind" {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key was already used for a different request",
+            None,
+        ));
+    }
+    let stored_run_id = receipt.outcome["run"]["run_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "idempotency-conflict",
+                "stored rebind receipt has no exact run identity",
+                None,
+            )
+        })?;
+    if select_active_controller_run_optional(registry, record)?
+        .is_some_and(|run| run.run_id != stored_run_id)
+    {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key belongs to a different Main Agent run",
+            None,
+        ));
+    }
+    let request_digest = rebind_request_digest(if_revision, stored_run_id);
+    let legacy_request_digest = crate::coordination::request_digest(
+        "main-agent-rebind",
+        &json!({ "if_revision": if_revision }),
+    );
+    if receipt.request_digest != request_digest && receipt.request_digest != legacy_request_digest {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key was already used for a different request",
+            None,
+        ));
+    }
+    Ok(Some(receipt.outcome.clone()))
+}
+
+fn select_active_controller_run_optional<'a>(
+    registry: &'a orchestration::Registry,
+    record: &SessionRecord,
+) -> Result<Option<&'a RunRecord>, CliError> {
+    let mut matches = registry.runs.values().filter(|run| {
+        run.state == "active"
+            && run.controller.session_id == record.id
+            && run.controller.session_created_at == record.created_at
+    });
+    let selected = matches.next();
+    if matches.next().is_some() {
+        return Err(CliError::data(
+            "main-agent-run-conflict",
+            "authenticated session matches more than one active Main Agent run",
+            None,
+        ));
+    }
+    Ok(selected)
+}
+
+fn select_active_controller_run<'a>(
+    registry: &'a orchestration::Registry,
+    record: &SessionRecord,
+) -> Result<&'a RunRecord, CliError> {
+    select_active_controller_run_optional(registry, record)?.ok_or_else(|| {
+        not_found(
+            "orchestration-self-not-found",
+            "authenticated session has no active orchestration relationship",
+        )
+    })
+}
+
+fn validate_rebind_candidate(
+    context: &CliContext,
+    run: &RunRecord,
+    record: &SessionRecord,
+    incarnation: &str,
+    if_revision: u64,
+) -> Result<bool, CliError> {
+    if run.state != "active"
+        || run.controller.session_id != record.id
+        || run.controller.session_created_at != record.created_at
+    {
+        return Err(CliError::data(
+            "main-agent-run-conflict",
+            "selected Main Agent run is no longer the active continuity relationship",
+            None,
+        ));
+    }
+    ensure_revision(if_revision, run.revision, "run")?;
+    let rebound = run.controller.session_incarnation != incarnation;
+    if rebound && orchestration::session_ref_is_live(context, &run.controller) {
+        return Err(CliError::data(
+            "controller-incarnation-still-live",
+            "prior controller incarnation is still live; continuity rebind refused",
+            Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+        ));
+    }
+    Ok(rebound)
+}
+
+fn rollback_rebind_claim_after_error(
+    context: &CliContext,
+    record: &SessionRecord,
+    acquired_claim: Option<&crate::coordination::claims::AcquiredClaim>,
+    idempotency_key: &str,
+    session_authority: &crate::LockedSessionAuthority,
+    mut error: CliError,
+) -> CliError {
+    if let Err(rollback_error) = rollback_rebind_claim(
+        context,
+        record,
+        acquired_claim,
+        idempotency_key,
+        session_authority,
+    ) {
+        let original_details = error.0.details.take();
+        error.0.details = Some(json!({
+            "original_details": original_details,
+            "claim_rollback_error": {
+                "code": rollback_error.code(),
+                "message": rollback_error.message()
+            }
+        }));
+    }
+    error
+}
+
+fn rollback_rebind_claim(
+    context: &CliContext,
+    record: &SessionRecord,
+    acquired_claim: Option<&crate::coordination::claims::AcquiredClaim>,
+    idempotency_key: &str,
+    session_authority: &crate::LockedSessionAuthority,
+) -> Result<(), CliError> {
+    let Some(acquired_claim) = acquired_claim else {
+        return Ok(());
+    };
+    let rollback_digest = crate::coordination::request_digest(
+        "main-agent-rebind-claim-rollback",
+        &json!({
+            "idempotency_key": idempotency_key,
+            "claim_id": acquired_claim.claim_id,
+            "claim_revision": acquired_claim.revision
+        }),
+    );
+    crate::coordination::claims::release_prelocked(
+        context,
+        cli::WorkContextReleaseArgs {
+            session: record.id.clone(),
+            claim: acquired_claim.claim_id.clone(),
+            if_revision: acquired_claim.revision,
+            capability_file: None,
+            idempotency_key: child_idempotency_key(
+                idempotency_key,
+                &format!("rebind-rollback-{}", &rollback_digest[..16]),
+            ),
+            format: OutputFormat::Json,
+        },
+        session_authority,
     )?;
-    locked.save()?;
-    Ok(outcome)
+    Ok(())
 }
 
 fn run_self_show(context: &CliContext, _args: ReadArgs) -> Result<Value, CliError> {
@@ -1628,19 +1984,25 @@ fn run_controller_recover(
                 None,
             )
         })?;
+    crate::coordination::validate_recovery_capability(context, &record, &capability_file)?;
     let registry = orchestration::load_registry_readonly(context)?;
+    if let Some(outcome) = controller_recovery_idempotency_replay(
+        &registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+    )? {
+        return Ok(outcome);
+    }
     let controller_run = match resolve_principal(&registry, &record, &incarnation)? {
         Principal::Main {
             run,
             rebind_required: false,
         } => *run,
-        Principal::Main {
-            rebind_required: true,
-            ..
-        } => {
+        Principal::Main { .. } => {
             return Err(CliError::data(
                 "controller-recovery-incarnation-conflict",
-                "the durable run is bound to a different controller incarnation",
+                "the active durable run is not bound to the exact controller incarnation",
                 None,
             ));
         }
@@ -1652,7 +2014,6 @@ fn run_controller_recover(
             ));
         }
     };
-    crate::coordination::validate_recovery_capability(context, &record, &capability_file)?;
     let request_digest = crate::coordination::request_digest(
         "main-agent-controller-recover",
         &json!({
@@ -1661,15 +2022,12 @@ fn run_controller_recover(
             "run_id": controller_run.run_id
         }),
     );
-    if let Some(outcome) = idempotency_replay(
-        &registry,
-        &record,
-        &incarnation,
-        &args.idempotency_key,
-        "controller-recover",
-        &request_digest,
-    )? {
-        return Ok(outcome);
+    if controller_run.state != "active" {
+        return Err(CliError::data(
+            "controller-recovery-incarnation-conflict",
+            "the active durable run is not bound to the exact controller incarnation",
+            None,
+        ));
     }
     let mut runtime = crate::coordination_runtime_evidence(&record)?;
     #[cfg(debug_assertions)]
@@ -1805,7 +2163,7 @@ fn run_controller_recover(
             Principal::Main {
                 run,
                 rebind_required: false,
-            } if run.run_id == controller_run.run_id => *run,
+            } if run.state == "active" && run.run_id == controller_run.run_id => *run,
             _ => {
                 return Err(CliError::data(
                     "controller-recovery-verification-failed",
@@ -1859,13 +2217,11 @@ fn run_controller_recover(
     drop(verified_quiescence);
 
     let mut locked = orchestration::lock_registry(context)?;
-    if let Some(existing) = idempotency_replay(
+    if let Some(existing) = controller_recovery_idempotency_replay(
         &locked.registry,
         &record,
         &incarnation,
         &args.idempotency_key,
-        "controller-recover",
-        &request_digest,
     )? {
         return Ok(existing);
     }
@@ -1873,7 +2229,7 @@ fn run_controller_recover(
         Principal::Main {
             run,
             rebind_required: false,
-        } if run.run_id == controller_run.run_id => {}
+        } if run.state == "active" && run.run_id == controller_run.run_id => {}
         _ => {
             return Err(CliError::data(
                 "controller-recovery-verification-failed",
@@ -1893,6 +2249,60 @@ fn run_controller_recover(
     )?;
     locked.save()?;
     Ok(outcome)
+}
+
+fn controller_recovery_idempotency_replay(
+    registry: &orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+) -> Result<Option<Value>, CliError> {
+    let key = receipt_key(&record.id, incarnation, idempotency_key);
+    let Some(receipt) = registry.receipts.get(&key) else {
+        return Ok(None);
+    };
+    if receipt.operation != "controller-recover" {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key was already used for a different request",
+            None,
+        ));
+    }
+    let stored_run_id = receipt.outcome["run"]["run_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "idempotency-conflict",
+                "stored controller recovery receipt has no exact run identity",
+                None,
+            )
+        })?;
+    if select_active_controller_run_optional(registry, record)?
+        .is_some_and(|run| run.run_id != stored_run_id)
+    {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key belongs to a different Main Agent run",
+            None,
+        ));
+    }
+    let request_digest = crate::coordination::request_digest(
+        "main-agent-controller-recover",
+        &json!({
+            "session_id": record.id,
+            "session_incarnation": incarnation,
+            "run_id": stored_run_id
+        }),
+    );
+    idempotency_replay(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        "controller-recover",
+        &request_digest,
+    )
 }
 
 fn run_status(context: &CliContext, _args: ReadArgs) -> Result<Value, CliError> {
@@ -1954,7 +2364,7 @@ fn run_checkpoint(context: &CliContext, args: CheckpointArgs) -> Result<Value, C
         Principal::Main {
             run,
             rebind_required: false,
-        } => {
+        } if run.state == "active" => {
             let current = locked
                 .registry
                 .runs
@@ -18793,6 +19203,61 @@ fn ensure_or_acquire_claim(
             Err(error) => return Err(error),
         }
     }
+    let (candidate_path, claim_args) =
+        prepare_claim_args(context, record, candidate, idempotency_key)?;
+    let result = if checkout_shell_grant {
+        crate::coordination::claims::claim_main_agent_worker(
+            context,
+            claim_args,
+            rebind_from.map(|previous| previous.session_incarnation.as_str()),
+        )
+    } else {
+        crate::coordination::claims::claim(context, claim_args)
+    };
+    let _ = fs::remove_file(candidate_path);
+    result.map(|_| ())
+}
+
+fn ensure_or_acquire_claim_tracked(
+    context: &CliContext,
+    record: &SessionRecord,
+    candidate: &WorkContextInput,
+    idempotency_key: &str,
+    session_authority: &crate::LockedSessionAuthority,
+) -> Result<Option<crate::coordination::claims::AcquiredClaim>, CliError> {
+    match crate::coordination::claims::main_agent_controller_claim_match(
+        context, record, candidate,
+    )? {
+        Some(true) => return Ok(None),
+        Some(false) => {
+            return Err(CliError::data(
+                "controller-rebind-claim-mismatch",
+                "controller rebind requires the exact stored run work context",
+                None,
+            ));
+        }
+        None => {}
+    }
+    let (candidate_path, claim_args) =
+        prepare_claim_args(context, record, candidate, idempotency_key)?;
+    let result = crate::coordination::claims::claim_tracked(context, claim_args, session_authority);
+    let _ = fs::remove_file(candidate_path);
+    let acquired = result?.acquired.ok_or_else(|| {
+        CliError::data(
+            "claim-replay-invalid",
+            "stored work claim outcome is not resumable",
+            None,
+        )
+    })?;
+    Ok(Some(acquired))
+}
+
+fn prepare_claim_args(
+    context: &CliContext,
+    record: &SessionRecord,
+    candidate: &WorkContextInput,
+    idempotency_key: &str,
+) -> Result<(PathBuf, cli::WorkContextClaimArgs), CliError> {
     let directory = session_dir(context, &record.id).join("coordination");
     fs::create_dir_all(&directory)
         .map_err(|_| invalid_input("claim input directory is unavailable"))?;
@@ -18809,17 +19274,7 @@ fn ensure_or_acquire_claim(
         if_revision: None,
         format: OutputFormat::Json,
     };
-    let result = if checkout_shell_grant {
-        crate::coordination::claims::claim_main_agent_worker(
-            context,
-            claim_args,
-            rebind_from.map(|previous| previous.session_incarnation.as_str()),
-        )
-    } else {
-        crate::coordination::claims::claim(context, claim_args)
-    };
-    let _ = fs::remove_file(candidate_path);
-    result.map(|_| ())
+    Ok((candidate_path, claim_args))
 }
 
 fn resolve_principal(
@@ -18827,8 +19282,27 @@ fn resolve_principal(
     record: &SessionRecord,
     incarnation: &str,
 ) -> Result<Principal, CliError> {
+    if let Some(run) = select_active_controller_run_optional(registry, record)? {
+        return Ok(Principal::Main {
+            run: Box::new(run.clone()),
+            rebind_required: !orchestration::session_ref_matches(
+                &run.controller,
+                record,
+                incarnation,
+            ),
+        });
+    }
+    if let Some((assignment, rebind_required)) =
+        select_current_worker_assignment(registry, record, incarnation)?
+    {
+        return Ok(Principal::Worker {
+            assignment: Box::new(assignment.clone()),
+            rebind_required,
+        });
+    }
     if let Some(run) = registry.runs.values().find(|run| {
-        run.controller.session_id == record.id
+        run.state != "active"
+            && run.controller.session_id == record.id
             && run.controller.session_created_at == record.created_at
     }) {
         return Ok(Principal::Main {
@@ -18855,16 +19329,45 @@ fn resolve_principal(
     ))
 }
 
+fn select_current_worker_assignment<'a>(
+    registry: &'a orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+) -> Result<Option<(&'a AssignmentRecord, bool)>, CliError> {
+    let mut exact = None;
+    let mut continuity = None;
+    for assignment in registry.assignments.values().filter(|assignment| {
+        !matches!(assignment.state.as_str(), "released" | "cancelled")
+            && assignment.worker.as_ref().is_some_and(|worker| {
+                worker.session_id == record.id && worker.session_created_at == record.created_at
+            })
+    }) {
+        let worker = assignment.worker.as_ref().expect("worker was selected");
+        let slot = if worker.session_incarnation == incarnation {
+            &mut exact
+        } else {
+            &mut continuity
+        };
+        if slot.replace(assignment).is_some() {
+            return Err(CliError::data(
+                "main-agent-assignment-conflict",
+                "authenticated session matches more than one current worker assignment",
+                None,
+            ));
+        }
+    }
+    Ok(exact
+        .map(|assignment| (assignment, false))
+        .or_else(|| continuity.map(|assignment| (assignment, true))))
+}
+
 fn require_current_main<'a>(
     registry: &'a orchestration::Registry,
     record: &SessionRecord,
     incarnation: &str,
 ) -> Result<&'a RunRecord, CliError> {
-    registry
-        .runs
-        .values()
-        .find(|run| orchestration::session_ref_matches(&run.controller, record, incarnation))
-        .filter(|run| run.state == "active")
+    select_active_controller_run_optional(registry, record)?
+        .filter(|run| orchestration::session_ref_matches(&run.controller, record, incarnation))
         .ok_or_else(rebind_required)
 }
 

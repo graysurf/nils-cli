@@ -22,8 +22,9 @@ use super::context::{
     validate_physical_targets,
 };
 use super::{
-    Registry, authenticate_any_from_file, authenticate_from_file, clean_expired, digest_bytes,
-    ensure_fingerprint_key, idempotency_replay, json_value, lock_registry, now_epoch,
+    Registry, authenticate_any_from_file, authenticate_from_file, authenticate_token,
+    capability_token_from_file, clean_expired, digest_bytes, ensure_fingerprint_key,
+    idempotency_replay, json_value, lock_registry, lock_registry_observational, now_epoch,
     read_bounded_json, read_private_text, request_digest, store_receipt, timestamp,
     worktree_fingerprint,
 };
@@ -31,6 +32,17 @@ use super::{
 const CLAIM_TTL_SECS: i64 = 30 * 60;
 const OPERATION_TTL_SECS: i64 = 30 * 60;
 const OPERATION_LEASE_VERSION: &str = "agent-session.operation-lease.v1";
+
+#[derive(Clone, Debug)]
+pub(crate) struct AcquiredClaim {
+    pub claim_id: String,
+    pub revision: u64,
+}
+
+pub(crate) struct ClaimTransactionResult {
+    pub outcome: Value,
+    pub acquired: Option<AcquiredClaim>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct OperationLease {
@@ -299,7 +311,7 @@ struct ReconcileProof {
 }
 
 pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<Value, CliError> {
-    claim_impl(context, args, None, false)
+    claim_impl(context, args, None, false, false, None).map(|result| result.outcome)
 }
 
 pub(crate) fn claim_main_agent_worker(
@@ -307,7 +319,15 @@ pub(crate) fn claim_main_agent_worker(
     args: WorkContextClaimArgs,
     previous_incarnation: Option<&str>,
 ) -> Result<Value, CliError> {
-    claim_impl(context, args, previous_incarnation, true)
+    claim_impl(context, args, previous_incarnation, true, false, None).map(|result| result.outcome)
+}
+
+pub(crate) fn claim_tracked(
+    context: &CliContext,
+    args: WorkContextClaimArgs,
+    session_authority: &crate::LockedSessionAuthority,
+) -> Result<ClaimTransactionResult, CliError> {
+    claim_impl(context, args, None, false, true, Some(session_authority))
 }
 
 fn claim_impl(
@@ -315,9 +335,21 @@ fn claim_impl(
     args: WorkContextClaimArgs,
     resume_from_incarnation: Option<&str>,
     checkout_shell_grant: bool,
-) -> Result<Value, CliError> {
+    resume_inactive_replay: bool,
+    session_authority: Option<&crate::LockedSessionAuthority>,
+) -> Result<ClaimTransactionResult, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    let _owned_session_authority = if let Some(session_authority) = session_authority {
+        validate_claim_session_authority(session_authority, &record, &incarnation)?;
+        None
+    } else {
+        Some(lock_claim_session_authority(
+            context,
+            &record,
+            &incarnation,
+        )?)
+    };
     let candidate: WorkContextInput =
         read_bounded_json(&args.file, 16 * 1024, "invalid-work-context")?;
     let mut candidate = candidate.validate_and_canonicalize()?;
@@ -358,7 +390,20 @@ fn claim_impl(
         "work-context-claim",
         &digest,
     )? {
-        return Ok(replay);
+        if !resume_inactive_replay {
+            return Ok(ClaimTransactionResult {
+                outcome: replay,
+                acquired: None,
+            });
+        }
+        let (acquired, inactive) =
+            tracked_claim_replay_state(&locked.registry, &record.id, &incarnation, &replay)?;
+        if acquired.is_some() || !inactive {
+            return Ok(ClaimTransactionResult {
+                outcome: replay,
+                acquired,
+            });
+        }
     }
     super::ensure_notification_submission_not_in_progress(
         &locked.registry,
@@ -499,7 +544,86 @@ fn claim_impl(
         now,
     )?;
     locked.save()?;
-    Ok(outcome)
+    Ok(ClaimTransactionResult {
+        outcome,
+        acquired: Some(AcquiredClaim {
+            claim_id: claim.claim_id,
+            revision: claim.revision,
+        }),
+    })
+}
+
+fn tracked_claim_replay_state(
+    registry: &Registry,
+    session_id: &str,
+    incarnation: &str,
+    outcome: &Value,
+) -> Result<(Option<AcquiredClaim>, bool), CliError> {
+    let context = outcome.get("context").and_then(Value::as_object);
+    let claim_id = context
+        .and_then(|value| value.get("claim_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "claim-replay-invalid",
+                "stored work claim outcome does not identify its claim",
+                None,
+            )
+        })?;
+    let outcome_session_id = context
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str);
+    let outcome_incarnation = context
+        .and_then(|value| value.get("session_incarnation"))
+        .and_then(Value::as_str);
+    let outcome_revision = context
+        .and_then(|value| value.get("revision"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CliError::data(
+                "claim-replay-invalid",
+                "stored work claim outcome does not identify its revision",
+                None,
+            )
+        })?;
+    if outcome_session_id != Some(session_id) || outcome_incarnation != Some(incarnation) {
+        return Err(CliError::data(
+            "claim-replay-conflict",
+            "stored work claim outcome belongs to a different session identity",
+            None,
+        ));
+    }
+    match registry
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == claim_id)
+    {
+        Some(claim)
+            if claim.session_id != session_id || claim.session_incarnation != incarnation =>
+        {
+            Err(CliError::data(
+                "claim-replay-conflict",
+                "stored work claim identity conflicts with the current registry",
+                None,
+            ))
+        }
+        Some(claim) if claim.state == "active" && claim.revision != outcome_revision => {
+            Err(CliError::data(
+                "claim-replay-revision-conflict",
+                "stored work claim outcome no longer matches the active claim revision",
+                None,
+            ))
+        }
+        Some(claim) if claim.state == "active" => Ok((
+            Some(AcquiredClaim {
+                claim_id: claim.claim_id.clone(),
+                revision: claim.revision,
+            }),
+            false,
+        )),
+        Some(_) | None => Ok((None, true)),
+    }
 }
 
 pub(crate) fn set_declared(
@@ -509,6 +633,7 @@ pub(crate) fn set_declared(
     candidate: WorkContextInput,
     reject_conflict: bool,
 ) -> Result<Value, CliError> {
+    let _session_authority = lock_claim_session_authority(context, record, incarnation)?;
     let mut candidate = candidate.validate_and_canonicalize()?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
@@ -623,6 +748,7 @@ pub(crate) fn clear_declared(
     record: &crate::SessionRecord,
     incarnation: &str,
 ) -> Result<Value, CliError> {
+    let _session_authority = lock_claim_session_authority(context, record, incarnation)?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     crate::orchestration::ensure_session_not_runtime_stop_fenced(context, record)?;
@@ -724,6 +850,7 @@ pub(crate) fn check(context: &CliContext, args: WorkContextCheckArgs) -> Result<
 pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    let _session_authority = lock_claim_session_authority(context, &record, &incarnation)?;
     let digest = request_digest(
         "work-context-renew",
         &json!({
@@ -796,8 +923,34 @@ pub(crate) fn release(
     context: &CliContext,
     args: WorkContextReleaseArgs,
 ) -> Result<Value, CliError> {
+    release_impl(context, args, None)
+}
+
+pub(crate) fn release_prelocked(
+    context: &CliContext,
+    args: WorkContextReleaseArgs,
+    session_authority: &crate::LockedSessionAuthority,
+) -> Result<Value, CliError> {
+    release_impl(context, args, Some(session_authority))
+}
+
+fn release_impl(
+    context: &CliContext,
+    args: WorkContextReleaseArgs,
+    session_authority: Option<&crate::LockedSessionAuthority>,
+) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    let _owned_session_authority = if let Some(session_authority) = session_authority {
+        validate_claim_session_authority(session_authority, &record, &incarnation)?;
+        None
+    } else {
+        Some(lock_claim_session_authority(
+            context,
+            &record,
+            &incarnation,
+        )?)
+    };
     let digest = request_digest(
         "work-context-release",
         &json!({
@@ -864,9 +1017,90 @@ pub(crate) fn release(
     Ok(outcome)
 }
 
+fn lock_claim_session_authority(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+) -> Result<crate::LockedSessionAuthority, CliError> {
+    signal_claim_authority_lock_for_test("before_authority_lock")?;
+    let authority =
+        crate::lock_exact_session_authority(context, &record.id)?.ok_or_else(claim_unavailable)?;
+    signal_claim_authority_lock_for_test("after_authority_lock")?;
+    validate_claim_session_authority(&authority, record, incarnation)?;
+    Ok(authority)
+}
+
+fn validate_claim_session_authority(
+    authority: &crate::LockedSessionAuthority,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+) -> Result<(), CliError> {
+    let locked_incarnation = authority
+        .record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if authority.record.created_at != record.created_at || locked_incarnation != incarnation {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "session identity changed before work claim mutation",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn signal_claim_authority_lock_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        env::var_os("NILS_AGENT_SESSION_TEST_CLAIM_LOCK_TRACE_DIR").map(PathBuf::from)
+    {
+        fs::write(directory.join(stage), stage).map_err(|_| {
+            CliError::runtime(
+                "claim-test-barrier",
+                "claim authority-lock trace could not be signalled",
+                None,
+            )
+        })?;
+    }
+    let _ = stage;
+    Ok(())
+}
+
+fn pause_claim_mutation_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_STAGE").as_deref() == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_CLAIM_BARRIER_DIR").map(PathBuf::from)
+    {
+        fs::write(directory.join("ready"), stage).map_err(|_| {
+            CliError::runtime(
+                "claim-test-barrier",
+                "claim mutation test barrier is unavailable",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "claim-test-barrier",
+                    "claim mutation test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
 pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<Value, CliError> {
-    let (record, incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    let capability_token = capability_token_from_file(args.capability_file.as_deref())?;
+    let capability_digest = digest_bytes(capability_token.as_bytes());
+    let (record, incarnation) = authenticate_token(context, &args.session, &capability_token)?;
     validate_operation_kind(&args.operation)?;
     let execution_token =
         read_private_text(&args.execution_token_file, 256, "invalid-execution-token")?;
@@ -903,10 +1137,42 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             "execution_token_digest": digest_bytes(execution_token.as_bytes()),
         }),
     );
-    let now = now_epoch();
+    {
+        let _session_authority = lock_claim_session_authority(context, &record, &incarnation)?;
+        let locked = lock_registry_observational(context)?;
+        crate::orchestration::ensure_session_not_authority_quarantined(context, &record)?;
+        ensure_current_broker_capability(
+            context,
+            &locked.registry,
+            &record.id,
+            &incarnation,
+            &capability_digest,
+        )?;
+        if let Some(replay) = idempotency_replay(
+            &locked.registry,
+            &args.idempotency_key,
+            &record.id,
+            &incarnation,
+            "work-context-admit",
+            &digest,
+        )? {
+            return Ok(replay);
+        }
+    }
+    validate_physical_targets(&record.cwd, &targets, &input.checkouts)?;
+    pause_claim_mutation_for_test("before_final_authority_lock")?;
+    let _session_authority = lock_claim_session_authority(context, &record, &incarnation)?;
     let mut locked = lock_registry(context)?;
+    let now = now_epoch();
     crate::orchestration::ensure_session_not_authority_quarantined(context, &record)?;
     clean_expired(&mut locked.registry, now);
+    ensure_current_broker_capability(
+        context,
+        &locked.registry,
+        &record.id,
+        &incarnation,
+        &capability_digest,
+    )?;
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -917,7 +1183,6 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     )? {
         return Ok(replay);
     }
-    ensure_current_broker(context, &locked.registry, &record.id, &incarnation)?;
     super::ensure_notification_submission_not_in_progress(
         &locked.registry,
         &record.id,
@@ -937,6 +1202,9 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         ));
     }
     let claim = active_claim(&locked.registry, &record.id, &incarnation)?;
+    if claim.expires_at_epoch <= now {
+        return Err(claim_unavailable());
+    }
     if claim.claim_id != args.claim || claim.revision != args.if_revision {
         return Err(revision_conflict("claim-revision-conflict"));
     }
@@ -968,7 +1236,6 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             None,
         ));
     }
-    validate_physical_targets(&record.cwd, &targets, &input.checkouts)?;
     let candidate = input_from_record(claim);
     let complete =
         complete_relevant_universe(context, &locked.registry, Some((&record.id, &incarnation)));
@@ -1508,6 +1775,24 @@ pub(crate) fn ensure_current_broker(
     Ok(())
 }
 
+fn ensure_current_broker_capability(
+    context: &CliContext,
+    registry: &Registry,
+    session_id: &str,
+    incarnation: &str,
+    capability_digest: &str,
+) -> Result<(), CliError> {
+    ensure_current_broker(context, registry, session_id, incarnation)?;
+    let broker = registry
+        .brokers
+        .get(session_id)
+        .ok_or_else(super::unauthorized)?;
+    if !super::digest_eq(&broker.capability_digest, capability_digest) {
+        return Err(super::unauthorized());
+    }
+    Ok(())
+}
+
 pub(crate) fn active_claim<'a>(
     registry: &'a Registry,
     session_id: &str,
@@ -1627,6 +1912,30 @@ pub(crate) fn main_agent_worker_claim_match(
     )
 }
 
+/// Return whether the authenticated controller's active claim is the exact
+/// stored run context without a worker-only checkout-shell grant.
+pub(crate) fn main_agent_controller_claim_match(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    candidate: &WorkContextInput,
+) -> Result<Option<bool>, CliError> {
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(claim_unavailable)?;
+    let locked = lock_registry(context)?;
+    main_agent_claim_match_in_registry(
+        context,
+        &locked.registry,
+        record,
+        incarnation,
+        candidate,
+        false,
+    )
+}
+
 /// Check the exact assignment-derived worker claim against an already locked
 /// coordination registry. This lets Main-owned authority revocation bind scope
 /// identity and the destructive seal to one registry snapshot.
@@ -1636,6 +1945,17 @@ pub(crate) fn main_agent_worker_claim_match_in_registry(
     record: &crate::SessionRecord,
     incarnation: &str,
     candidate: &WorkContextInput,
+) -> Result<Option<bool>, CliError> {
+    main_agent_claim_match_in_registry(context, registry, record, incarnation, candidate, true)
+}
+
+fn main_agent_claim_match_in_registry(
+    context: &CliContext,
+    registry: &Registry,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    candidate: &WorkContextInput,
+    checkout_shell_grant: bool,
 ) -> Result<Option<bool>, CliError> {
     let mut expected = candidate.clone().validate_and_canonicalize()?;
     ensure_current_broker(context, registry, &record.id, incarnation)?;
@@ -1654,7 +1974,7 @@ pub(crate) fn main_agent_worker_claim_match_in_registry(
         expected.worktrees.sort();
     }
     Ok(Some(
-        claim.checkout_shell_grant && input_from_record(claim) == expected,
+        claim.checkout_shell_grant == checkout_shell_grant && input_from_record(claim) == expected,
     ))
 }
 
