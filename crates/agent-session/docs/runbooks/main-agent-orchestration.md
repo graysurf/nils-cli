@@ -413,8 +413,11 @@ envelopes. `idle_claim_revocation_required` and
 `idle_claim_revocation_in_progress` use the v4 envelopes with an explicit
 `claim_revocation.in_flight` projection.
 `claimed_runtime_stop_in_progress` uses the v5 envelopes with an explicit
-`claimed_runtime_stop.in_flight` projection. Branch on `classification`, never
-on prose:
+`claimed_runtime_stop.in_flight` projection. The canary-authorized
+`provider_stop_canary_release_in_progress`,
+`provider_process_stopped_wrapper_live`, and generic
+`process_runtime_stopped_wrapper_live_contradiction` classifications use the
+v6 envelopes. Branch on `classification`, never on prose:
 
 | Classification | Deterministic action |
 | --- | --- |
@@ -424,6 +427,9 @@ on prose:
 | `worker_unreachable` | Preserve the assignment and investigate the missing bound worker. Do not infer safe reassignment from absence alone. |
 | `pre_claim_failure` | When `reassignment_safe:true`, cancel/retire or use `worker reassign`; otherwise preserve the worker. |
 | `post_claim_failure` | The worker held its assignment-derived claim before its runtime died. Run revision-fenced `worker reconcile-stopped`, then retire. `worker cancel` and `worker reassign` refuse this state by design. |
+| `provider_stop_canary_release_in_progress` | A release marker and matching durable reservation already exist. Replay only the returned exact argv, including its original idempotency key. |
+| `provider_process_stopped_wrapper_live` | The exact provider child is stopped while its bounded canary supervisor and tmux wrapper remain live. Preserve the worker, retain this supervision result, then run only the returned revision- and incarnation-fenced `worker release-provider-canary` action. |
+| `process_runtime_stopped_wrapper_live_contradiction` | Generic stopped process-runtime evidence conflicts with a visible tmux wrapper, but no exact canary release authority exists. Preserve the worker and reconcile identity evidence; the returned action is deliberately non-executable. |
 | `account_handoff_in_flight` | Complete the reserved account handoff or execute its typed `worker account-handoff-cancel` action before any readiness stop. |
 | `readiness_stop_required` | Execute the returned Main-owned exact argv for `worker stop-runtime`. It sends no provider input and preserves state; then re-supervise and use guarded pre-claim cancellation. |
 | `readiness_stop_in_progress` | Execute the returned exact replay argv. It contains the original privately retained idempotency key and cannot send provider input. |
@@ -792,9 +798,133 @@ adopted revision after proving the intermediate controller non-live. The
 successor then runs `reconcile-stopped` at the
 adopted revision and may delete the terminal exact worker normally.
 
+For the B2 field boundary, an assignment packet may opt in to the narrowly
+scoped Codex-only canary:
+
+```json
+{
+  "provider_stop_canary": {
+    "schema_version": "main-agent.provider-process-stop-canary.v1"
+  }
+}
+```
+
+This additive private packet field is the only public authority switch and is
+admitted only on Linux, where PID start-time and parent-death semantics provide
+the required exact-process evidence.
+Ordinary `agent-session start`, daemon launches, Claude workers, unknown
+schemas, and already-created non-canary sessions cannot acquire the
+capability. The compiled supervisor reconstructs only the recorded Codex
+binary and arguments for its exact session incarnation through a same-release
+compiled guardian. Before guardian launch, the supervisor becomes a child
+subreaper and creates and pins the incarnation-derived child cgroup v2
+directory, membership, freeze, and event handles. The guardian reopens only
+that device/inode-fenced boundary, becomes the provider tree's child
+subreaper, installs its parent-death handler, moves the provider into the
+cgroup before exec, and enters a process session distinct from the tmux
+supervisor. Before provider exec, the provider
+gets its own user, mount, and cgroup namespaces with that exact child cgroup
+as the cgroup namespace root and a read-only `/sys/fs/cgroup` view. It
+therefore cannot migrate itself or a descendant to the writable delegated
+parent or a sibling, while the outer guardian retains the exact observation
+and freeze handles.
+Provider cwd, executable, and standard streams are rejected if they are
+cgroupfs-backed, and every non-standard inherited descriptor is sealed
+close-on-exec after namespace setup. This prevents an inherited path handle
+from bypassing the read-only rooted view. The guardian also requires exactly
+one inherited cgroup2 mount at `/sys/fs/cgroup`; any alternate bind alias
+fails admission before provider exec.
+The guardian continuously pidfd-pins only processes whose ancestry terminates
+at its exact subreaper identity, including orphans after an immediate provider
+leader exit. An authorized stop freezes membership, rejects any
+unrelated or reused PID present in the stable snapshot, and signals only that
+pinned set; `cgroup.kill` is never used. A same-UID host process concurrently
+migrated into the cgroup is never a termination target, even if it arrives
+after the final snapshot. Such an out-of-provider host process can cause only
+a bounded cleanup failure/denial of service and is outside the canary's
+termination-authority trust boundary. The provider itself cannot perform that
+migration from its rooted read-only namespace.
+An abrupt supervisor exit is handled by the guardian's pinned boundary. A
+hard guardian crash reparents the provider tree to the supervisor subreaper,
+which performs the same membership validation through its already-pinned
+handles and never reopens a path for termination. A host without the
+required namespaces or a privately delegated writable cgroup v2 parent
+refuses the canary before provider exec. It accepts no
+executable, PID, signal, timeout, or tmux target. Its typed stop request is
+admitted only for the current run/controller, exact assignment revision,
+exact worker incarnation, active assignment-derived claim, authoritative-idle
+provider turn, authoritative broker, and zero active or uncertain operations.
+Admission first commits a mutually exclusive orchestration-owned, owner-only
+sidecar reservation bound to the run, controller, assignment revision,
+activity revision, runtime identity, exact worker/controller claim tuples,
+worker incarnation, request digest, idempotency key, and the supervisor's
+observed child PID/start-time identity. A session-owned execution fence is
+durable before the stop marker, blocks CLI and HTTP resume, and remains until
+stopped reconciliation.
+The sidecar deliberately leaves the released v3 registry and assignment wire
+schema unchanged. Before provider exec, the guardian requires the live
+controller pane to match the PID/start-time tuple already persisted for that
+controller incarnation, pins that process with a pidfd for its lifetime, and
+opens a private Unix control socket. A marker plus sidecar is never sufficient authority: stop and
+release additionally require Linux `SO_PEERCRED` proof that the requesting
+CLI process descends from that captured controller and is outside the
+provider child cgroup. Every provider descendant remains in that rooted
+cgroup and therefore cannot self-authorize even though it shares the host
+UID and can read owner-only state. The guardian also requires the matching
+durable reservation before acting. It freezes the pinned cgroup, verifies
+every stable member as the exact provider leader or a previously pidfd-pinned
+descendant, signals only those identities, and removes the same pinned empty
+cgroup. If the guardian dies abnormally, the supervisor validates and signals
+only provider members reparented to its exact subreaper through the boundary
+it pinned before launch. It never reopens a path for termination. Main
+independently proves that the same PID/start-time identity is absent or stopped
+before writing the supervision proof. Private markers are bounded regular
+files opened without symlink following and must be owned by the current user
+with no group/other access. They are coordination signals, not bearer
+authority. The wrapper remains live for at most 120 seconds.
+
+```bash
+main-agent worker stop-provider-canary ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key stop-provider-canary-001 \
+  --format json
+```
+
+During the bounded hold, supervision must return
+`provider_process_stopped_wrapper_live`, never `healthy_progress` or
+`evidence_unavailable`. Every competing assignment mutation is fenced.
+Release only the same exact canary:
+
+```bash
+main-agent worker release-provider-canary ASSIGNMENT_ID \
+  --worker-incarnation WORKER_INCARNATION \
+  --if-revision ASSIGNMENT_REVISION \
+  --idempotency-key release-provider-canary-001 \
+  --format json
+```
+
+Release sends no provider input and lets the wrapper, broker heartbeat, and
+tmux session exit normally. Exact request identity makes interrupted stop and
+release calls replayable. `release_requested` is durable before the
+controller-authenticated guardian request, so a crash after the marker but
+before that request or the terminal receipt resumes the same reservation.
+Supervision exposes that exact replay as
+`provider_stop_canary_release_in_progress`; a competing idempotency identity
+fails closed. `worker_claim_preserved` reports the exact admitted claim tuple
+as observed at terminal release; it is `false`, without blocking cleanup, if
+that claim expired or disappeared during the bounded hold. If the
+controller does not release within 120 seconds, the wrapper exits
+automatically. That timeout invalidates the field observation, but does not
+wedge the assignment: once exact runtime and tmux evidence are stopped,
+`reconcile-stopped` may consume the expired reservation and session fence
+after terminalizing the assignment. If the original controller is lost, a
+successor may adopt only after exact runtime and tmux evidence are stopped;
+the controller-bound sidecar is consumed, while the execution fence remains
+until successor-owned stopped reconciliation.
+
 Once the exact runtime is stopped, supervision returns
-`post_claim_failure`. A process-stopped/tmux-live contradiction instead returns
-`evidence_unavailable`; never treat it as healthy progress. Do not reach for
+`post_claim_failure`. Do not reach for
 `worker cancel`, `worker reassign`, or
 Agent Console force group cleanup: the first two refuse a post-claim assignment
 and the third deletes the Main Agent session that would have to run it. Use the
@@ -1031,23 +1161,40 @@ a live state.
 
 ### 7. Close the run and converge cards
 
-Repeat accept, release, and delete for every worker. Then read current run state
-and close only after every assignment is terminal:
+After every worker has reached an accepted, released, or cancelled terminal
+state, write the private final checkpoint and use the run-wide macro:
 
 ```bash
-main-agent status --format json
-main-agent close \
-  --if-revision RUN_REVISION \
-  --idempotency-key close-001 \
+main-agent closeout \
+  --if-run-revision RUN_REVISION \
+  --checkpoint-file /private/path/final-checkpoint.json \
+  --idempotency-key closeout-001 \
   --format json
-agent-session work-context clear
 ```
 
-`close` marks the durable run closed; it does not delete the Main Agent's own
-interactive session. Confirm that `agent-session list` and the serve
-`GET /sessions` projection no longer show deleted worker sessions and that the
-Main Agent projection reports the closed run. Agent Console cards converge from
-those projections; never repair a stale card by editing orchestration storage.
+Require `handoff_ready: true`. The result records checkpoint and final run
+revisions, every worker disposition, bound controller-claim disposition, and
+the final projection readback. `provider_session_preserved: true` confirms
+that the Main Agent's own interactive provider session was not stopped or
+deleted.
+
+`handoff_ready: false` is a resumable partial result. Inspect
+`progress_receipt.completed_stages`, `retained_exceptions`, and
+`cleanup_pending`; resolve only the named worker or operation, then retry the
+identical command, checkpoint content, initial run revision, and idempotency
+key. Do not switch to a new key after a committed stage. A pre-provenance run returns
+`controller-claim-provenance-required` rather than guessing ownership from a
+matching context.
+
+The lower-level `worker retire`, `close`, and `work-context release` commands
+remain available for diagnosis and intentional primitive recovery. They are
+not the normal closeout path because only `closeout` retains run-wide progress
+and performs the final ownership/readback checks.
+
+Confirm that `agent-session list` and the serve `GET /sessions` projection no
+longer show live worker sessions and that the Main Agent projection reports
+the closed run. Agent Console cards converge from those projections; never
+repair a stale card by editing orchestration storage.
 
 When the Main Agent terminal is no longer needed, stop it and have an external
 operator use the normal guarded command:

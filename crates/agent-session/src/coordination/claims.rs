@@ -39,6 +39,15 @@ pub(crate) struct AcquiredClaim {
     pub revision: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ControllerClaimSnapshot {
+    pub claim_id: String,
+    pub revision: u64,
+    pub session_id: String,
+    pub session_incarnation: String,
+    pub work_context_digest: String,
+}
+
 pub(crate) struct ClaimTransactionResult {
     pub outcome: Value,
     pub acquired: Option<AcquiredClaim>,
@@ -1934,6 +1943,113 @@ pub(crate) fn main_agent_controller_claim_match(
         candidate,
         false,
     )
+}
+
+/// Return the exact active controller claim identity and canonical scope
+/// digest after proving that it matches the stored objective work context.
+pub(crate) fn main_agent_controller_claim_snapshot(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    candidate: &WorkContextInput,
+) -> Result<Option<ControllerClaimSnapshot>, CliError> {
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(claim_unavailable)?;
+    let locked = lock_registry(context)?;
+    if main_agent_claim_match_in_registry(
+        context,
+        &locked.registry,
+        record,
+        incarnation,
+        candidate,
+        false,
+    )? != Some(true)
+    {
+        return Ok(None);
+    }
+    let claim = active_claim(&locked.registry, &record.id, incarnation)?;
+    Ok(Some(controller_claim_snapshot(claim)?))
+}
+
+/// Observe the caller's current active claim without treating context equality
+/// as ownership. Closeout compares this snapshot to retained run provenance.
+pub(crate) fn active_controller_claim_snapshot(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+) -> Result<Option<ControllerClaimSnapshot>, CliError> {
+    let locked = lock_registry(context)?;
+    locked
+        .registry
+        .claims
+        .iter()
+        .find(|claim| {
+            claim.session_id == record.id
+                && claim.session_incarnation == incarnation
+                && claim.state == "active"
+        })
+        .map(controller_claim_snapshot)
+        .transpose()
+}
+
+pub(crate) fn controller_claim_has_nonterminal_operation(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    claim_id: &str,
+) -> Result<bool, CliError> {
+    let locked = lock_registry(context)?;
+    let claim = locked.registry.claims.iter().find(|claim| {
+        claim.claim_id == claim_id
+            && claim.session_id == record.id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    });
+    let Some(claim) = claim else {
+        return Err(claim_unavailable());
+    };
+    Ok(has_nonterminal_operation(&locked.registry, &claim.claim_id))
+}
+
+pub(crate) fn controller_claim_is_active(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    claim_id: &str,
+) -> Result<bool, CliError> {
+    let locked = lock_registry(context)?;
+    Ok(locked.registry.claims.iter().any(|claim| {
+        claim.claim_id == claim_id
+            && claim.session_id == record.id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    }))
+}
+
+fn controller_claim_snapshot(
+    claim: &WorkContextRecord,
+) -> Result<ControllerClaimSnapshot, CliError> {
+    let work_context_digest = crate::orchestration::packet_digest(&json!({
+        "schema_version": claim.schema_version,
+        "intent": claim.intent,
+        "tier": claim.tier,
+        "repositories": claim.repositories,
+        "worktrees": claim.worktrees,
+        "provider_refs": claim.provider_refs,
+        "plan_refs": claim.plan_refs,
+        "scopes": claim.scopes,
+        "summary": claim.summary
+    }))?;
+    Ok(ControllerClaimSnapshot {
+        claim_id: claim.claim_id.clone(),
+        revision: claim.revision,
+        session_id: claim.session_id.clone(),
+        session_incarnation: claim.session_incarnation.clone(),
+        work_context_digest,
+    })
 }
 
 /// Check the exact assignment-derived worker claim against an already locked

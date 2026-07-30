@@ -18,8 +18,9 @@ use toml_edit::{DocumentMut as TomlDocument, Item as TomlItem};
 
 use crate::cli::AgentKind;
 use crate::{
-    CliContext, CliError, ProviderResume, SessionRecord, canonical_provider_resume_args,
-    load_session_record, mutate_session_record, session_dir,
+    CliContext, CliError, Envelope, ProviderResume, SessionRecord, canonical_provider_resume_args,
+    load_session_record, mutate_session_record, run_output_with_timeout_and_strict_cap,
+    session_dir, valid_sha256,
 };
 
 mod provider;
@@ -54,6 +55,7 @@ pub(crate) const ACTIVITY_RETRY_PROVIDER_ENV: &str = "AGENT_SESSION_ACTIVITY_RET
 const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_UNHEALTHY_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const AGENT_HOOK_DOCTOR_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3127,14 +3129,26 @@ pub(crate) fn doctor(
                     .as_deref()
                     .expect("Codex notification path is resolved above");
                 let hooks = codex_hook_status(&path, config_path);
+                let hook_control = agent_hook_codex_configured();
                 let notification = codex_notification_status(config_path);
-                let configured = hooks.as_ref().is_ok_and(|status| status.configured)
+                let configured = hook_control.as_ref().is_ok_and(|configured| *configured)
                     && notification.as_ref().is_ok_and(|status| status.configured);
                 let configuration_error = hooks
                     .as_ref()
                     .err()
-                    .or_else(|| notification.as_ref().err())
-                    .map(|error| error.code().to_string());
+                    .map(|error| error.code().to_string())
+                    .or_else(|| {
+                        notification
+                            .as_ref()
+                            .err()
+                            .map(|error| error.code().to_string())
+                    })
+                    .or_else(|| {
+                        hook_control
+                            .as_ref()
+                            .err()
+                            .map(|error| (*error).to_string())
+                    });
                 let notification_mode = Some(
                     notification
                         .map(|status| status.mode)
@@ -3321,6 +3335,50 @@ fn command_resolves_on_path(command: &str, path: Option<&std::ffi::OsStr>) -> bo
         fs::metadata(directory.join(command))
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
     })
+}
+
+fn agent_hook_codex_configured() -> Result<bool, &'static str> {
+    let binary = std::env::var_os("AGENT_HOOK_BIN").unwrap_or_else(|| "agent-hook".into());
+    let mut command = ProcessCommand::new(binary);
+    command.args(["doctor", "--product", "codex", "--format", "json"]);
+    let output = run_output_with_timeout_and_strict_cap(
+        command,
+        Duration::from_secs(10),
+        AGENT_HOOK_DOCTOR_MAX_OUTPUT_BYTES,
+    )
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            "agent-hook-doctor-output-invalid"
+        } else {
+            "agent-hook-doctor-unavailable"
+        }
+    })?;
+    let envelope: Envelope<Vec<agent_hook::setup::DoctorResult>> =
+        serde_json::from_slice(&output.stdout).map_err(|_| "agent-hook-doctor-output-invalid")?;
+    if !output.status.success()
+        || !envelope.ok
+        || envelope.error.is_some()
+        || envelope.schema_version != "cli.agent-hook.doctor.v1"
+    {
+        return Err("agent-hook-doctor-output-invalid");
+    }
+    let mut results = envelope
+        .data
+        .ok_or("agent-hook-doctor-output-invalid")?
+        .into_iter();
+    let result = results.next().ok_or("agent-hook-doctor-output-invalid")?;
+    if results.next().is_some()
+        || result.schema_version != "agent-hook.doctor.v1"
+        || result.product != "codex"
+        || !valid_sha256(&result.config_digest)
+        || !valid_sha256(&result.policy_digest)
+    {
+        return Err("agent-hook-doctor-output-invalid");
+    }
+    Ok(result.supported
+        && result.status == agent_hook::setup::ProviderStatus::Converged
+        && result.owned_count == result.expected_owned_count
+        && result.legacy_residue_count == 0)
 }
 
 #[derive(Clone, Debug, Default)]

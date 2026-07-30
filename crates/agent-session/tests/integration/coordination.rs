@@ -3,6 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,8 +17,91 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::cli::{
-    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls,
+    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group,
+    spawn_test_process_group, tmux_calls,
 };
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_test_capability() -> Result<(), String> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|_| "unified cgroup membership is unavailable".to_string())?;
+    let relative = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .and_then(|path| Path::new(path).strip_prefix("/").ok())
+        .filter(|path| {
+            path.components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+        .ok_or_else(|| "unified cgroup membership is invalid".to_string())?;
+    let parent = Path::new("/sys/fs/cgroup").join(relative);
+    let metadata = fs::symlink_metadata(&parent)
+        .map_err(|_| "delegated cgroup parent is unavailable".to_string())?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("current cgroup is not privately delegated".to_string());
+    }
+    let probe = parent.join(format!(
+        "nils-provider-stop-canary-test-probe-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&probe)
+        .map_err(|_| "delegated cgroup does not permit a child boundary".to_string())?;
+    let controls_present = probe.join("cgroup.procs").is_file()
+        && probe.join("cgroup.freeze").is_file()
+        && probe.join("cgroup.events").is_file()
+        && OpenOptions::new()
+            .write(true)
+            .open(probe.join("cgroup.procs"))
+            .is_ok()
+        && fs::write(probe.join("cgroup.freeze"), "0").is_ok()
+        && OpenOptions::new()
+            .read(true)
+            .open(probe.join("cgroup.events"))
+            .is_ok();
+    let removed = fs::remove_dir(&probe).is_ok();
+    if !controls_present || !removed {
+        return Err("delegated cgroup controls are unavailable".to_string());
+    }
+    let unshare = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("unshare"))
+                .find(|candidate| candidate.is_file())
+        })
+        .ok_or_else(|| "unshare capability probe is unavailable".to_string())?;
+    let status = Command::new(unshare)
+        .args([
+            "--user",
+            "--map-current-user",
+            "--keep-caps",
+            "--mount",
+            "--cgroup",
+            "--fork",
+            "true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "namespace capability probe could not run".to_string())?;
+    if !status.success() {
+        return Err("user, mount, and cgroup namespaces are unavailable".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_test_capability_or_skip() -> bool {
+    match provider_stop_canary_test_capability() {
+        Ok(()) => true,
+        Err(reason) if std::env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() == Ok("1") => {
+            panic!("provider stop canary cgroup capability is required but unavailable: {reason}");
+        }
+        Err(reason) => {
+            eprintln!("SKIP: provider stop canary cgroup capability unavailable: {reason}");
+            false
+        }
+    }
+}
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved("agent-session", args, &CmdOptions::new().with_cwd(dir))
@@ -367,6 +452,20 @@ fn seed_live_runtime_identity(
     runtime
 }
 
+fn linux_process_start_ticks(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("Linux process stat");
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .expect("Linux process stat command boundary");
+    fields
+        .split_whitespace()
+        .nth(19)
+        .expect("Linux process start-time field")
+        .parse()
+        .expect("Linux process start-time ticks")
+}
+
 fn init_checkout(path: &Path, remote: &str) {
     fs::create_dir_all(path).expect("checkout directory");
     let init = Command::new("git")
@@ -609,6 +708,43 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     )
     .expect("write private json");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
+}
+
+fn provider_stop_canary_reservation_path(state_dir: &Path, assignment_id: &str) -> PathBuf {
+    state_dir
+        .join("orchestration/provider-stop-canary-reservations")
+        .join(digest(assignment_id))
+}
+
+fn write_provider_stop_canary_reservation(
+    state_dir: &Path,
+    assignment_id: &str,
+    value: &serde_json::Value,
+) {
+    let path = provider_stop_canary_reservation_path(state_dir, assignment_id);
+    let parent = path.parent().expect("canary reservation directory");
+    fs::create_dir_all(parent).expect("canary reservation directory");
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .expect("canary reservation directory mode");
+    write_private_json(&path, value);
+}
+
+fn provider_stop_canary_reservation(
+    state_dir: &Path,
+    assignment_id: &str,
+) -> Option<serde_json::Value> {
+    let path = provider_stop_canary_reservation_path(state_dir, assignment_id);
+    path.is_file().then(|| {
+        serde_json::from_slice(&fs::read(path).expect("provider stop canary reservation"))
+            .expect("provider stop canary reservation json")
+    })
+}
+
+fn provider_stop_canary_fence_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(session_id)
+        .join("provider-stop-canary-fence.json")
 }
 
 fn init_main_run(
@@ -939,6 +1075,20 @@ fn orchestration_registry(state_dir: &Path) -> serde_json::Value {
     .expect("orchestration registry json")
 }
 
+fn controller_claim_binding_path(state_dir: &Path, run_id: &str) -> PathBuf {
+    state_dir
+        .join("orchestration/controller-claim-bindings")
+        .join(digest(run_id))
+}
+
+fn controller_claim_binding(state_dir: &Path, run_id: &str) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(controller_claim_binding_path(state_dir, run_id))
+            .expect("controller claim binding"),
+    )
+    .expect("controller claim binding json")
+}
+
 fn load_coordination_registry(state_dir: &Path) -> serde_json::Value {
     serde_json::from_slice(
         &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
@@ -985,50 +1135,259 @@ fn coordination_authority_snapshot(
     })
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3SessionRef {
+    #[serde(default)]
+    machine: Option<String>,
+    session_id: String,
+    session_incarnation: String,
+    session_created_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3RunCheckpoint {
+    revision: u64,
+    summary: String,
+    next_action: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3TimedRelationship {
+    session: FrozenBaseV3SessionRef,
+    expires_at: String,
+    expires_at_epoch: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3SubmitRecovery {
+    schema_version: String,
+    attempt_id: String,
+    #[serde(default = "frozen_base_v3_default_submit_recovery_origin")]
+    origin: String,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    controller: Option<FrozenBaseV3SessionRef>,
+    session_incarnation: String,
+    reserved_revision: u64,
+    state: String,
+    attempt_count: u8,
+    result: String,
+    attempted_at: String,
+    updated_at: String,
+}
+
+fn frozen_base_v3_default_submit_recovery_origin() -> String {
+    "explicit".to_string()
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3WorkerQuarantine {
+    schema_version: String,
+    worker: FrozenBaseV3SessionRef,
+    reason: String,
+    runtime_identity_digest: String,
+    created_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3AccountHandoff {
+    schema_version: String,
+    request_digest: String,
+    #[serde(default)]
+    reservation_id: Option<String>,
+    #[serde(default)]
+    account_intent_id: Option<String>,
+    run_id: String,
+    controller: FrozenBaseV3SessionRef,
+    worker: FrozenBaseV3SessionRef,
+    reserved_revision: u64,
+    account: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3RuntimeStop {
+    schema_version: String,
+    request_digest: String,
+    idempotency_key: String,
+    run_id: String,
+    controller: FrozenBaseV3SessionRef,
+    worker: FrozenBaseV3SessionRef,
+    reserved_revision: u64,
+    #[serde(default)]
+    adopted_revision: Option<u64>,
+    controller_claim_id: String,
+    controller_claim_revision: u64,
+    controller_claim_expires_at_epoch: i64,
+    created_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3ClaimRevocation {
+    schema_version: String,
+    request_digest: String,
+    idempotency_key: String,
+    run_id: String,
+    controller: FrozenBaseV3SessionRef,
+    worker: FrozenBaseV3SessionRef,
+    reserved_revision: u64,
+    #[serde(default)]
+    adopted_revision: Option<u64>,
+    terminal_revision: u64,
+    runtime_identity_digest: String,
+    reason: String,
+    created_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3ReadinessStopProof {
+    schema_version: String,
+    worker: FrozenBaseV3SessionRef,
+    readiness_state: String,
+    delivery_proof: String,
+    automatic_retry_safe: bool,
+    recorded_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3Run {
+    schema_version: String,
+    run_id: String,
+    revision: u64,
+    state: String,
+    tier: String,
+    objective_summary: String,
+    objective_packet_digest: String,
+    controller: FrozenBaseV3SessionRef,
+    #[serde(default)]
+    durable_refs: Vec<String>,
+    #[serde(default)]
+    ephemeral: bool,
+    #[serde(default)]
+    checkpoint: Option<FrozenBaseV3RunCheckpoint>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3Assignment {
+    schema_version: String,
+    assignment_id: String,
+    run_id: String,
+    revision: u64,
+    state: String,
+    task_summary: String,
+    private_packet_digest: String,
+    primary_manager: FrozenBaseV3SessionRef,
+    #[serde(default)]
+    worker: Option<FrozenBaseV3SessionRef>,
+    #[serde(default)]
+    previous_worker: Option<FrozenBaseV3SessionRef>,
+    #[serde(default)]
+    collaborators: Vec<FrozenBaseV3SessionRef>,
+    #[serde(default)]
+    borrowed_by: Vec<FrozenBaseV3TimedRelationship>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
+    base_ref: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    durable_refs: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    checkpoint: Option<FrozenBaseV3RunCheckpoint>,
+    #[serde(default)]
+    result_summary: Option<String>,
+    #[serde(default)]
+    blocker_summary: Option<String>,
+    #[serde(default)]
+    submit_recovery: Option<FrozenBaseV3SubmitRecovery>,
+    #[serde(default)]
+    worker_quarantine: Option<FrozenBaseV3WorkerQuarantine>,
+    #[serde(default)]
+    account_handoff: Option<FrozenBaseV3AccountHandoff>,
+    #[serde(default)]
+    runtime_stop: Option<FrozenBaseV3RuntimeStop>,
+    #[serde(default)]
+    claim_revocation: Option<FrozenBaseV3ClaimRevocation>,
+    #[serde(default)]
+    readiness_stop_proof: Option<FrozenBaseV3ReadinessStopProof>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct FrozenBaseV3Receipt {
+    principal_session_id: String,
+    principal_incarnation: String,
+    operation: String,
+    request_digest: String,
+    outcome: serde_json::Value,
+    created_at_epoch: i64,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)]
+#[serde(default, deny_unknown_fields)]
+struct FrozenBaseV3Registry {
+    schema_version: String,
+    runs: BTreeMap<String, FrozenBaseV3Run>,
+    assignments: BTreeMap<String, FrozenBaseV3Assignment>,
+    receipts: BTreeMap<String, FrozenBaseV3Receipt>,
+}
+
 fn assert_frozen_base_v3_registry_compatible(registry: &serde_json::Value) {
+    let frozen: FrozenBaseV3Registry =
+        serde_json::from_value(registry.clone()).expect("pinned released-v3 reader");
     assert_eq!(
-        registry["schema_version"], "agent-session.orchestration-registry.v3",
+        frozen.schema_version, "agent-session.orchestration-registry.v3",
         "B2 must keep the released v3 registry envelope"
     );
-    let released_assignment_fields = [
-        "schema_version",
-        "assignment_id",
-        "run_id",
-        "revision",
-        "state",
-        "task_summary",
-        "private_packet_digest",
-        "primary_manager",
-        "worker",
-        "previous_worker",
-        "collaborators",
-        "borrowed_by",
-        "repository",
-        "worktree",
-        "base_ref",
-        "scopes",
-        "durable_refs",
-        "depends_on",
-        "checkpoint",
-        "result_summary",
-        "blocker_summary",
-        "submit_recovery",
-        "worker_quarantine",
-        "account_handoff",
-        "created_at",
-        "updated_at",
-    ];
-    for assignment in registry["assignments"]
-        .as_object()
-        .expect("assignments")
-        .values()
-    {
-        for field in assignment.as_object().expect("assignment").keys() {
-            assert!(
-                released_assignment_fields.contains(&field.as_str()),
-                "released v3 assignment reader rejects unknown field {field}"
-            );
-        }
+    assert_eq!(
+        frozen.runs.len(),
+        registry["runs"].as_object().unwrap().len()
+    );
+    assert_eq!(
+        frozen.assignments.len(),
+        registry["assignments"].as_object().unwrap().len()
+    );
+    assert_eq!(
+        frozen.receipts.len(),
+        registry["receipts"].as_object().unwrap().len()
+    );
+    for assignment in registry["assignments"].as_object().unwrap().values() {
         if !assignment["worker_quarantine"].is_null() {
             let recovery = &assignment["submit_recovery"];
             assert_eq!(
@@ -1042,6 +1401,41 @@ fn assert_frozen_base_v3_registry_compatible(registry: &serde_json::Value) {
             );
         }
     }
+}
+
+#[test]
+fn frozen_base_v3_reader_rejects_unknown_nested_session_fields() {
+    let registry = json!({
+        "schema_version": "agent-session.orchestration-registry.v3",
+        "runs": {
+            "run-one": {
+                "schema_version": "main-agent.run.v1",
+                "run_id": "run-one",
+                "revision": 1,
+                "state": "active",
+                "tier": "L0",
+                "objective_summary": "compatibility control",
+                "objective_packet_digest": "a".repeat(64),
+                "controller": {
+                    "machine": null,
+                    "session_id": "controller",
+                    "session_incarnation": "controller-incarnation",
+                    "session_created_at": "2030-01-01T00:00:00Z",
+                    "future_nested_field": true
+                },
+                "durable_refs": [],
+                "ephemeral": false,
+                "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": "2030-01-01T00:00:00Z"
+            }
+        },
+        "assignments": {},
+        "receipts": {}
+    });
+    assert!(
+        serde_json::from_value::<FrozenBaseV3Registry>(registry).is_err(),
+        "the frozen released-v3 reader must reject additive nested fields"
+    );
 }
 
 #[test]
@@ -1135,9 +1529,9 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
     for lifecycle_step in [
         "SAFE LIFECYCLE",
         "init -> rehydrate/status -> worker start --await-ready -> worker bootstrap",
-        "worker supervise -> accept -> retire -> close",
+        "worker supervise -> accept -> closeout",
         "MACRO-FIRST RECOVERY",
-        "never resend a prompt or inject an unbounded/manual Enter",
+        "Never resend a prompt or inject an",
     ] {
         assert!(
             root_help.contains(lifecycle_step),
@@ -8446,6 +8840,401 @@ fn main_agent_worker_start_binds_broker_to_same_release_agent_session_sibling() 
     assert_eq!(broker, expected_broker);
     assert_ne!(broker, main_agent);
     assert_ne!(broker, path_agent_session);
+    assert!(
+        launch.iter().any(|arg| arg == &codex_arg),
+        "an unarmed Codex worker must launch the selected provider binary"
+    );
+    assert!(
+        launch
+            .iter()
+            .all(|arg| arg != "provider-stop-canary-supervisor"),
+        "an unarmed worker must not enter the canary supervisor path"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = tmp.path().join("codex-canary-worker");
+    let descendant_pid_file = tmp.path().join("codex-canary-descendant.pid");
+    fs::write(
+        &codex_bin,
+        "#!/usr/bin/env sh\nsetsid sh -c 'sleep 60' &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CANARY_DESCENDANT_PID_FILE\"\nwait \"$descendant\"\n",
+    )
+    .expect("canary provider fixture");
+    fs::set_permissions(&codex_bin, fs::Permissions::from_mode(0o700))
+        .expect("canary provider fixture mode");
+    let assignment_path = tmp.path().join("assignment-canary-supervisor.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-supervisor",
+            "task_summary": "Exercise exact compiled canary supervisor launch",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-supervisor",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    let started = run_main_agent_with_codex_trust(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-supervisor-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+        &codex_home,
+        &[&checkout],
+    );
+    assert_eq!(started.code, 0, "outcome={}", started.stdout_text());
+    let controller_pid = std::process::id();
+    let controller_record_path = state_dir.join("sessions/main-one/session.json");
+    let mut controller_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&controller_record_path).expect("controller record"))
+            .expect("controller record json");
+    controller_record["delete_tmux_identity"] = json!({
+        "launch_id": "main-incarnation-one",
+        "session_id": "$92",
+        "pane_id": "%92",
+        "pane_pid": controller_pid,
+        "process_group_id": controller_pid,
+        "process_session_id": controller_pid,
+        "process_session_members": [{
+            "pid": controller_pid,
+            "start_time": linux_process_start_ticks(controller_pid)
+        }]
+    });
+    write_private_json(&controller_record_path, &controller_record);
+    let launch = tmux_calls(&tmux_log)
+        .into_iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("worker tmux launch");
+    let helper = bin::resolve("agent-session");
+    let helper_arg = helper.to_string_lossy().into_owned();
+    let helper_index = launch
+        .iter()
+        .rposition(|arg| arg == &helper_arg)
+        .expect("compiled canary runtime helper executable");
+    assert_eq!(
+        &launch[helper_index..],
+        &[
+            helper_arg.clone(),
+            "--state-dir".to_string(),
+            state_dir.to_string_lossy().into_owned(),
+            "provider-stop-canary-supervisor".to_string(),
+            "--id".to_string(),
+            "worker-canary-supervisor".to_string()
+        ]
+    );
+    assert!(
+        launch.iter().all(|arg| arg != &codex_arg),
+        "tmux must launch only the compiled supervisor, not the provider directly"
+    );
+    let record_path = state_dir.join("sessions/worker-canary-supervisor/session.json");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    assert_eq!(
+        record["runtime"]["provider_stop_canary"],
+        json!({
+            "schema_version": "agent-session.provider-stop-canary.v1",
+            "hold_seconds": 120,
+            "launch_id": record["runtime"]["launch_id"],
+            "assignment_id": "assignment-canary-supervisor"
+        })
+    );
+
+    let spawn_supervisor = || {
+        let mut command = Command::new(&launch[helper_index]);
+        command
+            .current_dir(&checkout)
+            .args(&launch[helper_index + 1..])
+            .env("AGENT_SESSION_ID", "worker-canary-supervisor")
+            .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
+            .env(
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS",
+                "500",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        command.spawn().expect("execute emitted canary command")
+    };
+    let mut stale_identity_supervisor = spawn_supervisor();
+    let stale_identity_pid = stale_identity_supervisor.id();
+    let mut stale_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    stale_record["delete_tmux_identity"] = json!({
+        "launch_id": stale_record["runtime"]["launch_id"],
+        "session_id": "$93",
+        "pane_id": "%93",
+        "pane_pid": stale_identity_pid,
+        "process_group_id": stale_identity_pid,
+        "process_session_id": stale_identity_pid,
+        "process_session_members": [{
+            "pid": stale_identity_pid,
+            "start_time": linux_process_start_ticks(stale_identity_pid).saturating_add(1)
+        }]
+    });
+    write_private_json(&record_path, &stale_record);
+    let stale_status = stale_identity_supervisor
+        .wait()
+        .expect("wait stale-identity supervisor");
+    assert!(
+        !stale_status.success(),
+        "a reused numeric pane PID with different start ticks must fail before provider launch"
+    );
+    let mut supervisor = spawn_supervisor();
+    let supervisor_pid = supervisor.id();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": record["runtime"]["launch_id"],
+        "session_id": "$94",
+        "pane_id": "%94",
+        "pane_pid": supervisor_pid,
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "process_session_members": [{
+            "pid": supervisor_pid,
+            "start_time": linux_process_start_ticks(supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+    let ready =
+        state_dir.join("sessions/worker-canary-supervisor/.provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.is_file() {
+        if let Some(status) = supervisor.try_wait().expect("probe canary supervisor") {
+            let mut stderr = String::new();
+            supervisor
+                .stderr
+                .as_mut()
+                .expect("canary supervisor stderr")
+                .read_to_string(&mut stderr)
+                .expect("read canary supervisor stderr");
+            panic!(
+                "the emitted compiled supervisor exited before readiness: status={status}, stderr={stderr}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exact command emitted by worker start did not launch the compiled supervisor"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    while !descendant_pid_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the exact provider did not publish its descendant identity"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let child_pid = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&ready).expect("canary ready marker"),
+    )
+    .expect("canary ready json")["child_pid"]
+        .as_u64()
+        .expect("provider child pid") as u32;
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("provider descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("provider descendant numeric pid");
+    // SAFETY: the test-created supervisor owns this private process group.
+    // Killing the complete supervisor group exercises correlated pane/job
+    // teardown while the separately-sessioned guardian must still clean the
+    // provider cgroup.
+    assert_eq!(
+        unsafe { libc::kill(-(supervisor_pid as libc::pid_t), libc::SIGKILL) },
+        0
+    );
+    supervisor.wait().expect("reap emitted canary supervisor");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (Path::new(&format!("/proc/{child_pid}")).exists()
+        || Path::new(&format!("/proc/{descendant_pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "the crash guardian must stop the emitted supervisor's exact provider child"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{descendant_pid}")).exists(),
+        "the crash guardian cgroup must stop a descendant that escaped into its own process session"
+    );
+    // SAFETY: the exact child PID was the private process-group leader and has
+    // been reaped; ESRCH proves no descendant remains in that group.
+    let group_status = unsafe { libc::kill(-(child_pid as libc::pid_t), 0) };
+    assert_eq!(group_status, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+
+    fs::remove_file(&ready).expect("remove first ready marker");
+    fs::remove_file(&descendant_pid_file).expect("remove first descendant marker");
+    let mut guardian_crash_supervisor = spawn_supervisor();
+    let guardian_crash_supervisor_pid = guardian_crash_supervisor.id();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": record["runtime"]["launch_id"],
+        "session_id": "$96",
+        "pane_id": "%96",
+        "pane_pid": guardian_crash_supervisor_pid,
+        "process_group_id": guardian_crash_supervisor_pid,
+        "process_session_id": guardian_crash_supervisor_pid,
+        "process_session_members": [{
+            "pid": guardian_crash_supervisor_pid,
+            "start_time": linux_process_start_ticks(guardian_crash_supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.is_file() || !descendant_pid_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the guardian-crash fixture did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let guardian_child_pid = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&ready).expect("guardian-crash ready marker"),
+    )
+    .expect("guardian-crash ready json")["child_pid"]
+        .as_u64()
+        .expect("guardian-crash provider child pid") as u32;
+    let guardian_descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("guardian-crash descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("guardian-crash descendant numeric pid");
+    let guardian_child_cgroup = fs::read_to_string(format!("/proc/{guardian_child_pid}/cgroup"))
+        .expect("guardian-crash child cgroup")
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|relative| Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+        .expect("guardian-crash unified cgroup");
+    let children_path = format!(
+        "/proc/{guardian_crash_supervisor_pid}/task/{guardian_crash_supervisor_pid}/children"
+    );
+    let guardian_pid = loop {
+        let child = fs::read_to_string(&children_path)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok());
+        if let Some(child) = child {
+            break child;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor did not expose its exact guardian child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: this test owns the exact direct guardian child and exercises its
+    // abnormal-death cleanup path; production exposes no caller-selected PID.
+    assert_eq!(unsafe { libc::kill(guardian_pid, libc::SIGKILL) }, 0);
+    let status = guardian_crash_supervisor
+        .wait()
+        .expect("wait guardian-crash supervisor");
+    assert!(
+        !status.success(),
+        "abnormal guardian death must be surfaced by the supervisor"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (Path::new(&format!("/proc/{guardian_child_pid}")).exists()
+        || Path::new(&format!("/proc/{guardian_descendant_pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{guardian_child_pid}")).exists(),
+        "supervisor cleanup must stop the provider after guardian death"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{guardian_descendant_pid}")).exists(),
+        "supervisor cleanup must stop escaped descendants after guardian death"
+    );
+    assert!(
+        !guardian_child_cgroup.exists(),
+        "supervisor cleanup must remove the exact pinned cgroup after guardian death"
+    );
 }
 
 #[test]
@@ -12545,6 +13334,10 @@ struct StoppedPostClaimFixture {
 
 impl StoppedPostClaimFixture {
     fn new() -> Self {
+        Self::new_with_canary(false)
+    }
+
+    fn new_with_canary(canary: bool) -> Self {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
         let checkout = tmp.path().join("main-checkout");
@@ -12632,7 +13425,7 @@ impl StoppedPostClaimFixture {
             run_three["controller"]["session_incarnation"] = json!("main-incarnation-three");
             registry["runs"]["run-three"] = run_three;
         });
-        let packet = json!({
+        let mut packet = json!({
             "schema_version": "main-agent.assignment-input.v1",
             "assignment_id": "assignment-stopped",
             "task_summary": "Focused stopped post-claim worker",
@@ -12651,6 +13444,11 @@ impl StoppedPostClaimFixture {
             "scopes": ["docs/stopped-focused"],
             "durable_refs": []
         });
+        if canary {
+            packet["provider_stop_canary"] = json!({
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            });
+        }
         insert_orchestration_assignment(
             &state_dir,
             "assignment-stopped",
@@ -12725,7 +13523,36 @@ impl StoppedPostClaimFixture {
             "pane_pid": 2_000_000_000u32,
             "process_group_id": 2_000_000_000u32
         });
+        if canary {
+            record["runtime"]["provider_stop_canary"] = json!({
+                "schema_version": "agent-session.provider-stop-canary.v1",
+                "hold_seconds": 120,
+                "launch_id": "worker-stopped-incarnation",
+                "assignment_id": "assignment-stopped"
+            });
+        }
         write_private_json(&worker_record_path, &record);
+        if canary {
+            let controller_pid = std::process::id();
+            let controller_record_path = state_dir.join("sessions/main-one/session.json");
+            let mut controller_record: serde_json::Value = serde_json::from_slice(
+                &fs::read(&controller_record_path).expect("controller record"),
+            )
+            .expect("controller json");
+            controller_record["delete_tmux_identity"] = json!({
+                "launch_id": "main-incarnation-one",
+                "session_id": "$90",
+                "pane_id": "%90",
+                "pane_pid": controller_pid,
+                "process_group_id": controller_pid,
+                "process_session_id": controller_pid,
+                "process_session_members": [{
+                    "pid": controller_pid,
+                    "start_time": linux_process_start_ticks(controller_pid)
+                }]
+            });
+            write_private_json(&controller_record_path, &controller_record);
+        }
         let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
         Self {
             _tmp: tmp,
@@ -15523,10 +16350,2189 @@ fn stopped_process_with_live_tmux_is_never_healthy_progress() {
     assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
     assert_eq!(
         data(&supervised)["classification"],
-        "evidence_unavailable",
-        "stopped process evidence conflicting with a live tmux wrapper must fail closed"
+        "process_runtime_stopped_wrapper_live_contradiction",
+        "stopped provider process evidence conflicting with a live tmux wrapper must have a typed fail-closed classification"
+    );
+    assert_eq!(
+        data(&supervised)["schema_version"],
+        "main-agent.worker-supervise-result.v6"
     );
     assert_eq!(data(&supervised)["automatic_retry_safe"], false);
+    assert_eq!(
+        data(&supervised)["recovery_action"]["kind"],
+        "identity_evidence_reconciliation",
+        "a generic contradiction must not advertise canary release authority"
+    );
+    assert_eq!(data(&supervised)["recovery_action"]["executable"], false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "compiled-provider-stop-canary-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let record_path = session_dir.join("session.json");
+    let provider_fixture = fixture._tmp.path().join("codex-canary-normal-stop");
+    let descendant_pid_file = fixture._tmp.path().join("normal-stop-descendant.pid");
+    let containment_file = fixture._tmp.path().join("normal-stop-containment.txt");
+    fs::write(
+        &provider_fixture,
+        "#!/usr/bin/env sh\nsetsid sh -c 'sleep 60' &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CANARY_DESCENDANT_PID_FILE\"\nguardian=$PPID\nsupervisor=$(awk '{print $4}' \"/proc/$guardian/stat\")\nouter_cgroup=$(awk -F: '$1 == \"0\" {print $3}' \"/proc/$supervisor/cgroup\")\nouter_procs=\"/proc/$supervisor/root/sys/fs/cgroup${outer_cgroup}/cgroup.procs\"\ncgroup_fd=0\nfor fd in /proc/self/fd/*; do\n  case \"$(readlink \"$fd\" 2>/dev/null || true)\" in\n    /sys/fs/cgroup/*) cgroup_fd=1 ;;\n  esac\ndone\nif test \"$(awk -F: '$1 == \"0\" {print $3}' /proc/self/cgroup)\" = / && test \"$cgroup_fd\" = 0 && ! printf '%s\\n' \"$$\" > /sys/fs/cgroup/cgroup.procs 2>/dev/null && ! printf '%s\\n' \"$$\" > \"$outer_procs\" 2>/dev/null; then\n  printf 'rooted-read-only-fd-sealed\\n' > \"$CANARY_CONTAINMENT_FILE\"\nelse\n  printf 'containment-escaped\\n' > \"$CANARY_CONTAINMENT_FILE\"\nfi\nwait \"$descendant\"\n",
+    )
+    .expect("normal-stop provider fixture");
+    fs::set_permissions(&provider_fixture, fs::Permissions::from_mode(0o700))
+        .expect("normal-stop provider fixture mode");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["agent_bin"] = json!(provider_fixture);
+    record["agent_args"] = json!([]);
+    write_private_json(&record_path, &record);
+
+    let sentinel = spawn_test_process_group();
+    let mut supervisor_command = Command::new(bin::resolve("agent-session"));
+    supervisor_command
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_HOLD_MS",
+            "5000",
+        )
+        .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
+        .env("CANARY_CONTAINMENT_FILE", &containment_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
+    unsafe {
+        supervisor_command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut supervisor = supervisor_command
+        .spawn()
+        .expect("spawn provider stop canary supervisor");
+    let supervisor_pid = supervisor.id();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": "worker-stopped-incarnation",
+        "session_id": "$91",
+        "pane_id": "%91",
+        "pane_pid": supervisor_pid,
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "process_session_members": [{
+            "pid": supervisor_pid,
+            "start_time": linux_process_start_ticks(supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+    let ready_path = session_dir.join(".provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready_path.is_file() {
+        if let Some(status) = supervisor.try_wait().expect("poll starting supervisor") {
+            let mut stderr = String::new();
+            supervisor
+                .stderr
+                .take()
+                .expect("supervisor stderr")
+                .read_to_string(&mut stderr)
+                .expect("read supervisor stderr");
+            panic!("canary supervisor exited before ready: status={status} stderr={stderr}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "canary supervisor did not publish its exact child identity"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ready_path).expect("ready marker"))
+            .expect("ready marker json");
+    let child_pid = ready["child_pid"].as_u64().expect("child pid") as u32;
+    let child_start_ticks = linux_process_start_ticks(child_pid);
+    while !descendant_pid_file.is_file() || !containment_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the normal-stop provider fixture did not publish containment evidence"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("normal-stop descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("normal-stop descendant numeric pid");
+    assert_eq!(
+        fs::read_to_string(&containment_file)
+            .expect("provider containment result")
+            .trim(),
+        "rooted-read-only-fd-sealed",
+        "the provider must see only its read-only child cgroup root without inherited cgroup handles"
+    );
+    let duplicate = Command::new(bin::resolve("agent-session"))
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .output()
+        .expect("run duplicate supervisor");
+    assert!(
+        !duplicate.status.success(),
+        "a second supervisor must not spawn another provider child"
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("already has a live supervisor"),
+        "duplicate supervisor stderr={}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+    let stop_key = "supervisor-stop-key";
+    let supervisor_pid_arg = supervisor_pid.to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let stop_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PANE_PID",
+            supervisor_pid_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            supervisor_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+            "1",
+        ),
+    ];
+    let stopped = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            stop_key,
+            "--format",
+            "json",
+        ],
+        &stop_env,
+    );
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert_eq!(data(&stopped)["provider_process"], "stopped");
+    assert_eq!(data(&stopped)["tmux_wrapper"], "running");
+    let typed_reservation =
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("typed provider stop canary reservation");
+    assert_eq!(typed_reservation["child_pid"], child_pid);
+    assert_eq!(typed_reservation["child_start_ticks"], child_start_ticks);
+    let stopped_path = session_dir.join(".provider-stop-canary-stopped.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !stopped_path.is_file() {
+        if let Some(status) = supervisor.try_wait().expect("poll stopped supervisor") {
+            let mut stderr = String::new();
+            supervisor
+                .stderr
+                .take()
+                .expect("supervisor stderr")
+                .read_to_string(&mut stderr)
+                .expect("read supervisor stderr");
+            panic!(
+                "canary supervisor exited before stopped proof: status={status} stderr={stderr}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "canary supervisor did not stop and reap its exact child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !Path::new(&format!("/proc/{child_pid}")).exists(),
+        "the recorded provider child must be absent after the stopped marker"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{descendant_pid}")).exists(),
+        "normal typed stop must remove a descendant that escaped the provider process session"
+    );
+    // SAFETY: this is a signal-0 existence probe for the exact private process
+    // group created from the recorded child PID.
+    assert!(
+        unsafe { libc::kill(-(child_pid as libc::pid_t), 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "the supervisor must stop the sealed provider process session, including descendants"
+    );
+    assert!(
+        supervisor.try_wait().expect("poll supervisor").is_none(),
+        "the wrapper supervisor must remain live during the bounded hold"
+    );
+    assert!(
+        sentinel.is_running(),
+        "the canary must not affect an unrelated process group"
+    );
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &stop_env,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "provider_process_stopped_wrapper_live"
+    );
+    let release_path = session_dir.join(".provider-stop-canary-release.json");
+    let tmux_killed = PathBuf::from(format!("{}.killed", fixture.tmux_log.display()));
+    let tmux_session = record["tmux_session"]
+        .as_str()
+        .expect("worker tmux session")
+        .to_string();
+    let release_observer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "typed compiled canary release marker was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = supervisor.wait().expect("reap typed canary supervisor");
+        fs::write(tmux_killed, format!("={tmux_session}\n"))
+            .expect("make fake tmux observe the exited wrapper");
+        status
+    });
+    let release_env = stop_env
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key != "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP")
+        .collect::<Vec<_>>();
+    let released = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "supervisor-release-key",
+            "--format",
+            "json",
+        ],
+        &release_env,
+    );
+    assert_eq!(released.code, 0, "outcome={}", released.stdout_text());
+    assert_eq!(
+        data(&released)["schema_version"],
+        "main-agent.worker-release-provider-canary-result.v1"
+    );
+    assert_eq!(data(&released)["provider_process"], "stopped");
+    assert_eq!(data(&released)["tmux_wrapper"], "stopped");
+    let status = release_observer
+        .join()
+        .expect("join typed compiled release observer");
+    assert!(status.success(), "supervisor release status={status}");
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "typed release must clear the exact reservation"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "typed release retains the execution fence until stopped reconciliation"
+    );
+    assert!(
+        sentinel.is_running(),
+        "release must not affect an unrelated process group"
+    );
+    let out_of_band = Command::new(bin::resolve("agent-session"))
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS",
+            "75",
+        )
+        .output()
+        .expect("run out-of-band supervisor");
+    assert!(
+        !out_of_band.status.success(),
+        "a hidden command invocation outside the recorded tmux pane must not launch a provider"
+    );
+    assert!(
+        String::from_utf8_lossy(&out_of_band.stderr)
+            .contains("not the recorded exact tmux pane process"),
+        "out-of-band supervisor stderr={}",
+        String::from_utf8_lossy(&out_of_band.stderr)
+    );
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
+    assert!(
+        !provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists(),
+        "stopped reconciliation must clear the retained execution fence"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "provider-stop-canary-same-uid-attack",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let record_path = session_dir.join("session.json");
+    let provider_fixture = fixture._tmp.path().join("codex-canary-same-uid-attack");
+    let attack_result = fixture._tmp.path().join("same-uid-attack-result.json");
+    let attack_code = fixture._tmp.path().join("same-uid-attack-code");
+    fs::write(
+        &provider_fixture,
+        "#!/usr/bin/env sh\nwhile ! test -f \"$CANARY_READY_PATH\"; do sleep 0.01; done\n\"$CANARY_MAIN_AGENT_BIN\" --state-dir \"$CANARY_STATE_DIR\" worker stop-provider-canary assignment-stopped --worker-incarnation worker-stopped-incarnation --if-revision 3 --idempotency-key provider-same-uid-attack-0001 --format json > \"$CANARY_ATTACK_RESULT\" 2>&1\nprintf '%s\\n' \"$?\" > \"$CANARY_ATTACK_CODE\"\nsleep 10\n",
+    )
+    .expect("same-uid attack provider fixture");
+    fs::set_permissions(&provider_fixture, fs::Permissions::from_mode(0o700))
+        .expect("same-uid attack provider fixture mode");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["agent_bin"] = json!(provider_fixture);
+    record["agent_args"] = json!([]);
+    write_private_json(&record_path, &record);
+
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let mut supervisor_command = Command::new(bin::resolve("agent-session"));
+    supervisor_command
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .env("AGENT_SESSION_CAPABILITY_FILE", &fixture.main_capability)
+        .env("AGENT_SESSION_TMUX_BIN", &fixture.tmux_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &fixture.tmux_log)
+        .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+        .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
+        .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
+        .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
+        .env("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_runtime)
+        .env(
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+            "1",
+        )
+        .env("CANARY_MAIN_AGENT_BIN", bin::resolve("main-agent"))
+        .env("CANARY_STATE_DIR", &fixture.state_dir)
+        .env(
+            "CANARY_READY_PATH",
+            session_dir.join(".provider-stop-canary-ready.json"),
+        )
+        .env("CANARY_ATTACK_RESULT", &attack_result)
+        .env("CANARY_ATTACK_CODE", &attack_code)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
+    unsafe {
+        supervisor_command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut supervisor = supervisor_command
+        .spawn()
+        .expect("spawn same-uid attack canary supervisor");
+    let supervisor_pid = supervisor.id();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": "worker-stopped-incarnation",
+        "session_id": "$91",
+        "pane_id": "%91",
+        "pane_pid": supervisor_pid,
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "process_session_members": [{
+            "pid": supervisor_pid,
+            "start_time": linux_process_start_ticks(supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+
+    let ready_path = session_dir.join(".provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !attack_code.is_file() {
+        if let Some(status) = supervisor.try_wait().expect("poll attack supervisor") {
+            let mut stderr = String::new();
+            supervisor
+                .stderr
+                .take()
+                .expect("attack supervisor stderr")
+                .read_to_string(&mut stderr)
+                .expect("read attack supervisor stderr");
+            panic!("same-uid attack supervisor exited early: status={status} stderr={stderr}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-uid provider attack did not return within its bound"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        ready_path.is_file(),
+        "the compiled guardian must have been ready"
+    );
+    assert_ne!(
+        fs::read_to_string(&attack_code)
+            .expect("same-uid attack exit code")
+            .trim(),
+        "0",
+        "a provider-cgroup caller must not gain stop authority"
+    );
+    let attack: serde_json::Value =
+        serde_json::from_slice(&fs::read(&attack_result).expect("same-uid attack result"))
+            .expect("same-uid attack result json");
+    assert_eq!(
+        attack["error"]["code"], "provider-stop-canary-controller-unauthorized",
+        "attack={attack}"
+    );
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ready_path).expect("ready marker"))
+            .expect("ready marker json");
+    let child_pid = ready["child_pid"].as_u64().expect("child pid") as u32;
+    assert!(
+        Path::new(&format!("/proc/{child_pid}")).exists(),
+        "the rejected same-UID request must leave the exact provider child live"
+    );
+    assert!(
+        !session_dir
+            .join(".provider-stop-canary-stopped.json")
+            .exists(),
+        "forged durable files alone must not create stopped-child proof"
+    );
+    let reservation = provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+        .expect("same-UID attack retained exact replay reservation");
+    assert_eq!(reservation["state"], "stop_requested");
+    assert_eq!(
+        reservation["idempotency_key"],
+        "provider-same-uid-attack-0001"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "the rejected channel must retain its exact execution fence for controller replay"
+    );
+
+    let child_cgroup = fs::read_to_string(format!("/proc/{child_pid}/cgroup"))
+        .expect("provider child cgroup")
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|relative| Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+        .expect("provider unified cgroup");
+    let parent_procs = child_cgroup
+        .parent()
+        .expect("delegated provider cgroup parent")
+        .join("cgroup.procs");
+    let mut injected_sentinel = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("same-UID injected sentinel");
+    fs::write(
+        child_cgroup.join("cgroup.procs"),
+        injected_sentinel.id().to_string(),
+    )
+    .expect("inject sentinel into provider cgroup");
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        supervisor
+            .try_wait()
+            .expect("poll contaminated guardian")
+            .is_none(),
+        "foreign membership must keep the compiled guardian live for exact replay"
+    );
+    assert!(
+        Path::new(&format!("/proc/{child_pid}")).exists(),
+        "foreign membership must fail before signaling the provider leader"
+    );
+    assert!(
+        injected_sentinel
+            .try_wait()
+            .expect("poll injected sentinel")
+            .is_none(),
+        "foreign membership must never signal the injected same-UID process"
+    );
+    fs::write(&parent_procs, injected_sentinel.id().to_string())
+        .expect("remove injected sentinel from provider cgroup");
+
+    let supervisor_pid_arg = supervisor_pid.to_string();
+    let controller_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PANE_PID",
+            supervisor_pid_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            supervisor_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+            "1",
+        ),
+    ];
+    let replayed = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-same-uid-attack-0001",
+            "--format",
+            "json",
+        ],
+        &controller_env,
+    );
+    assert_eq!(
+        replayed.code,
+        0,
+        "the exact controller must resume the rejected channel request: outcome={}",
+        replayed.stdout_text()
+    );
+    assert_eq!(data(&replayed)["provider_process"], "stopped");
+    assert_eq!(data(&replayed)["tmux_wrapper"], "running");
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &controller_env,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "provider_process_stopped_wrapper_live"
+    );
+
+    let release_path = session_dir.join(".provider-stop-canary-release.json");
+    let tmux_killed = PathBuf::from(format!("{}.killed", fixture.tmux_log.display()));
+    let tmux_session = record["tmux_session"]
+        .as_str()
+        .expect("worker tmux session")
+        .to_string();
+    let release_observer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "same-UID replay release marker was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = supervisor.wait().expect("reap same-UID replay supervisor");
+        fs::write(tmux_killed, format!("={tmux_session}\n"))
+            .expect("make fake tmux observe same-UID replay wrapper exit");
+        status
+    });
+    let release_env = controller_env
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key != "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP")
+        .collect::<Vec<_>>();
+    let released = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-same-uid-release-0001",
+            "--format",
+            "json",
+        ],
+        &release_env,
+    );
+    assert_eq!(released.code, 0, "outcome={}", released.stdout_text());
+    let status = release_observer
+        .join()
+        .expect("join same-UID replay release observer");
+    assert!(
+        status.success(),
+        "same-uid attack supervisor status={status}"
+    );
+    assert!(provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none());
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
+    assert!(
+        !provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists(),
+        "typed reconciliation must clear the attack-retained execution fence"
+    );
+    injected_sentinel
+        .kill()
+        .expect("stop injected sentinel fixture");
+    injected_sentinel
+        .wait()
+        .expect("reap injected sentinel fixture");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_spontaneous_leader_exit_seals_detached_descendants() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    let session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let record_path = session_dir.join("session.json");
+    let provider_fixture = fixture._tmp.path().join("codex-canary-leader-exit");
+    let descendant_pid_file = fixture._tmp.path().join("leader-exit-descendant.pid");
+    fs::write(
+        &provider_fixture,
+        "#!/usr/bin/env sh\nsetsid sh -c 'sleep 60' &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CANARY_DESCENDANT_PID_FILE\"\nexit 0\n",
+    )
+    .expect("leader-exit provider fixture");
+    fs::set_permissions(&provider_fixture, fs::Permissions::from_mode(0o700))
+        .expect("leader-exit provider fixture mode");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["agent_bin"] = json!(provider_fixture);
+    record["agent_args"] = json!([]);
+    write_private_json(&record_path, &record);
+
+    let mut command = Command::new(bin::resolve("agent-session"));
+    command
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the test wrapper creates its exact private process session.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut supervisor = command.spawn().expect("spawn leader-exit supervisor");
+    let supervisor_pid = supervisor.id();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": "worker-stopped-incarnation",
+        "session_id": "$98",
+        "pane_id": "%98",
+        "pane_pid": supervisor_pid,
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "process_session_members": [{
+            "pid": supervisor_pid,
+            "start_time": linux_process_start_ticks(supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+
+    let ready_path = session_dir.join(".provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !descendant_pid_file.is_file() || !ready_path.is_file() {
+        if let Some(status) = supervisor.try_wait().expect("poll leader-exit supervisor") {
+            let mut stderr = String::new();
+            supervisor
+                .stderr
+                .take()
+                .expect("supervisor stderr")
+                .read_to_string(&mut stderr)
+                .expect("read supervisor stderr");
+            panic!("leader-exit supervisor returned before evidence: status={status} {stderr}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "leader-exit provider did not publish its exact process identities"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ready_path).expect("ready marker"))
+            .expect("ready marker json");
+    let child_pid = ready["child_pid"].as_u64().expect("provider child pid") as u32;
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("leader-exit descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("leader-exit descendant numeric pid");
+    let status = supervisor.wait().expect("wait leader-exit supervisor");
+    assert!(status.success(), "leader-exit supervisor status={status}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (Path::new(&format!("/proc/{child_pid}")).exists()
+        || Path::new(&format!("/proc/{descendant_pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
+    assert!(
+        !Path::new(&format!("/proc/{descendant_pid}")).exists(),
+        "spontaneous provider leader exit must seal its detached descendants"
+    );
+    assert!(
+        !session_dir
+            .join(".provider-stop-canary-stopped.json")
+            .exists(),
+        "unexpected provider exit must not fabricate typed stop proof"
+    );
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "unexpected provider exit must not fabricate release authority"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "compiled-canary-hold-expiry",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let record_path = fixture
+        .state_dir
+        .join("sessions/worker-stopped/session.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["agent_bin"] = json!(fake_agent(fixture._tmp.path(), "codex-canary-expiry"));
+    record["agent_args"] = json!([]);
+    write_private_json(&record_path, &record);
+
+    let mut command = Command::new(bin::resolve("agent-session"));
+    command
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "provider-stop-canary-supervisor",
+            "--id",
+            "worker-stopped",
+        ])
+        .env("AGENT_SESSION_ID", "worker-stopped")
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_HOLD_MS",
+            "150",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the child performs only the async-signal-safe `setsid` before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut supervisor = command.spawn().expect("spawn expiry canary supervisor");
+    let supervisor_pid = supervisor.id();
+    let supervisor_pid_arg = supervisor_pid.to_string();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    record["delete_tmux_identity"] = json!({
+        "launch_id": "worker-stopped-incarnation",
+        "session_id": "$95",
+        "pane_id": "%95",
+        "pane_pid": supervisor_pid,
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "process_session_members": [{
+            "pid": supervisor_pid,
+            "start_time": linux_process_start_ticks(supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &record);
+    let ready = fixture
+        .state_dir
+        .join("sessions/worker-stopped/.provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "expiry canary did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PANE_PID",
+            supervisor_pid_arg.as_str(),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            supervisor_pid_arg.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$95"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%95"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_STOP_CLAIMED_RUNTIME_MARGIN_SECONDS",
+            "1",
+        ),
+    ];
+    let stopped = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-stop-canary-expiry-0001",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    let status = supervisor.wait().expect("wait bounded hold expiry");
+    assert!(status.success(), "expiry supervisor status={status}");
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
+    assert!(provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none());
+    assert!(!provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn typed_provider_stop_canary_stops_only_the_armed_child_boundary() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "provider-stop-canary-turn",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        92,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let live_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$92"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%92"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_SKIP_CONTROLLER_CHANNEL",
+            "1",
+        ),
+    ];
+    let session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let request_path = session_dir.join(".provider-stop-canary-stop.json");
+    let stopped_path = session_dir.join(".provider-stop-canary-stopped.json");
+    let provider = spawn_test_process_group();
+    let provider_pid = provider.pid();
+    write_private_json(
+        &session_dir.join(".provider-stop-canary-ready.json"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary.v1",
+            "session_id": "worker-stopped",
+            "launch_id": "worker-stopped-incarnation",
+            "state": "ready",
+            "child_pid": provider_pid
+        }),
+    );
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-provider-canary",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "provider-stop-canary-0001",
+        "--format",
+        "json",
+    ];
+    let mut interrupted_stop_env = live_env.to_vec();
+    interrupted_stop_env.push((
+        "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_FAIL_AFTER_REQUEST",
+        "stop",
+    ));
+    let interrupted_stop = run_main_agent(&fixture.checkout, &stop_args, &interrupted_stop_env);
+    assert_ne!(
+        interrupted_stop.code, 0,
+        "the injected stop interruption must precede child termination"
+    );
+    assert_eq!(
+        interrupted_stop.stdout_json()["error"]["code"],
+        "test-provider-stop-canary-interruption"
+    );
+    let interrupted_reservation =
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("stop-side durable reservation");
+    assert_eq!(interrupted_reservation["state"], "stop_requested");
+    let interrupted_request = fs::read(&request_path).expect("durable stop request");
+    assert!(
+        provider.is_running(),
+        "the first stop process must not kill on interruption"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "the session-owned execution fence must survive the interrupted stop owner"
+    );
+    let marker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !request_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "typed canary request was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("typed canary request"))
+                .expect("typed canary request json");
+        drop(provider);
+        write_private_json(
+            &stopped_path,
+            &json!({
+                "schema_version": "agent-session.provider-stop-canary.v1",
+                "session_id": "worker-stopped",
+                "launch_id": "worker-stopped-incarnation",
+                "state": "stopped",
+                "child_pid": provider_pid,
+                "request_digest": request["request_digest"],
+                "idempotency_key": request["idempotency_key"],
+                "child_exit_success": false
+            }),
+        );
+    });
+    let stopped = run_main_agent(&fixture.checkout, &stop_args, &live_env);
+    marker.join().expect("canary marker thread");
+    assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
+    assert_eq!(
+        data(&stopped)["schema_version"],
+        "main-agent.worker-stop-provider-canary-result.v1"
+    );
+    assert_eq!(data(&stopped)["provider_process"], "stopped");
+    assert_eq!(data(&stopped)["tmux_wrapper"], "running");
+    assert_eq!(data(&stopped)["input_sent"], false);
+    assert_eq!(
+        fs::read(session_dir.join(".provider-stop-canary-stop.json"))
+            .expect("replayed stop request"),
+        interrupted_request,
+        "stop replay must retain one byte-stable durable request identity"
+    );
+    assert_eq!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("provider stop canary reservation")["state"],
+        "stopped"
+    );
+    assert_frozen_base_v3_registry_compatible(&orchestration_registry(&fixture.state_dir));
+    let stop_replay = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-stop-canary-0001",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(stop_replay.code, 0, "outcome={}", stop_replay.stdout_text());
+    assert_eq!(data(&stop_replay), data(&stopped));
+    let competing_stop = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-stop-canary-competing",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_ne!(
+        competing_stop.code, 0,
+        "a competing canary identity must fail closed"
+    );
+    assert_eq!(
+        competing_stop.stdout_json()["error"]["code"],
+        "provider-stop-canary-request-conflict"
+    );
+
+    let supervised = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(supervised.code, 0, "outcome={}", supervised.stdout_text());
+    assert_eq!(
+        data(&supervised)["classification"],
+        "provider_process_stopped_wrapper_live"
+    );
+    assert_eq!(
+        data(&supervised)["schema_version"],
+        "main-agent.worker-supervise-result.v6"
+    );
+    assert_eq!(data(&supervised)["automatic_retry_safe"], false);
+    assert_eq!(
+        data(&supervised)["recovery_action"]["kind"],
+        "exact_provider_stop_canary_release"
+    );
+    seed_operation(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "provider-stop-canary-active-operation",
+        "active",
+    );
+    let operation_precedence = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        operation_precedence.code,
+        0,
+        "outcome={}",
+        operation_precedence.stdout_text()
+    );
+    assert_eq!(
+        data(&operation_precedence)["classification"],
+        "uncertain_mutation",
+        "active operation evidence must outrank canary release advertisement"
+    );
+    rewrite_registry(&fixture.state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .retain(|operation| operation["lease_id"] != "provider-stop-canary-active-operation");
+    });
+
+    let release_path = fixture
+        .state_dir
+        .join("sessions/worker-stopped/.provider-stop-canary-release.json");
+    let tmux_killed = PathBuf::from(format!("{}.killed", fixture.tmux_log.display()));
+    let worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .state_dir
+                .join("sessions/worker-stopped/session.json"),
+        )
+        .expect("worker session"),
+    )
+    .expect("worker session json");
+    let tmux_session = worker_record["tmux_session"]
+        .as_str()
+        .expect("tmux session")
+        .to_string();
+    let mut interrupted_release_env = live_env.to_vec();
+    interrupted_release_env.push((
+        "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_FAIL_AFTER_REQUEST",
+        "release",
+    ));
+    let interrupted_release = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-release-canary-0001",
+            "--format",
+            "json",
+        ],
+        &interrupted_release_env,
+    );
+    assert_ne!(
+        interrupted_release.code, 0,
+        "the injected interruption must stop before terminal receipt"
+    );
+    assert_eq!(
+        interrupted_release.stdout_json()["error"]["code"],
+        "test-provider-stop-canary-interruption"
+    );
+    assert_eq!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("provider stop canary reservation")["state"],
+        "release_requested"
+    );
+    assert!(
+        runtime.is_running(),
+        "the replay fixture must retain the wrapper until release is resumed"
+    );
+    let release_supervision = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        release_supervision.code,
+        0,
+        "outcome={}",
+        release_supervision.stdout_text()
+    );
+    assert_eq!(
+        data(&release_supervision)["classification"],
+        "provider_stop_canary_release_in_progress"
+    );
+    assert_eq!(
+        data(&release_supervision)["recovery_action"]["kind"],
+        "exact_provider_stop_canary_release_replay"
+    );
+    assert_eq!(
+        data(&release_supervision)["recovery_action"]["argv"][9],
+        "provider-release-canary-0001"
+    );
+    rewrite_registry(&fixture.state_dir, |registry| {
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .retain(|claim| claim["session_id"] != "worker-stopped");
+    });
+    let released_runtime = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "typed canary release was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(runtime);
+        fs::write(tmux_killed, format!("={tmux_session}\n")).expect("mark fake tmux stopped");
+    });
+    let mut terminal_receipt_interruption_env = live_env.to_vec();
+    terminal_receipt_interruption_env.push((
+        "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_FAIL_AFTER_TERMINAL_RECEIPT",
+        "release",
+    ));
+    let terminal_receipt_interruption = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-release-canary-0001",
+            "--format",
+            "json",
+        ],
+        &terminal_receipt_interruption_env,
+    );
+    released_runtime.join().expect("release marker thread");
+    assert_ne!(terminal_receipt_interruption.code, 0);
+    assert_eq!(
+        terminal_receipt_interruption.stdout_json()["error"]["code"],
+        "test-provider-stop-canary-terminal-receipt-interruption"
+    );
+    assert_eq!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("release sidecar retained after terminal receipt interruption")["state"],
+        "release_requested"
+    );
+    let released = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-release-canary-0001",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(released.code, 0, "outcome={}", released.stdout_text());
+    assert_eq!(
+        data(&released)["schema_version"],
+        "main-agent.worker-release-provider-canary-result.v1"
+    );
+    assert_eq!(data(&released)["provider_process"], "stopped");
+    assert_eq!(data(&released)["tmux_wrapper"], "stopped");
+    assert_eq!(
+        data(&released)["worker_claim_preserved"],
+        false,
+        "release cleanup must report the exact observed worker-claim truth"
+    );
+    assert_eq!(data(&released)["input_sent"], false);
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "exact release must clear the durable reservation sidecar"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "release must retain the session-owned execution fence until stopped reconciliation"
+    );
+    let fenced_resume = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "resume",
+            "worker-stopped",
+            "--format",
+            "json",
+        ],
+        &[
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                fixture.tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                fixture.tmux_log.to_str().expect("tmux log"),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(
+        fenced_resume.code,
+        65,
+        "outcome={}",
+        fenced_resume.stdout_text()
+    );
+    assert_eq!(
+        fenced_resume.stdout_json()["error"]["code"],
+        "provider-stop-canary-fenced"
+    );
+    let release_replay = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-release-canary-0001",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        release_replay.code,
+        0,
+        "outcome={}",
+        release_replay.stdout_text()
+    );
+    assert_eq!(data(&release_replay), data(&released));
+    let current_registry = orchestration_registry(&fixture.state_dir);
+    let current_assignment = &current_registry["assignments"]["assignment-stopped"];
+    write_provider_stop_canary_reservation(
+        &fixture.state_dir,
+        "assignment-stopped",
+        &json!({
+            "schema_version": "main-agent.provider-stop-canary-reservation.v1",
+            "state": "release_requested",
+            "request_digest": "7".repeat(64),
+            "idempotency_key": "newer-stop-canary-key",
+            "run_id": current_assignment["run_id"],
+            "controller": current_assignment["primary_manager"],
+            "worker": current_assignment["worker"],
+            "reserved_revision": current_assignment["revision"],
+            "activity_revision": 99,
+            "runtime_identity_digest": "8".repeat(64),
+            "worker_claim_id": "newer-worker-claim",
+            "worker_claim_revision": 4,
+            "worker_claim_expires_at_epoch": 1_893_456_000i64,
+            "controller_claim_id": "newer-controller-claim",
+            "controller_claim_revision": 5,
+            "controller_claim_expires_at_epoch": 1_893_456_000i64,
+            "child_pid": 2_000_000_002u32,
+            "child_start_ticks": 2,
+            "release_request_digest": "9".repeat(64),
+            "release_idempotency_key": "newer-release-canary-key",
+            "created_at": "2030-01-01T00:00:05Z",
+            "updated_at": "2030-01-01T00:00:06Z"
+        }),
+    );
+    let newer_reservation_path =
+        provider_stop_canary_reservation_path(&fixture.state_dir, "assignment-stopped");
+    let newer_reservation = fs::read(&newer_reservation_path).expect("newer reservation");
+    let stale_release_replay = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "release-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-release-canary-0001",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_ne!(
+        stale_release_replay.code, 0,
+        "an old terminal receipt must not consume a newer reservation"
+    );
+    assert_eq!(
+        stale_release_replay.stdout_json()["error"]["code"],
+        "provider-stop-canary-request-conflict"
+    );
+    assert_eq!(
+        fs::read(&newer_reservation_path).expect("preserved newer reservation"),
+        newer_reservation
+    );
+    fs::remove_file(newer_reservation_path).expect("remove test-only newer reservation");
+
+    let after_release = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "supervise",
+            "assignment-stopped",
+            "--format",
+            "json",
+        ],
+        &live_env,
+    );
+    assert_eq!(
+        after_release.code,
+        0,
+        "outcome={}",
+        after_release.stdout_text()
+    );
+    assert_eq!(data(&after_release)["classification"], "post_claim_failure");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stopped_wrapper_reconciliation_consumes_an_expired_canary_reservation() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    let registry = orchestration_registry(&fixture.state_dir);
+    let assignment = &registry["assignments"]["assignment-stopped"];
+    write_provider_stop_canary_reservation(
+        &fixture.state_dir,
+        "assignment-stopped",
+        &json!({
+            "schema_version": "main-agent.provider-stop-canary-reservation.v1",
+            "state": "stopped",
+            "request_digest": "a".repeat(64),
+            "idempotency_key": "expired-canary-stop",
+            "run_id": assignment["run_id"],
+            "controller": assignment["primary_manager"],
+            "worker": assignment["worker"],
+            "reserved_revision": assignment["revision"],
+            "activity_revision": 1,
+            "runtime_identity_digest": "b".repeat(64),
+            "worker_claim_id": "expired-worker-canary-claim",
+            "worker_claim_revision": 1,
+            "worker_claim_expires_at_epoch": 1_893_456_000i64,
+            "controller_claim_id": "expired-controller-canary-claim",
+            "controller_claim_revision": 1,
+            "controller_claim_expires_at_epoch": 1_893_456_000i64,
+            "child_pid": 2_000_000_001u32,
+            "child_start_ticks": 1,
+            "release_request_digest": null,
+            "release_idempotency_key": null,
+            "created_at": "2030-01-01T00:00:03Z",
+            "updated_at": "2030-01-01T00:00:04Z"
+        }),
+    );
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(
+        data(&reconciled)["schema_version"],
+        "main-agent.worker-reconcile-stopped-result.v2"
+    );
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "typed stopped-runtime cleanup must consume an expired canary fence"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stopped_wrapper_reconciliation_replays_post_commit_canary_fence_cleanup() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    let registry = orchestration_registry(&fixture.state_dir);
+    let assignment = &registry["assignments"]["assignment-stopped"];
+    let request_digest = "a".repeat(64);
+    write_provider_stop_canary_reservation(
+        &fixture.state_dir,
+        "assignment-stopped",
+        &json!({
+            "schema_version": "main-agent.provider-stop-canary-reservation.v1",
+            "state": "stopped",
+            "request_digest": request_digest,
+            "idempotency_key": "cleanup-crash-canary-stop",
+            "run_id": assignment["run_id"],
+            "controller": assignment["primary_manager"],
+            "worker": assignment["worker"],
+            "reserved_revision": assignment["revision"],
+            "activity_revision": 1,
+            "runtime_identity_digest": "b".repeat(64),
+            "worker_claim_id": "cleanup-worker-canary-claim",
+            "worker_claim_revision": 1,
+            "worker_claim_expires_at_epoch": 1_893_456_000i64,
+            "controller_claim_id": "cleanup-controller-canary-claim",
+            "controller_claim_revision": 1,
+            "controller_claim_expires_at_epoch": 1_893_456_000i64,
+            "child_pid": 2_000_000_001u32,
+            "child_start_ticks": 1,
+            "release_request_digest": null,
+            "release_idempotency_key": null,
+            "created_at": "2030-01-01T00:00:03Z",
+            "updated_at": "2030-01-01T00:00:04Z"
+        }),
+    );
+    let worker = assignment["worker"].clone();
+    write_private_json(
+        &provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary-fence.v1",
+            "assignment_id": "assignment-stopped",
+            "assignment_revision": assignment["revision"],
+            "worker": worker,
+            "controller": assignment["primary_manager"],
+            "request_digest": request_digest,
+            "created_at": "2030-01-01T00:00:03Z"
+        }),
+    );
+
+    let barrier = fixture._tmp.path().join("canary-cleanup-crash-window");
+    let first = fixture.spawn_reconcile_at_barrier(&barrier, "before_canary_sidecar_cleanup");
+    wait_for_barrier(&barrier);
+    assert_eq!(
+        orchestration_registry(&fixture.state_dir)["assignments"]["assignment-stopped"]["state"],
+        "cancelled",
+        "the terminal registry commit must precede external canary cleanup"
+    );
+    assert!(
+        provider_stop_canary_reservation_path(&fixture.state_dir, "assignment-stopped").is_file()
+    );
+    assert!(provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file());
+    terminate_at_barrier(first, "post-commit canary cleanup interruption");
+
+    let replay = fixture.run_reconcile();
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        data(&replay)["schema_version"],
+        "main-agent.worker-reconcile-stopped-result.v2"
+    );
+    assert!(provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none());
+    assert!(!provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stopped_orphan_provider_stop_canary_adopts_then_reconciles_under_successor() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    let registry = orchestration_registry(&fixture.state_dir);
+    let assignment = &registry["assignments"]["assignment-stopped"];
+    let request_digest = "c".repeat(64);
+    write_provider_stop_canary_reservation(
+        &fixture.state_dir,
+        "assignment-stopped",
+        &json!({
+            "schema_version": "main-agent.provider-stop-canary-reservation.v1",
+            "state": "stopped",
+            "request_digest": request_digest,
+            "idempotency_key": "orphan-canary-stop",
+            "run_id": assignment["run_id"],
+            "controller": assignment["primary_manager"],
+            "worker": assignment["worker"],
+            "reserved_revision": assignment["revision"],
+            "activity_revision": 1,
+            "runtime_identity_digest": "d".repeat(64),
+            "worker_claim_id": "orphan-worker-canary-claim",
+            "worker_claim_revision": 1,
+            "worker_claim_expires_at_epoch": 1_893_456_000i64,
+            "controller_claim_id": "orphan-controller-canary-claim",
+            "controller_claim_revision": 1,
+            "controller_claim_expires_at_epoch": 1_893_456_000i64,
+            "child_pid": 2_000_000_001u32,
+            "child_start_ticks": 1,
+            "release_request_digest": null,
+            "release_idempotency_key": null,
+            "created_at": "2030-01-01T00:00:03Z",
+            "updated_at": "2030-01-01T00:00:04Z"
+        }),
+    );
+    write_private_json(
+        &provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary-fence.v1",
+            "assignment_id": "assignment-stopped",
+            "assignment_revision": assignment["revision"],
+            "worker": assignment["worker"],
+            "controller": assignment["primary_manager"],
+            "request_digest": request_digest,
+            "created_at": "2030-01-01T00:00:03Z"
+        }),
+    );
+    fs::rename(
+        fixture.state_dir.join("sessions/main-one"),
+        fixture.state_dir.join("stale-main-one"),
+    )
+    .expect("make original canary controller unavailable");
+    let successor_env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.successor_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+    ];
+    let barrier = fixture._tmp.path().join("orphan-canary-adopt-crash-window");
+    let successor_checkpoint = Path::new(&fixture.successor_capability).with_file_name(
+        Path::new(&fixture.successor_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .map(|name| format!("main-agent-checkpoint-{name}.json"))
+            .expect("successor capability filename"),
+    );
+    let mut first_adopt = Command::new(bin::resolve("main-agent"));
+    first_adopt
+        .current_dir(&fixture.checkout)
+        .args([
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "adopt",
+            "assignment-stopped",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "orphan-canary-adopt-0001",
+            "--format",
+            "json",
+        ])
+        .env(
+            "AGENT_SESSION_CAPABILITY_FILE",
+            &fixture.successor_capability,
+        )
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &successor_checkpoint)
+        .env("AGENT_SESSION_TMUX_BIN", &fixture.tmux_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &fixture.tmux_log)
+        .env("AGENT_SESSION_FAKE_TMUX_ABSENT", "1")
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ADOPT_BARRIER_STAGE",
+            "after_registry_save_before_canary_sidecar_cleanup",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ADOPT_BARRIER_DIR",
+            &barrier,
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let first_adopt = first_adopt.spawn().expect("spawn canary orphan adoption");
+    wait_for_barrier(&barrier);
+    assert_eq!(
+        orchestration_registry(&fixture.state_dir)["assignments"]["assignment-stopped"]["revision"],
+        4,
+        "adoption must commit before external sidecar cleanup"
+    );
+    assert!(
+        provider_stop_canary_reservation_path(&fixture.state_dir, "assignment-stopped").is_file(),
+        "the crash window must retain the exact old-controller sidecar"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "the session execution fence must remain active across adoption"
+    );
+    terminate_at_barrier(
+        first_adopt,
+        "post-commit canary adoption cleanup interruption",
+    );
+
+    let adopted = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "adopt",
+            "assignment-stopped",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "orphan-canary-adopt-0001",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(adopted.code, 0, "outcome={}", adopted.stdout_text());
+    assert_eq!(data(&adopted)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&adopted)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "adoption must consume the controller-bound sidecar"
+    );
+    assert!(
+        provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").is_file(),
+        "the successor must inherit a non-executing worker until stopped reconciliation"
+    );
+
+    let reconciled = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "reconcile-stopped",
+            "assignment-stopped",
+            "--if-revision",
+            "4",
+            "--reason",
+            "orphan canary wrapper stopped",
+            "--idempotency-key",
+            "orphan-canary-reconcile-0001",
+            "--format",
+            "json",
+        ],
+        &successor_env,
+    );
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
+    assert!(!provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_timeout_replays_the_exact_durable_reservation() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "provider-stop-canary-timeout",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        93,
+    );
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
+    let env = [
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            fixture.main_capability.as_str(),
+        ),
+        (
+            "AGENT_SESSION_TMUX_BIN",
+            fixture.tmux_bin.to_str().expect("tmux bin"),
+        ),
+        (
+            "AGENT_SESSION_FAKE_TMUX_LOG",
+            fixture.tmux_log.to_str().expect("tmux log"),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$93"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%93"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-stopped-incarnation",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_TRANSITION_MS",
+            "75",
+        ),
+        (
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_SKIP_CONTROLLER_CHANNEL",
+            "1",
+        ),
+    ];
+    let provider = spawn_test_process_group();
+    let provider_pid = provider.pid();
+    let session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    write_private_json(
+        &session_dir.join(".provider-stop-canary-ready.json"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary.v1",
+            "session_id": "worker-stopped",
+            "launch_id": "worker-stopped-incarnation",
+            "state": "ready",
+            "child_pid": provider_pid
+        }),
+    );
+    let stop_args = [
+        "--state-dir",
+        fixture.state_dir.to_str().expect("state dir"),
+        "worker",
+        "stop-provider-canary",
+        "assignment-stopped",
+        "--worker-incarnation",
+        "worker-stopped-incarnation",
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "provider-stop-timeout-replay",
+        "--format",
+        "json",
+    ];
+    let timed_out = run_main_agent(&fixture.checkout, &stop_args, &env);
+    assert_ne!(timed_out.code, 0, "the first transition must time out");
+    assert_eq!(
+        timed_out.stdout_json()["error"]["code"],
+        "provider-stop-canary-transition-timeout"
+    );
+    assert_eq!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("provider stop canary reservation")["state"],
+        "stop_requested"
+    );
+    let fenced_resume = run_with_env(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "resume",
+            "worker-stopped",
+            "--format",
+            "json",
+        ],
+        &env,
+    );
+    assert_eq!(
+        fenced_resume.code,
+        65,
+        "outcome={}",
+        fenced_resume.stdout_text()
+    );
+    assert_eq!(
+        fenced_resume.stdout_json()["error"]["code"],
+        "provider-stop-canary-fenced"
+    );
+    let request_path = session_dir.join(".provider-stop-canary-stop.json");
+    let request: serde_json::Value =
+        serde_json::from_slice(&fs::read(&request_path).expect("stop request"))
+            .expect("stop request json");
+    drop(provider);
+    write_private_json(
+        &session_dir.join(".provider-stop-canary-stopped.json"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary.v1",
+            "session_id": "worker-stopped",
+            "launch_id": "worker-stopped-incarnation",
+            "state": "stopped",
+            "child_pid": provider_pid,
+            "request_digest": request["request_digest"],
+            "idempotency_key": request["idempotency_key"],
+            "child_exit_success": false
+        }),
+    );
+    let replay = run_main_agent(&fixture.checkout, &stop_args, &env);
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        data(&replay)["schema_version"],
+        "main-agent.worker-stop-provider-canary-result.v1"
+    );
+    assert_eq!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
+            .expect("provider stop canary reservation")["state"],
+        "stopped"
+    );
+    assert!(runtime.is_running(), "the wrapper runtime must remain live");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_fence_blocks_http_resume_before_authority_provisioning() {
+    let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    let assignment =
+        orchestration_registry(&fixture.state_dir)["assignments"]["assignment-stopped"].clone();
+    write_private_json(
+        &provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped"),
+        &json!({
+            "schema_version": "agent-session.provider-stop-canary-fence.v1",
+            "assignment_id": "assignment-stopped",
+            "assignment_revision": assignment["revision"],
+            "worker": assignment["worker"],
+            "controller": assignment["primary_manager"],
+            "request_digest": "e".repeat(64),
+            "created_at": "2030-01-01T00:00:03Z"
+        }),
+    );
+    let worker_record_path = fixture
+        .state_dir
+        .join("sessions/worker-stopped/session.json");
+    let runtime_before =
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&worker_record_path).unwrap())
+            .unwrap()["runtime"]
+            .clone();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve HTTP port");
+    let address = listener.local_addr().expect("HTTP address");
+    drop(listener);
+    let token = "provider-stop-canary-http-test-token";
+    let mut server = KillChild(Some(
+        Command::new(bin::resolve("agent-session"))
+            .current_dir(&fixture.checkout)
+            .args([
+                "serve",
+                "--bind",
+                &address.to_string(),
+                "--state-dir",
+                fixture.state_dir.to_str().expect("state dir"),
+                "--token",
+                token,
+                "--tmux-bin",
+                fixture.tmux_bin.to_str().expect("tmux bin"),
+            ])
+            .env("AGENT_SESSION_FAKE_TMUX_ABSENT", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn HTTP server"),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("HTTP server did not start: {error}"),
+        }
+    }
+    let response = post_json_over_http(
+        &address.to_string(),
+        "/sessions/worker-stopped/resume",
+        token,
+    );
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "provider-stop-canary-fenced");
+    let runtime_after =
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&worker_record_path).unwrap())
+            .unwrap()["runtime"]
+            .clone();
+    assert_eq!(runtime_after, runtime_before);
+    let _ = server.0.as_mut().expect("server").kill();
 }
 
 fn wait_for_barrier(barrier: &Path) {
@@ -26131,12 +29137,18 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
             .write(true)
             .open(&record_lock_path)
             .expect("worker record lock");
-        // SAFETY: the test owns this descriptor and releases it before dropping it.
-        assert_eq!(
-            unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
-            0
-        );
-        let recovery = Command::new(bin::resolve("main-agent"))
+        let checkpoint_barrier = tmp.path().join("submit-recovery-checkpoint-barrier");
+        if case == "worker-checkpoint-before-enter" {
+            fs::create_dir(&checkpoint_barrier).expect("checkpoint barrier");
+        } else {
+            // SAFETY: the test owns this descriptor and releases it before dropping it.
+            assert_eq!(
+                unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
+                0
+            );
+        }
+        let mut recovery_command = Command::new(bin::resolve("main-agent"));
+        recovery_command
             .current_dir(&checkout)
             .args([
                 "--state-dir",
@@ -26176,9 +29188,19 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                 },
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn submit recovery");
+            .stderr(Stdio::piped());
+        if case == "worker-checkpoint-before-enter" {
+            recovery_command
+                .env(
+                    "NILS_AGENT_SESSION_TEST_SUBMIT_RECOVERY_BARRIER_STAGE",
+                    "before_serialized_send",
+                )
+                .env(
+                    "NILS_AGENT_SESSION_TEST_SUBMIT_RECOVERY_BARRIER_DIR",
+                    &checkpoint_barrier,
+                );
+        }
+        let recovery = recovery_command.spawn().expect("spawn submit recovery");
         let reservation_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let registry: serde_json::Value = serde_json::from_slice(
@@ -26193,6 +29215,16 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                 "submit recovery did not reserve its attempt"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if case == "worker-checkpoint-before-enter" {
+            let barrier_deadline = Instant::now() + Duration::from_secs(10);
+            while !checkpoint_barrier.join("ready").is_file() {
+                assert!(
+                    Instant::now() < barrier_deadline,
+                    "submit recovery did not reach its serialized send boundary"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         let mut account_state_before = None;
         let mut auto_resume_state_before = None;
@@ -26383,6 +29415,8 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     ],
                 );
                 assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+                fs::write(checkpoint_barrier.join("release"), b"release")
+                    .expect("release submit recovery checkpoint barrier");
             }
             "account-next-queued" => {
                 let worker_record_path = state_dir.join("sessions/worker-race/session.json");
@@ -26487,11 +29521,13 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
             "tmux-timeout" | "tmux-timeout-terminal-reconcile" => {}
             _ => unreachable!(),
         }
-        // SAFETY: the test owns the locked descriptor.
-        assert_eq!(
-            unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
+        if case != "worker-checkpoint-before-enter" {
+            // SAFETY: the test owns the locked descriptor.
+            assert_eq!(
+                unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+        }
         let output = recovery.wait_with_output().expect("submit recovery output");
         assert!(
             output.status.success(),
@@ -29784,6 +32820,728 @@ fn main_agent_capabilities_exposes_the_runtime_checkpoint_contract() {
     assert_eq!(
         data(&output)["capabilities"]["runtime_checkpoint_file"],
         "main-agent.runtime-checkpoint-file.v1"
+    );
+    assert_eq!(
+        data(&output)["capabilities"]["run_wide_closeout"],
+        "main-agent.run-wide-closeout.v1"
+    );
+}
+
+#[test]
+fn main_agent_closeout_checkpoints_closes_and_releases_only_the_bound_claim() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-closeout",
+            "main-closeout-incarnation",
+            "main-closeout-private-capability-material-0001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-closeout",
+        "run-closeout",
+    );
+    let binding = controller_claim_binding(&state_dir, "run-closeout");
+    assert_eq!(
+        binding["schema_version"],
+        "main-agent.controller-claim-binding.v1"
+    );
+    assert_eq!(binding["lineage"].as_array().map(Vec::len), Some(1));
+    let bound_claim_id = binding["lineage"][0]["claim_id"]
+        .as_str()
+        .expect("bound claim id")
+        .to_string();
+
+    let checkpoint = tmp.path().join("final-checkpoint.json");
+    write_private_json(
+        &checkpoint,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Run delivery is complete",
+            "next_action": "Return final result to the user"
+        }),
+    );
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "closeout",
+        "--if-run-revision",
+        "1",
+        "--checkpoint-file",
+        checkpoint.to_str().expect("checkpoint"),
+        "--idempotency-key",
+        "closeout-basic-0001",
+        "--format",
+        "json",
+    ];
+    let closed = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        closed.code,
+        0,
+        "stdout={} stderr={}",
+        closed.stdout_text(),
+        closed.stderr_text()
+    );
+    let result = data(&closed);
+    assert_eq!(result["schema_version"], "main-agent.closeout-result.v1");
+    assert_eq!(result["run_closed"], true);
+    assert_eq!(result["workers_absent"], true);
+    assert_eq!(result["cleanup_pending"], false);
+    assert_eq!(result["controller_claim"]["bound"], true);
+    assert_eq!(result["controller_claim"]["disposition"], "released");
+    assert_eq!(result["controller_claim"]["run_owned_claim_absent"], true);
+    assert_eq!(result["controller_claim"]["active_after"], false);
+    assert_eq!(result["provider_session_preserved"], true);
+    assert_eq!(result["handoff_ready"], true);
+    assert_eq!(
+        result["progress_receipt"]["completed_stages"],
+        json!([
+            "checkpoint",
+            "workers",
+            "run_close",
+            "claim_release",
+            "readback"
+        ])
+    );
+
+    let final_registry = orchestration_registry(&state_dir);
+    assert_eq!(final_registry["runs"]["run-closeout"]["state"], "closed");
+    assert_eq!(
+        final_registry["runs"]["run-closeout"]["checkpoint"]["summary"],
+        "Run delivery is complete"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    let bound_claim = coordination["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["claim_id"] == bound_claim_id)
+        .expect("bound claim retained for audit");
+    assert_eq!(bound_claim["state"], "released");
+    assert!(
+        state_dir
+            .join("sessions/main-closeout/session.json")
+            .is_file(),
+        "closeout must preserve the Main provider session"
+    );
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay), result);
+}
+
+#[test]
+fn main_agent_closeout_returns_partial_and_same_key_resumes_after_worker_terminalizes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-closeout-resume",
+                "main-closeout-resume-incarnation",
+                "main-closeout-resume-private-capability-0001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-closeout-proven-absent",
+                "worker-closeout-proven-absent-incarnation",
+                "worker-closeout-private-capability-0001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-closeout-resume",
+        "run-closeout-resume",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-closeout-resume",
+        "task_summary": "Finish before closeout",
+        "task": {},
+        "launch": {
+            "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+            "coordination_mode": "enforce", "agent_args": []
+        },
+        "repository": "example/repository", "worktree": null, "base_ref": "main",
+        "scopes": ["crates/agent-session"], "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-closeout-resume",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-closeout-resume",
+            "run_id": "run-closeout-resume",
+            "revision": 2,
+            "state": "working",
+            "task_summary": "Finish before closeout",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-closeout-resume",
+                "session_incarnation": "main-closeout-resume-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-closeout-proven-absent",
+                "session_incarnation": "worker-closeout-proven-absent-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let checkpoint = tmp.path().join("resume-final-checkpoint.json");
+    write_private_json(
+        &checkpoint,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Closeout is waiting on a worker",
+            "next_action": "Resume once the worker is terminal"
+        }),
+    );
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "closeout",
+        "--if-run-revision",
+        "1",
+        "--checkpoint-file",
+        checkpoint.to_str().expect("checkpoint"),
+        "--idempotency-key",
+        "closeout-resume-0001",
+        "--format",
+        "json",
+    ];
+    let partial = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(partial.code, 0, "stderr={}", partial.stderr_text());
+    assert_eq!(data(&partial)["handoff_ready"], false);
+    assert_eq!(data(&partial)["run_closed"], false);
+    assert_eq!(
+        data(&partial)["retained_exceptions"][0]["reason"],
+        "assignment-not-retireable"
+    );
+    assert_eq!(
+        data(&partial)["progress_receipt"]["completed_stages"],
+        json!(["checkpoint"])
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["run-closeout-resume"]["revision"],
+        2
+    );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-closeout-resume"]["state"] = json!("cancelled");
+        registry["assignments"]["assignment-closeout-resume"]["revision"] = json!(3);
+    });
+    let tombstone_root = state_dir.join("session-delete-tombstones");
+    fs::create_dir(&tombstone_root).expect("tombstone root");
+    fs::set_permissions(&tombstone_root, fs::Permissions::from_mode(0o700))
+        .expect("tombstone root mode");
+    let tombstone = tombstone_root.join("worker-closeout-proven-absent-fixture");
+    fs::rename(
+        state_dir.join("sessions/worker-closeout-proven-absent"),
+        &tombstone,
+    )
+    .expect("persist logical delete tombstone");
+
+    let cleanup_waiting = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        cleanup_waiting.code,
+        0,
+        "stdout={} stderr={}",
+        cleanup_waiting.stdout_text(),
+        cleanup_waiting.stderr_text()
+    );
+    assert_eq!(data(&cleanup_waiting)["handoff_ready"], false);
+    assert_eq!(data(&cleanup_waiting)["cleanup_pending"], true);
+    assert_eq!(data(&cleanup_waiting)["run_closed"], false);
+
+    fs::remove_dir_all(&tombstone).expect("maintenance clears logical delete tombstone");
+    let resumed = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    assert_eq!(
+        data(&resumed)["handoff_ready"],
+        true,
+        "{}",
+        resumed.stdout_text()
+    );
+    assert_eq!(data(&resumed)["workers_absent"], true);
+    assert_eq!(data(&resumed)["checkpoint_revision"], 2);
+    assert_eq!(data(&resumed)["final_run_revision"], 3);
+}
+
+#[test]
+fn main_agent_closeout_preserves_an_unrelated_successor_claim_on_resume() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-closeout-successor",
+            "main-closeout-successor-incarnation",
+            "main-closeout-successor-private-capability-0001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-closeout-successor",
+        "run-closeout-successor",
+    );
+    let bound =
+        controller_claim_binding(&state_dir, "run-closeout-successor")["lineage"][0].clone();
+    let checkpoint_value = json!({
+        "schema_version": "main-agent.checkpoint-input.v1",
+        "summary": "Run is closed before claim disposition resumes",
+        "next_action": "Finish claim readback",
+        "state": null,
+        "result_summary": null,
+        "blocker_summary": null
+    });
+    let checkpoint = tmp.path().join("successor-final-checkpoint.json");
+    write_private_json(
+        &checkpoint,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Run is closed before claim disposition resumes",
+            "next_action": "Finish claim readback"
+        }),
+    );
+    let request_digest = orchestration_request_digest(
+        "main-agent-closeout",
+        &json!({
+            "if_run_revision": 1,
+            "checkpoint": checkpoint_value
+        }),
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let run = &mut registry["runs"]["run-closeout-successor"];
+        run["revision"] = json!(3);
+        run["state"] = json!("closed");
+        run["checkpoint"] = json!({
+            "revision": 2,
+            "summary": "Run is closed before claim disposition resumes",
+            "next_action": "Finish claim readback",
+            "updated_at": "2030-01-01T00:00:02Z"
+        });
+        registry["receipts"]["main-closeout-successor:main-closeout-successor-incarnation:closeout-successor-0001"] = json!({
+            "principal_session_id": "main-closeout-successor",
+            "principal_incarnation": "main-closeout-successor-incarnation",
+            "operation": "closeout",
+            "request_digest": request_digest,
+            "outcome": {
+                "schema_version": "main-agent.closeout-progress.v1",
+                "state": "in_progress",
+                "run_id": "run-closeout-successor",
+                "expected_run_revision": 1,
+                "checkpoint_revision": 2,
+                "final_run_revision": 3,
+                "completed_stages": ["checkpoint", "workers", "run_close"],
+                "worker_dispositions": [],
+                "workers_absent": true,
+                "controller_claim": {
+                    "bound": true,
+                    "claim_id": bound["claim_id"],
+                    "controller": bound["controller"],
+                    "work_context_digest": bound["work_context_digest"],
+                    "observed_revision": 1,
+                    "disposition": "pending",
+                    "run_owned_claim_absent": false,
+                    "active_after": true
+                }
+            },
+            "created_at_epoch": 1
+        });
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let claims = registry["claims"].as_array_mut().expect("claims");
+        let old = claims
+            .iter_mut()
+            .find(|claim| claim["claim_id"] == bound["claim_id"])
+            .expect("bound claim");
+        old["state"] = json!("released");
+        old["revision"] = json!(2);
+        old["terminal_at_epoch"] = json!(1);
+        claims.push(json!({
+            "schema_version": "agent-session.work-context.v1",
+            "session_id": "main-closeout-successor",
+            "session_incarnation": "main-closeout-successor-incarnation",
+            "claim_id": "unrelated-successor-claim",
+            "revision": 1,
+            "state": "active",
+            "intent": "implementation",
+            "tier": "L0",
+            "repositories": ["example/other"],
+            "worktrees": [],
+            "provider_refs": [],
+            "plan_refs": [],
+            "scopes": [],
+            "summary": "A later unrelated task",
+            "updated_at": "2030-01-01T00:00:03Z",
+            "expires_at": "9999-12-31T23:59:59Z",
+            "expires_at_epoch": i64::MAX
+        }));
+    });
+    let resumed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "closeout",
+            "--if-run-revision",
+            "1",
+            "--checkpoint-file",
+            checkpoint.to_str().expect("checkpoint"),
+            "--idempotency-key",
+            "closeout-successor-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    assert_eq!(data(&resumed)["handoff_ready"], true);
+    assert_eq!(
+        data(&resumed)["controller_claim"]["disposition"],
+        "preserved_unrelated"
+    );
+    assert_eq!(
+        data(&resumed)["controller_claim"]["run_owned_claim_absent"],
+        true
+    );
+    assert_eq!(data(&resumed)["controller_claim"]["active_after"], true);
+    let coordination = load_coordination_registry(&state_dir);
+    assert_eq!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .find(|claim| claim["claim_id"] == "unrelated-successor-claim")
+            .expect("unrelated claim")["state"],
+        "active"
+    );
+}
+
+#[test]
+fn main_agent_closeout_waits_for_a_bound_claim_operation_before_closing() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-closeout-operation",
+            "main-closeout-operation-incarnation",
+            "main-closeout-operation-private-capability-0001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-closeout-operation",
+        "run-closeout-operation",
+    );
+    let bound_claim_id = controller_claim_binding(&state_dir, "run-closeout-operation")["lineage"]
+        [0]["claim_id"]
+        .as_str()
+        .expect("bound claim")
+        .to_string();
+    seed_activity_state(
+        &state_dir,
+        "main-closeout-operation",
+        "main-closeout-operation-incarnation",
+        "working",
+        json!({
+            "provider_turn_id": "turn-closeout-operation",
+            "started_at": "2030-01-01T00:00:01Z"
+        }),
+        serde_json::Value::Null,
+    );
+    let _runtime = seed_live_runtime_identity(
+        &state_dir,
+        "main-closeout-operation",
+        "main-closeout-operation-incarnation",
+        211,
+    );
+    let mutation_target = checkout.join("crates/agent-session/src/main_agent.rs");
+    fs::create_dir_all(mutation_target.parent().expect("target parent")).expect("target parent");
+    fs::write(&mutation_target, "// fixture\n").expect("mutation target");
+    let targets = tmp.path().join("closeout-operation-targets.json");
+    write_private_json(
+        &targets,
+        &json!({
+            "schema_version": "agent-session.operation-targets.v1",
+            "targets": [{
+                "kind": "path-exact",
+                "repository": "example/repository",
+                "value": "crates/agent-session/src/main_agent.rs"
+            }]
+        }),
+    );
+    let execution_token = tmp.path().join("closeout-operation-token");
+    fs::write(&execution_token, "closeout-operation-token-material").expect("execution token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600))
+        .expect("execution token mode");
+    let admitted = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "admit",
+            "--session",
+            "main-closeout-operation",
+            "--claim",
+            &bound_claim_id,
+            "--if-revision",
+            "1",
+            "--targets-file",
+            targets.to_str().expect("targets"),
+            "--operation",
+            "edit",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--capability-file",
+            &capability_file,
+            "--idempotency-key",
+            "closeout-operation-admit-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        admitted.code,
+        0,
+        "stdout={} stderr={}",
+        admitted.stdout_text(),
+        admitted.stderr_text()
+    );
+    let lease_id = data(&admitted)["lease_id"]
+        .as_str()
+        .expect("lease id")
+        .to_string();
+    let checkpoint = tmp.path().join("operation-final-checkpoint.json");
+    write_private_json(
+        &checkpoint,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Wait for the active mutation",
+            "next_action": "Resume closeout after operation completion"
+        }),
+    );
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "closeout",
+        "--if-run-revision",
+        "1",
+        "--checkpoint-file",
+        checkpoint.to_str().expect("checkpoint"),
+        "--idempotency-key",
+        "closeout-operation-0001",
+        "--format",
+        "json",
+    ];
+    let waiting = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(waiting.code, 0, "stderr={}", waiting.stderr_text());
+    assert_eq!(data(&waiting)["handoff_ready"], false);
+    assert_eq!(data(&waiting)["run_closed"], false);
+    assert_eq!(
+        data(&waiting)["retained_exceptions"][0]["reason"],
+        "operation-in-progress"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["run-closeout-operation"]["state"],
+        "active"
+    );
+
+    let completed = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "work-context",
+            "complete",
+            "--session",
+            "main-closeout-operation",
+            "--lease",
+            &lease_id,
+            "--if-revision",
+            "1",
+            "--execution-token-file",
+            execution_token.to_str().expect("execution token"),
+            "--outcome",
+            "pass",
+            "--capability-file",
+            &capability_file,
+            "--idempotency-key",
+            "closeout-operation-complete-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(completed.code, 0, "stderr={}", completed.stderr_text());
+    let resumed = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    assert_eq!(data(&resumed)["handoff_ready"], true);
+    assert_eq!(data(&resumed)["run_closed"], true);
+    assert_eq!(
+        data(&resumed)["controller_claim"]["disposition"],
+        "released"
+    );
+}
+
+#[test]
+fn main_agent_closeout_fails_closed_for_a_pre_provenance_run() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-closeout-pre-provenance",
+            "main-closeout-pre-provenance-incarnation",
+            "main-closeout-pre-provenance-private-capability-0001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &checkout,
+        "main-closeout-pre-provenance",
+        "run-closeout-pre-provenance",
+    );
+    fs::remove_file(controller_claim_binding_path(
+        &state_dir,
+        "run-closeout-pre-provenance",
+    ))
+    .expect("remove pre-provenance binding");
+    let checkpoint = tmp.path().join("pre-provenance-final-checkpoint.json");
+    write_private_json(
+        &checkpoint,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Pre-provenance closeout",
+            "next_action": "Establish provenance first"
+        }),
+    );
+    let rejected = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "closeout",
+            "--if-run-revision",
+            "1",
+            "--checkpoint-file",
+            checkpoint.to_str().expect("checkpoint"),
+            "--idempotency-key",
+            "closeout-pre-provenance-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_ne!(rejected.code, 0);
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "controller-claim-provenance-required"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["runs"]["run-closeout-pre-provenance"]["revision"],
+        1
     );
 }
 

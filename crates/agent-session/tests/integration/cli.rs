@@ -2423,6 +2423,234 @@ fn activity_doctor_reports_binary_version_and_launch_readiness() {
 }
 
 #[test]
+fn codex_activity_doctor_accepts_the_converged_agent_hook_control_plane() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    fs::write(codex.join("hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    fs::write(
+        codex.join("config.toml"),
+        r#"notify = ["agent-session", "activity", "notify", "--agent", "codex"]"#,
+    )
+    .expect("Codex config");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+test "$*" = "doctor --product codex --format json" || exit 64
+printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}'
+"#,
+    );
+    let codex_bin = tmp.path().join("codex");
+    write_executable(
+        &codex_bin,
+        "#!/usr/bin/env sh\nprintf 'codex-cli 0.146.0\\n'\n",
+    );
+    let home_arg = home.to_string_lossy().into_owned();
+    let hook_arg = hook.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_HOOK_BIN", hook_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    let provider = &data(&doctor_json)["providers"][0];
+    assert_eq!(provider["configured"], true, "{doctor_json}");
+    assert_eq!(provider["can_launch_worker"], true, "{doctor_json}");
+}
+
+#[test]
+fn codex_activity_doctor_fails_closed_on_invalid_agent_hook_control_plane() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    fs::write(codex.join("hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    fs::write(
+        codex.join("config.toml"),
+        r#"notify = ["agent-session", "activity", "notify", "--agent", "codex"]"#,
+    )
+    .expect("Codex config");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+: "${AGENT_HOOK_RESPONSE:?}"
+printf '%s\n' "$AGENT_HOOK_RESPONSE"
+exit "${AGENT_HOOK_EXIT_CODE:-0}"
+"#,
+    );
+    let home_arg = home.to_string_lossy().into_owned();
+    let hook_arg = hook.to_string_lossy().into_owned();
+    let valid = json!({
+        "schema_version":"cli.agent-hook.doctor.v1",
+        "ok":true,
+        "data":[{
+            "schema_version":"agent-hook.doctor.v1",
+            "product":"codex",
+            "status":"converged",
+            "supported":true,
+            "owned_count":7,
+            "expected_owned_count":7,
+            "legacy_residue_count":0,
+            "unrelated_count":0,
+            "config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "recovery":"challenge-authorize-consume"
+        }]
+    });
+    let mut cases = vec![
+        (
+            "wrong-envelope",
+            json!({"schema_version":"wrong"}).to_string(),
+            "0",
+            Some("agent-hook-doctor-output-invalid"),
+        ),
+        (
+            "nonzero-exit",
+            valid.to_string(),
+            "1",
+            Some("agent-hook-doctor-output-invalid"),
+        ),
+    ];
+    let mut multi = valid.clone();
+    let duplicate = multi["data"][0].clone();
+    multi["data"]
+        .as_array_mut()
+        .expect("doctor results")
+        .push(duplicate);
+    cases.push((
+        "multi-record",
+        multi.to_string(),
+        "0",
+        Some("agent-hook-doctor-output-invalid"),
+    ));
+    let mut mismatched = valid.clone();
+    mismatched["data"][0]["product"] = json!("claude");
+    cases.push((
+        "provider-mismatch",
+        mismatched.to_string(),
+        "0",
+        Some("agent-hook-doctor-output-invalid"),
+    ));
+    let mut invalid_digest = valid.clone();
+    invalid_digest["data"][0]["config_digest"] = json!("sha256:not-a-digest");
+    cases.push((
+        "invalid-digest",
+        invalid_digest.to_string(),
+        "0",
+        Some("agent-hook-doctor-output-invalid"),
+    ));
+    let mut conflicting_error = valid.clone();
+    conflicting_error["error"] = json!({
+        "code":"doctor-failed",
+        "message":"conflicting failure"
+    });
+    cases.push((
+        "success-with-error",
+        conflicting_error.to_string(),
+        "0",
+        Some("agent-hook-doctor-output-invalid"),
+    ));
+    let mut non_converged = valid.clone();
+    non_converged["data"][0]["status"] = json!("drifted");
+    cases.push(("non-converged", non_converged.to_string(), "0", None));
+    let mut unsupported = valid.clone();
+    unsupported["data"][0]["status"] = json!("unsupported");
+    unsupported["data"][0]["supported"] = json!(false);
+    cases.push(("unsupported", unsupported.to_string(), "0", None));
+    let mut count_mismatch = valid.clone();
+    count_mismatch["data"][0]["owned_count"] = json!(6);
+    cases.push((
+        "owned-count-mismatch",
+        count_mismatch.to_string(),
+        "0",
+        None,
+    ));
+    let mut residue_case = valid;
+    residue_case["data"][0]["legacy_residue_count"] = json!(1);
+    cases.push(("retired-residue", residue_case.to_string(), "0", None));
+
+    for (name, response, exit_code, expected_error) in cases {
+        let doctor = run(
+            tmp.path(),
+            &["activity", "doctor", "--agent", "codex", "--format", "json"],
+            &[
+                ("HOME", home_arg.as_str()),
+                ("AGENT_HOOK_BIN", hook_arg.as_str()),
+                ("AGENT_HOOK_RESPONSE", response.as_str()),
+                ("AGENT_HOOK_EXIT_CODE", exit_code),
+            ],
+        );
+        assert_eq!(doctor.code, 0, "{name}: stderr={}", doctor.stderr_text());
+        let doctor_json = doctor.stdout_json();
+        let provider = &data(&doctor_json)["providers"][0];
+        assert_eq!(provider["configured"], false, "{name}: {doctor_json}");
+        assert_eq!(
+            provider["can_launch_worker"], false,
+            "{name}: {doctor_json}"
+        );
+        match expected_error {
+            Some(expected) => {
+                assert_eq!(provider["configuration_error"], expected, "{name}")
+            }
+            None => assert!(provider["configuration_error"].is_null(), "{name}"),
+        }
+    }
+}
+
+#[test]
+fn codex_activity_doctor_rejects_agent_hook_output_beyond_the_strict_cap() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    fs::write(codex.join("hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    fs::write(
+        codex.join("config.toml"),
+        r#"notify = ["agent-session", "activity", "notify", "--agent", "codex"]"#,
+    )
+    .expect("Codex config");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}'
+dd if=/dev/zero bs=1048577 count=1 2>/dev/null | tr '\000' ' '
+printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":false}'
+"#,
+    );
+    let home_arg = home.to_string_lossy().into_owned();
+    let hook_arg = hook.to_string_lossy().into_owned();
+
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_HOOK_BIN", hook_arg.as_str()),
+        ],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    let provider = &data(&doctor_json)["providers"][0];
+    assert_eq!(provider["configured"], false, "{doctor_json}");
+    assert_eq!(provider["can_launch_worker"], false, "{doctor_json}");
+    assert_eq!(
+        provider["configuration_error"], "agent-hook-doctor-output-invalid",
+        "{doctor_json}"
+    );
+}
+
+#[test]
 fn codex_activity_doctor_recognizes_audited_computer_use_owned_notify() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");

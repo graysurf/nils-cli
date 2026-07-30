@@ -203,6 +203,26 @@ jobs:
             tests::delete_kills_a_detached_descendant_inside_a_pinned_tmux_control_group \
             -- --exact --nocapture
 
+      - name: Require provider-stop canary containment and lifecycle
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
+        env:
+          AGENT_SESSION_TEST_REQUIRE_CGROUP: "1"
+        run: |
+          systemd-run --user --scope --quiet --collect \
+            --unit "nils-provider-stop-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-1" \
+            -- cargo test -p nils-agent-session --test integration \
+              provider_stop_canary -- --nocapture
+          systemd-run --user --scope --quiet --collect \
+            --unit "nils-provider-stop-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-2" \
+            -- cargo test -p nils-agent-session --test integration \
+              coordination::main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor \
+              -- --exact --nocapture
+          systemd-run --user --scope --quiet --collect \
+            --unit "nils-provider-stop-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3" \
+            -- cargo test -p nils-agent-session --lib \
+              tests::provider_stop_canary_never_signals_an_injected_same_uid_cgroup_member \
+              -- --exact --nocapture
+
       - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, tempdir-leak-audit, test-stale-audit)
         env:
           NILS_CLI_TEST_RUNNER: nextest

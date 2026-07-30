@@ -375,7 +375,11 @@ response. If the matching `agent-hook` binary is absent, setup returns
 `activity hook`, `activity notify`, and read-only `activity doctor` paths remain
 for runtime compatibility and migration diagnostics.
 
-`activity doctor` remains read-only and recognizes exact pre-dispatch
+`activity doctor` remains read-only. Codex launch readiness requires a bounded,
+strictly typed `agent-hook doctor` result for Codex whose status is
+`converged`, whose owned count is exact, and whose retired residue is zero.
+Missing, failed, malformed, oversized, multi-record, or mismatched
+control-plane evidence fails closed. The diagnostic still recognizes exact pre-dispatch
 `agent-session` registrations, including an audited Computer Use outer wrapper
 at the fixed executable path under the active Codex config root, so an operator
 can diagnose and migrate older installations. Existing `activity hook` and

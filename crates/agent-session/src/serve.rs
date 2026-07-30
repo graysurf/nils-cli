@@ -3771,6 +3771,8 @@ async fn create_handler(
     };
     let args = cli::StartArgs {
         app_server_managed: true,
+        provider_stop_canary: false,
+        provider_stop_canary_assignment_id: None,
         initial_codex_account: selected_account.clone(),
         initial_title_state: title_state,
         initial_agent_profile: launch_profile.as_ref().map(|profile| profile.id.clone()),

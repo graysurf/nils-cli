@@ -878,6 +878,8 @@ pub(crate) const ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v3";
 pub(crate) const WORKER_RUNTIME_STOP_RESERVATION_SCHEMA: &str =
     "main-agent.worker-runtime-stop-reservation.v1";
+pub(crate) const PROVIDER_STOP_CANARY_RESERVATION_SCHEMA: &str =
+    "main-agent.provider-stop-canary-reservation.v1";
 pub(crate) const WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA: &str =
     "main-agent.worker-claim-revocation-reservation.v1";
 pub(crate) const WORKER_READINESS_STOP_PROOF_SCHEMA: &str =
@@ -889,6 +891,8 @@ pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
 const SESSION_AUTHORITY_QUARANTINE_SCHEMA: &str = "agent-session.worker-authority-quarantine.v1";
 const SESSION_GROUP_CLEANUP_FENCE_SCHEMA: &str = "agent-session.group-cleanup-fence.v1";
 const SESSION_RUNTIME_STOP_FENCE_SCHEMA: &str = "agent-session.runtime-stop-fence.v1";
+const SESSION_PROVIDER_STOP_CANARY_FENCE_SCHEMA: &str =
+    "agent-session.provider-stop-canary-fence.v1";
 const SESSION_CLAIMED_RUNTIME_STOP_IDENTITY_SCHEMA: &str =
     "agent-session.claimed-runtime-stop-identity.v1";
 const SESSION_CLAIMED_RUNTIME_STOP_IDENTITY_FILE: &str = "claimed-runtime-stop.json";
@@ -1084,12 +1088,16 @@ const MAX_SESSION_AUTHORITY_QUARANTINE_BYTES: u64 = 64 * 1024;
 const SESSION_AUTHORITY_QUARANTINE_FILE: &str = "authority-quarantine.json";
 const SESSION_GROUP_CLEANUP_FENCE_FILE: &str = "group-cleanup-fence.json";
 const SESSION_RUNTIME_STOP_FENCE_FILE: &str = "runtime-stop-fence.json";
+const SESSION_PROVIDER_STOP_CANARY_FENCE_FILE: &str = "provider-stop-canary-fence.json";
 const WORKER_DELETE_IDENTITIES_DIR: &str = "worker-delete-identities";
 const WORKER_DELETE_IDENTITY_SCHEMA: &str = "main-agent.worker-delete-identity.v1";
 const REQUEST_CHANGES_IDENTITIES_DIR: &str = "request-changes-identities";
 const REQUEST_CHANGES_IDENTITY_SCHEMA: &str = "main-agent.request-changes-identity.v1";
 const WORKER_REENTRY_IDENTITIES_DIR: &str = "worker-reentry-identities";
 const WORKER_REENTRY_IDENTITY_SCHEMA: &str = "main-agent.worker-reentry-identity.v1";
+const CONTROLLER_CLAIM_BINDINGS_DIR: &str = "controller-claim-bindings";
+const CONTROLLER_CLAIM_BINDING_SCHEMA: &str = "main-agent.controller-claim-binding.v1";
+const PROVIDER_STOP_CANARY_RESERVATIONS_DIR: &str = "provider-stop-canary-reservations";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1109,6 +1117,25 @@ pub(crate) struct RunCheckpoint {
     pub summary: String,
     pub next_action: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControllerClaimIdentity {
+    pub claim_id: String,
+    pub controller: SessionRef,
+    pub acquisition_revision: u64,
+    pub work_context_digest: String,
+    pub bound_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControllerClaimBinding {
+    pub schema_version: String,
+    pub run_id: String,
+    pub objective_packet_digest: String,
+    pub lineage: Vec<ControllerClaimIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1230,6 +1257,18 @@ pub(crate) struct SessionRuntimeStopFence {
     origin_assignment_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin_controller: Option<SessionRef>,
+    request_digest: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionProviderStopCanaryFence {
+    schema_version: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    worker: SessionRef,
+    controller: SessionRef,
     request_digest: String,
     created_at: String,
 }
@@ -1366,6 +1405,35 @@ pub(crate) struct WorkerRuntimeStopReservationRecord {
     pub controller_claim_revision: u64,
     pub controller_claim_expires_at_epoch: i64,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderStopCanaryReservationRecord {
+    pub schema_version: String,
+    pub state: String,
+    pub request_digest: String,
+    pub idempotency_key: String,
+    pub run_id: String,
+    pub controller: SessionRef,
+    pub worker: SessionRef,
+    pub reserved_revision: u64,
+    pub activity_revision: u64,
+    pub runtime_identity_digest: String,
+    pub worker_claim_id: String,
+    pub worker_claim_revision: u64,
+    pub worker_claim_expires_at_epoch: i64,
+    pub controller_claim_id: String,
+    pub controller_claim_revision: u64,
+    pub controller_claim_expires_at_epoch: i64,
+    pub child_pid: u32,
+    pub child_start_ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_request_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_idempotency_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1945,6 +2013,10 @@ enum SessionExecutionAuthorityFence {
         assignment_id: String,
         assignment_revision: u64,
     },
+    ProviderStopCanary {
+        assignment_id: String,
+        assignment_revision: u64,
+    },
     Quarantine {
         assignment_id: String,
         assignment_revision: u64,
@@ -1956,6 +2028,7 @@ impl SessionExecutionAuthorityFence {
         match self {
             Self::GroupCleanup { .. } => "worker-group-cleanup-fenced",
             Self::RuntimeStop { .. } => "worker-runtime-stop-fenced",
+            Self::ProviderStopCanary { .. } => "provider-stop-canary-fenced",
             Self::Quarantine { .. } => "worker-quarantined",
         }
     }
@@ -1982,6 +2055,12 @@ fn session_execution_authority_fence(
         return Ok(Some(SessionExecutionAuthorityFence::RuntimeStop {
             assignment_id,
             assignment_revision,
+        }));
+    }
+    if let Some(marker) = validated_session_provider_stop_canary_fence(context, record)? {
+        return Ok(Some(SessionExecutionAuthorityFence::ProviderStopCanary {
+            assignment_id: marker.assignment_id,
+            assignment_revision: marker.assignment_revision,
         }));
     }
     Ok(
@@ -2024,6 +2103,17 @@ pub(crate) fn ensure_session_not_quarantined(
                 "assignment_revision": assignment_revision
             })),
         )),
+        SessionExecutionAuthorityFence::ProviderStopCanary {
+            assignment_id,
+            assignment_revision,
+        } => Err(CliError::data(
+            "provider-stop-canary-fenced",
+            "worker execution authority is fenced by an exact provider stop canary",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "assignment_revision": assignment_revision
+            })),
+        )),
         SessionExecutionAuthorityFence::Quarantine {
             assignment_id,
             assignment_revision,
@@ -2044,6 +2134,7 @@ pub(crate) fn ensure_session_not_runtime_stop_fenced(
 ) -> Result<(), CliError> {
     let runtime_stop = validated_session_runtime_stop_fence(context, record)?;
     let claimed_stop = validated_session_claimed_runtime_stop_identity(context, record)?;
+    let provider_stop_canary = validated_session_provider_stop_canary_fence(context, record)?;
     if let Some((assignment_id, assignment_revision)) = runtime_stop
         .as_ref()
         .map(|marker| (&marker.assignment_id, marker.assignment_revision))
@@ -2062,6 +2153,16 @@ pub(crate) fn ensure_session_not_runtime_stop_fenced(
             })),
         ));
     }
+    if let Some(marker) = provider_stop_canary {
+        return Err(CliError::data(
+            "provider-stop-canary-fenced",
+            "worker execution authority is fenced by an exact provider stop canary",
+            Some(json!({
+                "assignment_id": marker.assignment_id,
+                "assignment_revision": marker.assignment_revision
+            })),
+        ));
+    }
     Ok(())
 }
 
@@ -2071,7 +2172,8 @@ pub(crate) fn session_runtime_stop_fenced(
 ) -> Result<bool, CliError> {
     Ok(
         validated_session_runtime_stop_fence(context, record)?.is_some()
-            || validated_session_claimed_runtime_stop_identity(context, record)?.is_some(),
+            || validated_session_claimed_runtime_stop_identity(context, record)?.is_some()
+            || validated_session_provider_stop_canary_fence(context, record)?.is_some(),
     )
 }
 
@@ -2314,6 +2416,186 @@ fn validated_session_runtime_stop_fence(
         ));
     }
     Ok(Some(marker))
+}
+
+fn validate_session_provider_stop_canary_fence(
+    marker: &SessionProviderStopCanaryFence,
+) -> Result<(), CliError> {
+    if marker.schema_version != SESSION_PROVIDER_STOP_CANARY_FENCE_SCHEMA
+        || marker.assignment_revision == 0
+        || marker.request_digest.len() != 64
+        || !marker
+            .request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || marker.created_at.is_empty()
+    {
+        return Err(store_invalid(
+            "session provider stop canary fence identity is invalid",
+        ));
+    }
+    validate_slug(
+        "provider stop canary fence assignment id",
+        &marker.assignment_id,
+        128,
+    )?;
+    validate_session_ref(&marker.worker)?;
+    validate_session_ref(&marker.controller)?;
+    Ok(())
+}
+
+fn read_session_provider_stop_canary_fence(
+    context: &CliContext,
+    session_id: &str,
+) -> Result<Option<SessionProviderStopCanaryFence>, CliError> {
+    let path =
+        crate::session_dir(context, session_id).join(SESSION_PROVIDER_STOP_CANARY_FENCE_FILE);
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "session provider stop canary fence permissions are unsafe",
+        "session provider stop canary fence exceeds byte limit",
+        "session provider stop canary fence changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("session provider stop canary fence is invalid"))
+}
+
+fn validated_session_provider_stop_canary_fence(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<Option<SessionProviderStopCanaryFence>, CliError> {
+    let Some(marker) = read_session_provider_stop_canary_fence(context, &record.id)? else {
+        return Ok(None);
+    };
+    validate_session_provider_stop_canary_fence(&marker)?;
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !session_ref_matches(&marker.worker, record, incarnation) {
+        return Err(store_invalid(
+            "session provider stop canary fence identity is invalid",
+        ));
+    }
+    Ok(Some(marker))
+}
+
+pub(crate) fn persist_session_provider_stop_canary_fence(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    request_digest: &str,
+) -> Result<(), CliError> {
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-worker-missing",
+            "provider stop canary fence requires the exact bound worker",
+            None,
+        )
+    })?;
+    let marker = SessionProviderStopCanaryFence {
+        schema_version: SESSION_PROVIDER_STOP_CANARY_FENCE_SCHEMA.to_string(),
+        assignment_id: assignment.assignment_id.clone(),
+        assignment_revision: assignment.revision,
+        worker: worker.clone(),
+        controller: assignment.primary_manager.clone(),
+        request_digest: request_digest.to_string(),
+        created_at: crate::coordination::timestamp(crate::coordination::now_epoch()),
+    };
+    validate_session_provider_stop_canary_fence(&marker)?;
+    if let Some(existing) = read_session_provider_stop_canary_fence(context, &worker.session_id)? {
+        validate_session_provider_stop_canary_fence(&existing)?;
+        if existing.assignment_id != marker.assignment_id
+            || existing.assignment_revision != marker.assignment_revision
+            || existing.worker != marker.worker
+            || existing.controller != marker.controller
+            || existing.request_digest != marker.request_digest
+        {
+            return Err(CliError::data(
+                "provider-stop-canary-fence-conflict",
+                "worker session has a different provider stop canary fence",
+                None,
+            ));
+        }
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|_| store_invalid("session provider stop canary fence is invalid"))?;
+    let path = crate::session_dir(context, &worker.session_id)
+        .join(SESSION_PROVIDER_STOP_CANARY_FENCE_FILE);
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn session_provider_stop_canary_fence_matches(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    request_digest: &str,
+) -> Result<bool, CliError> {
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(false);
+    };
+    let Some(marker) = read_session_provider_stop_canary_fence(context, &worker.session_id)? else {
+        return Ok(false);
+    };
+    validate_session_provider_stop_canary_fence(&marker)?;
+    Ok(marker.assignment_id == assignment.assignment_id
+        && marker.assignment_revision == assignment.revision
+        && marker.worker == *worker
+        && marker.controller == assignment.primary_manager
+        && marker.request_digest == request_digest)
+}
+
+pub(crate) fn clear_session_provider_stop_canary_fence(
+    context: &CliContext,
+    assignment_id: &str,
+    worker: &SessionRef,
+    request_digest: &str,
+) -> Result<(), CliError> {
+    let Some(marker) = read_session_provider_stop_canary_fence(context, &worker.session_id)? else {
+        return Ok(());
+    };
+    validate_session_provider_stop_canary_fence(&marker)?;
+    if marker.assignment_id != assignment_id
+        || marker.worker != *worker
+        || marker.request_digest != request_digest
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-fence-conflict",
+            "provider stop canary fence does not match cleanup",
+            None,
+        ));
+    }
+    let path = crate::session_dir(context, &worker.session_id)
+        .join(SESSION_PROVIDER_STOP_CANARY_FENCE_FILE);
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
+}
+
+pub(crate) fn session_provider_stop_canary_fence_request_digest(
+    context: &CliContext,
+    assignment_id: &str,
+    worker: &SessionRef,
+) -> Result<Option<String>, CliError> {
+    let Some(marker) = read_session_provider_stop_canary_fence(context, &worker.session_id)? else {
+        return Ok(None);
+    };
+    validate_session_provider_stop_canary_fence(&marker)?;
+    if marker.assignment_id != assignment_id || marker.worker != *worker {
+        return Err(CliError::data(
+            "provider-stop-canary-fence-conflict",
+            "provider stop canary fence does not match the reconciled worker",
+            None,
+        ));
+    }
+    Ok(Some(marker.request_digest))
 }
 
 pub(crate) fn persist_session_runtime_stop_fence(
@@ -2877,6 +3159,303 @@ fn worker_reentry_identity_path(
     let root = ensure_orchestration_root(context)?.join(WORKER_REENTRY_IDENTITIES_DIR);
     ensure_private_directory(&root)?;
     Ok(root.join(hex(&Sha256::digest(assignment_id.as_bytes()))))
+}
+
+fn provider_stop_canary_reservation_path(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<PathBuf, CliError> {
+    validate_slug("provider stop canary assignment id", assignment_id, 128)?;
+    let root = ensure_orchestration_root(context)?.join(PROVIDER_STOP_CANARY_RESERVATIONS_DIR);
+    ensure_private_directory(&root)?;
+    Ok(root.join(hex(&Sha256::digest(assignment_id.as_bytes()))))
+}
+
+fn read_provider_stop_canary_reservation(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<Option<ProviderStopCanaryReservationRecord>, CliError> {
+    validate_slug("provider stop canary assignment id", assignment_id, 128)?;
+    let root = orchestration_root(context).join(PROVIDER_STOP_CANARY_RESERVATIONS_DIR);
+    match fs::symlink_metadata(&root) {
+        Ok(_) => ensure_private_directory(&root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(store_unavailable()),
+    }
+    let path = root.join(hex(&Sha256::digest(assignment_id.as_bytes())));
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "provider stop canary reservation permissions are unsafe",
+        "provider stop canary reservation exceeds byte limit",
+        "provider stop canary reservation changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("provider stop canary reservation is invalid"))
+}
+
+fn validate_provider_stop_canary_reservation(
+    reservation: &ProviderStopCanaryReservationRecord,
+    assignment: &AssignmentRecord,
+) -> Result<(), CliError> {
+    let revision_matches = reservation.reserved_revision == assignment.revision
+        || (assignment.state == "cancelled"
+            && assignment.revision == reservation.reserved_revision.saturating_add(1));
+    if reservation.schema_version != PROVIDER_STOP_CANARY_RESERVATION_SCHEMA
+        || !matches!(
+            reservation.state.as_str(),
+            "stop_requested" | "stopped" | "release_requested"
+        )
+        || reservation.request_digest.len() != 64
+        || !reservation
+            .request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || validate_slug(
+            "provider stop canary idempotency key",
+            &reservation.idempotency_key,
+            128,
+        )
+        .is_err()
+        || reservation.run_id != assignment.run_id
+        || reservation.controller != assignment.primary_manager
+        || assignment.worker.as_ref() != Some(&reservation.worker)
+        || !revision_matches
+        || reservation.activity_revision == 0
+        || reservation.runtime_identity_digest.len() != 64
+        || !reservation
+            .runtime_identity_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || validate_slug(
+            "provider stop canary worker claim id",
+            &reservation.worker_claim_id,
+            256,
+        )
+        .is_err()
+        || reservation.worker_claim_revision == 0
+        || reservation.worker_claim_expires_at_epoch <= 0
+        || validate_slug(
+            "provider stop canary controller claim id",
+            &reservation.controller_claim_id,
+            256,
+        )
+        .is_err()
+        || reservation.controller_claim_revision == 0
+        || reservation.controller_claim_expires_at_epoch <= 0
+        || reservation.child_pid <= 1
+        || reservation.child_start_ticks == 0
+        || match reservation.state.as_str() {
+            "release_requested" => {
+                reservation
+                    .release_request_digest
+                    .as_ref()
+                    .is_none_or(|digest| {
+                        digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    || reservation
+                        .release_idempotency_key
+                        .as_ref()
+                        .is_none_or(|key| {
+                            validate_slug("provider stop canary release idempotency key", key, 128)
+                                .is_err()
+                        })
+            }
+            _ => {
+                reservation.release_request_digest.is_some()
+                    || reservation.release_idempotency_key.is_some()
+            }
+        }
+        || reservation.created_at.is_empty()
+        || reservation.updated_at.is_empty()
+    {
+        return Err(store_invalid(
+            "provider stop canary reservation identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn provider_stop_canary_reservation(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<Option<ProviderStopCanaryReservationRecord>, CliError> {
+    let Some(reservation) =
+        read_provider_stop_canary_reservation(context, &assignment.assignment_id)?
+    else {
+        return Ok(None);
+    };
+    validate_provider_stop_canary_reservation(&reservation, assignment)?;
+    Ok(Some(reservation))
+}
+
+pub(crate) fn store_provider_stop_canary_reservation(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    reservation: &ProviderStopCanaryReservationRecord,
+) -> Result<(), CliError> {
+    validate_provider_stop_canary_reservation(reservation, assignment)?;
+    if assignment.account_handoff.is_some()
+        || assignment.runtime_stop.is_some()
+        || assignment.claim_revocation.is_some()
+    {
+        return Err(CliError::unavailable(
+            "provider-stop-canary-request-conflict",
+            "another exact assignment mutation reservation is active",
+            None,
+        ));
+    }
+    if let Some(existing) =
+        read_provider_stop_canary_reservation(context, &assignment.assignment_id)?
+    {
+        validate_provider_stop_canary_reservation(&existing, assignment)?;
+        let same_identity = existing.request_digest == reservation.request_digest
+            && existing.idempotency_key == reservation.idempotency_key
+            && existing.run_id == reservation.run_id
+            && existing.controller == reservation.controller
+            && existing.worker == reservation.worker
+            && existing.reserved_revision == reservation.reserved_revision
+            && existing.activity_revision == reservation.activity_revision
+            && existing.runtime_identity_digest == reservation.runtime_identity_digest
+            && existing.worker_claim_id == reservation.worker_claim_id
+            && existing.worker_claim_revision == reservation.worker_claim_revision
+            && existing.worker_claim_expires_at_epoch == reservation.worker_claim_expires_at_epoch
+            && existing.controller_claim_id == reservation.controller_claim_id
+            && existing.controller_claim_revision == reservation.controller_claim_revision
+            && existing.controller_claim_expires_at_epoch
+                == reservation.controller_claim_expires_at_epoch
+            && existing.child_pid == reservation.child_pid
+            && existing.child_start_ticks == reservation.child_start_ticks
+            && existing.created_at == reservation.created_at;
+        let transition_valid = matches!(
+            (existing.state.as_str(), reservation.state.as_str()),
+            ("stop_requested", "stop_requested" | "stopped")
+                | ("stopped", "stopped" | "release_requested")
+                | ("release_requested", "release_requested")
+        );
+        let release_identity_valid = match (existing.state.as_str(), reservation.state.as_str()) {
+            ("stopped", "release_requested") => {
+                existing.release_request_digest.is_none()
+                    && existing.release_idempotency_key.is_none()
+                    && reservation.release_request_digest.is_some()
+                    && reservation.release_idempotency_key.is_some()
+            }
+            ("release_requested", "release_requested") => {
+                existing.release_request_digest == reservation.release_request_digest
+                    && existing.release_idempotency_key == reservation.release_idempotency_key
+            }
+            _ => {
+                existing.release_request_digest == reservation.release_request_digest
+                    && existing.release_idempotency_key == reservation.release_idempotency_key
+            }
+        };
+        if !same_identity || !transition_valid || !release_identity_valid {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-request-conflict",
+                "a different exact provider stop canary reservation owns the assignment",
+                None,
+            ));
+        }
+    } else if reservation.state != "stop_requested" {
+        return Err(CliError::data(
+            "provider-stop-canary-reservation-missing",
+            "provider stop canary state cannot advance without its exact admission reservation",
+            None,
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(reservation)
+        .map_err(|_| store_invalid("provider stop canary reservation is invalid"))?;
+    let path = provider_stop_canary_reservation_path(context, &assignment.assignment_id)?;
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+pub(crate) fn clear_provider_stop_canary_reservation(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    request_digest: &str,
+    idempotency_key: &str,
+) -> Result<(), CliError> {
+    let Some(reservation) = provider_stop_canary_reservation(context, assignment)? else {
+        return Ok(());
+    };
+    if reservation.request_digest != request_digest
+        || reservation.idempotency_key != idempotency_key
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-request-conflict",
+            "provider stop canary reservation does not match finalization",
+            None,
+        ));
+    }
+    match fs::remove_file(provider_stop_canary_reservation_path(
+        context,
+        &assignment.assignment_id,
+    )?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
+}
+
+pub(crate) fn clear_adopted_provider_stop_canary_reservation(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<(), CliError> {
+    let Some(reservation) =
+        read_provider_stop_canary_reservation(context, &assignment.assignment_id)?
+    else {
+        return Ok(());
+    };
+    if assignment.revision != reservation.reserved_revision.saturating_add(1)
+        || assignment.primary_manager == reservation.controller
+    {
+        // A reservation owned at the current or another revision is not the
+        // post-commit adoption artifact this replay is allowed to consume.
+        return Ok(());
+    }
+    let mut prior = assignment.clone();
+    prior.run_id = reservation.run_id.clone();
+    prior.primary_manager = reservation.controller.clone();
+    prior.revision = reservation.reserved_revision;
+    validate_provider_stop_canary_reservation(&reservation, &prior)?;
+    if assignment.worker.as_ref() != Some(&reservation.worker) {
+        return Err(CliError::unavailable(
+            "provider-stop-canary-request-conflict",
+            "adoption replay does not own the current exact canary reservation",
+            None,
+        ));
+    }
+    let fence_digest = session_provider_stop_canary_fence_request_digest(
+        context,
+        &assignment.assignment_id,
+        &reservation.worker,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-fence-missing",
+            "adoption replay requires its exact session-owned execution fence",
+            None,
+        )
+    })?;
+    if fence_digest != reservation.request_digest {
+        return Err(CliError::unavailable(
+            "provider-stop-canary-request-conflict",
+            "adoption replay reservation and session fence disagree",
+            None,
+        ));
+    }
+    match fs::remove_file(provider_stop_canary_reservation_path(
+        context,
+        &assignment.assignment_id,
+    )?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
 }
 
 fn read_worker_reentry_identity(
@@ -4038,6 +4617,162 @@ pub(crate) fn packet_path(context: &CliContext, digest: &str) -> Result<PathBuf,
     let root = ensure_orchestration_root(context)?.join(PACKETS_DIR);
     ensure_private_directory(&root)?;
     Ok(root.join(digest.trim_start_matches("sha256:")))
+}
+
+fn controller_claim_binding_path(context: &CliContext, run_id: &str) -> Result<PathBuf, CliError> {
+    validate_slug("run id", run_id, 128)?;
+    let root = ensure_orchestration_root(context)?.join(CONTROLLER_CLAIM_BINDINGS_DIR);
+    ensure_private_directory(&root)?;
+    Ok(root.join(packet_digest_bytes(run_id.as_bytes()).trim_start_matches("sha256:")))
+}
+
+pub(crate) fn load_controller_claim_binding(
+    context: &CliContext,
+    run: &RunRecord,
+) -> Result<Option<ControllerClaimBinding>, CliError> {
+    let path = controller_claim_binding_path(context, &run.run_id)?;
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        64 * 1024,
+        "controller claim binding permissions are unsafe",
+        "controller claim binding exceeds byte limit",
+        "controller claim binding changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    let binding: ControllerClaimBinding = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| store_invalid("controller claim binding is invalid"))?;
+    validate_controller_claim_binding(&binding, run)?;
+    Ok(Some(binding))
+}
+
+/// Create the authenticated claim provenance sidecar for a newly committed
+/// run. Callers hold the orchestration registry lock so sidecar and registry
+/// ordering is serialized. Writing the sidecar first is crash-safe: an orphan
+/// is ignored until a matching run exists.
+pub(crate) fn create_controller_claim_binding(
+    context: &CliContext,
+    run: &RunRecord,
+    identity: ControllerClaimIdentity,
+) -> Result<(), CliError> {
+    if let Some(binding) = load_controller_claim_binding(context, run)? {
+        if binding.lineage.len() == 1
+            && binding.lineage[0].claim_id == identity.claim_id
+            && binding.lineage[0].controller == identity.controller
+            && binding.lineage[0].acquisition_revision == identity.acquisition_revision
+            && binding.lineage[0].work_context_digest == identity.work_context_digest
+        {
+            return Ok(());
+        }
+        return Err(CliError::data(
+            "controller-claim-provenance-conflict",
+            "controller claim provenance already exists for the new run id",
+            Some(json!({ "run_id": run.run_id })),
+        ));
+    }
+    store_controller_claim_binding(
+        context,
+        &ControllerClaimBinding {
+            schema_version: CONTROLLER_CLAIM_BINDING_SCHEMA.to_string(),
+            run_id: run.run_id.clone(),
+            objective_packet_digest: run.objective_packet_digest.clone(),
+            lineage: vec![identity],
+        },
+    )
+}
+
+/// Append a rebind successor without changing the v1 run record shape. A
+/// failed registry save may leave a pending successor in this sidecar; readers
+/// select the newest identity matching the committed run controller.
+pub(crate) fn append_controller_claim_binding(
+    context: &CliContext,
+    run: &RunRecord,
+    identity: ControllerClaimIdentity,
+) -> Result<bool, CliError> {
+    let mut binding = load_controller_claim_binding(context, run)?.ok_or_else(|| {
+        CliError::data(
+            "controller-claim-provenance-required",
+            "pre-provenance run cannot infer controller-claim ownership from context equality",
+            Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+        )
+    })?;
+    if binding.lineage.last().is_some_and(|current| {
+        current.claim_id == identity.claim_id
+            && current.controller == identity.controller
+            && current.work_context_digest == identity.work_context_digest
+    }) {
+        return Ok(false);
+    }
+    if binding.lineage.len() >= 16 {
+        return Err(CliError::data(
+            "controller-claim-lineage-full",
+            "controller claim successor lineage reached its retention limit",
+            Some(json!({ "run_id": run.run_id })),
+        ));
+    }
+    binding.lineage.push(identity);
+    store_controller_claim_binding(context, &binding)?;
+    Ok(true)
+}
+
+pub(crate) fn controller_claim_identity_for_run(
+    context: &CliContext,
+    run: &RunRecord,
+) -> Result<Option<ControllerClaimIdentity>, CliError> {
+    Ok(
+        load_controller_claim_binding(context, run)?.and_then(|binding| {
+            binding
+                .lineage
+                .into_iter()
+                .rev()
+                .find(|identity| identity.controller == run.controller)
+        }),
+    )
+}
+
+fn store_controller_claim_binding(
+    context: &CliContext,
+    binding: &ControllerClaimBinding,
+) -> Result<(), CliError> {
+    let path = controller_claim_binding_path(context, &binding.run_id)?;
+    let bytes = serde_json::to_vec_pretty(binding)
+        .map_err(|_| store_invalid("controller claim binding is invalid"))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(store_invalid("controller claim binding exceeds byte limit"));
+    }
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())
+}
+
+fn validate_controller_claim_binding(
+    binding: &ControllerClaimBinding,
+    run: &RunRecord,
+) -> Result<(), CliError> {
+    if binding.schema_version != CONTROLLER_CLAIM_BINDING_SCHEMA
+        || binding.run_id != run.run_id
+        || binding.objective_packet_digest != run.objective_packet_digest
+        || binding.lineage.is_empty()
+        || binding.lineage.len() > 16
+    {
+        return Err(store_invalid("controller claim binding is invalid"));
+    }
+    validate_digest(&binding.objective_packet_digest)?;
+    for identity in &binding.lineage {
+        validate_slug("controller claim id", &identity.claim_id, 256)?;
+        validate_session_ref(&identity.controller)?;
+        if identity.acquisition_revision == 0 {
+            return Err(store_invalid(
+                "controller claim binding revision is invalid",
+            ));
+        }
+        validate_digest(&identity.work_context_digest)?;
+        if identity.bound_at.is_empty() {
+            return Err(store_invalid(
+                "controller claim binding timestamp is invalid",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn group_cleanup_progress_path(context: &CliContext, key: &str) -> Result<PathBuf, CliError> {
@@ -5871,6 +6606,88 @@ fn store_unavailable() -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_stop_canary_store_fences_exact_release_replay_identity() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: Some("test-host".to_string()),
+        };
+        let controller = SessionRef {
+            machine: None,
+            session_id: "main-canary".to_string(),
+            session_incarnation: "main-canary-incarnation".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let worker = SessionRef {
+            machine: None,
+            session_id: "worker-canary".to_string(),
+            session_incarnation: "worker-canary-incarnation".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let assignment: AssignmentRecord = serde_json::from_value(json!({
+            "schema_version": ASSIGNMENT_SCHEMA,
+            "assignment_id": "assignment-canary",
+            "run_id": "run-canary",
+            "revision": 3,
+            "state": "working",
+            "task_summary": "provider stop canary",
+            "private_packet_digest": format!("sha256:{}", "a".repeat(64)),
+            "primary_manager": controller,
+            "worker": worker,
+            "created_at": "2030-01-01T00:00:00Z",
+            "updated_at": "2030-01-01T00:00:00Z"
+        }))
+        .expect("assignment");
+        let mut reservation = ProviderStopCanaryReservationRecord {
+            schema_version: PROVIDER_STOP_CANARY_RESERVATION_SCHEMA.to_string(),
+            state: "stop_requested".to_string(),
+            request_digest: "b".repeat(64),
+            idempotency_key: "stop-canary-key".to_string(),
+            run_id: assignment.run_id.clone(),
+            controller: assignment.primary_manager.clone(),
+            worker: assignment.worker.clone().expect("worker"),
+            reserved_revision: assignment.revision,
+            activity_revision: 7,
+            runtime_identity_digest: "c".repeat(64),
+            worker_claim_id: "worker-claim".to_string(),
+            worker_claim_revision: 2,
+            worker_claim_expires_at_epoch: 1_893_456_000,
+            controller_claim_id: "controller-claim".to_string(),
+            controller_claim_revision: 3,
+            controller_claim_expires_at_epoch: 1_893_456_000,
+            child_pid: 42,
+            child_start_ticks: 99,
+            release_request_digest: None,
+            release_idempotency_key: None,
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+            updated_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        store_provider_stop_canary_reservation(&context, &assignment, &reservation)
+            .expect("initial reservation");
+        reservation.state = "stopped".to_string();
+        store_provider_stop_canary_reservation(&context, &assignment, &reservation)
+            .expect("stopped reservation");
+        reservation.state = "release_requested".to_string();
+        reservation.release_request_digest = Some("d".repeat(64));
+        reservation.release_idempotency_key = Some("release-canary-key".to_string());
+        store_provider_stop_canary_reservation(&context, &assignment, &reservation)
+            .expect("release reservation");
+
+        let mut conflicting = reservation.clone();
+        conflicting.release_request_digest = Some("e".repeat(64));
+        conflicting.release_idempotency_key = Some("different-release-key".to_string());
+        let error = store_provider_stop_canary_reservation(&context, &assignment, &conflicting)
+            .expect_err("release replay identity must be immutable");
+        assert_eq!(error.code(), "provider-stop-canary-request-conflict");
+        assert_eq!(
+            provider_stop_canary_reservation(&context, &assignment)
+                .expect("stored reservation")
+                .expect("reservation"),
+            reservation
+        );
+    }
 
     #[test]
     fn group_cleanup_progress_receipt_decoder_enforces_one_v1_v2_contract() {

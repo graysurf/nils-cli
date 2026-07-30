@@ -31,12 +31,14 @@ use crate::coordination::context::{
 use crate::orchestration::{
     self, ACCOUNT_HANDOFF_RESERVATION_SCHEMA, ASSIGNMENT_INPUT_SCHEMA, ASSIGNMENT_SCHEMA,
     AccountHandoffReservationRecord, AssignmentRecord, CHECKPOINT_INPUT_SCHEMA,
-    GroupCleanupProgressReceipt, IdempotencyReceipt, LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA,
-    PACKET_SCHEMA, RunCheckpoint, RunRecord, SUBMIT_RECOVERY_SCHEMA, SessionRef,
-    SubmitRecoveryRecord, TimedRelationship, WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA,
-    WORKER_QUARANTINE_SCHEMA, WORKER_READINESS_STOP_PROOF_SCHEMA,
-    WORKER_RUNTIME_STOP_RESERVATION_SCHEMA, WorkerClaimRevocationReservationRecord,
-    WorkerQuarantineRecord, WorkerReadinessStopProofRecord, WorkerRuntimeStopReservationRecord,
+    ControllerClaimIdentity, GroupCleanupProgressReceipt, IdempotencyReceipt,
+    LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA, PACKET_SCHEMA,
+    PROVIDER_STOP_CANARY_RESERVATION_SCHEMA, ProviderStopCanaryReservationRecord, RunCheckpoint,
+    RunRecord, SUBMIT_RECOVERY_SCHEMA, SessionRef, SubmitRecoveryRecord, TimedRelationship,
+    WORKER_CLAIM_REVOCATION_RESERVATION_SCHEMA, WORKER_QUARANTINE_SCHEMA,
+    WORKER_READINESS_STOP_PROOF_SCHEMA, WORKER_RUNTIME_STOP_RESERVATION_SCHEMA,
+    WorkerClaimRevocationReservationRecord, WorkerQuarantineRecord, WorkerReadinessStopProofRecord,
+    WorkerRuntimeStopReservationRecord,
 };
 use crate::{
     CliContext, CliError, PromptDelivery, SessionRecord, SessionRegistryFence,
@@ -64,7 +66,7 @@ const WORKER_PROMPT_OBSERVATION_MAX_READERS: usize = 4;
 static ACTIVE_WORKER_PROMPT_OBSERVATION_READERS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
-const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start --await-ready -> worker bootstrap\n  worker supervise -> accept -> retire -> close\n\nMACRO-FIRST RECOVERY:\n  Use worker supervise for repeatable diagnosis. Use self recover only for this\n  exact Main Agent controller's stale broker. Guidance continuity and managed\n  account handoff use their typed worker actions. Use worker reassign only when\n  supervision proves safe reassignment. If a macro stops, continue from its\n  last_proven_safe_state with worker diagnose, submit-recovery, cancel,\n  account-handoff-cancel, or retire. Account handoff cancellation requires the\n  current assignment revision and --authorize-account-change.\n  never resend a prompt or inject an unbounded/manual Enter.\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent self recover --idempotency-key controller-recover-001 --format json\n  main-agent worker start --assignment-file assignment.json --await-ready 5m --idempotency-key start-001 --format json\n  main-agent worker supervise ASSIGNMENT_ID --format json\n  main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason \"pre-claim bootstrap failure\" --idempotency-key reassign-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
+const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start --await-ready -> worker bootstrap\n  worker supervise -> accept -> closeout (retires terminal workers and closes)\n\nMACRO-FIRST RECOVERY:\n  Use worker supervise for repeatable diagnosis. Use self recover only for this\n  exact Main Agent controller's stale broker. Guidance continuity and managed\n  account handoff use their typed worker actions. Use worker reassign only when\n  supervision proves safe reassignment. If a macro stops, continue from its\n  last_proven_safe_state with worker diagnose, submit-recovery, cancel,\n  account-handoff-cancel, retire, or exact closeout replay. Account handoff\n  cancellation requires the current assignment revision and\n  --authorize-account-change. Never resend a prompt or inject an\n  unbounded/manual Enter.\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request. A partial closeout reuses its original run revision, checkpoint,\n  and key because its progress receipt owns later stage revisions.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent self recover --idempotency-key controller-recover-001 --format json\n  main-agent worker start --assignment-file assignment.json --await-ready 5m --idempotency-key start-001 --format json\n  main-agent worker supervise ASSIGNMENT_ID --format json\n  main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason \"pre-claim bootstrap failure\" --idempotency-key reassign-001 --format json\n  main-agent closeout --if-run-revision 7 --checkpoint-file final.json --idempotency-key closeout-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -119,6 +121,9 @@ enum MainAgentCommand {
     Adopt(AssignmentMutationArgs),
     /// Close this run after all assignments are terminal.
     Close(RunMutationArgs),
+    /// Persist the final checkpoint, retire terminal workers, close the run,
+    /// and release only the controller claim bound to this run.
+    Closeout(CloseoutArgs),
     /// Fast-path: create an ephemeral run, single assignment, and launch in one
     /// call. The run auto-closes once the worker is torn down.
     Quick(QuickArgs),
@@ -308,6 +313,13 @@ enum WorkerCommand {
     /// reconcile-stopped.
     #[command(name = "stop-claimed-runtime")]
     StopClaimedRuntime(WorkerStopClaimedRuntimeArgs),
+    /// Stop only the exact Codex child of an explicitly armed canary worker,
+    /// leaving its bounded supervisor and tmux runtime live for classification.
+    #[command(name = "stop-provider-canary")]
+    StopProviderCanary(WorkerProviderStopCanaryArgs),
+    /// Release an exact stopped canary wrapper so the worker runtime exits.
+    #[command(name = "release-provider-canary")]
+    ReleaseProviderCanary(WorkerProviderStopCanaryArgs),
     /// Terminalize a working assignment whose exact worker runtime is durably
     /// stopped, revoking only that worker's claim without sending input,
     /// deleting the run, or touching its managed worktree.
@@ -422,6 +434,20 @@ struct WorkerStopRuntimeArgs {
 
 #[derive(Clone, Debug, Args)]
 struct WorkerStopClaimedRuntimeArgs {
+    assignment_id: String,
+    /// Exact worker incarnation currently bound to the assignment.
+    #[arg(long)]
+    worker_incarnation: String,
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
+    if_revision: u64,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerProviderStopCanaryArgs {
     assignment_id: String,
     /// Exact worker incarnation currently bound to the assignment.
     #[arg(long)]
@@ -690,6 +716,20 @@ struct RunMutationArgs {
     format: OutputFormat,
 }
 
+#[derive(Clone, Debug, Args)]
+struct CloseoutArgs {
+    /// Expected run revision before the closeout macro performs any stage.
+    #[arg(long)]
+    if_run_revision: u64,
+    /// Private final checkpoint JSON file.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    checkpoint_file: PathBuf,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 pub(crate) const GROUP_CLEANUP_SCHEMA: &str = "agent-session.main-agent-group-cleanup.v1";
 pub(crate) const GROUP_CLEANUP_REQUEST_SCHEMA: &str =
     "agent-session.main-agent-group-cleanup-request.v1";
@@ -845,6 +885,15 @@ struct AssignmentInput {
     /// omit it keep an identical request digest and stored-packet digest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     depends_on: Vec<String>,
+    /// Explicit production-only opt-in for the bounded B2 provider-stop canary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_stop_canary: Option<ProviderStopCanaryInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderStopCanaryInput {
+    schema_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -981,6 +1030,7 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
         MainAgentCommand::Handoff(args) => run_handoff(context, args.clone()),
         MainAgentCommand::Adopt(args) => run_adopt(context, args.clone()),
         MainAgentCommand::Close(args) => run_close(context, args.clone()),
+        MainAgentCommand::Closeout(args) => run_closeout(context, args.clone()),
         MainAgentCommand::Quick(args) => run_quick(context, args.clone()),
         MainAgentCommand::PacketSchema(_) => Ok(objective_packet_schema_example()),
         MainAgentCommand::Completion(_) => unreachable!(),
@@ -996,6 +1046,7 @@ fn main_agent_capabilities(provider: RuntimeHookProduct) -> Value {
         "capabilities": {
             "runtime_checkpoint_file": "main-agent.runtime-checkpoint-file.v1",
             "runtime_hook_checkpoint_write": runtime_hook_checkpoint_write,
+            "run_wide_closeout": "main-agent.run-wide-closeout.v1",
         }
     })
 }
@@ -1295,6 +1346,18 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
         &args.idempotency_key,
         &session_authority,
     )?;
+    let claim_snapshot = crate::coordination::claims::main_agent_controller_claim_snapshot(
+        context,
+        &record,
+        &packet.work_context,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "controller-claim-provenance-unavailable",
+            "Main Agent init could not bind the exact authenticated controller claim",
+            None,
+        )
+    })?;
     let mutation = (|| {
         let mut locked = orchestration::lock_registry(context)?;
         if let Some(value) = idempotency_replay(
@@ -1324,7 +1387,11 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
                     &packet_digest,
                     args.if_revision,
                 )?;
-                if rebound {
+                let identity =
+                    controller_claim_identity(context, &record, &incarnation, &claim_snapshot)?;
+                let binding_changed =
+                    orchestration::append_controller_claim_binding(context, existing, identity)?;
+                if rebound || binding_changed {
                     existing.controller = session_ref(context, &record, &incarnation);
                     existing.revision = existing.revision.saturating_add(1);
                     existing.updated_at = timestamp();
@@ -1385,6 +1452,11 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
                     created_at: now.clone(),
                     updated_at: now,
                 };
+                orchestration::create_controller_claim_binding(
+                    context,
+                    &run,
+                    controller_claim_identity(context, &record, &incarnation, &claim_snapshot)?,
+                )?;
                 let outcome = run_outcome(&run, false);
                 locked.registry.runs.insert(run_id, run);
                 store_receipt(
@@ -1515,6 +1587,18 @@ fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliE
         &args.idempotency_key,
         &rebind_authority,
     )?;
+    let claim_snapshot = crate::coordination::claims::main_agent_controller_claim_snapshot(
+        context,
+        &record,
+        &packet.work_context,
+    )?
+    .ok_or_else(|| {
+        CliError::data(
+            "controller-claim-provenance-unavailable",
+            "Main Agent rebind could not bind the exact authenticated controller claim",
+            None,
+        )
+    })?;
 
     let mutation = (|| {
         let mut locked = orchestration::lock_registry(context)?;
@@ -1549,7 +1633,10 @@ fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliE
             .runs
             .get_mut(&run_id)
             .expect("selected run was revalidated");
-        if rebound {
+        let identity = controller_claim_identity(context, &record, &incarnation, &claim_snapshot)?;
+        let binding_changed =
+            orchestration::append_controller_claim_binding(context, existing, identity)?;
+        if rebound || binding_changed {
             existing.controller = session_ref(context, &record, &incarnation);
             existing.revision = existing.revision.saturating_add(1);
             existing.updated_at = timestamp();
@@ -1595,6 +1682,28 @@ fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliE
             ))
         }
     }
+}
+
+fn controller_claim_identity(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    snapshot: &crate::coordination::claims::ControllerClaimSnapshot,
+) -> Result<ControllerClaimIdentity, CliError> {
+    if snapshot.session_id != record.id || snapshot.session_incarnation != incarnation {
+        return Err(CliError::data(
+            "controller-claim-provenance-conflict",
+            "controller claim identity does not match the authenticated session",
+            None,
+        ));
+    }
+    Ok(ControllerClaimIdentity {
+        claim_id: snapshot.claim_id.clone(),
+        controller: session_ref(context, record, incarnation),
+        acquisition_revision: snapshot.revision,
+        work_context_digest: snapshot.work_context_digest.clone(),
+        bound_at: timestamp(),
+    })
 }
 
 fn signal_rebind_authority_lock_for_test(stage: &str) -> Result<(), CliError> {
@@ -2842,6 +2951,12 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
         WorkerCommand::ReconcileRecovery(args) => run_worker_reconcile_recovery(context, args),
         WorkerCommand::StopRuntime(args) => run_worker_stop_runtime(context, args),
         WorkerCommand::StopClaimedRuntime(args) => run_worker_stop_claimed_runtime(context, args),
+        WorkerCommand::StopProviderCanary(args) => {
+            run_worker_provider_stop_canary(context, args, false)
+        }
+        WorkerCommand::ReleaseProviderCanary(args) => {
+            run_worker_provider_stop_canary(context, args, true)
+        }
         WorkerCommand::ReconcileStopped(args) => run_worker_reconcile_stopped(context, args),
         WorkerCommand::RevokeClaim(args) => run_worker_revoke_claim(context, args),
         WorkerCommand::Cancel(args) => run_worker_cancel(context, args),
@@ -3363,6 +3478,11 @@ fn run_worker_start_single_input(
                 // bounded raw path until worker creation crosses a typed
                 // `agent-session serve` launch boundary.
                 app_server_managed: false,
+                provider_stop_canary: launch_input.provider_stop_canary.is_some(),
+                provider_stop_canary_assignment_id: launch_input
+                    .provider_stop_canary
+                    .as_ref()
+                    .map(|_| assignment_id.clone()),
                 initial_codex_account: None,
                 initial_title_state: None,
                 initial_agent_profile: None,
@@ -4766,7 +4886,7 @@ fn retry_stable_worker_session_id(assignment_id: &str, request_digest: &str) -> 
 }
 
 fn ensure_worker_launch_matches(
-    _context: &CliContext,
+    context: &CliContext,
     worker: &SessionRecord,
     input: &AssignmentInput,
     expected_prompts: &[&str],
@@ -4781,10 +4901,20 @@ fn ensure_worker_launch_matches(
         .as_deref()
         .and_then(|path| fs::read_to_string(path).ok())
         .is_some_and(|prompt| expected_prompts.contains(&prompt.as_str()));
+    let canary_matches = input.provider_stop_canary.is_some()
+        == matches!(
+            crate::provider_stop_canary_state(context, worker),
+            Ok(crate::ProviderStopCanaryState::Armed
+                | crate::ProviderStopCanaryState::Ready
+                | crate::ProviderStopCanaryState::StopRequested
+                | crate::ProviderStopCanaryState::StoppedWrapperLive
+                | crate::ProviderStopCanaryState::Released)
+        );
     if worker.agent != input.launch.agent
         || !worker_cwd_matches
         || worker.coordination_mode != input.launch.coordination_mode
         || !prompt_matches
+        || !canary_matches
     {
         return Err(CliError::data(
             "assignment-start-conflict",
@@ -6489,6 +6619,8 @@ fn send_reserved_submit_recovery(
     {
         return Err("worker-incarnation-changed".to_string());
     }
+    pause_submit_recovery_for_test("before_serialized_send")
+        .map_err(|error| error.code().to_string())?;
     send_submit_recovery_input_serialized(
         context,
         &worker_record,
@@ -6963,6 +7095,7 @@ fn run_worker_diagnose(context: &CliContext, args: WorkerDiagnoseArgs) -> Result
 fn run_worker_supervise(context: &CliContext, args: WorkerDiagnoseArgs) -> Result<Value, CliError> {
     let diagnosis = diagnose_worker(context, &args.assignment_id)?;
     let schema_version = match diagnosis["schema_version"].as_str() {
+        Some("main-agent.worker-diagnose-result.v6") => "main-agent.worker-supervise-result.v6",
         Some("main-agent.worker-diagnose-result.v5") => "main-agent.worker-supervise-result.v5",
         Some("main-agent.worker-diagnose-result.v4") => "main-agent.worker-supervise-result.v4",
         Some("main-agent.worker-diagnose-result.v3") => "main-agent.worker-supervise-result.v3",
@@ -7305,7 +7438,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     );
     let worker_unreachable =
         assignment.worker.is_some() && matches!(&session_evidence, DiagnosticEvidence::Absent(_));
-    let mut evidence_unavailable = packet_evidence.is_unavailable_or_mismatched()
+    let evidence_unavailable = packet_evidence.is_unavailable_or_mismatched()
         || session_evidence.is_unavailable_or_mismatched()
         || activity_evidence.is_unavailable_or_mismatched()
         || coordination_evidence.is_unavailable_or_mismatched()
@@ -7340,11 +7473,41 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     let durable_runtime_running =
         durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Running);
     // A visible tmux wrapper cannot overrule exact stopped process evidence.
-    // Treat the contradiction as fail-closed evidence rather than allowing
-    // live-worker classifications such as `healthy_progress`.
-    if durable_runtime_stopped && worker_status == "running" {
-        evidence_unavailable = true;
-    }
+    // The canary supervisor additionally supplies exact-child proof while its
+    // own managed runtime remains live. Both paths receive distinct typed,
+    // non-healthy classifications so generic evidence never advertises canary
+    // release authority.
+    let provider_stop_canary_stopped_wrapper_live = worker_status == "running"
+        && session_evidence.value().is_some_and(|record| {
+            matches!(
+                crate::provider_stop_canary_state(context, record),
+                Ok(crate::ProviderStopCanaryState::StoppedWrapperLive
+                    | crate::ProviderStopCanaryState::Released)
+            )
+        });
+    let provider_process_stopped_wrapper_live = worker_status == "running"
+        && (durable_runtime_stopped || provider_stop_canary_stopped_wrapper_live);
+    let provider_stop_canary_reservation = if provider_stop_canary_stopped_wrapper_live {
+        orchestration::provider_stop_canary_reservation(context, &assignment)?
+    } else {
+        None
+    };
+    let provider_stop_canary_authorized =
+        provider_stop_canary_reservation
+            .as_ref()
+            .is_some_and(|reservation| {
+                session_evidence.value().is_some_and(|record| {
+                    crate::provider_stop_canary_proof_matches_reservation(
+                        context,
+                        record,
+                        reservation,
+                    )
+                })
+            });
+    let provider_stop_canary_release_in_progress = provider_stop_canary_authorized
+        && provider_stop_canary_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.state == "release_requested");
     // The B2 fact: bootstrap already recorded the `working` checkpoint, so the
     // worker held its assignment-derived claim before its exact runtime died.
     // `worker_failed_preclaim` deliberately refuses this state, and the claim
@@ -7482,13 +7645,27 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         submitted: assignment.state == "submitted",
         reassignment_safe: new_assignment_safe,
     };
-    let (classification, next_action, automatic_retry_safe) = classify_worker_diagnosis(facts);
+    let operations_quiescent = active_operations == 0 && uncertain_operations == 0;
+    let (classification, next_action, automatic_retry_safe) =
+        classify_provider_stop_canary(ProviderStopCanaryClassificationFacts {
+            release_in_progress: provider_stop_canary_release_in_progress,
+            authorized_stopped: provider_stop_canary_authorized,
+            generic_stopped_wrapper_live: provider_process_stopped_wrapper_live,
+            operations_quiescent,
+            claimed_runtime_stop_in_flight,
+            runtime_stop_in_flight,
+            claim_revocation_in_flight,
+            account_handoff_in_flight,
+        })
+        .unwrap_or_else(|| classify_worker_diagnosis(facts));
     let recovery_action = worker_recovery_action(
         classification,
         &assignment,
         claim_id,
         claim_revision,
         claimed_runtime_stop_replay.as_ref(),
+        provider_stop_canary_authorized,
+        provider_stop_canary_reservation.as_ref(),
     );
 
     let activity_view = activity.map(|state| {
@@ -7500,7 +7677,14 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
             "attention_kind": attention_kind
         })
     });
-    let diagnosis_schema = if classification == "claimed_runtime_stop_in_progress" {
+    let diagnosis_schema = if matches!(
+        classification,
+        "provider_stop_canary_release_in_progress"
+            | "provider_process_stopped_wrapper_live"
+            | "process_runtime_stopped_wrapper_live_contradiction"
+    ) {
+        "main-agent.worker-diagnose-result.v6"
+    } else if classification == "claimed_runtime_stop_in_progress" {
         "main-agent.worker-diagnose-result.v5"
     } else if matches!(
         classification,
@@ -7606,7 +7790,14 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
             }
         }
     });
-    if diagnosis_schema == "main-agent.worker-diagnose-result.v5" {
+    if diagnosis_schema == "main-agent.worker-diagnose-result.v6" {
+        diagnosis["provider_stop_canary"] = json!({
+            "authorized": provider_stop_canary_authorized,
+            "provider_process_stopped": provider_process_stopped_wrapper_live,
+            "wrapper_live": provider_process_stopped_wrapper_live,
+            "bounded_hold_seconds": 120
+        });
+    } else if diagnosis_schema == "main-agent.worker-diagnose-result.v5" {
         diagnosis["claimed_runtime_stop"] = json!({
             "in_flight": claimed_runtime_stop_in_flight
         });
@@ -7628,6 +7819,8 @@ fn worker_recovery_action(
     claim_id: Option<&str>,
     claim_revision: Option<u64>,
     claimed_runtime_stop_replay: Option<&ClaimedRuntimeStopReplay>,
+    provider_stop_canary_authorized: bool,
+    provider_stop_canary_reservation: Option<&ProviderStopCanaryReservationRecord>,
 ) -> Value {
     let main_owner = json!({
         "role": "main",
@@ -7661,6 +7854,62 @@ fn worker_recovery_action(
         "argv": supervise
     });
     match classification {
+        "provider_stop_canary_release_in_progress" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v6");
+            debug_assert!(provider_stop_canary_authorized);
+            let reservation = provider_stop_canary_reservation
+                .expect("release-in-progress classification requires a durable reservation");
+            action["kind"] = json!("exact_provider_stop_canary_release_replay");
+            action["argv"] = json!([
+                "main-agent",
+                "worker",
+                "release-provider-canary",
+                assignment.assignment_id,
+                "--worker-incarnation",
+                reservation.worker.session_incarnation,
+                "--if-revision",
+                reservation.reserved_revision.to_string(),
+                "--idempotency-key",
+                reservation
+                    .release_idempotency_key
+                    .as_deref()
+                    .expect("release reservation requires an idempotency key"),
+                "--format",
+                "json"
+            ]);
+        }
+        "provider_process_stopped_wrapper_live" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v6");
+            debug_assert!(provider_stop_canary_authorized);
+            action["kind"] = json!("exact_provider_stop_canary_release");
+            let worker = assignment
+                .worker
+                .as_ref()
+                .expect("provider stop canary classification requires a bound worker");
+            action["argv_template"] = json!([
+                "main-agent",
+                "worker",
+                "release-provider-canary",
+                assignment.assignment_id,
+                "--worker-incarnation",
+                worker.session_incarnation,
+                "--if-revision",
+                assignment.revision.to_string(),
+                "--idempotency-key",
+                "<idempotency-key>",
+                "--format",
+                "json"
+            ]);
+            action["executable"] = json!(false);
+            action["required_inputs"] = json!(["idempotency_key"]);
+        }
+        "process_runtime_stopped_wrapper_live_contradiction" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v6");
+            action["kind"] = json!("identity_evidence_reconciliation");
+            action["executable"] = json!(false);
+            action["argv"] = Value::Null;
+            action["required_inputs"] = json!([]);
+        }
         "readiness_stop_required" => {
             action["schema_version"] = json!("main-agent.worker-recovery-action.v3");
             action["kind"] = json!("exact_worker_runtime_stop");
@@ -8053,6 +8302,51 @@ struct WorkerDiagnosisFacts {
     terminal_quiescent: bool,
     submitted: bool,
     reassignment_safe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProviderStopCanaryClassificationFacts {
+    release_in_progress: bool,
+    authorized_stopped: bool,
+    generic_stopped_wrapper_live: bool,
+    operations_quiescent: bool,
+    claimed_runtime_stop_in_flight: bool,
+    runtime_stop_in_flight: bool,
+    claim_revocation_in_flight: bool,
+    account_handoff_in_flight: bool,
+}
+
+fn classify_provider_stop_canary(
+    facts: ProviderStopCanaryClassificationFacts,
+) -> Option<(&'static str, &'static str, bool)> {
+    let mutation_owner_in_flight = facts.claimed_runtime_stop_in_flight
+        || facts.runtime_stop_in_flight
+        || facts.claim_revocation_in_flight
+        || facts.account_handoff_in_flight;
+    if !facts.operations_quiescent || mutation_owner_in_flight {
+        return None;
+    }
+    if facts.release_in_progress {
+        Some((
+            "provider_stop_canary_release_in_progress",
+            "replay only the exact durable provider stop canary release request",
+            false,
+        ))
+    } else if facts.authorized_stopped {
+        Some((
+            "provider_process_stopped_wrapper_live",
+            "preserve the exact worker and release only its revision- and incarnation-fenced provider stop canary",
+            false,
+        ))
+    } else if facts.generic_stopped_wrapper_live {
+        Some((
+            "process_runtime_stopped_wrapper_live_contradiction",
+            "preserve the exact worker and reconcile its contradictory process/runtime identity evidence without mutation",
+            false,
+        ))
+    } else {
+        None
+    }
 }
 
 fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'static str, bool) {
@@ -9736,6 +10030,42 @@ fn parse_reconcile_stopped_progress(
 /// active claim, controller authority loss prevents every target authority
 /// mutation; a fresh same-controller successor makes the progress roll-forward
 /// explicit and auditable.
+fn clear_reconciled_provider_stop_canary_fences(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<(), CliError> {
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "reconciled assignment has no bound worker for canary fence cleanup",
+            None,
+        )
+    })?;
+    let fence_digest = orchestration::session_provider_stop_canary_fence_request_digest(
+        context,
+        &assignment.assignment_id,
+        worker,
+    )?;
+    if let Some(reservation) = orchestration::provider_stop_canary_reservation(context, assignment)?
+    {
+        orchestration::clear_provider_stop_canary_reservation(
+            context,
+            assignment,
+            &reservation.request_digest,
+            &reservation.idempotency_key,
+        )?;
+    }
+    if let Some(request_digest) = fence_digest {
+        orchestration::clear_session_provider_stop_canary_fence(
+            context,
+            &assignment.assignment_id,
+            worker,
+            &request_digest,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_worker_reconcile_stopped(
     context: &CliContext,
     args: WorkerReconcileStoppedArgs,
@@ -9764,6 +10094,9 @@ fn run_worker_reconcile_stopped(
         &request_digest,
     )? {
         Some(value) if is_reconcile_stopped_terminal_result(&value) => {
+            if let Some(assignment) = registry.assignments.get(&args.assignment_id) {
+                clear_reconciled_provider_stop_canary_fences(context, assignment)?;
+            }
             return Ok(value);
         }
         Some(value) => Some(parse_reconcile_stopped_progress(
@@ -9800,6 +10133,7 @@ fn run_worker_reconcile_stopped(
             RECONCILE_STOPPED_QUARANTINE_REASON,
             &format!("sha256:{}", progress.runtime_identity_digest),
         )?;
+        clear_reconciled_provider_stop_canary_fences(context, assignment)?;
         progress
     } else {
         // Every precondition is proved directly rather than through the
@@ -9822,7 +10156,7 @@ fn run_worker_reconcile_stopped(
         ensure_assignment_mutation_admitted(
             context,
             &assignment,
-            AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::StoppedReconciliation,
         )?;
         if assignment.state != "working" {
             return Err(CliError::data(
@@ -9924,7 +10258,11 @@ fn run_worker_reconcile_stopped(
         ensure_primary_manager(current, &main, &main_incarnation)?;
         ensure_revision(args.if_revision, current.revision, "assignment")?;
         ensure_submit_recovery_not_in_flight(current)?;
-        ensure_assignment_mutation_admitted(context, current, AssignmentMutationOwner::Ordinary)?;
+        ensure_assignment_mutation_admitted(
+            context,
+            current,
+            AssignmentMutationOwner::StoppedReconciliation,
+        )?;
         if current.state != "working" {
             return Err(CliError::data(
                 "assignment-state-conflict",
@@ -9957,6 +10295,18 @@ fn run_worker_reconcile_stopped(
             terminal_revision,
             &proposed_quarantine,
         )?;
+        // A timed-out canary supervisor may already have stopped its wrapper
+        // before the explicit release result could clear the reservation.
+        // Exact stopped-runtime proof above makes reconciliation the only
+        // safe fallback owner. Retain the stale reservation through the
+        // terminal registry commit, then consume it; an interruption leaves
+        // a replayable progress receipt plus the still-fenced sidecar.
+        let canary_cleanup = orchestration::provider_stop_canary_reservation(context, current)?;
+        let canary_fence_digest = orchestration::session_provider_stop_canary_fence_request_digest(
+            context,
+            &current.assignment_id,
+            &worker,
+        )?;
         current.state = "cancelled".to_string();
         current.revision = terminal_revision;
         current.updated_at = terminalized_at;
@@ -9964,6 +10314,7 @@ fn run_worker_reconcile_stopped(
             "Terminalized after the exact worker runtime stopped post-claim: {}",
             args.reason
         ));
+        let terminal_assignment = current.clone();
         let progress = ReconcileStoppedProgressReceipt {
             schema_version: RECONCILE_STOPPED_PROGRESS_SCHEMA.to_string(),
             state: "in_progress".to_string(),
@@ -9994,6 +10345,23 @@ fn run_worker_reconcile_stopped(
         )?;
         locked.save()?;
         drop(locked);
+        pause_reconcile_stopped_for_test("before_canary_sidecar_cleanup")?;
+        if let Some(reservation) = canary_cleanup {
+            orchestration::clear_provider_stop_canary_reservation(
+                context,
+                &terminal_assignment,
+                &reservation.request_digest,
+                &reservation.idempotency_key,
+            )?;
+        }
+        if let Some(request_digest) = canary_fence_digest {
+            orchestration::clear_session_provider_stop_canary_fence(
+                context,
+                &terminal_assignment.assignment_id,
+                &worker,
+                &request_digest,
+            )?;
+        }
         drop(terminalization);
         drop(worker_lifecycle);
         progress
@@ -11021,6 +11389,771 @@ fn run_worker_revoke_claim(
     drop(locked);
     drop(worker_lifecycle);
     Ok(outcome)
+}
+
+fn clear_exact_terminal_provider_stop_canary_replay(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+    worker: &SessionRef,
+    assignment_revision: u64,
+    release_request_digest: &str,
+    release_idempotency_key: &str,
+) -> Result<(), CliError> {
+    let Some(reservation) = orchestration::provider_stop_canary_reservation(context, assignment)?
+    else {
+        return Ok(());
+    };
+    if reservation.state != "release_requested"
+        || reservation.release_request_digest.as_deref() != Some(release_request_digest)
+        || reservation.release_idempotency_key.as_deref() != Some(release_idempotency_key)
+        || reservation.controller != assignment.primary_manager
+        || reservation.worker != *worker
+        || reservation.reserved_revision != assignment_revision
+    {
+        return Err(CliError::unavailable(
+            "provider-stop-canary-request-conflict",
+            "terminal release replay does not own the current exact canary reservation",
+            None,
+        ));
+    }
+    orchestration::clear_provider_stop_canary_reservation(
+        context,
+        assignment,
+        &reservation.request_digest,
+        &reservation.idempotency_key,
+    )
+}
+
+fn run_worker_provider_stop_canary(
+    context: &CliContext,
+    args: WorkerProviderStopCanaryArgs,
+    release: bool,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
+        return Err(invalid_input("worker incarnation is invalid"));
+    }
+    let operation = if release {
+        "worker-release-provider-canary"
+    } else {
+        "worker-stop-provider-canary"
+    };
+    let (main, main_incarnation, controller_claim) =
+        crate::coordination::authenticate_any_from_file_with_active_claim_observational(
+            context, None,
+        )?;
+    let request_digest = crate::coordination::request_digest(
+        operation,
+        &json!({
+            "assignment_id": args.assignment_id,
+            "worker_incarnation": args.worker_incarnation,
+            "if_revision": args.if_revision
+        }),
+    );
+    let registry = orchestration::load_registry_readonly(context)?;
+    let terminal_replay = idempotency_replay(
+        &registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        operation,
+        &request_digest,
+    )?
+    .filter(|value| {
+        matches!(
+            value["schema_version"].as_str(),
+            Some(
+                "main-agent.worker-stop-provider-canary-result.v1"
+                    | "main-agent.worker-release-provider-canary-result.v1"
+            )
+        )
+    });
+    let run = require_current_main(&registry, &main, &main_incarnation)?;
+    let assignment = registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
+        .clone();
+    ensure_primary_manager(&assignment, &main, &main_incarnation)?;
+    ensure_revision(args.if_revision, assignment.revision, "assignment")?;
+    let worker = assignment.worker.clone().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "assignment has no bound worker canary",
+            None,
+        )
+    })?;
+    if worker.session_incarnation != args.worker_incarnation {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker incarnation does not match --worker-incarnation",
+            None,
+        ));
+    }
+    if let Some(value) = terminal_replay {
+        if release {
+            clear_exact_terminal_provider_stop_canary_replay(
+                context,
+                &assignment,
+                &worker,
+                args.if_revision,
+                &request_digest,
+                &args.idempotency_key,
+            )?;
+        }
+        return Ok(value);
+    }
+    ensure_submit_recovery_not_in_flight(&assignment)?;
+    ensure_assignment_mutation_admitted(
+        context,
+        &assignment,
+        AssignmentMutationOwner::ProviderStopCanary,
+    )?;
+    if assignment.state != "working" {
+        return Err(CliError::data(
+            "assignment-state-conflict",
+            "provider stop canary requires a working post-claim assignment",
+            Some(json!({ "state": assignment.state, "revision": assignment.revision })),
+        ));
+    }
+    let packet: AssignmentInput = serde_json::from_value(orchestration::read_packet(
+        context,
+        &assignment.private_packet_digest,
+    )?)
+    .map_err(|_| invalid_input("stored assignment packet is invalid"))?;
+    validate_assignment_input(&packet)?;
+    if packet
+        .provider_stop_canary
+        .as_ref()
+        .map(|value| value.schema_version.as_str())
+        != Some("main-agent.provider-process-stop-canary.v1")
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-not-authorized",
+            "the assignment packet did not explicitly authorize this canary",
+            None,
+        ));
+    }
+    let expected_work_context = assignment_worker_work_context(
+        context,
+        &registry,
+        &assignment,
+        "provider stop canary requires the packet repository",
+    )?;
+    drop(registry);
+
+    let _worker_lifecycle = acquire_session_record_lock(context, &worker.session_id)?;
+    let mut worker_record = load_session_record(context, &worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&worker, &worker_record, record_incarnation) {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "bound worker identity changed before provider stop canary admission",
+            None,
+        ));
+    }
+    let _activity_lock =
+        crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
+    let assignment_reservation =
+        orchestration::provider_stop_canary_reservation(context, &assignment)?;
+    let release_replay_stopped = release
+        && assignment_reservation.as_ref().is_some_and(|reservation| {
+            reservation.state == "release_requested"
+                && reservation.release_request_digest.as_deref() == Some(request_digest.as_str())
+                && reservation.release_idempotency_key.as_deref()
+                    == Some(args.idempotency_key.as_str())
+        })
+        && crate::coordination_runtime_evidence(&worker_record)?.status
+            == crate::CoordinationRuntimeStatus::Stopped;
+    let (activity_revision, runtime_identity_digest) = if release {
+        let reservation = assignment_reservation.as_ref().ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-not-stopped",
+                "provider stop canary release requires a durable stopped reservation",
+                None,
+            )
+        })?;
+        let evidence = crate::coordination_runtime_evidence(&worker_record)?;
+        if !release_replay_stopped && evidence.status != crate::CoordinationRuntimeStatus::Running {
+            return Err(CliError::data(
+                "provider-stop-canary-wrapper-not-live",
+                "provider stop canary release requires the exact wrapper runtime to remain live",
+                None,
+            ));
+        }
+        (
+            reservation.activity_revision,
+            reservation.runtime_identity_digest.clone(),
+        )
+    } else {
+        current_authoritative_idle_live_evidence(
+            context,
+            &worker_record,
+            &assignment,
+            "worker stop-provider-canary",
+        )?
+    };
+    if !release_replay_stopped
+        && session_status(&resolve_tmux_bin(None), &worker_record) != "running"
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-wrapper-not-live",
+            "provider stop canary requires the exact tmux wrapper to remain live",
+            None,
+        ));
+    }
+    let stop_replay_child_stopped = !release
+        && assignment_reservation.as_ref().is_some_and(|reservation| {
+            crate::provider_stop_canary_stopped_child_proven(
+                context,
+                &worker_record,
+                &reservation.request_digest,
+                &reservation.idempotency_key,
+                reservation.child_pid,
+                reservation.child_start_ticks,
+            )
+            .unwrap_or(false)
+        });
+    let mut claimed_guard = if release || stop_replay_child_stopped {
+        None
+    } else {
+        Some(crate::coordination::lock_claimed_worker_runtime_stop(
+            context,
+            &worker_record,
+            &worker.session_incarnation,
+            &expected_work_context,
+            &main.id,
+            &main_incarnation,
+            &controller_claim,
+        )?)
+    };
+    let admitted_worker_claim = claimed_guard
+        .as_ref()
+        .map(|guard| guard.worker_claim().clone());
+    if let Some(worker_claim) = admitted_worker_claim.as_ref() {
+        let minimum_expiry = crate::coordination::now_epoch()
+            .saturating_add(claimed_runtime_stop_termination_margin_secs());
+        if worker_claim.expires_at_epoch <= minimum_expiry {
+            return Err(CliError::data(
+                "worker-claim-ttl-insufficient",
+                "provider stop canary requires the exact worker claim beyond its bounded stop transition",
+                None,
+            ));
+        }
+        if controller_claim.expires_at_epoch <= minimum_expiry {
+            return Err(CliError::data(
+                "controller-claim-ttl-insufficient",
+                "provider stop canary requires the exact Main claim beyond its bounded stop transition",
+                None,
+            ));
+        }
+    }
+
+    let mut locked = orchestration::lock_registry(context)?;
+    if let Some(value) = idempotency_replay(
+        &locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        operation,
+        &request_digest,
+    )? && matches!(
+        value["schema_version"].as_str(),
+        Some(
+            "main-agent.worker-stop-provider-canary-result.v1"
+                | "main-agent.worker-release-provider-canary-result.v1"
+        )
+    ) {
+        if release {
+            let current_run_id = require_current_main(&locked.registry, &main, &main_incarnation)?
+                .run_id
+                .clone();
+            let current = locked
+                .registry
+                .assignments
+                .get(&args.assignment_id)
+                .filter(|current| current.run_id == current_run_id)
+                .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+            clear_exact_terminal_provider_stop_canary_replay(
+                context,
+                current,
+                &worker,
+                args.if_revision,
+                &request_digest,
+                &args.idempotency_key,
+            )?;
+        }
+        return Ok(value);
+    }
+    let current_run_id = require_current_main(&locked.registry, &main, &main_incarnation)?
+        .run_id
+        .clone();
+    let current = locked
+        .registry
+        .assignments
+        .get_mut(&args.assignment_id)
+        .filter(|current| current.run_id == current_run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(current, &main, &main_incarnation)?;
+    ensure_revision(args.if_revision, current.revision, "assignment")?;
+    if current.state != "working" || current.worker.as_ref() != Some(&worker) {
+        return Err(CliError::data(
+            "provider-stop-canary-conflict",
+            "assignment changed before provider stop canary admission",
+            None,
+        ));
+    }
+    let now = timestamp();
+    let existing_reservation = orchestration::provider_stop_canary_reservation(context, current)?;
+    let reservation = if release {
+        let mut reservation = existing_reservation.ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-not-stopped",
+                "provider stop canary release requires a durable stopped reservation",
+                None,
+            )
+        })?;
+        if reservation.state == "stopped" {
+            reservation.state = "release_requested".to_string();
+            reservation.release_request_digest = Some(request_digest.clone());
+            reservation.release_idempotency_key = Some(args.idempotency_key.clone());
+            reservation.updated_at = now.clone();
+        } else if reservation.state != "release_requested"
+            || reservation.release_request_digest.as_deref() != Some(request_digest.as_str())
+            || reservation.release_idempotency_key.as_deref() != Some(args.idempotency_key.as_str())
+        {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-request-conflict",
+                "a different exact provider stop canary release owns the assignment",
+                None,
+            ));
+        }
+        orchestration::store_provider_stop_canary_reservation(context, current, &reservation)?;
+        reservation
+    } else if let Some(reservation) = existing_reservation {
+        if reservation.request_digest != request_digest
+            || reservation.idempotency_key != args.idempotency_key
+            || !matches!(reservation.state.as_str(), "stop_requested" | "stopped")
+        {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-request-conflict",
+                "a different exact provider stop canary request owns the assignment",
+                None,
+            ));
+        }
+        if !stop_replay_child_stopped
+            && (admitted_worker_claim.as_ref().is_none_or(|worker_claim| {
+                reservation.worker_claim_id != worker_claim.claim_id
+                    || reservation.worker_claim_revision != worker_claim.revision
+                    || reservation.worker_claim_expires_at_epoch != worker_claim.expires_at_epoch
+            }) || reservation.controller_claim_id != controller_claim.claim_id
+                || reservation.controller_claim_revision != controller_claim.revision
+                || reservation.controller_claim_expires_at_epoch
+                    != controller_claim.expires_at_epoch)
+        {
+            return Err(CliError::data(
+                "provider-stop-canary-claim-changed",
+                "provider stop canary replay requires the exact admitted claim tuples",
+                None,
+            ));
+        }
+        reservation.clone()
+    } else {
+        let worker_claim = admitted_worker_claim.as_ref().ok_or_else(|| {
+            CliError::data(
+                "claim-not-active",
+                "provider stop canary requires the exact assignment-derived worker claim",
+                None,
+            )
+        })?;
+        let (child_pid, child_start_ticks) =
+            crate::provider_stop_canary_ready_child_identity(context, &worker_record)?;
+        let reservation = ProviderStopCanaryReservationRecord {
+            schema_version: PROVIDER_STOP_CANARY_RESERVATION_SCHEMA.to_string(),
+            state: "stop_requested".to_string(),
+            request_digest: request_digest.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+            run_id: current.run_id.clone(),
+            controller: current.primary_manager.clone(),
+            worker: worker.clone(),
+            reserved_revision: current.revision,
+            activity_revision,
+            runtime_identity_digest: runtime_identity_digest.clone(),
+            worker_claim_id: worker_claim.claim_id.clone(),
+            worker_claim_revision: worker_claim.revision,
+            worker_claim_expires_at_epoch: worker_claim.expires_at_epoch,
+            controller_claim_id: controller_claim.claim_id.clone(),
+            controller_claim_revision: controller_claim.revision,
+            controller_claim_expires_at_epoch: controller_claim.expires_at_epoch,
+            child_pid,
+            child_start_ticks,
+            release_request_digest: None,
+            release_idempotency_key: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        orchestration::store_provider_stop_canary_reservation(context, current, &reservation)?;
+        reservation
+    };
+    if !release {
+        orchestration::persist_session_provider_stop_canary_fence(
+            context,
+            current,
+            &reservation.request_digest,
+        )?;
+    }
+    let progress = json!({
+        "schema_version": if release {
+            "main-agent.worker-release-provider-canary-progress.v1"
+        } else {
+            "main-agent.worker-stop-provider-canary-progress.v1"
+        },
+        "state": "in_progress",
+        "assignment_id": current.assignment_id,
+        "assignment_revision": current.revision,
+        "worker": worker,
+        "request_digest": request_digest
+    });
+    store_receipt(
+        &mut locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        operation,
+        &request_digest,
+        progress,
+    )?;
+    locked.save()?;
+    drop(locked);
+    let mutation_fence_owner = if let Some(guard) = claimed_guard.as_mut() {
+        Some(guard.persist_claim_mutation_fence(
+            context,
+            &assignment.assignment_id,
+            args.if_revision,
+            &reservation.request_digest,
+        )?)
+    } else {
+        None
+    };
+    drop(claimed_guard);
+
+    if !release && !stop_replay_child_stopped {
+        let worker_claim = crate::coordination::ControllerClaimTuple {
+            claim_id: reservation.worker_claim_id.clone(),
+            revision: reservation.worker_claim_revision,
+            expires_at_epoch: reservation.worker_claim_expires_at_epoch,
+        };
+        let admitted_controller_claim = crate::coordination::ControllerClaimTuple {
+            claim_id: reservation.controller_claim_id.clone(),
+            revision: reservation.controller_claim_revision,
+            expires_at_epoch: reservation.controller_claim_expires_at_epoch,
+        };
+        let minimum_expiry = crate::coordination::now_epoch()
+            .saturating_add(claimed_runtime_stop_termination_margin_secs());
+        let exact_claims_active =
+            crate::coordination::verify_claimed_worker_runtime_stop_claim_fence(
+                context,
+                &assignment.assignment_id,
+                args.if_revision,
+                &worker.session_id,
+                &worker.session_incarnation,
+                &worker_claim,
+                &main.id,
+                &main_incarnation,
+                &admitted_controller_claim,
+                &reservation.request_digest,
+                true,
+            )?;
+        if !exact_claims_active
+            || worker_claim.expires_at_epoch <= minimum_expiry
+            || admitted_controller_claim.expires_at_epoch <= minimum_expiry
+        {
+            return Err(CliError::data(
+                "claim-ttl-insufficient-before-provider-stop",
+                "provider stop canary requires both exact claims beyond the bounded stop transition",
+                None,
+            ));
+        }
+    }
+
+    let state = crate::provider_stop_canary_state(context, &worker_record)?;
+    let transition_needs_authorization = if release {
+        match state {
+            crate::ProviderStopCanaryState::StoppedWrapperLive => {
+                crate::release_provider_stop_canary(
+                    context,
+                    &worker_record,
+                    &request_digest,
+                    &args.idempotency_key,
+                )?;
+                true
+            }
+            crate::ProviderStopCanaryState::Released
+                if crate::provider_stop_canary_release_identity_matches(
+                    context,
+                    &worker_record,
+                    &request_digest,
+                    &args.idempotency_key,
+                ) =>
+            {
+                !release_replay_stopped
+            }
+            _ => {
+                return Err(CliError::data(
+                    "provider-stop-canary-not-stopped",
+                    "provider stop canary release requires the exact stopped-child proof",
+                    None,
+                ));
+            }
+        }
+    } else {
+        match state {
+            crate::ProviderStopCanaryState::Ready => {
+                crate::request_provider_stop_canary(
+                    context,
+                    &worker_record,
+                    &request_digest,
+                    &args.idempotency_key,
+                )?;
+                true
+            }
+            crate::ProviderStopCanaryState::StopRequested
+                if crate::provider_stop_canary_request_identity_matches(
+                    context,
+                    &worker_record,
+                    &request_digest,
+                    &args.idempotency_key,
+                ) =>
+            {
+                true
+            }
+            crate::ProviderStopCanaryState::StoppedWrapperLive
+                if crate::provider_stop_canary_request_identity_matches(
+                    context,
+                    &worker_record,
+                    &request_digest,
+                    &args.idempotency_key,
+                ) =>
+            {
+                false
+            }
+            _ => {
+                return Err(CliError::unavailable(
+                    "provider-stop-canary-request-conflict",
+                    "the canary has no matching exact stop request",
+                    None,
+                ));
+            }
+        }
+    };
+    if transition_needs_authorization {
+        crate::authorize_provider_stop_canary_transition(
+            context,
+            &worker_record,
+            &main.id,
+            &main_incarnation,
+            if release { "release" } else { "stop" },
+            &request_digest,
+            &args.idempotency_key,
+        )?;
+    }
+    pause_provider_stop_canary_after_request_for_test(release)?;
+
+    let deadline = Instant::now() + provider_stop_canary_transition_timeout();
+    loop {
+        if release {
+            let runtime = crate::coordination_runtime_evidence(&worker_record)?;
+            if runtime.status == crate::CoordinationRuntimeStatus::Stopped
+                && session_status(&resolve_tmux_bin(None), &worker_record) == "stopped"
+            {
+                break;
+            }
+        } else if crate::provider_stop_canary_stopped_child_proven(
+            context,
+            &worker_record,
+            &reservation.request_digest,
+            &reservation.idempotency_key,
+            reservation.child_pid,
+            reservation.child_start_ticks,
+        )? && session_status(&resolve_tmux_bin(None), &worker_record) == "running"
+        {
+            crate::record_provider_stop_canary_proof(
+                context,
+                &mut worker_record,
+                &reservation.request_digest,
+                &reservation.idempotency_key,
+                reservation.child_pid,
+                reservation.child_start_ticks,
+            )?;
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-transition-timeout",
+                "the exact provider stop canary transition did not complete within its bound",
+                None,
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    drop(mutation_fence_owner);
+    let admitted_worker_claim = crate::coordination::ControllerClaimTuple {
+        claim_id: reservation.worker_claim_id.clone(),
+        revision: reservation.worker_claim_revision,
+        expires_at_epoch: reservation.worker_claim_expires_at_epoch,
+    };
+    let worker_claim_preserved = crate::coordination::exact_claim_active_observational(
+        context,
+        &worker.session_id,
+        &worker.session_incarnation,
+        &admitted_worker_claim,
+    )?;
+
+    let mut locked = orchestration::lock_registry(context)?;
+    let current_run_id = require_current_main(&locked.registry, &main, &main_incarnation)?
+        .run_id
+        .clone();
+    let current = locked
+        .registry
+        .assignments
+        .get_mut(&args.assignment_id)
+        .filter(|current| current.run_id == current_run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(current, &main, &main_incarnation)?;
+    ensure_revision(args.if_revision, current.revision, "assignment")?;
+    let mut committed = orchestration::provider_stop_canary_reservation(context, current)?
+        .filter(|current| {
+            current.request_digest == reservation.request_digest
+                && current.idempotency_key == reservation.idempotency_key
+                && current.worker == worker
+        })
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-conflict",
+                "provider stop canary reservation changed before finalization",
+                None,
+            )
+        })?;
+    if release {
+        if committed.state != "release_requested"
+            || committed.release_request_digest.as_deref() != Some(request_digest.as_str())
+            || committed.release_idempotency_key.as_deref() != Some(args.idempotency_key.as_str())
+        {
+            return Err(CliError::data(
+                "provider-stop-canary-conflict",
+                "provider stop canary release reservation changed before finalization",
+                None,
+            ));
+        }
+    } else {
+        committed.state = "stopped".to_string();
+        committed.updated_at = timestamp();
+        orchestration::store_provider_stop_canary_reservation(context, current, &committed)?;
+    }
+    let assignment_view = public_assignment_view(current);
+    let outcome = json!({
+        "schema_version": if release {
+            "main-agent.worker-release-provider-canary-result.v1"
+        } else {
+            "main-agent.worker-stop-provider-canary-result.v1"
+        },
+        "assignment": assignment_view,
+        "provider_process": "stopped",
+        "tmux_wrapper": if release { "stopped" } else { "running" },
+        "runtime_identity_digest": runtime_identity_digest,
+        "activity_revision": activity_revision,
+        "worker_claim_preserved": worker_claim_preserved,
+        "operation_quiescent": true,
+        "input_sent": false,
+        "automatic_retry_safe": false,
+        "next_action": if release {
+            format!(
+                "main-agent worker reconcile-stopped {} --if-revision {} --reason <REASON> --idempotency-key <KEY> --format json",
+                current.assignment_id, current.revision
+            )
+        } else {
+            format!(
+                "main-agent worker supervise {} --format json; then main-agent worker release-provider-canary {} --worker-incarnation {} --if-revision {} --idempotency-key <KEY> --format json",
+                current.assignment_id,
+                current.assignment_id,
+                worker.session_incarnation,
+                current.revision
+            )
+        }
+    });
+    store_receipt(
+        &mut locked.registry,
+        &main,
+        &main_incarnation,
+        &args.idempotency_key,
+        operation,
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    drop(locked);
+    fail_provider_stop_canary_after_terminal_receipt_for_test(release)?;
+    if release {
+        orchestration::clear_provider_stop_canary_reservation(
+            context,
+            &assignment,
+            &reservation.request_digest,
+            &reservation.idempotency_key,
+        )?;
+    }
+    Ok(outcome)
+}
+
+fn fail_provider_stop_canary_after_terminal_receipt_for_test(
+    release: bool,
+) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if release
+        && env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_FAIL_AFTER_TERMINAL_RECEIPT")
+            .as_deref()
+            == Ok("release")
+    {
+        return Err(CliError::runtime(
+            "test-provider-stop-canary-terminal-receipt-interruption",
+            "provider stop canary test interruption after terminal receipt",
+            None,
+        ));
+    }
+    let _ = release;
+    Ok(())
+}
+
+fn pause_provider_stop_canary_after_request_for_test(release: bool) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_FAIL_AFTER_REQUEST").as_deref()
+        == Ok(if release { "release" } else { "stop" })
+    {
+        return Err(CliError::runtime(
+            "test-provider-stop-canary-interruption",
+            "provider stop canary test interruption after the durable request",
+            None,
+        ));
+    }
+    let _ = release;
+    Ok(())
+}
+
+fn provider_stop_canary_transition_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_TRANSITION_MS")
+        .as_deref()
+        .map(str::parse::<u64>)
+        && let Ok(value) = value
+        && value > 0
+    {
+        return Duration::from_millis(value);
+    }
+    Duration::from_secs(10)
 }
 
 const STOP_CLAIMED_RUNTIME_RESULT_SCHEMA: &str = "main-agent.worker-stop-claimed-runtime-result.v1";
@@ -14900,10 +16033,12 @@ fn ensure_worker_claim_revocation_not_in_flight(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssignmentMutationOwner {
     Ordinary,
+    StoppedReconciliation,
     AccountHandoff,
     RuntimeStop,
     ClaimedRuntimeStop,
     ClaimRevocation,
+    ProviderStopCanary,
 }
 
 fn ensure_assignment_mutation_admitted(
@@ -14911,6 +16046,24 @@ fn ensure_assignment_mutation_admitted(
     assignment: &AssignmentRecord,
     owner: AssignmentMutationOwner,
 ) -> Result<(), CliError> {
+    if owner != AssignmentMutationOwner::ProviderStopCanary
+        && orchestration::provider_stop_canary_reservation(context, assignment)?.is_some()
+    {
+        // Stopped reconciliation re-establishes exact process and tmux proof
+        // under the session-record lock before committing. Let that sole
+        // cleanup owner reach its stronger checks; every other mutation stays
+        // fenced without relying on an unlocked preliminary runtime sample.
+        if owner != AssignmentMutationOwner::StoppedReconciliation {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-in-flight",
+                "assignment mutation is fenced until the exact provider stop canary is released",
+                Some(json!({
+                    "assignment_id": assignment.assignment_id,
+                    "revision": assignment.revision
+                })),
+            ));
+        }
+    }
     if orchestration::assignment_worker_reentry_in_progress(context, assignment)? {
         return Err(CliError::unavailable(
             "worker-reentry-in-flight",
@@ -16455,6 +17608,13 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         "adopt",
         &request_digest,
     )? {
+        let assignment = locked
+            .registry
+            .assignments
+            .get(&args.assignment_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
+            .clone();
+        orchestration::clear_adopted_provider_stop_canary_reservation(context, &assignment)?;
         return Ok(value);
     }
     let snapshot = locked
@@ -16473,6 +17633,8 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
             None,
         ));
     }
+    let orphan_provider_stop_canary =
+        prepare_orphan_provider_stop_canary_adoption(context, &snapshot)?;
     let adopted_revision = snapshot.revision.checked_add(1).ok_or_else(|| {
         CliError::data(
             "orchestration-revision-capacity",
@@ -16621,21 +17783,23 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         )?;
     }
 
-    let claimed_stop_rebind =
-        if snapshot.runtime_stop.is_none() && snapshot.claim_revocation.is_none() {
-            let rebound = orchestration::rebind_stopped_claimed_runtime_stop_for_adopt(
-                context,
-                &snapshot,
-                &run.controller,
-                adopted_revision,
-            )?;
-            if rebound {
-                pause_runtime_stop_adopt_for_test("after_claimed_stop_rebind")?;
-            }
-            rebound
-        } else {
-            false
-        };
+    let claimed_stop_rebind = if snapshot.runtime_stop.is_none()
+        && snapshot.claim_revocation.is_none()
+        && orphan_provider_stop_canary.is_none()
+    {
+        let rebound = orchestration::rebind_stopped_claimed_runtime_stop_for_adopt(
+            context,
+            &snapshot,
+            &run.controller,
+            adopted_revision,
+        )?;
+        if rebound {
+            pause_runtime_stop_adopt_for_test("after_claimed_stop_rebind")?;
+        }
+        rebound
+    } else {
+        false
+    };
     let (runtime_stop_rebind, claim_revocation_rebind) = if let Some(reservation) =
         snapshot.runtime_stop.as_ref()
     {
@@ -16766,7 +17930,7 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
                 successor_replay.is_none(),
             )),
         )
-    } else if claimed_stop_rebind {
+    } else if claimed_stop_rebind || orphan_provider_stop_canary.is_some() {
         (None, None)
     } else {
         ensure_assignment_mutation_admitted(context, &snapshot, AssignmentMutationOwner::Ordinary)?;
@@ -16844,7 +18008,89 @@ fn run_adopt(context: &CliContext, args: AssignmentMutationArgs) -> Result<Value
         pause_claim_revocation_adopt_for_test("before_registry_save")?;
     }
     locked.save()?;
+    if orphan_provider_stop_canary
+        .as_ref()
+        .and_then(|adoption| adoption.reservation.as_ref())
+        .is_some()
+    {
+        pause_provider_stop_canary_adopt_for_test(
+            "after_registry_save_before_canary_sidecar_cleanup",
+        )?;
+        let adopted = locked
+            .registry
+            .assignments
+            .get(&args.assignment_id)
+            .expect("saved adopted assignment remains present")
+            .clone();
+        orchestration::clear_adopted_provider_stop_canary_reservation(context, &adopted)?;
+    }
     Ok(outcome)
+}
+
+struct OrphanProviderStopCanaryAdoption {
+    reservation: Option<ProviderStopCanaryReservationRecord>,
+}
+
+fn prepare_orphan_provider_stop_canary_adoption(
+    context: &CliContext,
+    assignment: &AssignmentRecord,
+) -> Result<Option<OrphanProviderStopCanaryAdoption>, CliError> {
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(None);
+    };
+    let reservation = orchestration::provider_stop_canary_reservation(context, assignment)?;
+    let fence_digest = orchestration::session_provider_stop_canary_fence_request_digest(
+        context,
+        &assignment.assignment_id,
+        worker,
+    )?;
+    if reservation.is_none() && fence_digest.is_none() {
+        return Ok(None);
+    }
+    let fence_digest = fence_digest.ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-fence-missing",
+            "orphan provider stop canary adoption requires its session-owned execution fence",
+            None,
+        )
+    })?;
+    if reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.request_digest != fence_digest)
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-fence-conflict",
+            "orphan provider stop canary reservation and session fence disagree",
+            None,
+        ));
+    }
+    let worker_record = load_session_record(context, &worker.session_id)?;
+    let record_incarnation = worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(worker, &worker_record, record_incarnation) {
+        return Err(CliError::data(
+            "worker-incarnation-changed",
+            "orphan provider stop canary worker identity changed",
+            None,
+        ));
+    }
+    let runtime = crate::coordination_runtime_evidence(&worker_record)?;
+    if runtime.status != crate::CoordinationRuntimeStatus::Stopped
+        || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+    {
+        return Err(CliError::unavailable(
+            "provider-stop-canary-orphan-not-quiescent",
+            "orphan provider stop canary adoption waits for bounded exact wrapper shutdown",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": worker.session_incarnation
+            })),
+        ));
+    }
+    Ok(Some(OrphanProviderStopCanaryAdoption { reservation }))
 }
 
 fn recover_missing_claim_revocation_quarantine_for_adopt(
@@ -16972,6 +18218,44 @@ fn pause_claim_revocation_adopt_for_test(stage: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn pause_provider_stop_canary_adopt_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ADOPT_BARRIER_STAGE").as_deref()
+        == Ok(stage)
+        && let Some(directory) =
+            env::var_os("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ADOPT_BARRIER_DIR")
+                .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "provider stop canary adopt test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), stage.as_bytes()).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "provider stop canary adopt test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "provider stop canary adopt test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = stage;
+    Ok(())
+}
+
 fn pause_runtime_stop_adopt_for_test(stage: &str) -> Result<(), CliError> {
     #[cfg(debug_assertions)]
     if env::var("NILS_AGENT_SESSION_TEST_RUNTIME_STOP_ADOPT_BARRIER_STAGE").as_deref() == Ok(stage)
@@ -17007,11 +18291,702 @@ fn pause_runtime_stop_adopt_for_test(stage: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Run-wide closeout macro. Each durable stage is recorded in the parent
+/// idempotency receipt before the next cross-registry side effect, allowing an
+/// exact replay to resume after interruption without inferring ownership from
+/// work-context equality.
+fn run_closeout(context: &CliContext, args: CloseoutArgs) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let checkpoint: CheckpointInput = crate::coordination::read_bounded_json(
+        &args.checkpoint_file,
+        64 * 1024,
+        "invalid-checkpoint",
+    )?;
+    validate_checkpoint(&checkpoint)?;
+    let request_digest = crate::coordination::request_digest(
+        "main-agent-closeout",
+        &json!({
+            "if_run_revision": args.if_run_revision,
+            "checkpoint": checkpoint
+        }),
+    );
+    let (record, incarnation) = authenticated_self(context)?;
+    orchestration::ensure_session_not_quarantined(context, &record)?;
+
+    let registry = orchestration::load_registry_readonly(context)?;
+    let replay = idempotency_replay(
+        &registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        "closeout",
+        &request_digest,
+    )?;
+    let mut progress = match replay {
+        Some(value) if value["schema_version"] == "main-agent.closeout-result.v1" => {
+            return Ok(value);
+        }
+        Some(value)
+            if value["schema_version"] == "main-agent.closeout-progress.v1"
+                && value["state"] == "in_progress" =>
+        {
+            value
+        }
+        Some(_) => {
+            return Err(CliError::data(
+                "idempotency-conflict",
+                "closeout receipt is not resumable",
+                None,
+            ));
+        }
+        None => {
+            let run = require_current_main(&registry, &record, &incarnation)?;
+            ensure_revision(args.if_run_revision, run.revision, "run")?;
+            let bound = orchestration::controller_claim_identity_for_run(context, run)?
+                .ok_or_else(|| {
+                CliError::data(
+                    "controller-claim-provenance-required",
+                    "run-wide closeout requires retained authenticated controller-claim provenance",
+                    Some(json!({ "run_id": run.run_id, "current_revision": run.revision })),
+                )
+            })?;
+            let observed = crate::coordination::claims::active_controller_claim_snapshot(
+                context,
+                &record,
+                &incarnation,
+            )?
+            .ok_or_else(|| {
+                CliError::data(
+                    "controller-claim-provenance-unavailable",
+                    "run-wide closeout requires the bound controller claim to be active at admission",
+                    None,
+                )
+            })?;
+            if observed.claim_id != bound.claim_id
+                || observed.session_id != bound.controller.session_id
+                || observed.session_incarnation != bound.controller.session_incarnation
+                || observed.work_context_digest != bound.work_context_digest
+            {
+                return Err(CliError::data(
+                    "controller-claim-provenance-conflict",
+                    "active controller claim does not match the run-owned claim binding",
+                    Some(json!({ "run_id": run.run_id })),
+                ));
+            }
+            let progress = json!({
+                "schema_version": "main-agent.closeout-progress.v1",
+                "state": "in_progress",
+                "run_id": run.run_id,
+                "expected_run_revision": args.if_run_revision,
+                "checkpoint_revision": Value::Null,
+                "final_run_revision": Value::Null,
+                "completed_stages": [],
+                "worker_dispositions": [],
+                "workers_absent": false,
+                "controller_claim": {
+                    "bound": true,
+                    "claim_id": bound.claim_id,
+                    "controller": bound.controller,
+                    "work_context_digest": bound.work_context_digest,
+                    "observed_revision": observed.revision,
+                    "disposition": "pending",
+                    "run_owned_claim_absent": false,
+                    "active_after": true
+                }
+            });
+            persist_closeout_receipt(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                progress.clone(),
+            )?;
+            progress
+        }
+    };
+    drop(registry);
+
+    if !closeout_stage_complete(&progress, "checkpoint") {
+        let current_revision = orchestration::load_registry_readonly(context)?
+            .runs
+            .get(
+                progress["run_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid_input("closeout progress run id is invalid"))?,
+            )
+            .map(|run| run.revision)
+            .ok_or_else(|| not_found("run-not-found", "Main Agent run was not found"))?;
+        let checkpoint_result = run_checkpoint(
+            context,
+            CheckpointArgs {
+                file: args.checkpoint_file.clone(),
+                if_revision: current_revision,
+                idempotency_key: compatible_child_idempotency_key(
+                    &args.idempotency_key,
+                    "checkpoint",
+                ),
+                format: OutputFormat::Json,
+            },
+        )?;
+        progress["checkpoint_revision"] = checkpoint_result["run"]["revision"].clone();
+        closeout_complete_stage(&mut progress, "checkpoint")?;
+        persist_closeout_receipt(
+            context,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            &request_digest,
+            progress.clone(),
+        )?;
+    }
+
+    if !closeout_stage_complete(&progress, "workers") {
+        loop {
+            let registry = orchestration::load_registry_readonly(context)?;
+            let run_id = progress["run_id"]
+                .as_str()
+                .ok_or_else(|| invalid_input("closeout progress run id is invalid"))?;
+            let next = registry
+                .assignments
+                .values()
+                .find(|assignment| {
+                    assignment.run_id == run_id
+                        && !progress["worker_dispositions"]
+                            .as_array()
+                            .is_some_and(|dispositions| {
+                                dispositions.iter().any(|disposition| {
+                                    disposition["assignment_id"] == assignment.assignment_id
+                                })
+                            })
+                })
+                .cloned();
+            drop(registry);
+            let Some(assignment) = next else {
+                let pending_cleanup = progress["worker_dispositions"]
+                    .as_array()
+                    .ok_or_else(|| invalid_input("closeout worker dispositions are invalid"))?
+                    .iter()
+                    .filter(|disposition| disposition["cleanup_pending"] == true)
+                    .filter_map(|disposition| {
+                        disposition["assignment_id"].as_str().map(str::to_string)
+                    })
+                    .collect::<Vec<_>>();
+                for assignment_id in pending_cleanup {
+                    let registry = orchestration::load_registry_readonly(context)?;
+                    let worker = registry
+                        .assignments
+                        .get(&assignment_id)
+                        .and_then(|assignment| assignment.worker.clone())
+                        .ok_or_else(|| {
+                            CliError::data(
+                                "closeout-cleanup-observation-unavailable",
+                                "retained worker cleanup identity is unavailable",
+                                Some(json!({ "assignment_id": assignment_id })),
+                            )
+                        })?;
+                    drop(registry);
+                    if worker_delete_tombstone_exists(context, &worker)? {
+                        persist_closeout_receipt(
+                            context,
+                            &record,
+                            &incarnation,
+                            &args.idempotency_key,
+                            &request_digest,
+                            progress.clone(),
+                        )?;
+                        return Ok(closeout_result(
+                            &progress,
+                            vec![json!({
+                                "assignment_id": assignment_id,
+                                "reason": "worker-cleanup-pending"
+                            })],
+                            true,
+                            true,
+                        ));
+                    }
+                    let disposition = progress["worker_dispositions"]
+                        .as_array_mut()
+                        .and_then(|dispositions| {
+                            dispositions
+                                .iter_mut()
+                                .find(|disposition| disposition["assignment_id"] == assignment_id)
+                        })
+                        .ok_or_else(|| {
+                            invalid_input("closeout worker cleanup disposition is invalid")
+                        })?;
+                    disposition["cleanup_pending"] = json!(false);
+                }
+                progress["workers_absent"] = Value::Bool(true);
+                closeout_complete_stage(&mut progress, "workers")?;
+                persist_closeout_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    progress.clone(),
+                )?;
+                break;
+            };
+            if !matches!(
+                assignment.state.as_str(),
+                "accepted" | "released" | "cancelled"
+            ) {
+                persist_closeout_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    progress.clone(),
+                )?;
+                return Ok(closeout_result(
+                    &progress,
+                    vec![json!({
+                        "assignment_id": assignment.assignment_id,
+                        "state": assignment.state,
+                        "reason": "assignment-not-retireable"
+                    })],
+                    false,
+                    true,
+                ));
+            }
+            let disposition = match run_worker_retire(
+                context,
+                AssignmentMutationArgs {
+                    assignment_id: assignment.assignment_id.clone(),
+                    if_revision: assignment.revision,
+                    idempotency_key: compatible_child_idempotency_key(
+                        &args.idempotency_key,
+                        &format!("retire-{}", assignment.assignment_id),
+                    ),
+                    format: OutputFormat::Json,
+                },
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    persist_closeout_receipt(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        progress.clone(),
+                    )?;
+                    return Ok(closeout_result(
+                        &progress,
+                        vec![json!({
+                            "assignment_id": assignment.assignment_id,
+                            "state": assignment.state,
+                            "reason": error.code(),
+                            "message": error.message()
+                        })],
+                        false,
+                        true,
+                    ));
+                }
+            };
+            progress["worker_dispositions"]
+                .as_array_mut()
+                .ok_or_else(|| invalid_input("closeout worker dispositions are invalid"))?
+                .push(disposition.clone());
+            persist_closeout_receipt(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                progress.clone(),
+            )?;
+            if disposition["cleanup_pending"] == true {
+                return Ok(closeout_result(
+                    &progress,
+                    vec![json!({
+                        "assignment_id": assignment.assignment_id,
+                        "state": assignment.state,
+                        "reason": "worker-cleanup-pending"
+                    })],
+                    true,
+                    true,
+                ));
+            }
+        }
+    }
+
+    let closeout_authority = if !closeout_stage_complete(&progress, "claim_release") {
+        let authority = crate::lock_exact_session_authority(context, &record.id)?
+            .ok_or_else(|| not_found("session-not-found", "authenticated session was not found"))?;
+        let locked_incarnation = authority
+            .record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .unwrap_or_default();
+        if authority.record.created_at != record.created_at || locked_incarnation != incarnation {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "authenticated session identity changed before closeout boundary",
+                None,
+            ));
+        }
+        Some(authority)
+    } else {
+        None
+    };
+
+    if !closeout_stage_complete(&progress, "run_close") {
+        let bound_claim_id = progress["controller_claim"]["claim_id"]
+            .as_str()
+            .ok_or_else(|| invalid_input("closeout bound claim id is invalid"))?;
+        if crate::coordination::claims::controller_claim_has_nonterminal_operation(
+            context,
+            &record,
+            &incarnation,
+            bound_claim_id,
+        )? {
+            persist_closeout_receipt(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                progress.clone(),
+            )?;
+            return Ok(closeout_result(
+                &progress,
+                vec![json!({ "reason": "operation-in-progress" })],
+                false,
+                true,
+            ));
+        }
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = registry
+            .runs
+            .get(
+                progress["run_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid_input("closeout progress run id is invalid"))?,
+            )
+            .ok_or_else(|| not_found("run-not-found", "Main Agent run was not found"))?;
+        let close = match run_close(
+            context,
+            RunMutationArgs {
+                if_revision: run.revision,
+                idempotency_key: compatible_child_idempotency_key(
+                    &args.idempotency_key,
+                    "run-close",
+                ),
+                format: OutputFormat::Json,
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                persist_closeout_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    progress.clone(),
+                )?;
+                return Ok(closeout_result(
+                    &progress,
+                    vec![json!({
+                        "reason": error.code(),
+                        "message": error.message()
+                    })],
+                    false,
+                    true,
+                ));
+            }
+        };
+        progress["final_run_revision"] = close["run"]["revision"].clone();
+        closeout_complete_stage(&mut progress, "run_close")?;
+        persist_closeout_receipt(
+            context,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            &request_digest,
+            progress.clone(),
+        )?;
+    }
+
+    if !closeout_stage_complete(&progress, "claim_release") {
+        let active = crate::coordination::claims::active_controller_claim_snapshot(
+            context,
+            &record,
+            &incarnation,
+        )?;
+        let bound_claim_id = progress["controller_claim"]["claim_id"]
+            .as_str()
+            .ok_or_else(|| invalid_input("closeout bound claim id is invalid"))?;
+        let bound_digest = progress["controller_claim"]["work_context_digest"]
+            .as_str()
+            .ok_or_else(|| invalid_input("closeout bound claim digest is invalid"))?;
+        match active {
+            Some(active)
+                if active.claim_id == bound_claim_id
+                    && active.work_context_digest == bound_digest =>
+            {
+                if let Err(error) = crate::coordination::claims::release_prelocked(
+                    context,
+                    cli::WorkContextReleaseArgs {
+                        session: record.id.clone(),
+                        claim: active.claim_id,
+                        if_revision: active.revision,
+                        capability_file: None,
+                        idempotency_key: compatible_child_idempotency_key(
+                            &args.idempotency_key,
+                            "claim-release",
+                        ),
+                        format: OutputFormat::Json,
+                    },
+                    closeout_authority
+                        .as_ref()
+                        .expect("closeout authority is held through claim disposition"),
+                ) {
+                    persist_closeout_receipt(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        progress.clone(),
+                    )?;
+                    return Ok(closeout_result(
+                        &progress,
+                        vec![json!({
+                            "reason": error.code(),
+                            "message": error.message()
+                        })],
+                        false,
+                        true,
+                    ));
+                }
+                progress["controller_claim"]["disposition"] = json!("released");
+                progress["controller_claim"]["run_owned_claim_absent"] = json!(true);
+                progress["controller_claim"]["active_after"] = json!(false);
+            }
+            Some(active) if active.claim_id != bound_claim_id => {
+                if crate::coordination::claims::controller_claim_is_active(
+                    context,
+                    &record,
+                    &incarnation,
+                    bound_claim_id,
+                )? {
+                    persist_closeout_receipt(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        progress.clone(),
+                    )?;
+                    return Ok(closeout_result(
+                        &progress,
+                        vec![json!({ "reason": "controller-claim-provenance-conflict" })],
+                        false,
+                        true,
+                    ));
+                }
+                progress["controller_claim"]["disposition"] = json!("preserved_unrelated");
+                progress["controller_claim"]["run_owned_claim_absent"] = json!(true);
+                progress["controller_claim"]["active_after"] = json!(true);
+            }
+            Some(_) => {
+                persist_closeout_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    progress.clone(),
+                )?;
+                return Ok(closeout_result(
+                    &progress,
+                    vec![json!({ "reason": "controller-claim-provenance-conflict" })],
+                    false,
+                    true,
+                ));
+            }
+            None => {
+                if crate::coordination::claims::controller_claim_is_active(
+                    context,
+                    &record,
+                    &incarnation,
+                    bound_claim_id,
+                )? {
+                    persist_closeout_receipt(
+                        context,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        progress.clone(),
+                    )?;
+                    return Ok(closeout_result(
+                        &progress,
+                        vec![json!({ "reason": "controller-claim-provenance-conflict" })],
+                        false,
+                        true,
+                    ));
+                }
+                progress["controller_claim"]["disposition"] = json!("already_absent");
+                progress["controller_claim"]["run_owned_claim_absent"] = json!(true);
+                progress["controller_claim"]["active_after"] = json!(false);
+            }
+        }
+        closeout_complete_stage(&mut progress, "claim_release")?;
+        persist_closeout_receipt(
+            context,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            &request_digest,
+            progress.clone(),
+        )?;
+    }
+
+    let final_registry = orchestration::load_registry_readonly(context)?;
+    let run = final_registry
+        .runs
+        .get(
+            progress["run_id"]
+                .as_str()
+                .ok_or_else(|| invalid_input("closeout progress run id is invalid"))?,
+        )
+        .ok_or_else(|| not_found("run-not-found", "Main Agent run was not found"))?;
+    let workers_absent = final_registry
+        .assignments
+        .values()
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .all(|assignment| {
+            matches!(assignment.state.as_str(), "released" | "cancelled")
+                && assignment
+                    .worker
+                    .as_ref()
+                    .is_none_or(|worker| !orchestration::session_ref_is_live(context, worker))
+        });
+    let provider_session_preserved = load_session_record(context, &record.id)
+        .is_ok_and(|current| current.created_at == record.created_at);
+    if run.state != "closed"
+        || !workers_absent
+        || !provider_session_preserved
+        || progress["controller_claim"]["run_owned_claim_absent"] != true
+    {
+        return Ok(closeout_result(
+            &progress,
+            vec![json!({ "reason": "closeout-final-readback-incomplete" })],
+            !workers_absent,
+            provider_session_preserved,
+        ));
+    }
+    progress["workers_absent"] = json!(true);
+    progress["final_run_revision"] = json!(run.revision);
+    closeout_complete_stage(&mut progress, "readback")?;
+    let outcome = closeout_result(&progress, Vec::new(), false, true);
+    persist_closeout_receipt(
+        context,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        &request_digest,
+        outcome.clone(),
+    )?;
+    Ok(outcome)
+}
+
+fn closeout_stage_complete(progress: &Value, stage: &str) -> bool {
+    progress["completed_stages"]
+        .as_array()
+        .is_some_and(|stages| stages.iter().any(|value| value == stage))
+}
+
+fn closeout_complete_stage(progress: &mut Value, stage: &str) -> Result<(), CliError> {
+    if !closeout_stage_complete(progress, stage) {
+        progress["completed_stages"]
+            .as_array_mut()
+            .ok_or_else(|| invalid_input("closeout completed stages are invalid"))?
+            .push(json!(stage));
+    }
+    Ok(())
+}
+
+fn closeout_result(
+    progress: &Value,
+    retained_exceptions: Vec<Value>,
+    cleanup_pending: bool,
+    provider_session_preserved: bool,
+) -> Value {
+    let run_closed = closeout_stage_complete(progress, "run_close");
+    let workers_absent = progress["workers_absent"].as_bool().unwrap_or(false);
+    let handoff_ready = run_closed
+        && workers_absent
+        && !cleanup_pending
+        && retained_exceptions.is_empty()
+        && provider_session_preserved
+        && progress["controller_claim"]["run_owned_claim_absent"] == true
+        && closeout_stage_complete(progress, "readback");
+    json!({
+        "schema_version": "main-agent.closeout-result.v1",
+        "run_id": progress["run_id"],
+        "expected_run_revision": progress["expected_run_revision"],
+        "checkpoint_revision": progress["checkpoint_revision"],
+        "final_run_revision": progress["final_run_revision"],
+        "progress_receipt": {
+            "schema_version": "main-agent.closeout-progress-receipt.v1",
+            "completed_stages": progress["completed_stages"]
+        },
+        "run_closed": run_closed,
+        "worker_dispositions": progress["worker_dispositions"],
+        "workers_absent": workers_absent,
+        "cleanup_pending": cleanup_pending,
+        "retained_exceptions": retained_exceptions,
+        "controller_claim": progress["controller_claim"],
+        "provider_session_preserved": provider_session_preserved,
+        "handoff_ready": handoff_ready
+    })
+}
+
+fn persist_closeout_receipt(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    outcome: Value,
+) -> Result<(), CliError> {
+    let mut locked = orchestration::lock_registry(context)?;
+    store_receipt(
+        &mut locked.registry,
+        record,
+        incarnation,
+        idempotency_key,
+        "closeout",
+        request_digest,
+        outcome,
+    )?;
+    locked.save()
+}
+
 fn run_close(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
     let (record, incarnation) = authenticated_self(context)?;
     ensure_active_claim(context, &record)?;
+    let request_digest = crate::coordination::request_digest("close", &args.if_revision);
     let mut locked = orchestration::lock_registry(context)?;
+    if let Some(value) = idempotency_replay(
+        &locked.registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        "close",
+        &request_digest,
+    )? {
+        return Ok(value);
+    }
     let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
     ensure_revision(args.if_revision, run.revision, "run")?;
     let nonterminal = locked
@@ -17039,7 +19014,6 @@ fn run_close(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliEr
     current.updated_at = timestamp();
     let outcome =
         json!({ "schema_version": "main-agent.close-result.v1", "run": public_run_view(current) });
-    let request_digest = crate::coordination::request_digest("close", &args.if_revision);
     store_receipt(
         &mut locked.registry,
         &record,
@@ -19715,6 +21689,14 @@ fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
     if AgentKind::from_name(&input.launch.agent).is_none() {
         return Err(invalid_input("assignment launch agent is invalid"));
     }
+    if let Some(canary) = input.provider_stop_canary.as_ref()
+        && (canary.schema_version != "main-agent.provider-process-stop-canary.v1"
+            || input.launch.agent != "codex")
+    {
+        return Err(invalid_input(
+            "provider stop canary requires a Codex launch and schema_version \"main-agent.provider-process-stop-canary.v1\"",
+        ));
+    }
     if input.launch.cwd.trim().is_empty() || input.launch.cwd.len() > 4096 {
         return Err(invalid_input("assignment launch cwd is invalid"));
     }
@@ -20097,6 +22079,8 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::ReconcileRecovery(_) => "worker-reconcile-recovery",
             WorkerCommand::StopRuntime(_) => "worker-stop-runtime",
             WorkerCommand::StopClaimedRuntime(_) => "worker-stop-claimed-runtime",
+            WorkerCommand::StopProviderCanary(_) => "worker-stop-provider-canary",
+            WorkerCommand::ReleaseProviderCanary(_) => "worker-release-provider-canary",
             WorkerCommand::ReconcileStopped(_) => "worker-reconcile-stopped",
             WorkerCommand::RevokeClaim(_) => "worker-revoke-claim",
             WorkerCommand::Cancel(_) => "worker-cancel",
@@ -20107,6 +22091,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
         MainAgentCommand::Handoff(_) => "handoff",
         MainAgentCommand::Adopt(_) => "adopt",
         MainAgentCommand::Close(_) => "close",
+        MainAgentCommand::Closeout(_) => "closeout",
         MainAgentCommand::Quick(_) => "quick",
         MainAgentCommand::PacketSchema(_) => "packet-schema",
         MainAgentCommand::Completion(_) => "completion",
@@ -20151,6 +22136,8 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::ReconcileRecovery(args) => args.format,
             WorkerCommand::StopRuntime(args) => args.format,
             WorkerCommand::StopClaimedRuntime(args) => args.format,
+            WorkerCommand::StopProviderCanary(args)
+            | WorkerCommand::ReleaseProviderCanary(args) => args.format,
             WorkerCommand::ReconcileStopped(args) => args.format,
             WorkerCommand::RevokeClaim(args) => args.format,
             WorkerCommand::Cancel(args) => args.format,
@@ -20161,6 +22148,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
         MainAgentCommand::Handoff(args) => args.format,
         MainAgentCommand::Adopt(args) => args.format,
         MainAgentCommand::Close(args) => args.format,
+        MainAgentCommand::Closeout(args) => args.format,
         MainAgentCommand::Quick(args) => args.format,
         MainAgentCommand::PacketSchema(args) => args.format,
         MainAgentCommand::Completion(_) => OutputFormat::Text,
@@ -26418,6 +28406,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_stop_canary_classification_yields_to_every_durable_mutation_owner() {
+        for release_in_progress in [false, true] {
+            let base = ProviderStopCanaryClassificationFacts {
+                release_in_progress,
+                authorized_stopped: !release_in_progress,
+                generic_stopped_wrapper_live: false,
+                operations_quiescent: true,
+                ..ProviderStopCanaryClassificationFacts::default()
+            };
+            assert!(
+                classify_provider_stop_canary(base).is_some(),
+                "a quiescent exact canary state must retain its typed classification"
+            );
+            for (owner, owned) in [
+                (
+                    "claimed-runtime-stop",
+                    ProviderStopCanaryClassificationFacts {
+                        claimed_runtime_stop_in_flight: true,
+                        ..base
+                    },
+                ),
+                (
+                    "runtime-stop",
+                    ProviderStopCanaryClassificationFacts {
+                        runtime_stop_in_flight: true,
+                        ..base
+                    },
+                ),
+                (
+                    "claim-revocation",
+                    ProviderStopCanaryClassificationFacts {
+                        claim_revocation_in_flight: true,
+                        ..base
+                    },
+                ),
+                (
+                    "account-handoff",
+                    ProviderStopCanaryClassificationFacts {
+                        account_handoff_in_flight: true,
+                        ..base
+                    },
+                ),
+            ] {
+                assert!(
+                    classify_provider_stop_canary(owned).is_none(),
+                    "{owner} must suppress every executable canary classification"
+                );
+            }
+            assert!(
+                classify_provider_stop_canary(ProviderStopCanaryClassificationFacts {
+                    operations_quiescent: false,
+                    ..base
+                })
+                .is_none(),
+                "active or uncertain operations must suppress every canary classification"
+            );
+        }
+    }
+
     /// A worker whose provider runtime exits during startup never reaches
     /// `main-agent bootstrap`, so it records no turn and holds no claim. It must
     /// still be recognised as a pre-claim failure: otherwise supervision reports
@@ -26925,9 +28973,11 @@ mod tests {
         );
         for owner in [
             AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::StoppedReconciliation,
             AssignmentMutationOwner::RuntimeStop,
             AssignmentMutationOwner::ClaimedRuntimeStop,
             AssignmentMutationOwner::ClaimRevocation,
+            AssignmentMutationOwner::ProviderStopCanary,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &account_owned, owner)
@@ -26962,9 +29012,11 @@ mod tests {
         );
         for owner in [
             AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::StoppedReconciliation,
             AssignmentMutationOwner::AccountHandoff,
             AssignmentMutationOwner::ClaimedRuntimeStop,
             AssignmentMutationOwner::ClaimRevocation,
+            AssignmentMutationOwner::ProviderStopCanary,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &runtime_owned, owner)
@@ -26981,8 +29033,8 @@ mod tests {
             request_digest: "c".repeat(64),
             idempotency_key: "revoke-key".to_string(),
             run_id: "run".to_string(),
-            controller,
-            worker,
+            controller: controller.clone(),
+            worker: worker.clone(),
             reserved_revision: 1,
             adopted_revision: None,
             terminal_revision: 2,
@@ -27000,15 +29052,81 @@ mod tests {
         );
         for owner in [
             AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::StoppedReconciliation,
             AssignmentMutationOwner::AccountHandoff,
             AssignmentMutationOwner::RuntimeStop,
             AssignmentMutationOwner::ClaimedRuntimeStop,
+            AssignmentMutationOwner::ProviderStopCanary,
         ] {
             assert_eq!(
                 ensure_assignment_mutation_admitted(&context, &revocation_owned, owner)
                     .unwrap_err()
                     .code(),
                 "worker-claim-revocation-in-flight"
+            );
+        }
+
+        let mut canary_owned = dep_assignment("assignment", "run", "working");
+        canary_owned.worker = Some(worker.clone());
+        let canary_reservation = ProviderStopCanaryReservationRecord {
+            schema_version: PROVIDER_STOP_CANARY_RESERVATION_SCHEMA.to_string(),
+            state: "stop_requested".to_string(),
+            request_digest: "e".repeat(64),
+            idempotency_key: "canary-stop-key".to_string(),
+            run_id: "run".to_string(),
+            controller: canary_owned.primary_manager.clone(),
+            worker,
+            reserved_revision: 1,
+            activity_revision: 9,
+            runtime_identity_digest: "f".repeat(64),
+            worker_claim_id: "worker-canary-claim".to_string(),
+            worker_claim_revision: 1,
+            worker_claim_expires_at_epoch: 1_893_456_000,
+            controller_claim_id: "controller-canary-claim".to_string(),
+            controller_claim_revision: 1,
+            controller_claim_expires_at_epoch: 1_893_456_000,
+            child_pid: 2_000_000_001,
+            child_start_ticks: 1,
+            release_request_digest: None,
+            release_idempotency_key: None,
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+            updated_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        orchestration::store_provider_stop_canary_reservation(
+            &context,
+            &canary_owned,
+            &canary_reservation,
+        )
+        .expect("store provider stop canary reservation");
+        assert!(
+            ensure_assignment_mutation_admitted(
+                &context,
+                &canary_owned,
+                AssignmentMutationOwner::ProviderStopCanary
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_assignment_mutation_admitted(
+                &context,
+                &canary_owned,
+                AssignmentMutationOwner::StoppedReconciliation
+            )
+            .is_ok(),
+            "stopped reconciliation owns the stronger locked runtime proof and cleanup"
+        );
+        for owner in [
+            AssignmentMutationOwner::Ordinary,
+            AssignmentMutationOwner::AccountHandoff,
+            AssignmentMutationOwner::RuntimeStop,
+            AssignmentMutationOwner::ClaimedRuntimeStop,
+            AssignmentMutationOwner::ClaimRevocation,
+        ] {
+            assert_eq!(
+                ensure_assignment_mutation_admitted(&context, &canary_owned, owner)
+                    .unwrap_err()
+                    .code(),
+                "provider-stop-canary-in-flight"
             );
         }
     }
@@ -27285,6 +29403,8 @@ mod tests {
                 Some("worker-claim-one"),
                 Some(7),
                 None,
+                false,
+                None,
             );
             let expected_schema = if matches!(
                 classification,
@@ -27322,8 +29442,15 @@ mod tests {
                 );
             }
         }
-        let runtime_stop =
-            worker_recovery_action("readiness_stop_required", &assignment, None, None, None);
+        let runtime_stop = worker_recovery_action(
+            "readiness_stop_required",
+            &assignment,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
         assert_eq!(runtime_stop["kind"], "exact_worker_runtime_stop");
         assert_eq!(runtime_stop["owner"]["role"], "main");
         assert_eq!(runtime_stop["executable"], true);
@@ -27341,6 +29468,8 @@ mod tests {
             &assignment,
             None,
             None,
+            None,
+            false,
             None,
         );
         assert_eq!(claim_revocation["kind"], "exact_worker_claim_revocation");
@@ -27361,6 +29490,8 @@ mod tests {
             &assignment,
             Some("worker-claim-one"),
             Some(7),
+            None,
+            false,
             None,
         );
         assert_eq!(renewal["owner"]["session_id"], "worker-one");
@@ -27442,6 +29573,7 @@ mod tests {
             scopes: Vec::new(),
             durable_refs: Vec::new(),
             depends_on: Vec::new(),
+            provider_stop_canary: None,
         };
         let key = default_quick_idempotency_key(&input);
         assert!(key.starts_with("quick-"), "key = {key}");
@@ -27457,6 +29589,54 @@ mod tests {
         let mut other = input.clone();
         other.task_summary = "different task".to_string();
         assert_ne!(key, default_quick_idempotency_key(&other));
+    }
+
+    #[test]
+    fn provider_stop_canary_requires_exact_schema_and_codex_launch() {
+        let mut input = AssignmentInput {
+            schema_version: ASSIGNMENT_INPUT_SCHEMA.to_string(),
+            assignment_id: None,
+            task_summary: "bounded provider stop canary".to_string(),
+            task: json!({}),
+            launch: WorkerLaunchInput {
+                agent: "codex".to_string(),
+                cwd: "/repo".to_string(),
+                title: None,
+                session_id: None,
+                coordination_mode: CoordinationMode::Enforce,
+                agent_args: Vec::new(),
+            },
+            repository: Some("owner/name".to_string()),
+            worktree: None,
+            base_ref: None,
+            scopes: Vec::new(),
+            durable_refs: Vec::new(),
+            depends_on: Vec::new(),
+            provider_stop_canary: Some(ProviderStopCanaryInput {
+                schema_version: "main-agent.provider-process-stop-canary.v1".to_string(),
+            }),
+        };
+        assert!(validate_assignment_input(&input).is_ok());
+
+        input.launch.agent = "claude".to_string();
+        assert_eq!(
+            validate_assignment_input(&input)
+                .expect_err("Claude must not receive canary authority")
+                .code(),
+            "invalid-orchestration-input"
+        );
+        input.launch.agent = "codex".to_string();
+        input
+            .provider_stop_canary
+            .as_mut()
+            .expect("canary exists")
+            .schema_version = "main-agent.provider-process-stop-canary.v2".to_string();
+        assert_eq!(
+            validate_assignment_input(&input)
+                .expect_err("unknown canary schema must fail closed")
+                .code(),
+            "invalid-orchestration-input"
+        );
     }
 
     #[test]

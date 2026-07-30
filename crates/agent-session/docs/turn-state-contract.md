@@ -436,12 +436,18 @@ There is no embedded registration fallback, including for `--apply`,
 `--repair`, or `--remove`, so a mixed-version installation cannot reactivate a
 second writer.
 
-`activity doctor` remains a read-only compatibility diagnostic. It recognizes
-exact pre-dispatch `agent-session` hook and Codex notify shapes, including a
-bounded audited Computer Use outer wrapper whose exact helper path is a regular
+`activity doctor` remains a read-only compatibility diagnostic. Because
+`agent-hook` is the provider-registration owner, Codex launch readiness
+requires one bounded, strictly typed `agent-hook doctor` result for Codex.
+The result must be supported and `converged`, report its exact expected owned
+count, report zero retired residue, and carry valid configuration and policy
+digests. Missing, failed, malformed, oversized, multi-record, or
+provider-mismatched evidence fails closed. The diagnostic separately recognizes exact
+pre-dispatch `agent-session` hook and Codex notify shapes, including a bounded
+audited Computer Use outer wrapper whose exact helper path is a regular
 executable with no symlink below the active config root. It reports conflicts
 without provider content, probes provider versions with bounded timeouts, and
 selects the newest current-runtime diagnostic deterministically. The retained
 `activity hook` and `activity notify` commands continue to ingest already
-installed compatibility callbacks fail-open while provider registration converges on
-`agent-hook`.
+installed compatibility callbacks fail-open while provider registration
+converges on `agent-hook`.
