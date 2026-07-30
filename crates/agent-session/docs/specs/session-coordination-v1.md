@@ -296,6 +296,89 @@ attestation is deliberately distinct from session-owned `complete` and
 `reconcile`; it is for an observed missing completion signal, not a way to
 guess that an in-flight descendant has stopped.
 
+### Operator provider-turn reconciliation
+
+The loopback server exposes the separate server-operator route
+`POST /sessions/{id}/activity/provider-turn/operator-reconcile/v1`. It never
+accepts a target session capability as authority and never sends input. Its
+strict `agent-session.operator-provider-turn-reconcile-request.v1` body has
+exactly `schema_version`, `expected_session_incarnation`,
+`expected_runtime_launch_id`, `expected_runtime_generation`,
+`if_activity_revision`, `expected_provider_turn_id`, fixed reason
+`authoritative-completion-signal-missing`, `attest_inactive: true`,
+`confirmed: true`, and `idempotency_key`.
+
+The server acquires the session-record, activity, runtime-health, and
+coordination-registry fences in that order. The registry acquisition is
+observational: it performs no notification normalization, claim/operation
+renewal, or unrelated runtime probe, and the guard remains held through the
+activity commit. Admission requires:
+
+- the unchanged current session incarnation, launch id, runtime generation,
+  activity revision, provider, and projected open provider turn;
+- a healthy live runtime whose identity digest matches the same ready,
+  heartbeat-fresh authoritative broker and generation;
+- no active or uncertain operation: every exact-session/incarnation operation
+  is conflicting unless its state is explicitly terminal (`completed`,
+  `failed`, or `abandoned`); an active claim is allowed and preserved;
+- `working` state whose latest semantic event and latest provider event are the
+  same exact `stop_observed` for the selected current provider turn, whose diagnostic is
+  `completion_evidence_pending`, and whose pending journal is empty; and
+- no exact, conservative, overflow, or current-turn attention.
+
+A provider completion, failure, attention request, progress/turn-start event,
+stop event with a missing/different turn id, queued journal entry, replacement
+runtime, broker mismatch, or operation activity observed before admission wins
+and rejects the request. Runtime ownership and a queued journal are checked
+before transaction repair or any write; only an already persisted exact receipt
+may replay read-only while a journal is queued. Success
+increments only the activity revision, closes the selected current turn with
+outcome `operator_reconciled`, enters authoritative `waiting`, and records
+`agent-session.operator-provider-turn-reconciliation.v1` provenance
+`server_operator` on the matching completed turn. Later turns and runtime
+activation do not inherit that provenance. The session record, runtime, provider binding, assignment,
+worktree, active claim, broker, mailbox, coordination operations, and all
+provider-side state remain unchanged.
+
+Holding the observational registry guard through the final activity commit is
+an intentional, bounded operator-only correctness tradeoff. Releasing it
+earlier would admit a coordination writer between the quiescence check and
+commit. Reducing that lock hold requires a follow-up design shared by all
+coordination writers, such as a per-session reconciliation fence or WAL; it is
+not a safe local optimization of this route.
+
+The result is
+`agent-session.operator-provider-turn-reconcile-result.v1`, containing the
+session/runtime selectors, fixed reason, and typed reconciliation. It contains
+no capability, request digest, idempotency key, raw provider-side identifier,
+mailbox content, or local path. The activity lock is bound to the exact target
+session directory; a replay or fresh reconciliation presented with another
+session's lock fails before reading or writing activity state.
+
+The private activity receipt stores only its idempotency binding, fixed reason,
+typed reconciliation fields, and expiry. Replay reconstructs the public result
+from those compact fields plus the current exact session/runtime selectors; it
+does not persist a nested copy of the public result envelope. The activity
+document retains at most
+64 unexpired receipts for the current runtime. Each admitted receipt lives for
+exactly 24 hours: it remains replayable immediately before its expiry epoch and
+is no longer replayable at that epoch. Expired receipts are pruned before every ordinary activity-document
+persistence as well as before another success, and quota
+exhaustion rejects before transition instead of evicting a replayable receipt.
+Exact key/digest replay returns the original result even after a later
+reconciliation in the same runtime. Same key with a changed request returns
+`idempotency-key-reused`; a different key cannot replay a closed turn.
+
+Stable failures are `invalid-idempotency-key`,
+`invalid-operator-provider-turn-reconcile-request`,
+`operator-provider-turn-reconcile-confirmation-required`,
+`session-incarnation-conflict`, `activity-revision-conflict`,
+`provider-turn-id-mismatch`, `activity-runtime-unhealthy`,
+`operator-provider-turn-reconcile-runtime-conflict`,
+`operator-provider-turn-reconcile-operation-conflict`,
+`operator-provider-turn-reconcile-not-admissible`,
+`idempotency-key-reused`, and `quota-exceeded`.
+
 ### Message
 
 Messages use `agent-session.message.v1`. Public inbox rows contain message ID,
@@ -374,6 +457,7 @@ receive an admitted claim.
 | work-context show/session check/candidate check | public registry read; HTTP additionally requires the server operator token |
 | self check/claim/renew/release | matching session capability and incarnation |
 | operation admit/complete/reconcile | matching session capability, active claim, and execution token/proof |
+| operator provider-turn reconcile over HTTP | server operator token only, exact current runtime/activity/turn selectors, confirmed inactive attestation, and quiescent authoritative broker |
 | message send | matching sender capability |
 | inbox/show/ack/reply/wait | matching recipient capability |
 | broker status | public registry read; HTTP additionally requires the server operator token |
@@ -693,6 +777,8 @@ POST /sessions/{id}/broker/reconcile/v2
 POST /sessions/{id}/broker/adopt/v1       (transition alias)
 POST /sessions/{id}/broker/reconcile/v1   (transition alias)
 POST /sessions/{id}/operations/{lease_id}/operator-reconcile/v1
+                                               (HTTP-only, server Bearer)
+POST /sessions/{id}/activity/provider-turn/operator-reconcile/v1
                                                (HTTP-only, server Bearer)
 GET  /sessions/{id}/messages/v1
 POST /sessions/{id}/messages/v1

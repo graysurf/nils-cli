@@ -29,6 +29,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `POST /sessions/{id}/broker/{adopt,reconcile}/v2` | Bearer + capability; recovery proof is in the request body | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/broker/{adopt,reconcile}/v1` | Bearer + capability; retained transition alias for the v2 authorization contract | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/operations/{lease_id}/operator-reconcile/v1` | Bearer; explicit confirmed operator attestation | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/activity/provider-turn/operator-reconcile/v1` | Bearer only; explicit confirmed inactive attestation | [Provider-turn reconciliation](session-coordination-v1.md#operator-provider-turn-reconciliation) |
 | `GET and POST /sessions/{id}/messages/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `GET /sessions/{id}/messages/{message_id}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `POST /sessions/{id}/messages/{message_id}/{ack,reply}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
@@ -49,6 +50,22 @@ comma-separated route segments below are exact alternatives, not wildcards.
 `agent-session serve` exposes the session control plane over loopback HTTP for a per-machine edge (e.g. the agent-console
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
+
+### Operator provider-turn reconciliation
+
+`POST /sessions/{id}/activity/provider-turn/operator-reconcile/v1` is the
+Bearer-only server-operator repair for one exact open provider turn whose
+authoritative completion signal is missing. `X-Agent-Session-Capability` is
+ignored as authority; a target-session capability without the server Bearer
+returns `401 unauthorized` before body processing or mutation.
+
+The route uses the ordinary serve success/error envelope with its result under
+`data.coordination`. `activity-revision-conflict` is an HTTP `409`; malformed
+requests are `400`, unavailable dependencies are `503`, and other rejected
+admission evidence follows the shared coordination error mapping. Request and
+result schemas, exact admission fences, preservation, receipt TTL/quota,
+idempotency, and stable failure codes are normative in
+[Session Coordination V1](session-coordination-v1.md#operator-provider-turn-reconciliation).
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
   additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled, plus

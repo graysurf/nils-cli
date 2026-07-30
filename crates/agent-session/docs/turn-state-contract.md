@@ -122,7 +122,7 @@ Example:
 Phases are `starting`, `working`, `waiting`, `needs_input`, and `unknown`.
 Source kinds are `provider_hook`, `console_observation`,
 `terminal_heuristic`, and `runtime`. Last-turn outcomes are `completed`,
-`interrupted`, `failed`, and `unknown`.
+`interrupted`, `failed`, `operator_reconciled`, and `unknown`.
 
 `pending_count` is the only client-visible attention correlation summary. Only
 runtime-scoped projections of provider session/turn identifiers may be exposed.
@@ -249,6 +249,7 @@ event cancels that notification-only waiting signal.
 | correlated `attention_cleared` | remove only that request, advance monotonic `last_progress_at`, and remain `needs_input` while any remain |
 | uncorrelated `progress` | advance monotonic `last_progress_at`; may establish/retain `working`, but never clears attention |
 | `stop_observed` | increment evidence revision and journal it; never changes to Waiting |
+| admitted server-operator reconciliation | close only the exact stop-observed open provider turn as `operator_reconciled`, enter authoritative `waiting`, and retain typed reconciliation provenance |
 | matching `turn_completed` | close current turn, clear attention, enter `waiting`; authoritative Codex notifications require the exact open turn id |
 | matching `turn_failed` | close current turn with failed outcome, clear attention, enter `waiting` |
 | late completion for older turn | retain the newer current phase |
@@ -293,6 +294,26 @@ A raw Stop also projects `diagnostic.reason:
 completion_evidence_pending` while the turn remains open. The next accepted
 provider event replaces that diagnostic; it does not retroactively treat Stop
 as completion.
+
+## Missing authoritative completion reconciliation
+
+The HTTP server exposes
+`POST /sessions/{id}/activity/provider-turn/operator-reconcile/v1` as one
+narrow Bearer-only operator repair for a provider turn whose latest exact
+provider event is `stop_observed` but whose authoritative completion signal is
+missing. It is not another completion detector and never accepts provider
+input or target-session capability authority.
+
+Success advances only the activity revision, closes the exact current turn
+with outcome `operator_reconciled`, and enters authoritative `waiting`. Typed
+reconciliation provenance is owned by that matching `last_turn`; a later turn
+or runtime activation cannot expose it as unrelated top-level state, and an
+id-less completion never inherits it without exact same-turn identity. Provider
+completion, replacement runtime, queued/newer provider evidence, or attention
+wins before admission and leaves the activity document unchanged. The complete
+request/result schemas, fence ordering, admission and preservation rules,
+receipt contract, idempotency, and stable failures are normative in
+[Session Coordination V1](specs/session-coordination-v1.md#operator-provider-turn-reconciliation).
 
 ## Client presentation projection
 

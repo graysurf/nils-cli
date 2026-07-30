@@ -47,6 +47,8 @@ const REPLAY_HEADER_BYTES: usize = 64;
 const REPLAY_MAGIC: &[u8; 16] = b"agent-session-r1";
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
+const OPERATOR_PROVIDER_TURN_RECEIPT_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_OPERATOR_PROVIDER_TURN_RECEIPTS: usize = 64;
 const CODEX_NOTIFY_FORWARD_ACTIVE_ENV: &str = "AGENT_SESSION_CODEX_NOTIFY_FANOUT_ACTIVE";
 pub(crate) const ACTIVITY_RETRY_PROVIDER_ENV: &str = "AGENT_SESSION_ACTIVITY_RETRY_PROVIDER";
 const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
@@ -305,6 +307,8 @@ struct ActivityDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_provider_event_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_provider_event_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_event_at: Option<String>,
@@ -312,8 +316,43 @@ struct ActivityDocument {
     pending_journal: Option<JournalEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_unhealthy_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    operator_provider_turn_receipts: Vec<OperatorProviderTurnReceipt>,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OperatorProviderTurnReceipt {
+    idempotency_key: String,
+    request_digest: String,
+    reason: String,
+    reconciliation: OperatorProviderTurnReconciliation,
+    expires_at_epoch: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct OperatorProviderTurnReconciliation {
+    pub(crate) schema_version: String,
+    pub(crate) provider_turn_id: String,
+    pub(crate) state: String,
+    pub(crate) activity_revision_before: u64,
+    pub(crate) activity_revision_after: u64,
+    pub(crate) reconciled_at: String,
+    pub(crate) reason: String,
+    pub(crate) provenance: String,
+}
+
+pub(crate) struct OperatorProviderTurnReconcileInput<'a> {
+    pub(crate) session_incarnation: &'a str,
+    pub(crate) runtime_launch_id: &'a str,
+    pub(crate) runtime_generation: u64,
+    pub(crate) activity_revision: u64,
+    pub(crate) provider: &'a str,
+    pub(crate) provider_turn_id: &'a str,
+    pub(crate) reason: &'a str,
+    pub(crate) idempotency_key: &'a str,
+    pub(crate) request_digest: &'a str,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -661,13 +700,16 @@ pub(crate) struct ActivitySnapshot {
 }
 
 #[derive(Debug)]
-pub(crate) struct ActivityLock(fs::File);
+pub(crate) struct ActivityLock {
+    file: fs::File,
+    directory: PathBuf,
+}
 
 impl Drop for ActivityLock {
     fn drop(&mut self) {
         // SAFETY: flock only observes the valid file descriptor owned by self.
         unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
@@ -760,7 +802,10 @@ fn acquire_lock_with_mode(dir: &Path, mode: ActivityLockMode) -> Result<Activity
                 io::Error::last_os_error(),
             ));
         }
-        return Ok(ActivityLock(file));
+        return Ok(ActivityLock {
+            file,
+            directory: dir.to_path_buf(),
+        });
     }
 
     let deadline = match mode {
@@ -771,7 +816,10 @@ fn acquire_lock_with_mode(dir: &Path, mode: ActivityLockMode) -> Result<Activity
     loop {
         // SAFETY: flock only observes the valid file descriptor owned by file.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(ActivityLock(file));
+            return Ok(ActivityLock {
+                file,
+                directory: dir.to_path_buf(),
+            });
         }
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::WouldBlock {
@@ -1426,7 +1474,7 @@ pub(crate) fn activate_runtime_in_dir(
         state.extra = document.state.extra.clone();
         state.source.extra = document.state.source.extra.clone();
     }
-    let document = ActivityDocument {
+    let mut document = ActivityDocument {
         schema_version: ACTIVITY_DOCUMENT_VERSION.to_string(),
         runtime_id: runtime_id.to_string(),
         runtime_generation,
@@ -1439,6 +1487,7 @@ pub(crate) fn activate_runtime_in_dir(
         last_provider_event_kind: None,
         last_provider_event_provider: None,
         last_provider_event_at: None,
+        last_provider_event_turn_id: None,
         provider_session_id: record
             .provider_resume
             .as_ref()
@@ -1455,11 +1504,12 @@ pub(crate) fn activate_runtime_in_dir(
         last_event_at: None,
         pending_journal: None,
         runtime_unhealthy_reason: None,
+        operator_provider_turn_receipts: Vec::new(),
         extra: existing
             .take()
             .map_or_else(Map::new, |document| document.extra),
     };
-    write_document(&path, &document)?;
+    write_document(&path, &mut document)?;
     remove_runtime_unhealthy_marker(dir)?;
     Ok(document.state)
 }
@@ -1592,7 +1642,7 @@ pub(crate) fn mark_runtime_unhealthy(
         reason,
         &document.state,
     )?;
-    write_document(&path, &document)
+    write_document(&path, &mut document)
 }
 
 fn quarantine_activity_snapshot(path: &Path, code: &str) -> Result<(), CliError> {
@@ -1712,6 +1762,316 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
             "activity_state_unavailable",
         )),
     }
+}
+
+pub(crate) struct OperatorProviderTurnReplaySelector<'a> {
+    pub(crate) session_incarnation: &'a str,
+    pub(crate) runtime_launch_id: &'a str,
+    pub(crate) runtime_generation: u64,
+}
+
+pub(crate) fn operator_provider_turn_replay_locked(
+    context: &CliContext,
+    id: &str,
+    activity_lock: &ActivityLock,
+    selector: OperatorProviderTurnReplaySelector<'_>,
+    idempotency_key: &str,
+    request_digest: &str,
+) -> Result<Option<Value>, CliError> {
+    operator_provider_turn_replay_locked_at(
+        context,
+        id,
+        activity_lock,
+        selector,
+        idempotency_key,
+        request_digest,
+        crate::coordination::now_epoch(),
+    )
+}
+
+fn operator_provider_turn_replay_locked_at(
+    context: &CliContext,
+    id: &str,
+    activity_lock: &ActivityLock,
+    selector: OperatorProviderTurnReplaySelector<'_>,
+    idempotency_key: &str,
+    request_digest: &str,
+    now_epoch: i64,
+) -> Result<Option<Value>, CliError> {
+    let dir = session_dir(context, id);
+    ensure_activity_lock_owns(activity_lock, &dir, id)?;
+    let path = dir.join(ACTIVITY_FILE);
+    let document = read_document(&path)?;
+    if document.runtime_id != selector.runtime_launch_id
+        || document.runtime_generation != selector.runtime_generation
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "provider turn reconciliation selectors do not match the activity runtime",
+            Some(json!({ "id": id })),
+        ));
+    }
+    let Some(receipt) = document
+        .operator_provider_turn_receipts
+        .iter()
+        .filter(|receipt| operator_provider_turn_receipt_is_live(receipt, now_epoch))
+        .find(|receipt| receipt.idempotency_key == idempotency_key)
+    else {
+        return Ok(None);
+    };
+    if receipt.request_digest != request_digest {
+        return Err(CliError::data(
+            "idempotency-key-reused",
+            "idempotency key is already bound to another request",
+            None,
+        ));
+    }
+    Ok(Some(operator_provider_turn_result(
+        id,
+        selector.session_incarnation,
+        selector.runtime_launch_id,
+        selector.runtime_generation,
+        &receipt.reason,
+        &receipt.reconciliation,
+    )))
+}
+
+pub(crate) fn operator_reconcile_provider_turn_locked(
+    context: &CliContext,
+    id: &str,
+    activity_lock: &ActivityLock,
+    _health_fence: &RuntimeHealthFence,
+    input: OperatorProviderTurnReconcileInput<'_>,
+) -> Result<Value, CliError> {
+    let dir = session_dir(context, id);
+    ensure_activity_lock_owns(activity_lock, &dir, id)?;
+    if !matches!(
+        runtime_unhealthy_marker(&dir, input.runtime_launch_id, input.runtime_generation),
+        RuntimeUnhealthyStatus::Absent
+    ) {
+        return Err(CliError::data(
+            "activity-runtime-unhealthy",
+            "provider turn reconciliation requires healthy activity evidence",
+            Some(json!({ "id": id })),
+        ));
+    }
+    let path = dir.join(ACTIVITY_FILE);
+    let mut document = read_document(&path)?;
+    if document.runtime_id != input.runtime_launch_id
+        || document.runtime_generation != input.runtime_generation
+        || document.runtime_unhealthy_reason.is_some()
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "provider turn reconciliation selectors do not match the healthy activity runtime",
+            Some(json!({ "id": id })),
+        ));
+    }
+    if document.pending_journal.is_some() {
+        return Err(CliError::data(
+            "operator-provider-turn-reconcile-not-admissible",
+            "provider turn reconciliation refuses queued provider journal evidence",
+            Some(json!({ "id": id })),
+        ));
+    }
+    let now_epoch = crate::coordination::now_epoch();
+    document
+        .operator_provider_turn_receipts
+        .retain(|receipt| receipt.expires_at_epoch > now_epoch);
+    if let Some(receipt) = document
+        .operator_provider_turn_receipts
+        .iter()
+        .find(|receipt| receipt.idempotency_key == input.idempotency_key)
+    {
+        if receipt.request_digest == input.request_digest {
+            return Ok(operator_provider_turn_result(
+                id,
+                input.session_incarnation,
+                input.runtime_launch_id,
+                input.runtime_generation,
+                &receipt.reason,
+                &receipt.reconciliation,
+            ));
+        }
+        return Err(CliError::data(
+            "idempotency-key-reused",
+            "idempotency key is already bound to another request",
+            None,
+        ));
+    }
+    if document.operator_provider_turn_receipts.len() >= MAX_OPERATOR_PROVIDER_TURN_RECEIPTS {
+        return Err(CliError::data(
+            "quota-exceeded",
+            "provider turn reconciliation idempotency receipt quota exceeded",
+            None,
+        ));
+    }
+    if document.state.revision != input.activity_revision {
+        return Err(CliError::data(
+            "activity-revision-conflict",
+            "provider turn reconciliation activity revision is stale",
+            Some(json!({
+                "id": id,
+                "expected_revision": input.activity_revision,
+                "actual_revision": document.state.revision,
+            })),
+        ));
+    }
+    let current_turn = document.state.current_turn.as_ref().ok_or_else(|| {
+        CliError::data(
+            "operator-provider-turn-reconcile-not-admissible",
+            "provider turn reconciliation requires an exact open provider turn",
+            Some(json!({ "id": id })),
+        )
+    })?;
+    if current_turn.provider_turn_id.as_deref() != Some(input.provider_turn_id) {
+        return Err(CliError::data(
+            "provider-turn-id-mismatch",
+            "provider turn reconciliation selector does not match the open provider turn",
+            Some(json!({ "id": id })),
+        ));
+    }
+    let semantic_event_matches = document.state.semantic_event.as_ref().is_some_and(|event| {
+        event.kind == "stop_observed"
+            && document.last_provider_event_at.as_deref() == Some(event.observed_at.as_str())
+    });
+    let diagnostic_matches = document
+        .state
+        .diagnostic
+        .as_ref()
+        .is_some_and(|diagnostic| diagnostic.reason == "completion_evidence_pending");
+    let exact_stop_is_latest = document.last_provider_event_kind
+        == Some(TurnEventKind::StopObserved)
+        && document.last_provider_event_provider.as_deref() == Some(input.provider)
+        && document.last_provider_event_turn_id.as_deref() == Some(input.provider_turn_id)
+        && document.last_semantic_event_at == document.last_provider_event_at
+        && document.pending_journal.is_none();
+    let attention_is_empty = document.pending_attention.is_empty()
+        && document.overflow_attention.is_none()
+        && current_turn.attention.is_none();
+    if document.state.phase != TurnPhase::Working
+        || !semantic_event_matches
+        || !diagnostic_matches
+        || !exact_stop_is_latest
+        || !attention_is_empty
+    {
+        return Err(CliError::data(
+            "operator-provider-turn-reconcile-not-admissible",
+            "provider turn reconciliation requires the exact inactive stop-observed state with no pending attention or newer provider evidence",
+            Some(json!({ "id": id })),
+        ));
+    }
+
+    let reconciled_at = now();
+    let revision_before = document.state.revision;
+    let revision_after = revision_before.saturating_add(1);
+    let reconciliation = OperatorProviderTurnReconciliation {
+        schema_version: "agent-session.operator-provider-turn-reconciliation.v1".to_string(),
+        provider_turn_id: input.provider_turn_id.to_string(),
+        state: "operator_reconciled".to_string(),
+        activity_revision_before: revision_before,
+        activity_revision_after: revision_after,
+        reconciled_at: reconciled_at.clone(),
+        reason: input.reason.to_string(),
+        provenance: "server_operator".to_string(),
+    };
+    let started_at = current_turn.started_at.clone();
+    document.state.phase = TurnPhase::Waiting;
+    document.state.phase_changed_at = reconciled_at.clone();
+    document.state.revision = revision_after;
+    document.state.source = TurnSource {
+        kind: SourceKind::Runtime,
+        provider: None,
+        confidence: Confidence::Authoritative,
+        extra: Map::new(),
+    };
+    document.state.semantic_event = Some(SemanticEventView {
+        kind: "operator_reconciled".to_string(),
+        observed_at: reconciled_at.clone(),
+        extra: Map::new(),
+    });
+    document.state.diagnostic = None;
+    document.state.shadow_observation = None;
+    document.state.current_turn = None;
+    let mut last_turn_extra = Map::new();
+    last_turn_extra.insert(
+        "operator_reconciliation".to_string(),
+        serde_json::to_value(&reconciliation).map_err(|_| {
+            CliError::runtime(
+                "activity-write-failed",
+                "failed to encode operator provider turn reconciliation",
+                None,
+            )
+        })?,
+    );
+    document.state.last_turn = Some(LastTurn {
+        provider_turn_id: Some(input.provider_turn_id.to_string()),
+        started_at: Some(started_at),
+        completed_at: reconciled_at.clone(),
+        outcome: "operator_reconciled".to_string(),
+        extra: last_turn_extra,
+    });
+    document.last_event_at = Some(reconciled_at);
+    let result = operator_provider_turn_result(
+        id,
+        input.session_incarnation,
+        input.runtime_launch_id,
+        input.runtime_generation,
+        input.reason,
+        &reconciliation,
+    );
+    document
+        .operator_provider_turn_receipts
+        .push(OperatorProviderTurnReceipt {
+            idempotency_key: input.idempotency_key.to_string(),
+            request_digest: input.request_digest.to_string(),
+            reason: input.reason.to_string(),
+            reconciliation,
+            expires_at_epoch: now_epoch.saturating_add(OPERATOR_PROVIDER_TURN_RECEIPT_TTL_SECS),
+        });
+    write_document(&path, &mut document)?;
+    Ok(result)
+}
+
+fn operator_provider_turn_result(
+    id: &str,
+    session_incarnation: &str,
+    runtime_launch_id: &str,
+    runtime_generation: u64,
+    reason: &str,
+    reconciliation: &OperatorProviderTurnReconciliation,
+) -> Value {
+    json!({
+        "schema_version": "agent-session.operator-provider-turn-reconcile-result.v1",
+        "session_id": id,
+        "session_incarnation": session_incarnation,
+        "runtime_launch_id": runtime_launch_id,
+        "runtime_generation": runtime_generation,
+        "reason": reason,
+        "provider_turn_reconciliation": reconciliation,
+    })
+}
+
+fn operator_provider_turn_receipt_is_live(
+    receipt: &OperatorProviderTurnReceipt,
+    now_epoch: i64,
+) -> bool {
+    receipt.expires_at_epoch > now_epoch
+}
+
+fn ensure_activity_lock_owns(
+    activity_lock: &ActivityLock,
+    expected_directory: &Path,
+    id: &str,
+) -> Result<(), CliError> {
+    if activity_lock.directory == expected_directory {
+        return Ok(());
+    }
+    Err(CliError::data(
+        "activity-lock-session-mismatch",
+        "activity lock does not own the target session",
+        Some(json!({ "id": id })),
+    ))
 }
 
 pub(crate) fn claude_notification_waiting(
@@ -2114,6 +2474,7 @@ fn ingest_event_with_lock(
         document.last_provider_event_kind = Some(event.kind.clone());
         document.last_provider_event_provider = Some(event.provider.clone());
         document.last_provider_event_at = Some(received_at.clone());
+        document.last_provider_event_turn_id = event.provider_turn_id.clone();
     }
     if document.provider_session_id.is_none() {
         document.provider_session_id = event.provider_session_id.clone();
@@ -2126,7 +2487,7 @@ fn ingest_event_with_lock(
         event: event.clone(),
     };
     document.pending_journal = Some(journal_entry.clone());
-    write_document(&path, &document)?;
+    write_document(&path, &mut document)?;
     if uses_exact_replay_horizon {
         replay_insert(
             &replay_path,
@@ -2138,7 +2499,7 @@ fn ingest_event_with_lock(
     }
     append_journal_entry(&journal_path, journal_entry)?;
     document.pending_journal = None;
-    write_document(&path, &document)?;
+    write_document(&path, &mut document)?;
     let state = document.state;
     drop(_health_fence);
     drop(_lock);
@@ -4001,7 +4362,10 @@ fn yaml_has_spec(value: &serde_yaml_ng::Value, spec: ProviderSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CliContext, ProviderResume, RecordRequest, create_record, write_session_record};
+    use crate::{
+        CliContext, ProviderResume, RecordRequest, SessionRecord, create_record,
+        write_session_record,
+    };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
@@ -4040,12 +4404,531 @@ mod tests {
             last_provider_event_kind: None,
             last_provider_event_provider: None,
             last_provider_event_at: None,
+            last_provider_event_turn_id: None,
             provider_session_id: None,
             last_event_at: None,
             pending_journal: None,
             runtime_unhealthy_reason: None,
+            operator_provider_turn_receipts: Vec::new(),
             extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn activity_document_without_operator_receipts_remains_compatible() {
+        let mut value = serde_json::to_value(document()).expect("activity document");
+        value
+            .as_object_mut()
+            .expect("activity object")
+            .remove("operator_provider_turn_receipts");
+
+        let restored: ActivityDocument =
+            serde_json::from_value(value).expect("pre-receipt activity document");
+        assert!(restored.operator_provider_turn_receipts.is_empty());
+    }
+
+    #[test]
+    fn idless_completion_does_not_inherit_unrelated_operator_reconciliation() {
+        let mut document = document();
+        let mut reconciliation = Map::new();
+        reconciliation.insert(
+            "operator_reconciliation".to_string(),
+            json!({"canary": true}),
+        );
+        document.state.last_turn = Some(LastTurn {
+            provider_turn_id: Some("prior-provider-turn".to_string()),
+            started_at: Some("2026-07-10T00:00:00Z".to_string()),
+            completed_at: "2026-07-10T00:00:01Z".to_string(),
+            outcome: "operator_reconciled".to_string(),
+            extra: reconciliation,
+        });
+        let mut completion = event(TurnEventKind::TurnCompleted, "unrelated-idless-completion");
+        completion.provider_turn_id = None;
+
+        reduce(&mut document, &completion, "2026-07-10T00:00:02Z");
+
+        assert!(
+            document
+                .state
+                .last_turn
+                .as_ref()
+                .is_some_and(|turn| !turn.extra.contains_key("operator_reconciliation"))
+        );
+    }
+
+    #[test]
+    fn replacement_runtime_idless_completion_does_not_migrate_reconciliation_provenance() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+        reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            revision,
+            "operator-provider-turn-provenance",
+        )
+        .expect("reconcile prior runtime");
+        let mut replacement = created.record.clone();
+        let replacement_runtime_id = {
+            let replacement_runtime = replacement.runtime.as_mut().expect("runtime");
+            replacement_runtime.launch_id = "replacement-runtime".to_string();
+            replacement_runtime.generation = replacement_runtime.generation.saturating_add(1);
+            replacement_runtime.started_at = "2026-07-10T00:00:03Z".to_string();
+            replacement_runtime.launch_id.clone()
+        };
+        write_session_record(&context, &replacement).expect("replacement session");
+        activate_runtime(&context, &replacement).expect("replacement activity");
+        let mut completion = event(
+            TurnEventKind::TurnCompleted,
+            "replacement-runtime-idless-completion",
+        );
+        completion.runtime_id = replacement_runtime_id;
+        completion.provider_turn_id = None;
+
+        let completed =
+            ingest_event(&context, &replacement.id, completion).expect("idless completion");
+        let completed = serde_json::to_value(completed.turn_state).expect("completed state");
+
+        assert_eq!(completed["last_turn"]["outcome"], "completed");
+        assert!(
+            completed["last_turn"]
+                .get("operator_reconciliation")
+                .is_none()
+        );
+    }
+
+    fn prepare_operator_turn(
+        tmp: &tempfile::TempDir,
+    ) -> (CliContext, crate::CreatedRecord, String, u64) {
+        let (context, created) = test_session(tmp);
+        activate_runtime(&context, &created.record).expect("activate runtime");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        for (event_id, kind) in [
+            ("operator-start", TurnEventKind::TurnStarted),
+            ("operator-stop", TurnEventKind::StopObserved),
+        ] {
+            let mut provider_event = event(kind, event_id);
+            provider_event.runtime_id = runtime_id.clone();
+            ingest_event(&context, &created.record.id, provider_event).expect("provider event");
+        }
+        let revision = activity_status(&context, &created.record.id)
+            .expect("activity")
+            .turn_state
+            .revision;
+        (context, created, runtime_id, revision)
+    }
+
+    fn reconcile_operator_turn(
+        context: &CliContext,
+        record: &SessionRecord,
+        runtime_id: &str,
+        revision: u64,
+        idempotency_key: &str,
+    ) -> Result<Value, CliError> {
+        let provider_turn_id = activity_status(context, &record.id)?
+            .turn_state
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref())
+            .ok_or_else(|| {
+                CliError::data(
+                    "provider-turn-id-mismatch",
+                    "test fixture requires a canonical current provider turn",
+                    None,
+                )
+            })?
+            .to_string();
+        let dir = session_dir(context, &record.id);
+        let activity_lock = acquire_lock(&dir)?;
+        let health_fence = acquire_runtime_health_fence(context, record)?;
+        operator_reconcile_provider_turn_locked(
+            context,
+            &record.id,
+            &activity_lock,
+            &health_fence,
+            OperatorProviderTurnReconcileInput {
+                session_incarnation: runtime_id,
+                runtime_launch_id: runtime_id,
+                runtime_generation: record.runtime.as_ref().expect("runtime").generation,
+                activity_revision: revision,
+                provider: &record.agent,
+                provider_turn_id: &provider_turn_id,
+                reason: "authoritative-completion-signal-missing",
+                idempotency_key,
+                request_digest: idempotency_key,
+            },
+        )
+    }
+
+    fn test_operator_receipt(
+        idempotency_key: String,
+        request_digest: String,
+        expires_at_epoch: i64,
+    ) -> OperatorProviderTurnReceipt {
+        OperatorProviderTurnReceipt {
+            idempotency_key,
+            request_digest,
+            reason: "authoritative-completion-signal-missing".to_string(),
+            reconciliation: OperatorProviderTurnReconciliation {
+                schema_version: "agent-session.operator-provider-turn-reconciliation.v1"
+                    .to_string(),
+                provider_turn_id: "local:v1:test-provider-turn".to_string(),
+                state: "operator_reconciled".to_string(),
+                activity_revision_before: 2,
+                activity_revision_after: 3,
+                reconciled_at: "2026-07-10T00:00:02Z".to_string(),
+                reason: "authoritative-completion-signal-missing".to_string(),
+                provenance: "server_operator".to_string(),
+            },
+            expires_at_epoch,
+        }
+    }
+
+    #[test]
+    fn operator_receipt_quota_admits_64_and_preserves_state_on_65th() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+        let path = session_dir(&context, &created.record.id).join(ACTIVITY_FILE);
+        let mut document = read_document(&path).expect("activity");
+        document.operator_provider_turn_receipts = (0..63)
+            .map(|index| {
+                test_operator_receipt(
+                    format!("quota-key-{index:02}"),
+                    format!("quota-digest-{index:02}"),
+                    i64::MAX,
+                )
+            })
+            .collect();
+        write_document(&path, &mut document).expect("seed receipts");
+
+        reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            revision,
+            "quota-key-63",
+        )
+        .expect("64th receipt");
+        assert_eq!(
+            read_document(&path)
+                .expect("activity after 64th")
+                .operator_provider_turn_receipts
+                .len(),
+            64
+        );
+
+        for (event_id, kind) in [
+            ("operator-start-second", TurnEventKind::TurnStarted),
+            ("operator-stop-second", TurnEventKind::StopObserved),
+        ] {
+            let mut provider_event = event(kind, event_id);
+            provider_event.runtime_id = runtime_id.clone();
+            ingest_event(&context, &created.record.id, provider_event).expect("second event");
+        }
+        let second_revision = activity_status(&context, &created.record.id)
+            .expect("second activity")
+            .turn_state
+            .revision;
+        let before = fs::read(&path).expect("activity before quota rejection");
+        let error = reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            second_revision,
+            "quota-key-64",
+        )
+        .expect_err("65th receipt must reject");
+        assert_eq!(error.code(), "quota-exceeded");
+        assert_eq!(
+            fs::read(&path).expect("activity after quota rejection"),
+            before
+        );
+    }
+
+    #[test]
+    fn expired_operator_receipts_prune_on_hot_path_and_key_is_reusable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+        let path = session_dir(&context, &created.record.id).join(ACTIVITY_FILE);
+        let mut document = read_document(&path).expect("activity");
+        document.operator_provider_turn_receipts = (0..64)
+            .map(|index| {
+                test_operator_receipt(
+                    if index == 0 {
+                        "expired-reusable-key".to_string()
+                    } else {
+                        format!("expired-key-{index:02}")
+                    },
+                    "expired-digest".to_string(),
+                    0,
+                )
+            })
+            .collect();
+        let seeded = serde_json::to_vec_pretty(&document).expect("expired receipt document");
+        fs::write(&path, seeded).expect("seed expired receipts");
+
+        reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            revision,
+            "expired-reusable-key",
+        )
+        .expect("expired key reuse");
+        let persisted = read_document(&path).expect("activity after expired key reuse");
+        assert_eq!(persisted.operator_provider_turn_receipts.len(), 1);
+        assert_eq!(
+            persisted.operator_provider_turn_receipts[0].idempotency_key,
+            "expired-reusable-key"
+        );
+        let live_receipt = serde_json::to_value(&persisted.operator_provider_turn_receipts[0])
+            .expect("live receipt");
+
+        let mut with_expired_hot_path_receipt = persisted;
+        with_expired_hot_path_receipt
+            .operator_provider_turn_receipts
+            .push(test_operator_receipt(
+                "expired-hot-path-key".to_string(),
+                "expired-hot-path-digest".to_string(),
+                0,
+            ));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&with_expired_hot_path_receipt)
+                .expect("hot-path receipt document"),
+        )
+        .expect("seed hot-path expired receipt");
+        let mut progress = event(TurnEventKind::Progress, "post-reconcile-progress");
+        progress.runtime_id = runtime_id;
+        ingest_event(&context, &created.record.id, progress).expect("ordinary provider event");
+        let persisted = read_document(&path).expect("activity after hot-path prune");
+        assert_eq!(
+            persisted.operator_provider_turn_receipts.len(),
+            1,
+            "the current live receipt remains while expired payloads stay pruned"
+        );
+        assert_eq!(
+            serde_json::to_value(&persisted.operator_provider_turn_receipts[0])
+                .expect("persisted live receipt"),
+            live_receipt,
+            "ordinary persistence must not mutate the retained live receipt"
+        );
+    }
+
+    #[test]
+    fn operator_receipt_ttl_boundary_and_pending_journal_replay_are_exact_and_read_only() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created, runtime_id, revision) = prepare_operator_turn(&tmp);
+        let runtime_generation = created.record.runtime.as_ref().expect("runtime").generation;
+        let admission_before = crate::coordination::now_epoch();
+        let result = reconcile_operator_turn(
+            &context,
+            &created.record,
+            &runtime_id,
+            revision,
+            "operator-provider-turn-ttl-boundary",
+        )
+        .expect("reconcile");
+        let admission_after = crate::coordination::now_epoch();
+        let path = session_dir(&context, &created.record.id).join(ACTIVITY_FILE);
+        let mut document = read_document(&path).expect("reconciled activity");
+        let receipt = document
+            .operator_provider_turn_receipts
+            .first()
+            .expect("receipt");
+        let expires_at_epoch = receipt.expires_at_epoch;
+        assert!(
+            admission_before + 24 * 60 * 60 <= expires_at_epoch
+                && expires_at_epoch <= admission_after + 24 * 60 * 60
+        );
+        let encoded = serde_json::to_vec(receipt).expect("encoded receipt");
+        assert!(encoded.len() < 1_024, "receipt must remain compact");
+        let encoded = String::from_utf8(encoded).expect("receipt utf8");
+        assert!(!encoded.contains("\"result\""));
+        assert!(!encoded.contains("operator-provider-turn-reconcile-result"));
+        let lock = acquire_coordination_activity_lock(&context, &created.record.id).expect("lock");
+        let mut replay_result = result.clone();
+        replay_result["session_incarnation"] = json!("distinct-session-incarnation");
+        assert_eq!(
+            operator_provider_turn_replay_locked_at(
+                &context,
+                &created.record.id,
+                &lock,
+                OperatorProviderTurnReplaySelector {
+                    session_incarnation: "distinct-session-incarnation",
+                    runtime_launch_id: &runtime_id,
+                    runtime_generation,
+                },
+                "operator-provider-turn-ttl-boundary",
+                "operator-provider-turn-ttl-boundary",
+                expires_at_epoch - 1,
+            )
+            .expect("replay before expiry"),
+            Some(replay_result)
+        );
+        assert_eq!(
+            operator_provider_turn_replay_locked_at(
+                &context,
+                &created.record.id,
+                &lock,
+                OperatorProviderTurnReplaySelector {
+                    session_incarnation: &runtime_id,
+                    runtime_launch_id: &runtime_id,
+                    runtime_generation,
+                },
+                "operator-provider-turn-ttl-boundary",
+                "operator-provider-turn-ttl-boundary",
+                expires_at_epoch,
+            )
+            .expect("lookup at expiry"),
+            None
+        );
+
+        document.pending_journal = Some(JournalEntry {
+            received_at: "2030-01-01T00:00:00Z".to_string(),
+            event: event(TurnEventKind::StopObserved, "pending-after-reconciliation"),
+        });
+        write_document(&path, &mut document).expect("pending activity");
+        let pending_bytes = fs::read(&path).expect("pending bytes");
+        assert_eq!(
+            operator_provider_turn_replay_locked(
+                &context,
+                &created.record.id,
+                &lock,
+                OperatorProviderTurnReplaySelector {
+                    session_incarnation: &runtime_id,
+                    runtime_launch_id: &runtime_id,
+                    runtime_generation,
+                },
+                "operator-provider-turn-ttl-boundary",
+                "operator-provider-turn-ttl-boundary",
+            )
+            .expect("pending replay"),
+            Some(result)
+        );
+        let reused = operator_provider_turn_replay_locked(
+            &context,
+            &created.record.id,
+            &lock,
+            OperatorProviderTurnReplaySelector {
+                session_incarnation: &runtime_id,
+                runtime_launch_id: &runtime_id,
+                runtime_generation,
+            },
+            "operator-provider-turn-ttl-boundary",
+            "changed-digest",
+        )
+        .expect_err("changed digest must reject");
+        assert_eq!(reused.code(), "idempotency-key-reused");
+        assert_eq!(
+            operator_provider_turn_replay_locked(
+                &context,
+                &created.record.id,
+                &lock,
+                OperatorProviderTurnReplaySelector {
+                    session_incarnation: &runtime_id,
+                    runtime_launch_id: &runtime_id,
+                    runtime_generation,
+                },
+                "operator-provider-turn-new-key",
+                "operator-provider-turn-new-key",
+            )
+            .expect("new key lookup"),
+            None
+        );
+        let health_fence =
+            acquire_runtime_health_fence(&context, &created.record).expect("health fence");
+        let rejected = operator_reconcile_provider_turn_locked(
+            &context,
+            &created.record.id,
+            &lock,
+            &health_fence,
+            OperatorProviderTurnReconcileInput {
+                session_incarnation: &runtime_id,
+                runtime_launch_id: &runtime_id,
+                runtime_generation,
+                activity_revision: document.state.revision,
+                provider: &created.record.agent,
+                provider_turn_id: "local:v1:unused-pending-selector",
+                reason: "authoritative-completion-signal-missing",
+                idempotency_key: "operator-provider-turn-new-key",
+                request_digest: "operator-provider-turn-new-key",
+            },
+        )
+        .expect_err("pending journal must reject a new key");
+        assert_eq!(
+            rejected.code(),
+            "operator-provider-turn-reconcile-not-admissible"
+        );
+        assert_eq!(
+            fs::read(&path).expect("activity after lookups"),
+            pending_bytes
+        );
+    }
+
+    #[test]
+    fn coordination_activity_lock_cannot_authorize_another_session() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, alpha) = test_session(&tmp);
+        let mut beta = alpha.record.clone();
+        beta.id = "activity-test-beta".to_string();
+        beta.tmux_session = "hs-codex-activity-test-beta".to_string();
+        fs::create_dir_all(session_dir(&context, &beta.id)).expect("beta session dir");
+        write_session_record(&context, &beta).expect("beta session");
+        activate_runtime(&context, &alpha.record).expect("alpha activity");
+        activate_runtime(&context, &beta).expect("beta activity");
+        let alpha_lock =
+            acquire_coordination_activity_lock(&context, &alpha.record.id).expect("alpha lock");
+        let beta_path = session_dir(&context, &beta.id).join(ACTIVITY_FILE);
+        let before = fs::read(&beta_path).expect("beta activity before mismatch");
+        let runtime = beta.runtime.as_ref().expect("beta runtime");
+
+        let error = operator_provider_turn_replay_locked(
+            &context,
+            &beta.id,
+            &alpha_lock,
+            OperatorProviderTurnReplaySelector {
+                session_incarnation: &runtime.launch_id,
+                runtime_launch_id: &runtime.launch_id,
+                runtime_generation: runtime.generation,
+            },
+            "operator-provider-turn-lock-mismatch",
+            "operator-provider-turn-lock-mismatch",
+        )
+        .expect_err("another session's activity lock must reject");
+
+        assert_eq!(error.code(), "activity-lock-session-mismatch");
+        let health_fence =
+            acquire_runtime_health_fence(&context, &beta).expect("beta health fence");
+        let error = operator_reconcile_provider_turn_locked(
+            &context,
+            &beta.id,
+            &alpha_lock,
+            &health_fence,
+            OperatorProviderTurnReconcileInput {
+                session_incarnation: &runtime.launch_id,
+                runtime_launch_id: &runtime.launch_id,
+                runtime_generation: runtime.generation,
+                activity_revision: 1,
+                provider: &beta.agent,
+                provider_turn_id: "local:v1:mismatched-lock-provider-turn",
+                reason: "authoritative-completion-signal-missing",
+                idempotency_key: "operator-provider-turn-lock-mismatch-fresh",
+                request_digest: "operator-provider-turn-lock-mismatch-fresh",
+            },
+        )
+        .expect_err("another session's activity lock must reject a fresh reconciliation");
+        assert_eq!(error.code(), "activity-lock-session-mismatch");
+        assert_eq!(
+            fs::read(&beta_path).expect("beta activity after mismatch"),
+            before
+        );
     }
 
     #[test]
@@ -6058,7 +6941,7 @@ mod tests {
         let path = dir.join(ACTIVITY_FILE);
         let mut snapshot = read_document(&path).expect("activity snapshot");
         snapshot.seen_event_count = MAX_DEDUPE_EVENTS - 1;
-        write_document(&path, &snapshot).expect("near-capacity snapshot");
+        write_document(&path, &mut snapshot).expect("near-capacity snapshot");
 
         let progress = normalize_provider_hook(
             AgentKind::Claude,
@@ -7257,17 +8140,20 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
             };
             if matches_current {
                 let current = document.state.current_turn.take();
-                let extra = current
-                    .as_ref()
-                    .map(|turn| turn.extra.clone())
-                    .or_else(|| {
-                        document
-                            .state
-                            .last_turn
-                            .as_ref()
-                            .map(|turn| turn.extra.clone())
-                    })
-                    .unwrap_or_default();
+                let extra = if let Some(current) = current.as_ref() {
+                    current.extra.clone()
+                } else if let (Some(event_turn_id), Some(last_turn)) = (
+                    event.provider_turn_id.as_ref(),
+                    document.state.last_turn.as_ref(),
+                ) {
+                    if last_turn.provider_turn_id.as_ref() == Some(event_turn_id) {
+                        last_turn.extra.clone()
+                    } else {
+                        Map::new()
+                    }
+                } else {
+                    Map::new()
+                };
                 document.state.last_turn = Some(LastTurn {
                     provider_turn_id: event.provider_turn_id.clone().or_else(|| {
                         current
@@ -7408,7 +8294,11 @@ fn read_document(path: &Path) -> Result<ActivityDocument, CliError> {
     Ok(document)
 }
 
-fn write_document(path: &Path, document: &ActivityDocument) -> Result<(), CliError> {
+fn write_document(path: &Path, document: &mut ActivityDocument) -> Result<(), CliError> {
+    let now_epoch = crate::coordination::now_epoch();
+    document
+        .operator_provider_turn_receipts
+        .retain(|receipt| receipt.expires_at_epoch > now_epoch);
     let bytes = serde_json::to_vec_pretty(document).map_err(|err| {
         CliError::runtime(
             "activity-render-failed",

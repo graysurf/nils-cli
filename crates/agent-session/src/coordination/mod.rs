@@ -1686,7 +1686,34 @@ pub(crate) fn lock_session_quiescence(
     session_id: &str,
     incarnation: &str,
 ) -> Result<SessionQuiescenceGuard, CliError> {
-    let locked = lock_registry(context)?;
+    lock_session_quiescence_with_maintenance(
+        context,
+        session_id,
+        incarnation,
+        RegistryMaintenance::Full,
+    )
+}
+
+pub(crate) fn lock_session_quiescence_observational(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<SessionQuiescenceGuard, CliError> {
+    lock_session_quiescence_with_maintenance(
+        context,
+        session_id,
+        incarnation,
+        RegistryMaintenance::Observational,
+    )
+}
+
+fn lock_session_quiescence_with_maintenance(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+    maintenance: RegistryMaintenance,
+) -> Result<SessionQuiescenceGuard, CliError> {
+    let locked = lock_registry_with_maintenance(context, maintenance)?;
     let now = now_epoch();
     let broker = locked.registry.brokers.get(session_id);
     let broker_present = broker.is_some();
@@ -1724,7 +1751,10 @@ pub(crate) fn lock_session_quiescence(
     let uncertain_operation = locked.registry.operations.iter().any(|operation| {
         operation.session_id == session_id
             && operation.session_incarnation == incarnation
-            && matches!(operation.state.as_str(), "completing" | "reconcile_pending")
+            && !matches!(
+                operation.state.as_str(),
+                "active" | "completed" | "failed" | "abandoned"
+            )
     });
     Ok(SessionQuiescenceGuard {
         _locked: locked,

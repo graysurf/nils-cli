@@ -782,6 +782,10 @@ fn router(state: Arc<ServeState>) -> Router {
             post(coordination_operator_reconcile_handler),
         )
         .route(
+            "/sessions/{id}/activity/provider-turn/operator-reconcile/v1",
+            post(coordination_operator_provider_turn_reconcile_handler),
+        )
+        .route(
             "/sessions/{id}/messages/v1",
             get(coordination_inbox_handler).post(coordination_send_handler),
         )
@@ -1961,6 +1965,7 @@ fn envelope_err(err: CliError) -> Response {
         | "claim-conflict"
         | "claim-revision-conflict"
         | "operation-revision-conflict"
+        | "activity-revision-conflict"
         | "message-revision-conflict"
         | "idempotency-conflict"
         | "codex-account-session-incarnation-conflict"
@@ -3349,6 +3354,31 @@ async fn coordination_operator_reconcile_handler(
     let context = state.context.clone();
     match tokio::task::spawn_blocking(move || {
         coordination_server::operator_reconcile_operation(&context, &id, &lease_id, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_operator_provider_turn_reconcile_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::OperatorProviderTurnReconcileBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::operator_reconcile_provider_turn(&context, &id, body)
     })
     .await
     {
@@ -10263,6 +10293,7 @@ mod tests {
             "/sessions/example/broker/adopt/v2",
             "/sessions/example/broker/reconcile/v1",
             "/sessions/example/broker/reconcile/v2",
+            "/sessions/example/activity/provider-turn/operator-reconcile/v1",
             "/sessions/example/messages/v1",
             "/sessions/example/messages/message/ack/v1",
             "/sessions/example/messages/message/reply/v1",
@@ -10282,6 +10313,66 @@ mod tests {
                 "path={path} body={body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn provider_turn_reconcile_body_is_structurally_strict_and_semantically_versioned() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let base = json!({
+            "schema_version": "agent-session.operator-provider-turn-reconcile-request.v1",
+            "expected_session_incarnation": "runtime",
+            "expected_runtime_launch_id": "runtime",
+            "expected_runtime_generation": 1,
+            "if_activity_revision": 2,
+            "expected_provider_turn_id": "provider-turn",
+            "reason": "authoritative-completion-signal-missing",
+            "attest_inactive": true,
+            "confirmed": true,
+            "idempotency_key": "operator-provider-turn-strict-body"
+        });
+        let mut unknown = base.clone();
+        unknown["unknown_field"] = json!(true);
+        let mut missing = base.clone();
+        missing
+            .as_object_mut()
+            .expect("body object")
+            .remove("expected_provider_turn_id");
+        for body in [unknown, missing] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/sessions/example/activity/provider-turn/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).expect("body")))
+                .expect("request");
+            let (status, rejected) = call(router(state.clone()), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+            assert_eq!(rejected["error"]["code"], "invalid-json-body");
+        }
+
+        let mut unsupported_schema = base.clone();
+        unsupported_schema["schema_version"] =
+            json!("agent-session.operator-provider-turn-reconcile-request.v2");
+        let mut unsupported_reason = base;
+        unsupported_reason["reason"] = json!("operator-guessed-completion");
+        for body in [unsupported_schema, unsupported_reason] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/sessions/example/activity/provider-turn/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).expect("body")))
+                .expect("request");
+            let (status, rejected) = call(router(state.clone()), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+            assert_eq!(
+                rejected["error"]["code"],
+                "invalid-operator-provider-turn-reconcile-request"
+            );
+        }
+        assert!(!tmp.path().join("coordination/registry.json").exists());
+        assert!(!tmp.path().join("sessions/example").exists());
     }
 
     #[tokio::test]
@@ -11140,6 +11231,14 @@ esac
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    fn post_operator_provider_turn(body: &Value) -> Request<Body> {
+        post_json(
+            "/sessions/alpha/activity/provider-turn/operator-reconcile/v1",
+            Some(TOKEN),
+            body.clone(),
+        )
     }
 
     fn patch_json(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
@@ -21633,6 +21732,922 @@ exit 0
         let (status, replayed) = call(router(state), replay).await;
         assert_eq!(status, StatusCode::OK, "{replayed}");
         assert_eq!(replayed, reconciled);
+    }
+
+    #[tokio::test]
+    async fn operator_provider_turn_reconcile_is_bearer_only_fenced_and_replay_safe() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "codex", "hs-codex-beta");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let runtime_process = TestProcessGroup::spawn();
+        let mut alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let incarnation = alpha
+            .runtime
+            .as_ref()
+            .expect("alpha runtime")
+            .launch_id
+            .clone();
+        alpha.extra.insert(
+            "delete_tmux_identity".to_string(),
+            json!({
+                "launch_id": incarnation,
+                "session_id": "$77",
+                "pane_id": "%77",
+                "pane_pid": runtime_process.pid(),
+                "process_group_id": runtime_process.process_group_id
+            }),
+        );
+        crate::write_session_record(&state.context, &alpha).expect("live runtime identity");
+        let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
+        crate::activity::activate_runtime(&state.context, &alpha).expect("activate activity");
+        for (event_id, kind) in [
+            ("provider-turn-start", "turn_started"),
+            ("provider-turn-stop", "stop_observed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": incarnation,
+                "provider": "codex",
+                "provider_turn_id": "provider-turn-alpha",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .expect("activity event");
+            crate::activity::ingest_event(&state.context, &alpha.id, event).expect("ingest");
+        }
+        let stopped = crate::activity::activity_status(&state.context, &alpha.id)
+            .expect("activity")
+            .turn_state;
+        let provider_turn_id = stopped
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref())
+            .expect("exact provider turn")
+            .to_string();
+        let activity_revision = stopped.revision;
+        let target_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let beta_capability = provision_ready_coordination_fixture(&state.context, &beta);
+        let registry_path = tmp.path().join("coordination/registry.json");
+        let (status, claimed) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/work-context/claim/v1",
+                beta_capability.trim(),
+                json!({
+                    "candidate": {
+                        "schema_version": "agent-session.work-context-input.v1",
+                        "intent": "implementation",
+                        "tier": "L2",
+                        "repositories": ["example/repository"],
+                        "worktrees": [],
+                        "provider_refs": [],
+                        "plan_refs": [],
+                        "scopes": [{
+                            "kind": "path-exact",
+                            "repository": "example/repository",
+                            "value": "src/provider-turn.rs"
+                        }],
+                        "summary": "preserve provider-turn reconciliation claim"
+                    },
+                    "idempotency_key": "provider-turn-preserved-claim",
+                    "if_revision": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{claimed}");
+        let (status, canary_message) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                beta_capability.trim(),
+                json!({
+                    "body": "provider-turn-unrelated-mailbox-canary",
+                    "idempotency_key": "provider-turn-unrelated-message",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{canary_message}");
+        let canary_registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("canary registry"))
+                .expect("canary registry json");
+        assert!(
+            !canary_registry["messages"]
+                .as_array()
+                .expect("messages")
+                .is_empty()
+        );
+        assert!(
+            !canary_registry["receipts"]
+                .as_object()
+                .expect("receipts")
+                .is_empty()
+        );
+        assert!(
+            !canary_registry["notifications"]
+                .as_object()
+                .expect("notifications")
+                .is_empty()
+        );
+        let request = json!({
+            "schema_version": "agent-session.operator-provider-turn-reconcile-request.v1",
+            "expected_session_incarnation": incarnation,
+            "expected_runtime_launch_id": incarnation,
+            "expected_runtime_generation": generation,
+            "if_activity_revision": activity_revision,
+            "expected_provider_turn_id": provider_turn_id,
+            "reason": "authoritative-completion-signal-missing",
+            "attest_inactive": true,
+            "confirmed": true,
+            "idempotency_key": "operator/provider-turn@alpha#0001"
+        });
+
+        let activity_path = tmp.path().join("sessions/alpha/activity.json");
+        let session_path = tmp.path().join("sessions/alpha/session.json");
+        let activity_baseline = fs::read(&activity_path).expect("activity baseline");
+        let mut pending_activity: Value =
+            serde_json::from_slice(&activity_baseline).expect("activity json");
+        pending_activity["pending_journal"] = json!({
+            "received_at": "2030-01-01T00:00:00Z",
+            "event": {
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": "queued-provider-stop",
+                "runtime_id": incarnation,
+                "provider": "codex",
+                "provider_turn_id": "provider-turn-alpha",
+                "kind": "stop_observed",
+                "confidence": "authoritative"
+            }
+        });
+        let pending_bytes =
+            serde_json::to_vec_pretty(&pending_activity).expect("pending activity json");
+        fs::write(&activity_path, &pending_bytes).expect("pending activity");
+        let mut pending_request = request.clone();
+        pending_request["idempotency_key"] = json!("operator-provider-turn-pending-journal");
+        let pending = post_operator_provider_turn(&pending_request);
+        let (status, rejected) = call(router(state.clone()), pending).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-not-admissible"
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after pending rejection"),
+            pending_bytes
+        );
+
+        pending_activity["runtime_id"] = json!("prior-runtime");
+        let stale_runtime_bytes =
+            serde_json::to_vec_pretty(&pending_activity).expect("stale runtime activity json");
+        fs::write(&activity_path, &stale_runtime_bytes).expect("stale runtime activity");
+        let mut stale_runtime_request = request.clone();
+        stale_runtime_request["idempotency_key"] = json!("operator-provider-turn-stale-runtime");
+        let stale_runtime = post_operator_provider_turn(&stale_runtime_request);
+        let (status, rejected) = call(router(state.clone()), stale_runtime).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after stale runtime rejection"),
+            stale_runtime_bytes
+        );
+        fs::write(&activity_path, &activity_baseline).expect("restore activity baseline");
+
+        let before_denied = fs::read(&activity_path).expect("activity before denied request");
+        let target_capability_only = Request::builder()
+            .method("POST")
+            .uri("/sessions/alpha/activity/provider-turn/operator-reconcile/v1")
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", target_capability.trim()),
+            )
+            .header("x-agent-session-capability", target_capability.trim())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&request).expect("denied request"),
+            ))
+            .expect("denied request");
+        let (status, denied) = call(router(state.clone()), target_capability_only).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{denied}");
+        assert_eq!(denied["error"]["code"], "unauthorized");
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after denied request"),
+            before_denied,
+            "target session capability must not become server operator authority"
+        );
+
+        let mut invalid_key = request.clone();
+        invalid_key["idempotency_key"] = json!("short");
+        let mut unconfirmed = request.clone();
+        unconfirmed["confirmed"] = json!(false);
+        unconfirmed["idempotency_key"] = json!("operator-provider-turn-unconfirmed");
+        let mut unattested = request.clone();
+        unattested["attest_inactive"] = json!(false);
+        unattested["idempotency_key"] = json!("operator-provider-turn-unattested");
+        let mut stale_incarnation = request.clone();
+        stale_incarnation["expected_session_incarnation"] = json!("replacement-incarnation");
+        stale_incarnation["idempotency_key"] = json!("operator-provider-turn-incarnation");
+        let mut stale_launch = request.clone();
+        stale_launch["expected_runtime_launch_id"] = json!("replacement-launch");
+        stale_launch["idempotency_key"] = json!("operator-provider-turn-launch");
+        let mut stale_generation = request.clone();
+        stale_generation["expected_runtime_generation"] = json!(generation + 1);
+        stale_generation["idempotency_key"] = json!("operator-provider-turn-generation");
+        let mut stale_turn = request.clone();
+        stale_turn["expected_provider_turn_id"] = json!("replacement-provider-turn");
+        stale_turn["idempotency_key"] = json!("operator-provider-turn-selector");
+        for (body, expected_code) in [
+            (invalid_key, "invalid-idempotency-key"),
+            (
+                unconfirmed,
+                "operator-provider-turn-reconcile-confirmation-required",
+            ),
+            (
+                unattested,
+                "operator-provider-turn-reconcile-confirmation-required",
+            ),
+            (stale_incarnation, "session-incarnation-conflict"),
+            (stale_launch, "session-incarnation-conflict"),
+            (stale_generation, "session-incarnation-conflict"),
+            (stale_turn, "provider-turn-id-mismatch"),
+        ] {
+            let negative = post_operator_provider_turn(&body);
+            let (status, rejected) = call(router(state.clone()), negative).await;
+            assert_ne!(status, StatusCode::OK, "{rejected}");
+            assert_eq!(rejected["error"]["code"], expected_code, "{rejected}");
+            assert!(
+                !rejected.to_string().contains("replacement-provider-turn"),
+                "selector values must remain redacted: {rejected}"
+            );
+        }
+
+        let mut stale_revision = request.clone();
+        stale_revision["if_activity_revision"] = json!(activity_revision.saturating_sub(1));
+        stale_revision["idempotency_key"] = json!("operator-provider-turn-stale-revision");
+        let negative = post_operator_provider_turn(&stale_revision);
+        let (status, rejected) = call(router(state.clone()), negative).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "activity-revision-conflict");
+
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+            .expect("runtime evidence")
+            .identity_digest;
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "provider-turn-active-operation",
+                "session_id": "alpha",
+                "session_incarnation": incarnation,
+                "claim_id": "preserved-claim",
+                "claim_revision": 1,
+                "operation": "test mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": activity_revision,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": runtime_identity_digest,
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("persist active operation");
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+        let operation_conflict = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), operation_conflict).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-operation-conflict"
+        );
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"][0]["state"] = json!("completing");
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("persist uncertain operation");
+        let uncertain_operation = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), uncertain_operation).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-operation-conflict"
+        );
+        registry["operations"][0]["state"] = json!("future_nonterminal_state");
+        let unknown_registry =
+            serde_json::to_vec_pretty(&registry).expect("unknown operation registry");
+        fs::write(&registry_path, &unknown_registry).expect("persist unknown operation");
+        let unknown_activity = fs::read(&activity_path).expect("activity before unknown operation");
+        let unknown_session = fs::read(&session_path).expect("session before unknown operation");
+        let unknown_operation = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), unknown_operation).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-operation-conflict"
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after unknown operation"),
+            unknown_activity
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after unknown operation"),
+            unknown_session
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after unknown operation"),
+            unknown_registry
+        );
+        registry["operations"] = json!([{
+            "schema_version": "agent-session.operation-lease.v1",
+            "lease_id": "provider-turn-unrelated-operation",
+            "session_id": "unrelated-session",
+            "session_incarnation": "unrelated-incarnation",
+            "claim_id": "unrelated-claim",
+            "claim_revision": 1,
+            "operation": "unrelated mutation",
+            "targets": [],
+            "provider_targets": [],
+            "state": "active",
+            "revision": 1,
+            "started_at": "2030-01-01T00:00:00Z",
+            "expires_at": "9999-12-31T23:59:59Z",
+            "expires_at_epoch": i64::MAX,
+            "terminal_at_epoch": null,
+            "execution_token_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "activity_revision": 0,
+            "activity_identity_digest": "",
+            "runtime_identity_digest": runtime_identity_digest,
+            "descendant": null,
+            "reconcile_observed_at_epoch": null,
+            "outcome": null
+        }]);
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("persist unrelated operation canary");
+
+        let ready_registry = fs::read(&registry_path).expect("ready registry");
+        let ready_registry_json: Value =
+            serde_json::from_slice(&ready_registry).expect("ready registry json");
+        assert!(
+            !ready_registry_json["operations"]
+                .as_array()
+                .expect("operations")
+                .is_empty()
+        );
+        for (case, mutate) in [
+            ("missing-broker", "missing"),
+            ("wrong-incarnation", "incarnation"),
+            ("wrong-generation", "generation"),
+            ("non-ready", "state"),
+            ("stale-heartbeat", "heartbeat"),
+            ("runtime-digest-mismatch", "digest"),
+        ] {
+            let mut rejected_registry: Value =
+                serde_json::from_slice(&ready_registry).expect("ready registry json");
+            match mutate {
+                "missing" => {
+                    rejected_registry["brokers"]
+                        .as_object_mut()
+                        .expect("brokers")
+                        .remove("alpha");
+                }
+                "incarnation" => {
+                    rejected_registry["brokers"]["alpha"]["incarnation"] =
+                        json!("replacement-incarnation");
+                }
+                "generation" => {
+                    rejected_registry["brokers"]["alpha"]["generation"] = json!(generation + 1);
+                }
+                "state" => {
+                    rejected_registry["brokers"]["alpha"]["state"] = json!("stopped");
+                }
+                "heartbeat" => {
+                    rejected_registry["brokers"]["alpha"]["heartbeat_epoch"] = json!(0);
+                }
+                "digest" => {
+                    rejected_registry["brokers"]["alpha"]["runtime_identity_digest"] =
+                        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+                }
+                _ => unreachable!("admission case"),
+            }
+            let rejected_registry: crate::coordination::Registry =
+                serde_json::from_value(rejected_registry)
+                    .unwrap_or_else(|error| panic!("case={case} invalid registry: {error}"));
+            let rejected_registry = serde_json::to_vec_pretty(&rejected_registry)
+                .unwrap_or_else(|error| panic!("case={case} registry encoding failed: {error}"));
+            fs::write(&registry_path, &rejected_registry).expect("persist rejected registry");
+            let heartbeat_restore = (case == "stale-heartbeat").then(|| {
+                let path = crate::coordination::heartbeat_path(&state.context.state_dir, &alpha.id);
+                let bytes = fs::read(&path).expect("alpha heartbeat bytes");
+                let permissions = fs::metadata(&path)
+                    .expect("alpha heartbeat metadata")
+                    .permissions();
+                fs::remove_file(&path).expect("remove alpha heartbeat");
+                (path, bytes, permissions)
+            });
+            let activity_before =
+                fs::read(&activity_path).expect("activity before broker rejection");
+            let session_before = fs::read(&session_path).expect("session before broker rejection");
+            let request = post_operator_provider_turn(&request);
+            let (status, rejected) = call(router(state.clone()), request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "case={case} {rejected}"
+            );
+            assert_eq!(
+                rejected["error"]["code"], "operator-provider-turn-reconcile-operation-conflict",
+                "case={case} {rejected}"
+            );
+            assert_eq!(
+                fs::read(&activity_path).expect("activity after broker rejection"),
+                activity_before,
+                "case={case}"
+            );
+            assert_eq!(
+                fs::read(&session_path).expect("session after broker rejection"),
+                session_before,
+                "case={case}"
+            );
+            assert_eq!(
+                fs::read(&registry_path).expect("registry after broker rejection"),
+                rejected_registry,
+                "case={case}"
+            );
+            if let Some((path, bytes, permissions)) = heartbeat_restore {
+                fs::write(&path, bytes).expect("restore alpha heartbeat");
+                fs::set_permissions(&path, permissions).expect("restore alpha heartbeat mode");
+            }
+        }
+        fs::write(&registry_path, &ready_registry).expect("restore ready registry");
+
+        let capability_path =
+            crate::coordination::capability_path(&state.context, &alpha.id, &incarnation);
+        let capability_bytes = fs::read(&capability_path).expect("capability");
+        fs::remove_file(&capability_path).expect("remove capability");
+        let activity_before = fs::read(&activity_path).expect("activity before missing capability");
+        let session_before = fs::read(&session_path).expect("session before missing capability");
+        let missing_capability = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), missing_capability).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-operation-conflict"
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after missing capability"),
+            activity_before
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after missing capability"),
+            session_before
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after missing capability"),
+            ready_registry
+        );
+        fs::write(&capability_path, capability_bytes).expect("restore capability");
+        fs::set_permissions(&capability_path, fs::Permissions::from_mode(0o600))
+            .expect("capability mode");
+
+        let unhealthy_path = tmp.path().join("sessions/alpha/activity.unhealthy.json");
+        fs::write(
+            &unhealthy_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.activity-unhealthy.v1",
+                "runtime_id": incarnation,
+                "runtime_generation": generation,
+                "reason": "provider-turn-test-unhealthy",
+                "marked_at": "2030-01-01T00:00:00Z"
+            }))
+            .expect("unhealthy marker"),
+        )
+        .expect("persist unhealthy marker");
+        fs::set_permissions(&unhealthy_path, fs::Permissions::from_mode(0o600))
+            .expect("unhealthy marker mode");
+        let activity_before = fs::read(&activity_path).expect("activity before unhealthy");
+        let session_before = fs::read(&session_path).expect("session before unhealthy");
+        let unhealthy = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), unhealthy).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "activity-runtime-unhealthy");
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after unhealthy"),
+            activity_before
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after unhealthy"),
+            session_before
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after unhealthy"),
+            ready_registry
+        );
+        fs::remove_file(&unhealthy_path).expect("remove unhealthy marker");
+
+        let live_session = fs::read(&session_path).expect("live session");
+        let mut stopped_alpha = alpha.clone();
+        stopped_alpha.extra.insert(
+            "delete_tmux_identity".to_string(),
+            json!({
+                "launch_id": incarnation,
+                "session_id": "$77",
+                "pane_id": "%77",
+                "pane_pid": i32::MAX,
+                "process_group_id": i32::MAX
+            }),
+        );
+        crate::write_session_record(&state.context, &stopped_alpha).expect("stopped runtime");
+        let activity_before = fs::read(&activity_path).expect("activity before stopped runtime");
+        let session_before = fs::read(&session_path).expect("stopped session");
+        let stopped_runtime = post_operator_provider_turn(&request);
+        let (status, rejected) = call(router(state.clone()), stopped_runtime).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-runtime-conflict"
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after stopped runtime"),
+            activity_before
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after stopped runtime"),
+            session_before
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after stopped runtime"),
+            ready_registry
+        );
+        fs::write(&session_path, live_session).expect("restore live session");
+        fs::set_permissions(&session_path, fs::Permissions::from_mode(0o600))
+            .expect("session mode");
+
+        let session_before = fs::read(&session_path).expect("session before reconcile");
+        let registry_before = fs::read(&registry_path).expect("registry before reconcile");
+        let reconcile = post_operator_provider_turn(&request);
+        let (status, reconciled) = call(router(state.clone()), reconcile).await;
+        assert_eq!(status, StatusCode::OK, "{reconciled}");
+        let result = &reconciled["data"]["coordination"];
+        assert_eq!(
+            result["schema_version"],
+            "agent-session.operator-provider-turn-reconcile-result.v1"
+        );
+        assert_eq!(
+            result["provider_turn_reconciliation"]["state"],
+            "operator_reconciled"
+        );
+        assert_eq!(
+            result["provider_turn_reconciliation"]["provenance"],
+            "server_operator"
+        );
+        let activity = crate::activity::activity_status(&state.context, &alpha.id)
+            .expect("reconciled activity")
+            .turn_state;
+        assert_eq!(activity.phase, crate::activity::TurnPhase::Waiting);
+        assert!(activity.current_turn.is_none());
+        assert_eq!(
+            activity
+                .last_turn
+                .as_ref()
+                .map(|turn| turn.outcome.as_str()),
+            Some("operator_reconciled")
+        );
+        let activity_json = serde_json::to_value(&activity).expect("activity json");
+        assert!(activity_json.get("operator_reconciliation").is_none());
+        assert_eq!(
+            activity_json["last_turn"]["operator_reconciliation"]["provider_turn_id"],
+            provider_turn_id
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after reconcile"),
+            session_before,
+            "reconciliation must preserve the session/runtime record"
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after reconcile"),
+            registry_before,
+            "reconciliation must preserve claim, broker, operation, and mailbox state"
+        );
+        let rendered = reconciled.to_string();
+        assert!(!rendered.contains("operator/provider-turn@alpha#0001"));
+        assert!(!rendered.contains("hs-codex-alpha"));
+        assert!(!rendered.contains("request_digest"));
+
+        let activity_before_replay =
+            fs::read(&activity_path).expect("activity before exact replay");
+        let session_before_replay = fs::read(&session_path).expect("session before exact replay");
+        let registry_before_replay =
+            fs::read(&registry_path).expect("registry before exact replay");
+        let replay = post_operator_provider_turn(&request);
+        let (status, replayed) = call(router(state.clone()), replay).await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        assert_eq!(replayed, reconciled);
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after exact replay"),
+            activity_before_replay
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after exact replay"),
+            session_before_replay
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after exact replay"),
+            registry_before_replay
+        );
+
+        let mut pending_after_success: Value =
+            serde_json::from_slice(&activity_before_replay).expect("reconciled activity json");
+        pending_after_success["pending_journal"] = json!({
+            "received_at": "2030-01-01T00:00:00Z",
+            "event": {
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": "queued-after-operator-reconciliation",
+                "runtime_id": incarnation,
+                "provider": "codex",
+                "provider_turn_id": "provider-turn-alpha",
+                "kind": "stop_observed",
+                "confidence": "authoritative"
+            }
+        });
+        let pending_after_success =
+            serde_json::to_vec_pretty(&pending_after_success).expect("pending activity");
+        fs::write(&activity_path, &pending_after_success).expect("persist pending activity");
+        let pending_replay = post_operator_provider_turn(&request);
+        let (status, replayed) = call(router(state.clone()), pending_replay).await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        assert_eq!(replayed, reconciled);
+
+        let mut changed_request = request.clone();
+        changed_request["if_activity_revision"] = json!(activity_revision + 1);
+        let changed = post_operator_provider_turn(&changed_request);
+        let (status, rejected) = call(router(state.clone()), changed).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "idempotency-key-reused");
+
+        let mut changed_key = request.clone();
+        changed_key["idempotency_key"] = json!("operator/provider-turn@alpha#0002");
+        changed_key["if_activity_revision"] = json!(activity_revision + 1);
+        let changed = post_operator_provider_turn(&changed_key);
+        let (status, rejected) = call(router(state.clone()), changed).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(
+            rejected["error"]["code"],
+            "operator-provider-turn-reconcile-not-admissible"
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after queued replay cases"),
+            pending_after_success
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("session after queued replay cases"),
+            session_before_replay
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after queued replay cases"),
+            registry_before_replay
+        );
+        fs::write(&activity_path, activity_before_replay)
+            .expect("restore reconciled activity after queued replay cases");
+
+        for (event_id, kind) in [
+            ("provider-turn-start-second", "turn_started"),
+            ("provider-turn-stop-second", "stop_observed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": incarnation,
+                "provider": "codex",
+                "provider_turn_id": "provider-turn-alpha-second",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .expect("second activity event");
+            crate::activity::ingest_event(&state.context, &alpha.id, event)
+                .expect("ingest second turn");
+        }
+        let second_stopped = crate::activity::activity_status(&state.context, &alpha.id)
+            .expect("second stopped activity")
+            .turn_state;
+        let mut second_request = request.clone();
+        second_request["if_activity_revision"] = json!(second_stopped.revision);
+        second_request["expected_provider_turn_id"] = json!(
+            second_stopped
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.provider_turn_id.as_deref())
+                .expect("second projected turn")
+        );
+        second_request["idempotency_key"] = json!("operator/provider-turn@alpha#second");
+        let second = post_operator_provider_turn(&second_request);
+        let (status, second_reconciled) = call(router(state.clone()), second).await;
+        assert_eq!(status, StatusCode::OK, "{second_reconciled}");
+
+        let first_replay_after_second = post_operator_provider_turn(&request);
+        let (status, replayed) = call(router(state), first_replay_after_second).await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        assert_eq!(
+            replayed, reconciled,
+            "a later reconciliation in the same runtime must not evict the first 24-hour receipt"
+        );
+    }
+
+    async fn assert_provider_event_wins_operator_turn_reconciliation(
+        later_kind: &str,
+        later_provider_turn_id: Option<&str>,
+        expected_phase: crate::activity::TurnPhase,
+        expected_outcome: Option<&str>,
+        expected_error_code: &str,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let runtime_process = TestProcessGroup::spawn();
+        let mut alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let incarnation = alpha
+            .runtime
+            .as_ref()
+            .expect("alpha runtime")
+            .launch_id
+            .clone();
+        alpha.extra.insert(
+            "delete_tmux_identity".to_string(),
+            json!({
+                "launch_id": incarnation,
+                "session_id": "$77",
+                "pane_id": "%77",
+                "pane_pid": runtime_process.pid(),
+                "process_group_id": runtime_process.process_group_id
+            }),
+        );
+        crate::write_session_record(&state.context, &alpha).expect("live runtime identity");
+        let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
+        crate::activity::activate_runtime(&state.context, &alpha).expect("activate activity");
+        for (event_id, kind) in [
+            ("operator-race-start", "turn_started"),
+            ("operator-race-stop", "stop_observed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": incarnation,
+                "provider": "codex",
+                "provider_turn_id": "provider-turn-alpha",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .expect("activity event");
+            crate::activity::ingest_event(&state.context, &alpha.id, event).expect("ingest");
+        }
+        let stopped = crate::activity::activity_status(&state.context, &alpha.id)
+            .expect("stopped activity")
+            .turn_state;
+        let provider_turn_id = stopped
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref())
+            .expect("projected provider turn")
+            .to_string();
+        provision_ready_coordination_fixture(&state.context, &alpha);
+
+        let mut later = json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": format!("operator-race-{later_kind}"),
+            "runtime_id": incarnation,
+            "provider": "codex",
+            "kind": later_kind,
+            "confidence": "authoritative"
+        });
+        if let Some(provider_turn_id) = later_provider_turn_id {
+            later["provider_turn_id"] = json!(provider_turn_id);
+        }
+        if later_kind == "attention_requested" {
+            later["attention_id"] = json!("operator-race-attention");
+            later["attention_kind"] = json!("clarification");
+        }
+        let later = serde_json::from_value(later).expect("later provider event");
+        crate::activity::ingest_event(&state.context, &alpha.id, later)
+            .expect("ingest later provider event");
+        let latest = crate::activity::activity_status(&state.context, &alpha.id)
+            .expect("latest activity")
+            .turn_state;
+        let activity_path = tmp.path().join("sessions/alpha/activity.json");
+        let activity_before = fs::read(&activity_path).expect("activity before rejection");
+
+        let request = json!({
+            "schema_version": "agent-session.operator-provider-turn-reconcile-request.v1",
+            "expected_session_incarnation": incarnation,
+            "expected_runtime_launch_id": incarnation,
+            "expected_runtime_generation": generation,
+            "if_activity_revision": latest.revision,
+            "expected_provider_turn_id": provider_turn_id,
+            "reason": "authoritative-completion-signal-missing",
+            "attest_inactive": true,
+            "confirmed": true,
+            "idempotency_key": format!("operator-provider-race-{later_kind}")
+        });
+        let (status, rejected) = call(router(state), post_operator_provider_turn(&request)).await;
+        assert_ne!(status, StatusCode::OK, "{rejected}");
+        assert_eq!(rejected["error"]["code"], expected_error_code, "{rejected}");
+        assert_eq!(latest.phase, expected_phase);
+        assert_eq!(
+            latest.last_turn.as_ref().map(|turn| turn.outcome.as_str()),
+            expected_outcome
+        );
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after rejection"),
+            activity_before,
+            "a newer provider event must remain byte-for-byte authoritative"
+        );
+        assert!(!rejected.to_string().contains("operator-race-attention"));
+    }
+
+    #[tokio::test]
+    async fn provider_attention_newer_event_and_completion_win_before_turn_reconciliation() {
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "attention_requested",
+            Some("provider-turn-alpha"),
+            crate::activity::TurnPhase::NeedsInput,
+            None,
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "progress",
+            Some("provider-turn-alpha"),
+            crate::activity::TurnPhase::Working,
+            None,
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "turn_completed",
+            Some("provider-turn-alpha"),
+            crate::activity::TurnPhase::Waiting,
+            Some("completed"),
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "turn_failed",
+            Some("provider-turn-alpha"),
+            crate::activity::TurnPhase::Waiting,
+            Some("failed"),
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "turn_started",
+            Some("newer-provider-turn"),
+            crate::activity::TurnPhase::Working,
+            Some("interrupted"),
+            "provider-turn-id-mismatch",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "stop_observed",
+            Some("different-provider-turn"),
+            crate::activity::TurnPhase::Working,
+            None,
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
+        assert_provider_event_wins_operator_turn_reconciliation(
+            "stop_observed",
+            None,
+            crate::activity::TurnPhase::Working,
+            None,
+            "operator-provider-turn-reconcile-not-admissible",
+        )
+        .await;
     }
 
     #[tokio::test]

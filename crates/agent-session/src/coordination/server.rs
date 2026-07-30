@@ -123,6 +123,23 @@ pub(crate) struct OperatorOperationReconcileBody {
     pub idempotency_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorProviderTurnReconcileBody {
+    pub schema_version: String,
+    pub expected_session_incarnation: String,
+    pub expected_runtime_launch_id: String,
+    pub expected_runtime_generation: u64,
+    pub if_activity_revision: u64,
+    pub expected_provider_turn_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub attest_inactive: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxQuery {
@@ -545,6 +562,139 @@ pub(crate) fn operator_reconcile_operation(
     )?;
     locked.save()?;
     Ok(result)
+}
+
+pub(crate) fn operator_reconcile_provider_turn(
+    context: &CliContext,
+    id: &str,
+    body: OperatorProviderTurnReconcileBody,
+) -> Result<Value, CliError> {
+    if body.schema_version != "agent-session.operator-provider-turn-reconcile-request.v1"
+        || body.reason != "authoritative-completion-signal-missing"
+        || body.expected_session_incarnation.is_empty()
+        || body.expected_session_incarnation.len() > 256
+        || body.expected_runtime_launch_id.is_empty()
+        || body.expected_runtime_launch_id.len() > 256
+        || body.expected_provider_turn_id.is_empty()
+        || body.expected_provider_turn_id.len() > 256
+    {
+        return Err(CliError::usage(
+            "invalid-operator-provider-turn-reconcile-request",
+            "operator provider turn reconciliation request is unsupported",
+            None,
+        ));
+    }
+    super::validate_idempotency_key(&body.idempotency_key)?;
+    if !body.attest_inactive || !body.confirmed {
+        return Err(CliError::data(
+            "operator-provider-turn-reconcile-confirmation-required",
+            "operator provider turn reconciliation requires confirmed inactive attestation",
+            None,
+        ));
+    }
+    crate::validate_id(id)?;
+    let observed = crate::load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _session_lock = crate::acquire_session_record_lock(context, &canonical_id)?;
+    let record = crate::load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    let incarnation = super::incarnation(&record)?;
+    let runtime = record.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "session-incarnation-conflict",
+            "operator provider turn reconciliation requires a current runtime",
+            None,
+        )
+    })?;
+    if incarnation != body.expected_session_incarnation
+        || runtime.launch_id != body.expected_runtime_launch_id
+        || runtime.generation != body.expected_runtime_generation
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "operator provider turn reconciliation selectors do not match the current runtime",
+            None,
+        ));
+    }
+    let operation = "operator-provider-turn-reconcile";
+    let digest = super::request_digest(
+        operation,
+        &serde_json::json!({
+            "session_id": canonical_id,
+            "session_incarnation": incarnation,
+            "runtime_launch_id": runtime.launch_id,
+            "runtime_generation": runtime.generation,
+            "activity_revision": body.if_activity_revision,
+            "provider_turn_id": body.expected_provider_turn_id,
+            "reason": body.reason,
+            "attest_inactive": body.attest_inactive,
+            "confirmed": body.confirmed,
+        }),
+    );
+    // Global order for writers that take more than one fence is:
+    // session record -> activity -> runtime health -> coordination registry.
+    // Provider ingestion takes the same session/activity/health prefix.
+    // Registry maintenance reads activity snapshots without taking any of
+    // those locks, so this route never creates a registry-to-activity edge.
+    let _activity_fence =
+        crate::activity::acquire_coordination_activity_lock(context, &canonical_id)?;
+    let _health_fence = crate::activity::acquire_runtime_health_fence(context, &record)?;
+    if let Some(replay) = crate::activity::operator_provider_turn_replay_locked(
+        context,
+        &canonical_id,
+        &_activity_fence,
+        crate::activity::OperatorProviderTurnReplaySelector {
+            session_incarnation: &incarnation,
+            runtime_launch_id: &runtime.launch_id,
+            runtime_generation: runtime.generation,
+        },
+        &body.idempotency_key,
+        &digest,
+    )? {
+        return Ok(replay);
+    }
+    let runtime_evidence = crate::coordination_runtime_evidence(&record)?;
+    if runtime_evidence.status != crate::CoordinationRuntimeStatus::Running {
+        return Err(CliError::data(
+            "operator-provider-turn-reconcile-runtime-conflict",
+            "operator provider turn reconciliation requires the exact live runtime",
+            None,
+        ));
+    }
+    let quiescence =
+        super::lock_session_quiescence_observational(context, &canonical_id, &incarnation)?;
+    if !quiescence.broker_present
+        || !quiescence.broker_identity_matched
+        || !quiescence.broker_authoritative
+        || quiescence.broker_generation != Some(runtime.generation)
+        || quiescence.broker_runtime_identity_digest.as_deref()
+            != Some(runtime_evidence.identity_digest.as_str())
+        || quiescence.active_operation
+        || quiescence.uncertain_operation
+    {
+        return Err(CliError::data(
+            "operator-provider-turn-reconcile-operation-conflict",
+            "operator provider turn reconciliation requires the exact authoritative live broker with no active or uncertain operation",
+            None,
+        ));
+    }
+    crate::activity::operator_reconcile_provider_turn_locked(
+        context,
+        &canonical_id,
+        &_activity_fence,
+        &_health_fence,
+        crate::activity::OperatorProviderTurnReconcileInput {
+            session_incarnation: &incarnation,
+            runtime_launch_id: &runtime.launch_id,
+            runtime_generation: runtime.generation,
+            activity_revision: body.if_activity_revision,
+            provider: &record.agent,
+            provider_turn_id: &body.expected_provider_turn_id,
+            reason: &body.reason,
+            idempotency_key: &body.idempotency_key,
+            request_digest: &digest,
+        },
+    )
 }
 
 pub(crate) fn inbox(
