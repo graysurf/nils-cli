@@ -7988,7 +7988,7 @@ fn tmux_pane_identity_matches(
         .arg("-p")
         .arg("-t")
         .arg(managed_tmux_pane_target(&record.tmux_session))
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}");
+        .arg("#{session_id} #{pane_id} #{pane_pid}");
     let Ok(output) = run_output_with_timeout(command, timeout) else {
         return false;
     };
@@ -7998,7 +7998,7 @@ fn tmux_pane_identity_matches(
     let Ok(output) = String::from_utf8(output.stdout) else {
         return false;
     };
-    let mut fields = output.trim().split('\t');
+    let mut fields = output.split_whitespace();
     fields.next() == Some(expected_session_id)
         && fields.next() == Some(expected_pane_id)
         && fields
@@ -17439,6 +17439,42 @@ mod tests {
 
         assert!(provision < heartbeat);
         assert!(heartbeat < gate);
+    }
+
+    #[test]
+    fn tmux_pane_identity_verification_uses_display_message_safe_separator() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("display-message-separator"),
+        );
+        let record = load_session_record(&context, &id).expect("session record");
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            r#"#!/bin/sh
+if [ "$1" != display-message ]; then exit 64; fi
+if [ "$5" = '#{session_id} #{pane_id} #{pane_pid}' ]; then
+  printf '%s\n' '$123 %123 4242'
+else
+  printf '%s\n' '$123_%123_4242'
+fi
+"#,
+        )
+        .expect("fake tmux");
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).expect("executable tmux");
+
+        assert!(super::tmux_pane_identity_matches(
+            &tmux,
+            &record,
+            "$123",
+            "%123",
+            4242,
+            Duration::from_secs(1),
+        ));
     }
 
     #[test]
