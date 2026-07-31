@@ -23,6 +23,18 @@ use super::{
 };
 
 pub(crate) const BROKER_VERSION: &str = "agent-session.coordination-broker.v1";
+const STARTUP_RUNTIME_CONFIRMATION_WINDOW: Duration = Duration::from_secs(5);
+const STARTUP_RUNTIME_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+const STOPPED_RUNTIME_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(250);
+
+fn startup_runtime_retry_interval(status: crate::CoordinationRuntimeStatus) -> Duration {
+    match status {
+        crate::CoordinationRuntimeStatus::Stopped | crate::CoordinationRuntimeStatus::Unknown => {
+            STOPPED_RUNTIME_CONFIRMATION_INTERVAL
+        }
+        crate::CoordinationRuntimeStatus::Running => STARTUP_RUNTIME_RETRY_INTERVAL,
+    }
+}
 
 fn prepare_checkpoint_file(path: &Path) -> Result<bool, CliError> {
     match OpenOptions::new()
@@ -465,6 +477,41 @@ fn revoke_locked(
 
 pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
     revoke_locked(context, record, false)
+}
+
+pub(crate) fn forget_revoked_failed_launch(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    let incarnation = incarnation(record)?;
+    let mut locked = lock_registry(context)?;
+    let removable = locked
+        .registry
+        .brokers
+        .get(&record.id)
+        .is_some_and(|broker| {
+            broker.incarnation == incarnation
+                && broker.state == "stopped"
+                && broker.capability_digest.is_empty()
+        })
+        && !locked.registry.claims.iter().any(|claim| {
+            claim.session_id == record.id
+                && claim.session_incarnation == incarnation
+                && claim.state == "active"
+        })
+        && !locked.registry.operations.iter().any(|operation| {
+            operation.session_id == record.id
+                && operation.session_incarnation == incarnation
+                && matches!(
+                    operation.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                )
+        });
+    if removable {
+        locked.registry.brokers.remove(&record.id);
+        locked.save()?;
+    }
+    Ok(())
 }
 
 fn revoke_unless_runtime_stop_fenced(
@@ -1009,13 +1056,17 @@ pub(crate) fn run_heartbeat_sidecar(
             Ok(runtime) if runtime.status == crate::CoordinationRuntimeStatus::Running => {}
             Ok(runtime)
                 if runtime.status == crate::CoordinationRuntimeStatus::Stopped
-                    && started.elapsed() >= Duration::from_secs(5) =>
+                    && started.elapsed() >= STARTUP_RUNTIME_CONFIRMATION_WINDOW =>
             {
                 observed_stopped = true;
                 break;
             }
-            Ok(_) | Err(_) if started.elapsed() < Duration::from_secs(5) => {
-                thread::sleep(Duration::from_millis(20));
+            Ok(runtime) if started.elapsed() < STARTUP_RUNTIME_CONFIRMATION_WINDOW => {
+                thread::sleep(startup_runtime_retry_interval(runtime.status));
+                continue;
+            }
+            Err(_) if started.elapsed() < STARTUP_RUNTIME_CONFIRMATION_WINDOW => {
+                thread::sleep(STARTUP_RUNTIME_RETRY_INTERVAL);
                 continue;
             }
             Ok(_) | Err(_) => {
@@ -1241,6 +1292,24 @@ mod tests {
         .expect("serialize");
         assert!(value.get("capability_path").is_none());
         assert!(value.get("capability_digest").is_none());
+    }
+
+    #[test]
+    fn stopped_runtime_confirmation_bounds_process_snapshot_polling() {
+        assert_eq!(
+            startup_runtime_retry_interval(crate::CoordinationRuntimeStatus::Stopped),
+            STOPPED_RUNTIME_CONFIRMATION_INTERVAL
+        );
+        assert!(
+            STARTUP_RUNTIME_CONFIRMATION_WINDOW.as_millis()
+                / STOPPED_RUNTIME_CONFIRMATION_INTERVAL.as_millis()
+                <= 20,
+            "the stopped confirmation window must not trigger hundreds of process snapshots"
+        );
+        assert_eq!(
+            startup_runtime_retry_interval(crate::CoordinationRuntimeStatus::Unknown),
+            STOPPED_RUNTIME_CONFIRMATION_INTERVAL
+        );
     }
 
     #[test]

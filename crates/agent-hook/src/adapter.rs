@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -672,6 +673,39 @@ fn target_binding_material(binding: &TargetBinding) -> Result<Vec<u8>, HookError
 pub(crate) fn command_text(object: &Map<String, Value>) -> Option<&str> {
     string_at(object, &["command"])
         .or_else(|| nested_string(object, "tool_input", &["command", "cmd"]))
+}
+
+pub(crate) fn exact_main_agent_bootstrap_command(input: &[u8]) -> bool {
+    let Some(command) = strict_json::from_slice(input)
+        .ok()
+        .and_then(|value| value.as_object().and_then(command_text).map(str::to_string))
+    else {
+        return false;
+    };
+    if command.len() > MAX_MUTATION_TARGET_BYTES {
+        return false;
+    }
+    let Ok(words) = shell_words::split(&command) else {
+        return false;
+    };
+    if words.len() != 6 || command != shell_words::join(words.iter()) {
+        return false;
+    }
+    let executable = Path::new(&words[0]);
+    let trusted_shape = words[0] == "main-agent"
+        || (executable.is_absolute() && executable.file_name() == Some(OsStr::new("main-agent")));
+    trusted_shape
+        && words[1] == "bootstrap"
+        && words[2] == "--idempotency-key"
+        && lifecycle_idempotency_key(&words[3])
+        && words[4..] == ["--format", "json"]
+}
+
+fn lifecycle_idempotency_key(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 fn optional_provider_id<'a>(

@@ -75,6 +75,7 @@ in `crates/*/src`.
 | `glab` `mr note create --resolvable` | `forge-cli pr review` on GitLab probes `glab mr note create --help` and picks the most capable note form: with `--resolvable` it posts a non-resolvable status note; with `create` but no `--resolvable` it drops only that flag; with no `create` subcommand it uses the bare `glab mr note <id>` form. Only the first avoids registering on the `pr merge` thread gate | `brew upgrade glab` |
 | `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
 | `systemd-run` | Optional `agent-session` tmux cgroup isolation when `AGENT_SESSION_TMUX_SCOPE=1` on Linux/systemd hosts; falls back to direct `tmux` when unavailable | Usually provided by systemd packages |
+| `/usr/bin/systemctl` | Linux-only, fail-closed `main-agent worker cancel` proof for one exact pre-claim provider-stop canary whose recorded systemd scope has already been garbage-collected; the binary, user runtime directory, private manager socket, unit identity, and terminal properties are all verified, and absence leaves cleanup pending when any check fails | Usually provided by systemd packages |
 
 ## 3. Development and Validation Toolchain
 

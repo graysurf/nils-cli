@@ -814,9 +814,99 @@ admitted only on Linux, where PID start-time and parent-death semantics provide
 the required exact-process evidence.
 Ordinary `agent-session start`, daemon launches, Claude workers, unknown
 schemas, and already-created non-canary sessions cannot acquire the
-capability. The compiled supervisor reconstructs only the recorded Codex
+capability. On Linux, every successful tmux launch persists the pane start
+time beside the pane PID before returning. Canary admission consumes that
+immutable launch-time tuple directly; a single matching process-session member
+remains a read-only compatibility fallback for older session records, while
+missing, conflicting, or stale evidence fails closed. The compiled supervisor
+reconstructs only the recorded Codex
 binary and arguments for its exact session incarnation through a same-release
-compiled guardian. Before guardian launch, the supervisor becomes a child
+compiled guardian. Before releasing the held tmux runtime, `worker start`
+commits the same starting assignment from revision 1 with no worker to revision
+2 bound to the newly persisted exact session and incarnation. The supervisor
+independently waits at most five seconds, without launching the provider or
+reading terminal input, to observe that exact binding. Any other assignment
+transition, identity, or timeout fails before provider launch. The pending
+worker-start receipt records `assignment-created`,
+`worker-bound-runtime-held` (prior-version compatibility),
+`worker-bound-canary-startup-pending`, `canary-startup-failed`,
+`runtime-released-prompt-attempting`, `prompt-delivered`, and
+`prompt-outcome-unknown` phases. The rev2 prebind first
+installs an exact-incarnation execution quarantine, so generic resume cannot
+replace the canary process boundary while worker-start is pending. A failure
+proven to occur before prompt delivery rolls the exact rev2 binding back to
+rev1 while retaining that quarantine through exact typed session cleanup,
+revokes and forgets only that failed incarnation's empty broker, and permits
+replay of the same idempotency key. Removing the quarantined session directory
+is the rollback authority-release event. If the rollback commit itself is not
+proven, worker start preserves the rev2 binding, held exact session, receipt,
+and quarantine; it does not delete the session, and only the identical
+idempotency replay may resume the transaction. An interruption while the runtime is
+still held may release and continue
+only the exact recorded incarnation. A prior-version
+`worker-bound-runtime-held` receipt with no release gate first migrates
+durably to the startup-pending phase; if its release gate already exists, it
+remains fail-closed as prompt-outcome-unknown. The distinct
+`worker-bound-canary-startup-pending` phase may cross the release gate only to
+complete authenticated startup admission; success advances to prompt-attempt
+exactly once. A `canary-startup-failed` phase retains the rev2 binding, exact
+session/incarnation, receipt, and quarantine. Exact replay returns the same
+typed error; terminalize it through revision-fenced pre-claim `worker cancel`
+and exact `worker retire` (or the same closeout stages). Once any other release gate or prompt-attempt
+phase was observed without a durable prompt outcome, replay never sends the
+prompt again and returns typed outcome-unknown; it cannot finalize worker-start
+success. Only after a final worker-start receipt may the exact active
+quarantine gain a separate immutable release proof matching the assignment,
+revision, session/incarnation, reason, and runtime-identity digest. The proof
+is persisted before the active marker is removed, so interruption can replay
+without an authority gap. A missing or mismatched marker fails closed; the
+release proof is retained in an identity-keyed private proof collection until
+exact session cleanup. Later typed lifecycle operations may create and release
+a new active quarantine into a distinct proof without overwriting prior proofs;
+an exact identity already present in the proof collection cannot be persisted
+active again. Rollback
+retains the active quarantine until exact session cleanup. An authenticated bootstrap from that
+exact session/incarnation may recognize only its matching
+`runtime-released-prompt-attempting`, `prompt-delivered`, or
+`prompt-outcome-unknown` startup transaction and wait up to five seconds for
+the final receipt, absent startup quarantine, and matching typed release proof.
+It does not acquire a claim during the
+wait; timeout is typed and retryable after exact worker-start replay. Every
+other bootstrap and every generic resume remain fail-closed. A stopped rev2 runtime cannot be
+finalized as a successful worker
+start; a stopped runtime-held phase is safe to roll back because provider and
+prompt launch were never authorized. A stopped
+`worker-bound-canary-startup-pending` phase is likewise rolled back while its
+release gate is absent; after release it becomes the retained typed startup
+failure and requires the cancellation/retirement recovery above.
+For current records, an absent recorded cgroup is affirmative stopped evidence
+only when the observer still matches the persisted boot, cgroup namespace, and
+mount namespace plus the canonical cgroup-v2 mount identity, with no
+subordinate mount that could mask the exact scope path. A pre-provenance
+`canary-startup-failed` record has no such mount provenance, so `worker cancel`
+accepts absence only when the fixed root-owned `/usr/bin/systemctl` reaches the
+exact owning user manager through its verified private runtime socket and
+reports the exact UUID-derived scope as `not-found`, `inactive`, `dead`, with
+an empty control group. The same proof is re-established under the exact
+session lock before a cancelled worker is physically deleted; that deletion
+skips runtime termination and gains no signal or tmux-kill authority. The
+query has a two-second bound, a strict output cap, no shell or inherited
+environment, and no termination authority. Missing, untrusted, malformed,
+loaded, or unreachable evidence leaves the session and assignment retained.
+After releasing the startup-pending runtime,
+worker-start waits up to fifteen seconds for the exact guardian-authenticated
+startup channel to return a live provider PID/start-time identity inside the
+incarnation-derived child cgroup before it records
+`runtime-released-prompt-attempting`. Owner-only marker files are diagnostic
+signals and never satisfy this admission. An unverified guardian, invalid child
+identity, or timeout returns
+`provider-stop-canary-startup-failed`; no prompt bytes or submit key have been
+sent. The exact failure is durably retained as `canary-startup-failed`, so
+exact worker-start replay returns the same typed result without relaunch or
+prompt transport. Diagnose its bounded `stage` and `failure_code`, then use the
+typed pre-claim recovery. Never retry by inspecting the pane, resending the
+prompt, or injecting Enter. Before guardian launch, the supervisor
+becomes a child
 subreaper and creates and pins the incarnation-derived child cgroup v2
 directory, membership, freeze, and event handles. The guardian reopens only
 that device/inode-fenced boundary, becomes the provider tree's child
@@ -827,7 +917,29 @@ gets its own user, mount, and cgroup namespaces with that exact child cgroup
 as the cgroup namespace root and a read-only `/sys/fs/cgroup` view. It
 therefore cannot migrate itself or a descendant to the writable delegated
 parent or a sibling, while the outer guardian retains the exact observation
-and freeze handles.
+and freeze handles. The provider's host UID is mapped only to namespace UID
+zero for this private mount setup. Before exec, the guardian locks off root and
+setuid capability reconstruction, clears every capability set and bounding
+entry, sets no-new-privileges, and installs a native-architecture seccomp
+filter. The filter denies user-namespace creation through `unshare` or classic
+`clone`, denies `setns`, and makes uninspectable `clone3` return `ENOSYS` so
+ordinary thread creation can fall back to inspected classic `clone`. Every
+non-standard inherited descriptor is close-on-exec; local-domain `socket` and
+`socketpair` creation and `io_uring_setup` are denied, and the standard user
+D-Bus, SSH-agent, and runtime-directory discovery variables are removed. This
+prevents the ordinary same-UID user-systemd, D-Bus, agent, and
+container-daemon process-broker channels, including `IORING_OP_SOCKET`
+bypasses, while preserving ordinary Internet sockets. Startup fails closed if
+any part of that privilege seal cannot be installed or verified.
+
+This canary is an exact-process termination contract, not a general same-UID
+host sandbox. A separately pre-existing same-UID process broker reachable over
+an allowed Internet-domain socket, or a deferred host scheduler driven only by
+filesystem writes, remains outside its authority and containment boundary.
+Canary assignments MUST use the bounded field-proof prompt and MUST NOT ask
+the provider to invoke an external process broker or persistence mechanism.
+The stop proof covers only the guardian-authenticated provider identity and
+its pinned incarnation cgroup members.
 Provider cwd, executable, and standard streams are rejected if they are
 cgroupfs-backed, and every non-standard inherited descriptor is sealed
 close-on-exec after namespace setup. This prevents an inherited path handle
@@ -864,7 +976,9 @@ stopped reconciliation.
 The sidecar deliberately leaves the released v3 registry and assignment wire
 schema unchanged. Before provider exec, the guardian requires the live
 controller pane to match the PID/start-time tuple already persisted for that
-controller incarnation, pins that process with a pidfd for its lifetime, and
+controller incarnation. Fresh controller and canary-wrapper launches carry
+that tuple independently of the dynamic process-session member snapshot. The
+guardian pins the controller process with a pidfd for its lifetime and
 opens a private Unix control socket. A marker plus sidecar is never sufficient authority: stop and
 release additionally require Linux `SO_PEERCRED` proof that the requesting
 CLI process descends from that captured controller and is outside the
@@ -874,7 +988,12 @@ UID and can read owner-only state. The guardian also requires the matching
 durable reservation before acting. It freezes the pinned cgroup, verifies
 every stable member as the exact provider leader or a previously pidfd-pinned
 descendant, signals only those identities, and removes the same pinned empty
-cgroup. If the guardian dies abnormally, the supervisor validates and signals
+cgroup. Guardian request parsing and acknowledgement share one
+250-millisecond absolute deadline, with supervisor-loss checks between reads;
+controller connect, request, and acknowledgement also share one absolute
+deadline. A trickled frame or full local socket backlog therefore fails
+closed within the typed bound instead of delaying crash cleanup. If the
+guardian dies abnormally, the supervisor validates and signals
 only provider members reparented to its exact subreaper through the boundary
 it pinned before launch. It never reopens a path for termination. Main
 independently proves that the same PID/start-time identity is absent or stopped

@@ -25,6 +25,7 @@ nils-common = { version = "1.25.11", path = "../nils-common", package = "nils-co
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+shell-words = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }

@@ -68,14 +68,100 @@ fn sha256_hex(value: &str) -> String {
 pub(super) fn fake_tmux(tmp: &Path) -> (PathBuf, PathBuf) {
     let bin = tmp.join("tmux");
     let log = tmp.join("tmux.log");
+    let pane_parent_path = tmp.to_string_lossy();
+    let pane_parent = shell_words::quote(&pane_parent_path);
+    let pane_start_time = if cfg!(target_os = "linux") {
+        r#"stat = open("/proc/self/stat", encoding="utf-8").read()
+start_time = stat[stat.rfind(") ") + 2:].split()[19]"#
+    } else {
+        r#"start_time = "0""#
+    };
     write_executable(
         &bin,
-        r#"#!/usr/bin/env sh
+        &r#"#!/usr/bin/env sh
 : "${AGENT_SESSION_FAKE_TMUX_LOG:?}"
 for arg in "$@"; do
   printf '%s\000' "$arg" >> "$AGENT_SESSION_FAKE_TMUX_LOG"
 done
 printf '\036' >> "$AGENT_SESSION_FAKE_TMUX_LOG"
+
+NILS_TEST_PANE_PARENT=__NILS_TEST_PANE_PARENT__
+start_live_pane() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'fake tmux live-pane fixture requires python3' >&2
+    return 127
+  fi
+  ready="$NILS_TEST_PANE_PARENT/.pane-ready-$$"
+  rm -f "$ready"
+  NILS_TEST_PANE_PARENT="$NILS_TEST_PANE_PARENT" NILS_TEST_PANE_READY="$ready" NILS_TEST_PANE_LIFETIME_MS="${NILS_TEST_PANE_LIFETIME_MS:-30000}" python3 -c '
+import os
+import time
+os.setsid()
+ready = os.environ["NILS_TEST_PANE_READY"]
+temporary = ready + ".tmp." + str(os.getpid())
+__NILS_TEST_PANE_START_TIME__
+with open(temporary, "x", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()) + " " + start_time + "\n")
+os.replace(temporary, ready)
+deadline = time.monotonic() + int(os.environ["NILS_TEST_PANE_LIFETIME_MS"]) / 1000
+parent = os.environ["NILS_TEST_PANE_PARENT"]
+while os.path.isdir(parent) and time.monotonic() < deadline:
+    time.sleep(0.02)
+' >/dev/null 2>&1 &
+  launcher=$!
+  attempts=0
+  while [ ! -s "$ready" ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 200 ] || ! kill -0 "$launcher" 2>/dev/null; then
+      kill "$launcher" 2>/dev/null || true
+      wait "$launcher" 2>/dev/null || true
+      rm -f "$ready"
+      return 1
+    fi
+    sleep 0.01
+  done
+  set -- $(cat "$ready")
+  NILS_TEST_PANE_PID=$1
+  NILS_TEST_PANE_START_TIME=$2
+  rm -f "$ready"
+  [ -n "$NILS_TEST_PANE_PID" ] && [ -n "$NILS_TEST_PANE_START_TIME" ] &&
+    kill -0 "$NILS_TEST_PANE_PID" 2>/dev/null
+}
+
+pane_process_start_time() {
+  pane_pid="$1"
+  if [ -r "/proc/$pane_pid/stat" ]; then
+    sed 's/^.*) //' "/proc/$pane_pid/stat" 2>/dev/null | awk '{ print $20 }'
+    return
+  fi
+  LC_ALL=C ps -o lstart= -p "$pane_pid" 2>/dev/null | cksum | awk '{ print $1 ":" $2 }'
+}
+
+terminate_exact_pane() {
+  pane_target="$1"
+  pane_mapping="$(awk -F '\t' -v target="$pane_target" '
+    $1 == target || $2 == target {
+      count += 1
+      value = $4 "\t" $5
+    }
+    END {
+      if (count == 1) print value
+    }
+  ' "$AGENT_SESSION_FAKE_TMUX_LOG.panes" 2>/dev/null)"
+  [ -n "$pane_mapping" ] || return 0
+  old_ifs="$IFS"
+  IFS='	'
+  set -- $pane_mapping
+  IFS="$old_ifs"
+  pane_pid="$1"
+  expected_start_time="$2"
+  [ -n "$pane_pid" ] && [ -n "$expected_start_time" ] || return 0
+  observed_start_time="$(pane_process_start_time "$pane_pid")"
+  [ "$observed_start_time" = "$expected_start_time" ] || return 0
+  observed_pgid="$(LC_ALL=C ps -o pgid= -p "$pane_pid" 2>/dev/null | tr -d '[:space:]')"
+  [ "$observed_pgid" = "$pane_pid" ] || return 0
+  kill -TERM "-$pane_pid" 2>/dev/null || true
+}
 
 operation="$1"
 if [ "$operation" = "if-shell" ]; then
@@ -117,6 +203,8 @@ if [ "$1" = "kill-session" ]; then
   printf '%s\n' "$target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
   if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
     kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
+  elif [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
+    terminate_exact_pane "$target"
   fi
   exit 0
 fi
@@ -132,6 +220,8 @@ if [ "$1" = "if-shell" ]; then
   printf '%s\n' "$kill_target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
   if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
     kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
+  elif [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
+    terminate_exact_pane "$kill_target"
   fi
   exit 0
 fi
@@ -152,13 +242,29 @@ if [ "$1" = "has-session" ]; then
   exit 0
 fi
 
-if [ "$1" = "display-message" ] && [ -n "${AGENT_SESSION_FAKE_TMUX_PANE_PID:-}" ]; then
+if [ "$1" = "display-message" ]; then
   last_arg=""
   for arg in "$@"; do
     last_arg="$arg"
   done
   case "$last_arg" in
     *'#{pane_pid}')
+      tmux_name="${target#=}"
+      tmux_name="${tmux_name%%:*}"
+      mapped_identity="$(awk -F '\t' -v target="$tmux_name" '$1 == target { value=$2 "\t" $3 "\t" $4 } END { print value }' "$AGENT_SESSION_FAKE_TMUX_LOG.identities" 2>/dev/null)"
+      if [ -n "$mapped_identity" ]; then
+        if [ "${AGENT_SESSION_FAKE_TMUX_DRIFT_LAUNCH_IDENTITY:-0}" = "1" ]; then
+          old_ifs="$IFS"
+          IFS='	'
+          set -- $mapped_identity
+          IFS="$old_ifs"
+          printf '%s\t%s\t%s\n' "$1" "$2" "$(($3 + 1))"
+          exit 0
+        fi
+        printf '%s\n' "$mapped_identity"
+        exit 0
+      fi
+      [ -n "${AGENT_SESSION_FAKE_TMUX_PANE_PID:-}" ] || exit 0
       session_identity="${AGENT_SESSION_FAKE_TMUX_SESSION_ID:-}"
       [ -n "$session_identity" ] || session_identity='$77'
       pane_identity="${AGENT_SESSION_FAKE_TMUX_PANE_ID:-}"
@@ -170,6 +276,13 @@ if [ "$1" = "display-message" ] && [ -n "${AGENT_SESSION_FAKE_TMUX_PANE_PID:-}" 
 fi
 
 if [ "$1" = "show-environment" ]; then
+  tmux_name="${3#=}"
+  tmux_name="${tmux_name%%:*}"
+  mapped_value="$(awk -F '\t' -v target="$tmux_name" -v key="$4" '$1 == target && $2 == key { value=$3 } END { print value }' "$AGENT_SESSION_FAKE_TMUX_LOG.environments" 2>/dev/null)"
+  if [ -n "$mapped_value" ]; then
+    printf '%s=%s\n' "$4" "$mapped_value"
+    exit 0
+  fi
   case "$4" in
     AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' "$AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID" ;;
     AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' "$AGENT_SESSION_FAKE_TMUX_STATE_DIR" ;;
@@ -265,11 +378,50 @@ if [ "$1" = "new-session" ]; then
     printf 'contaminated launch output\n'
     exit 0
   fi
+  tmux_name=""
+  launch_agent_session_id=""
+  launch_state_dir=""
+  launch_runtime_id=""
+  previous=""
+  for arg in "$@"; do
+    if [ "$previous" = "-s" ]; then
+      tmux_name="$arg"
+    elif [ "$previous" = "-e" ]; then
+      case "$arg" in
+        AGENT_SESSION_ID=*) launch_agent_session_id="${arg#AGENT_SESSION_ID=}" ;;
+        AGENT_SESSION_STATE_DIR=*) launch_state_dir="${arg#AGENT_SESSION_STATE_DIR=}" ;;
+        AGENT_SESSION_RUNTIME_ID=*) launch_runtime_id="${arg#AGENT_SESSION_RUNTIME_ID=}" ;;
+      esac
+    fi
+    previous="$arg"
+  done
+  identity_number=77
+  while ! mkdir "$AGENT_SESSION_FAKE_TMUX_LOG.identity-$identity_number" 2>/dev/null; do
+    identity_number=$((identity_number + 1))
+  done
   session_identity="${AGENT_SESSION_FAKE_TMUX_SESSION_ID:-}"
-  [ -n "$session_identity" ] || session_identity='$77'
+  [ -n "$session_identity" ] || session_identity="\$$identity_number"
   pane_identity="${AGENT_SESSION_FAKE_TMUX_PANE_ID:-}"
-  [ -n "$pane_identity" ] || pane_identity='%77'
-  pane_pid="${AGENT_SESSION_FAKE_TMUX_PANE_PID:-$$}"
+  [ -n "$pane_identity" ] || pane_identity="%$identity_number"
+  pane_pid="${AGENT_SESSION_FAKE_TMUX_PANE_PID:-}"
+  if [ -n "${AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID:-}" ] &&
+     [ -n "$launch_agent_session_id" ] &&
+     [ "$launch_agent_session_id" != "$AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID" ]; then
+    pane_pid=""
+  fi
+  if [ -z "$pane_pid" ]; then
+    start_live_pane || exit 1
+    pane_pid="$NILS_TEST_PANE_PID"
+  fi
+  pane_start_time="$(pane_process_start_time "$pane_pid")"
+  [ -n "$pane_start_time" ] || exit 1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$tmux_name" "$session_identity" "$pane_identity" "$pane_pid" "$pane_start_time" >> "$AGENT_SESSION_FAKE_TMUX_LOG.panes"
+  if [ -n "$tmux_name" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$tmux_name" "$session_identity" "$pane_identity" "$pane_pid" >> "$AGENT_SESSION_FAKE_TMUX_LOG.identities"
+    printf '%s\t%s\t%s\n' "$tmux_name" "AGENT_SESSION_ID" "$launch_agent_session_id" >> "$AGENT_SESSION_FAKE_TMUX_LOG.environments"
+    printf '%s\t%s\t%s\n' "$tmux_name" "AGENT_SESSION_STATE_DIR" "$launch_state_dir" >> "$AGENT_SESSION_FAKE_TMUX_LOG.environments"
+    printf '%s\t%s\t%s\n' "$tmux_name" "AGENT_SESSION_RUNTIME_ID" "$launch_runtime_id" >> "$AGENT_SESSION_FAKE_TMUX_LOG.environments"
+  fi
   heartbeat=""
   heartbeat_slot=0
   for arg in "$@"; do
@@ -325,9 +477,100 @@ if [ "${AGENT_SESSION_FAKE_TMUX_FAIL_AFTER:-}" = "$operation" ]; then
 fi
 
 exit 0
-"#,
+"#
+        .replace("__NILS_TEST_PANE_PARENT__", &pane_parent)
+        .replace("__NILS_TEST_PANE_START_TIME__", pane_start_time),
     );
     (bin, log)
+}
+
+#[test]
+fn fake_tmux_allocates_and_terminates_exact_live_pane_identities() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (tmux, log) = fake_tmux(tmp.path());
+    let launch = |name: &str| {
+        let output = Command::new(&tmux)
+            .env("AGENT_SESSION_FAKE_TMUX_LOG", &log)
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_id}\t#{pane_id}\t#{pane_pid}",
+                "-s",
+                name,
+            ])
+            .output()
+            .expect("launch fake tmux pane");
+        assert!(
+            output.status.success(),
+            "fake tmux launch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fields = String::from_utf8(output.stdout)
+            .expect("utf8 launch identity")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3, "{fields:?}");
+        (
+            fields[0].clone(),
+            fields[2].parse::<libc::pid_t>().expect("pane pid"),
+        )
+    };
+
+    let (first_session, first_pid) = launch("first");
+    let (second_session, second_pid) = launch("second");
+    assert_ne!(first_session, second_session);
+    assert_ne!(first_pid, second_pid);
+    let revalidated = Command::new(&tmux)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &log)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            "=first:0.0",
+            "#{session_id}\t#{pane_id}\t#{pane_pid}",
+        ])
+        .output()
+        .expect("revalidate fake tmux pane");
+    assert!(revalidated.status.success());
+    assert_eq!(
+        String::from_utf8(revalidated.stdout)
+            .expect("UTF-8 revalidated identity")
+            .split_whitespace()
+            .last()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok()),
+        Some(first_pid)
+    );
+
+    let terminated = Command::new(&tmux)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &log)
+        .args(["kill-session", "-t", &first_session])
+        .output()
+        .expect("terminate first fake tmux pane");
+    assert!(terminated.status.success());
+
+    let pane_is_live = |pid: libc::pid_t| {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && !String::from_utf8_lossy(&output.stdout)
+                        .trim_start()
+                        .starts_with('Z')
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pane_is_live(first_pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!pane_is_live(first_pid), "first pane must stop");
+    assert!(
+        pane_is_live(second_pid),
+        "terminating the first identity must preserve the second pane"
+    );
 }
 
 pub(super) fn fake_agent(tmp: &Path, name: &str) -> PathBuf {
@@ -4890,7 +5133,7 @@ fn delete_uses_launch_identity_after_runtime_stops_before_first_delete() {
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
     let tmux_log_arg = tmux_log.to_string_lossy().to_string();
 
-    for agent in ["codex", "claude"] {
+    for (index, agent) in ["codex", "claude"].into_iter().enumerate() {
         let agent_bin = fake_agent(tmp.path(), agent);
         let agent_arg = agent_bin.to_string_lossy().to_string();
         let id = format!("stopped-before-delete-{agent}");
@@ -4915,19 +5158,62 @@ fn delete_uses_launch_identity_after_runtime_stops_before_first_delete() {
                 "--format",
                 "json",
             ],
-            &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("NILS_TEST_PANE_LIFETIME_MS", "500"),
+            ],
         );
-        assert_eq!(start.code, 0, "stdout={}", start.stdout_text());
+        assert_eq!(
+            start.code,
+            0,
+            "stdout={} stderr={}",
+            start.stdout_text(),
+            start.stderr_text()
+        );
         let session_dir = state_dir.join("sessions").join(&id);
         let record: Value = serde_json::from_slice(
             &fs::read(session_dir.join("session.json")).expect("launched session record"),
         )
         .expect("session json");
-        assert_eq!(record["delete_tmux_identity"]["session_id"], "$77");
-        assert_eq!(record["delete_tmux_identity"]["pane_id"], "%77");
+        assert_eq!(
+            record["delete_tmux_identity"]["session_id"],
+            format!("${}", 77 + index)
+        );
+        assert_eq!(
+            record["delete_tmux_identity"]["pane_id"],
+            format!("%{}", 77 + index)
+        );
         assert_eq!(
             record["delete_tmux_identity"]["launch_id"],
             record["runtime"]["launch_id"]
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                record["delete_tmux_identity"]["pane_start_time"]
+                    .as_u64()
+                    .is_some_and(|start_time| start_time > 0),
+                "a successful Linux tmux launch must persist its exact pane incarnation"
+            );
+        } else {
+            assert!(
+                record["delete_tmux_identity"]
+                    .get("pane_start_time")
+                    .is_none(),
+                "platforms without Linux start-time evidence must omit the field"
+            );
+        }
+        let process_group_id = record["delete_tmux_identity"]["process_group_id"]
+            .as_i64()
+            .expect("process group id") as libc::pid_t;
+        let stopped_deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(-process_group_id, 0) } == 0 && Instant::now() < stopped_deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(-process_group_id, 0) },
+            0,
+            "the bounded pane fixture must stop before delete"
         );
 
         let delete = run(
@@ -4954,6 +5240,57 @@ fn delete_uses_launch_identity_after_runtime_stops_before_first_delete() {
             "{agent} stopped state must be removed"
         );
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn start_fails_closed_when_exact_launch_pane_identity_drifts_before_persist() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let agent_bin = fake_agent(tmp.path(), "codex");
+    let id = "launch-pane-identity-drift";
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "start",
+            "--agent",
+            "codex",
+            "--id",
+            id,
+            "--cwd",
+            cwd.to_str().expect("cwd"),
+            "--tmux-bin",
+            tmux_bin.to_str().expect("tmux bin"),
+            "--agent-bin",
+            agent_bin.to_str().expect("agent bin"),
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_DRIFT_LAUNCH_IDENTITY", "1"),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let record_path = state_dir.join("sessions").join(id).join("session.json");
+    let record: Value =
+        serde_json::from_slice(&fs::read(record_path).expect("retained session record"))
+            .expect("session JSON");
+    assert!(
+        record.get("delete_tmux_identity").is_none(),
+        "a changed tmux pane identity must never become durable authentication evidence"
+    );
 }
 
 #[test]
@@ -5014,7 +5351,7 @@ fn resume_refuses_to_replace_a_surviving_prior_launch_identity() {
     ];
     let envs = [
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
-        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT_BEFORE_LAUNCH", "1"),
     ];
 
     let blocked = run(tmp.path(), &resume_args, &envs);
@@ -5632,10 +5969,11 @@ fn delete_runtime_identity_mismatch_never_kills_the_exact_name_reuse() {
     );
     let tmux_bin = tmp.path().join("tmux-identity-mismatch");
     let killed = tmp.path().join("wrong-session-killed");
+    let wrong_pane = spawn_test_process_group();
     write_executable(
         &tmux_bin,
         &format!(
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message) printf '$91\\t%%91\\t99999999\\n'; exit 0 ;;
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message) printf '$91\\t%%91\\t{}\\n'; exit 0 ;;
   show-environment)\n    case \"$4\" in\n      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=unrelated-session\\n' ;;
       AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR={}\\n' ;;
       AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=unrelated-runtime\\n' ;;
@@ -5643,6 +5981,7 @@ fn delete_runtime_identity_mismatch_never_kills_the_exact_name_reuse() {
   has-session) [ -f {} ] && exit 1; exit 0 ;;
   if-shell) : > {}; exit 0 ;;
 esac\nexit 42\n",
+            wrong_pane.pid(),
             state_dir.display(),
             killed.display(),
             killed.display(),

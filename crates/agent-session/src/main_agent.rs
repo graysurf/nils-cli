@@ -2586,10 +2586,248 @@ fn run_checkpoint(context: &CliContext, args: CheckpointArgs) -> Result<Value, C
     Ok(outcome)
 }
 
+fn worker_start_receipt_outcome(outcome: &Value) -> &Value {
+    if worker_start_readiness_is_pending(outcome) {
+        &outcome["outcome"]
+    } else {
+        outcome
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkerStartBootstrapHandshakeState {
+    transaction_observed: bool,
+    final_receipt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerStartBootstrapHandshakeAction {
+    Reject,
+    Wait,
+    Continue,
+    InvalidClear,
+}
+
+fn worker_start_bootstrap_handshake_action(
+    exact_starting_worker: bool,
+    handshake: WorkerStartBootstrapHandshakeState,
+    quarantine_matches: bool,
+) -> WorkerStartBootstrapHandshakeAction {
+    if !exact_starting_worker || (!handshake.transaction_observed && !handshake.final_receipt) {
+        WorkerStartBootstrapHandshakeAction::Reject
+    } else if quarantine_matches {
+        WorkerStartBootstrapHandshakeAction::Wait
+    } else if handshake.final_receipt {
+        WorkerStartBootstrapHandshakeAction::Continue
+    } else {
+        WorkerStartBootstrapHandshakeAction::InvalidClear
+    }
+}
+
+fn worker_start_bootstrap_handshake_state(
+    registry: &orchestration::Registry,
+    assignment: &AssignmentRecord,
+    worker: &SessionRef,
+) -> WorkerStartBootstrapHandshakeState {
+    let mut state = WorkerStartBootstrapHandshakeState::default();
+    for receipt in registry.receipts.values() {
+        if receipt.operation != "worker-start"
+            || receipt.principal_session_id != assignment.primary_manager.session_id
+            || receipt.principal_incarnation != assignment.primary_manager.session_incarnation
+        {
+            continue;
+        }
+        let outcome = worker_start_receipt_outcome(&receipt.outcome);
+        let outcome_worker = &outcome["worker"];
+        let worker_matches = outcome_worker["session_id"] == worker.session_id
+            && outcome_worker["session_incarnation"] == worker.session_incarnation;
+        if outcome["assignment_id"] == assignment.assignment_id && worker_matches {
+            state.transaction_observed |= matches!(
+                outcome["launch_phase"].as_str(),
+                Some(
+                    WORKER_START_PHASE_PROMPT_ATTEMPTING
+                        | WORKER_START_PHASE_PROMPT_DELIVERED
+                        | WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN
+                )
+            );
+        }
+        if outcome["assignment"]["assignment_id"] == assignment.assignment_id && worker_matches {
+            state.final_receipt = true;
+        }
+    }
+    state
+}
+
+fn worker_start_bootstrap_handshake_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS")
+        && let Ok(value) = value.parse::<u64>()
+        && (1..=5_000).contains(&value)
+    {
+        return Duration::from_millis(value);
+    }
+    Duration::from_secs(5)
+}
+
+fn await_worker_start_bootstrap_handshake(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+) -> Result<(), CliError> {
+    let initially_clear = match orchestration::ensure_session_not_quarantined(context, record) {
+        Ok(()) => true,
+        Err(error) if error.code() == "worker-quarantined" => false,
+        Err(error) => return Err(error),
+    };
+    if initially_clear && !crate::provider_stop_canary_armed(record) {
+        return Ok(());
+    }
+    let worker = session_ref(context, record, incarnation);
+    let (assignment_id, handshake) = {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let Principal::Worker {
+            assignment,
+            rebind_required: false,
+        } = resolve_principal(&registry, record, incarnation)?
+        else {
+            return orchestration::ensure_session_not_quarantined(context, record);
+        };
+        let exact_starting_worker = assignment.state == "starting"
+            && assignment.revision == 2
+            && assignment.worker.as_ref() == Some(&worker);
+        let handshake = worker_start_bootstrap_handshake_state(&registry, &assignment, &worker);
+        if !exact_starting_worker || (!handshake.transaction_observed && !handshake.final_receipt) {
+            return orchestration::ensure_session_not_quarantined(context, record);
+        }
+        (assignment.assignment_id.clone(), handshake)
+    };
+    let runtime_identity_digest = format!(
+        "sha256:{}",
+        crate::coordination_runtime_evidence(record)?.identity_digest
+    );
+    let quarantine_matches = orchestration::session_authority_quarantine_matches(
+        context,
+        &assignment_id,
+        2,
+        &worker,
+        WORKER_START_QUARANTINE_REASON,
+        &runtime_identity_digest,
+    )?;
+    match worker_start_bootstrap_handshake_action(true, handshake, quarantine_matches) {
+        WorkerStartBootstrapHandshakeAction::Reject => {
+            return orchestration::ensure_session_not_quarantined(context, record);
+        }
+        WorkerStartBootstrapHandshakeAction::InvalidClear => {
+            return Err(CliError::data(
+                "worker-start-bootstrap-handshake-invalid",
+                "worker-start quarantine cleared without a matching final receipt",
+                Some(json!({ "assignment_id": assignment_id })),
+            ));
+        }
+        WorkerStartBootstrapHandshakeAction::Continue => {
+            if !orchestration::session_authority_quarantine_released(
+                context,
+                &assignment_id,
+                2,
+                &worker,
+                WORKER_START_QUARANTINE_REASON,
+                &runtime_identity_digest,
+            )? {
+                return Err(CliError::data(
+                    "worker-start-bootstrap-handshake-invalid",
+                    "worker-start final receipt has no matching authority release",
+                    Some(json!({ "assignment_id": assignment_id })),
+                ));
+            }
+            orchestration::ensure_session_not_quarantined(context, record)?;
+            return Ok(());
+        }
+        WorkerStartBootstrapHandshakeAction::Wait => {}
+    }
+    pause_batch_lane_for_test("after_canary_bootstrap_matching_quarantine_observed")?;
+    let deadline = Instant::now() + worker_start_bootstrap_handshake_timeout();
+    let mut backoff = Duration::from_millis(25);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(CliError::runtime(
+                "worker-start-bootstrap-handshake-timeout",
+                "worker bootstrap timed out waiting for the exact worker-start transaction",
+                Some(json!({
+                    "assignment_id": assignment_id,
+                    "retryable": true,
+                    "next_action": "replay-worker-start-then-retry-bootstrap"
+                })),
+            ));
+        }
+        thread::sleep(backoff);
+        if !orchestration::session_authority_quarantine_matches(
+            context,
+            &assignment_id,
+            2,
+            &worker,
+            WORKER_START_QUARANTINE_REASON,
+            &runtime_identity_digest,
+        )? {
+            break;
+        }
+        backoff = (backoff * 2).min(Duration::from_millis(500));
+    }
+    let registry = orchestration::load_registry_readonly(context)?;
+    let Principal::Worker {
+        assignment,
+        rebind_required: false,
+    } = resolve_principal(&registry, record, incarnation)?
+    else {
+        return Err(CliError::data(
+            "worker-start-bootstrap-handshake-invalid",
+            "worker-start transaction changed before quarantine clear",
+            Some(json!({ "assignment_id": assignment_id })),
+        ));
+    };
+    let exact_starting_worker = assignment.assignment_id == assignment_id
+        && assignment.state == "starting"
+        && assignment.revision == 2
+        && assignment.worker.as_ref() == Some(&worker);
+    let handshake = worker_start_bootstrap_handshake_state(&registry, &assignment, &worker);
+    drop(registry);
+    match worker_start_bootstrap_handshake_action(exact_starting_worker, handshake, false) {
+        WorkerStartBootstrapHandshakeAction::Continue => {
+            if !orchestration::session_authority_quarantine_released(
+                context,
+                &assignment_id,
+                2,
+                &worker,
+                WORKER_START_QUARANTINE_REASON,
+                &runtime_identity_digest,
+            )? {
+                return Err(CliError::data(
+                    "worker-start-bootstrap-handshake-invalid",
+                    "worker-start final receipt has no matching authority release",
+                    Some(json!({ "assignment_id": assignment_id })),
+                ));
+            }
+            orchestration::ensure_session_not_quarantined(context, record)?;
+            Ok(())
+        }
+        _ => Err(CliError::data(
+            "worker-start-bootstrap-handshake-invalid",
+            "worker-start quarantine cleared without a matching final receipt",
+            Some(json!({ "assignment_id": assignment_id })),
+        )),
+    }
+}
+
 fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
     let (record, incarnation) = authenticated_self(context)?;
-    orchestration::ensure_session_not_quarantined(context, &record)?;
+    let main_agent_bin = env::current_exe().map_err(|_| {
+        CliError::runtime(
+            "main-agent-executable-unavailable",
+            "the current main-agent executable could not be resolved for worker instructions",
+            None,
+        )
+    })?;
+    await_worker_start_bootstrap_handshake(context, &record, &incarnation)?;
     let checkpoint_file = ensure_runtime_checkpoint_ready(context, &record, &incarnation)?;
     let (assignment, tier, rebind_from) = {
         let registry = orchestration::load_registry_readonly(context)?;
@@ -2741,8 +2979,58 @@ fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, Cli
         "schema_version": "main-agent.bootstrap-result.v1",
         "claim": "active",
         "checkpoint_file": crate::display_path(&checkpoint_file),
+        "worker_instructions": worker_bootstrap_instructions(
+            &main_agent_bin,
+            &checkpoint_file,
+            &current
+        ),
         "assignment": private_assignment_view(context, &current)?
     }))
+}
+
+fn worker_bootstrap_instructions(
+    main_agent_bin: &Path,
+    checkpoint_file: &Path,
+    assignment: &AssignmentRecord,
+) -> Value {
+    let executable = crate::display_path(main_agent_bin);
+    let checkpoint_file = crate::display_path(checkpoint_file);
+    json!({
+        "schema_version": "main-agent.worker-instructions.v1",
+        "task_source": "assignment.assignment_packet.task",
+        "checkpoint": {
+            "file": checkpoint_file,
+            "write": {
+                "required_before_execute": true,
+                "sole_write_target": true,
+                "payload_schema_version": CHECKPOINT_INPUT_SCHEMA
+            },
+            "argv_template": [
+                executable.clone(),
+                "checkpoint",
+                "--file",
+                checkpoint_file,
+                "--if-revision",
+                assignment.revision.to_string(),
+                "--idempotency-key",
+                "<stable-key>",
+                "--format",
+                "json"
+            ]
+        },
+        "claim_lifecycle": "After each submitted or blocked checkpoint succeeds, release the work-context claim before reporting that checkpoint.",
+        "request_changes": {
+            "required_before_mutation": true,
+            "argv_template": [
+                executable,
+                "bootstrap",
+                "--idempotency-key",
+                "<new-stable-key-for-current-revision>",
+                "--format",
+                "json"
+            ]
+        }
+    })
 }
 
 fn carry_forward_bootstrap_guidance_with_authorization(
@@ -3032,6 +3320,10 @@ fn run_worker_start_single_input(
                 &args.idempotency_key,
                 &request_digest,
                 &value,
+                input
+                    .provider_stop_canary
+                    .as_ref()
+                    .map(|_| input.assignment_id.as_deref()),
             )?;
             return finish_worker_start_readiness(
                 context,
@@ -3073,6 +3365,10 @@ fn run_worker_start_single_input(
                 &args.idempotency_key,
                 &request_digest,
                 &value,
+                input
+                    .provider_stop_canary
+                    .as_ref()
+                    .map(|_| input.assignment_id.as_deref()),
             )?;
             return Ok(value);
         }
@@ -3117,6 +3413,22 @@ fn run_worker_start_single_input(
             "pending worker start provider config directory is invalid",
         ));
     }
+    let expected_pending_worker = if pending_start.is_some()
+        && launch_input.provider_stop_canary.is_some()
+        && locked
+            .registry
+            .assignments
+            .get(&assignment_id)
+            .and_then(|assignment| assignment.worker.as_ref())
+            .is_some()
+    {
+        drop(locked);
+        let expected = load_worker_start_attachment(context, &worker_session_id)?;
+        locked = orchestration::lock_registry(context)?;
+        Some(expected)
+    } else {
+        None
+    };
     let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
     // T2: the run-revision fence is now advisory. Assignment creation is fenced
     // by the active claim, current-main check, and assignment-absence below, so
@@ -3132,10 +3444,16 @@ fn run_worker_start_single_input(
             .get(&assignment_id)
             .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
         ensure_primary_manager(current, &record, &incarnation)?;
+        let resumable_start = resumable_worker_start_attachment(
+            current,
+            &worker_session_id,
+            launch_input.provider_stop_canary.is_some(),
+            expected_pending_worker.as_ref(),
+        )
+        .is_ok();
         if current.run_id != run.run_id
             || current.state != "starting"
-            || current.revision != 1
-            || current.worker.is_some()
+            || !resumable_start
             || current.private_packet_digest != expected_packet_digest
         {
             return Err(CliError::data(
@@ -3237,10 +3555,16 @@ fn run_worker_start_single_input(
                 .get(&assignment_id)
                 .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
             ensure_primary_manager(current, &record, &incarnation)?;
+            let resumable_start = resumable_worker_start_attachment(
+                current,
+                &worker_session_id,
+                launch_input.provider_stop_canary.is_some(),
+                expected_pending_worker.as_ref(),
+            )
+            .is_ok();
             if current.run_id != run.run_id
                 || current.state != "starting"
-                || current.revision != 1
-                || current.worker.is_some()
+                || !resumable_start
                 || current.private_packet_digest != expected_packet_digest
             {
                 return Err(CliError::data(
@@ -3378,7 +3702,9 @@ fn run_worker_start_single_input(
             "canonical_launch_cwd": launch_input.launch.cwd.clone(),
             "provider_config_dir": launch_provider_config_dir.clone(),
             "state": "starting",
-            "acceptance": "pending"
+            "acceptance": "pending",
+            "launch_phase": WORKER_START_PHASE_ASSIGNMENT_CREATED,
+            "worker": null
         });
         store_receipt(
             &mut locked.registry,
@@ -3403,8 +3729,15 @@ fn run_worker_start_single_input(
         )
     })?;
     let prompt = worker_start_prompt(&assignment_id, &main_agent_bin);
+    let prior_compact_prompt = prior_compact_worker_start_prompt(&assignment_id, &main_agent_bin);
+    let legacy_prompt = legacy_worker_start_prompt(&assignment_id, &main_agent_bin);
     let previous_prompt = previous_worker_start_prompt(&assignment_id, &main_agent_bin);
-    let replay_prompts = [prompt.as_str(), previous_prompt.as_str()];
+    let replay_prompts = [
+        prompt.as_str(),
+        prior_compact_prompt.as_str(),
+        legacy_prompt.as_str(),
+        previous_prompt.as_str(),
+    ];
     if let Some(batch_lane) = batch_lane {
         renew_worker_start_batch_lane(context, batch_lane)?;
     }
@@ -3420,7 +3753,8 @@ fn run_worker_start_single_input(
     };
     let fresh_launch = existing.is_none();
     let mut worker_start_fence = None;
-    let (worker_record, worker_status, launch_observation) = if let Some(worker) = existing {
+    let (worker_record, mut worker_status, mut launch_observation) = if let Some(worker) = existing
+    {
         ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
         let status = session_status(&resolve_tmux_bin(None), &worker);
         (worker, status, None)
@@ -3450,6 +3784,8 @@ fn run_worker_start_single_input(
                     &legacy_request_digest,
                     &launch_input.launch.cwd,
                     launch_provider_config_dir.as_deref(),
+                    None,
+                    false,
                 )?;
                 if batch_lane.is_some() {
                     locked.save()?;
@@ -3470,6 +3806,259 @@ fn run_worker_start_single_input(
             }
             Ok(())
         };
+        let mut pre_runtime_release_guard =
+            |worker: &SessionRecord| -> Result<(), crate::PreRuntimeReleaseGuardError> {
+                let worker_incarnation = worker
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+                ensure_active_claim(context, &record)?;
+                let expected_worker = session_ref(context, worker, worker_incarnation);
+                let runtime_identity_digest = format!(
+                    "sha256:{}",
+                    crate::coordination_runtime_evidence(worker)?.identity_digest
+                );
+                orchestration::persist_session_authority_quarantine(
+                    context,
+                    &assignment_id,
+                    2,
+                    &orchestration::WorkerQuarantineRecord {
+                        schema_version: orchestration::WORKER_QUARANTINE_SCHEMA.to_string(),
+                        worker: expected_worker.clone(),
+                        reason: WORKER_START_QUARANTINE_REASON.to_string(),
+                        runtime_identity_digest,
+                        created_at: timestamp(),
+                    },
+                )?;
+                pause_batch_lane_for_test("after_canary_quarantine_before_registry_lock")?;
+                let mut locked = orchestration::lock_registry(context)?;
+                if let Some(batch_lane) = batch_lane {
+                    renew_worker_start_batch_lane_after_child_side_effect_locked(
+                        &mut locked.registry,
+                        batch_lane,
+                    )?;
+                }
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    None,
+                    false,
+                )?;
+                let current = locked
+                    .registry
+                    .assignments
+                    .get_mut(&assignment_id)
+                    .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+                current.worker = Some(expected_worker.clone());
+                current.revision = 2;
+                current.updated_at = timestamp();
+                store_worker_start_launch_phase_locked(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    WORKER_START_PHASE_CANARY_STARTUP_PENDING,
+                    Some(&expected_worker),
+                )?;
+                locked.save()?;
+                drop(locked);
+                if let Err(error) = pause_batch_lane_for_test(
+                    "after_canary_worker_attachment_before_runtime_release",
+                ) {
+                    return match rollback_prebound_canary_worker_start(
+                        context,
+                        &record,
+                        &incarnation,
+                        &assignment_id,
+                        &worker_session_id,
+                        &expected_packet_digest,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        launch_provider_config_dir.as_deref(),
+                        &expected_worker,
+                    ) {
+                        Ok(()) => Err(crate::PreRuntimeReleaseGuardError::rolled_back(error)),
+                        Err(rollback_error) => Err(crate::PreRuntimeReleaseGuardError::committed(
+                            rollback_error,
+                        )),
+                    };
+                }
+                Ok(())
+            };
+        let mut post_runtime_release_guard = |worker: &SessionRecord| {
+            if provider_stop_canary_startup_admission_required()
+                && let Err(error) = crate::await_provider_stop_canary_startup(
+                    context,
+                    worker,
+                    crate::provider_stop_canary_startup_wait(),
+                )
+            {
+                let worker_incarnation = worker
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+                let expected_worker = session_ref(context, worker, worker_incarnation);
+                ensure_active_claim(context, &record)?;
+                let mut locked = orchestration::lock_registry(context)?;
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    Some(&expected_worker),
+                    true,
+                )?;
+                store_worker_start_startup_failure_locked(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &expected_worker,
+                    &error,
+                )?;
+                locked.save()?;
+                return Err(error);
+            }
+            let worker_incarnation = worker
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+            let expected_worker = session_ref(context, worker, worker_incarnation);
+            ensure_active_claim(context, &record)?;
+            let mut locked = orchestration::lock_registry(context)?;
+            validate_worker_start_authority_locked(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &assignment_id,
+                &worker_session_id,
+                &expected_packet_digest,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &launch_input.launch.cwd,
+                launch_provider_config_dir.as_deref(),
+                Some(&expected_worker),
+                true,
+            )?;
+            store_worker_start_launch_phase_locked(
+                &mut locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                WORKER_START_PHASE_PROMPT_ATTEMPTING,
+                Some(&expected_worker),
+            )?;
+            locked.save()?;
+            pause_batch_lane_for_test("after_canary_runtime_release_before_prompt")
+        };
+        let mut post_prompt_delivery_guard = |worker: &SessionRecord| {
+            pause_batch_lane_for_test("after_canary_prompt_delivery_before_phase_commit")?;
+            let worker_incarnation = worker
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+            let expected_worker = session_ref(context, worker, worker_incarnation);
+            ensure_active_claim(context, &record)?;
+            let mut locked = orchestration::lock_registry(context)?;
+            validate_worker_start_authority_locked(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &assignment_id,
+                &worker_session_id,
+                &expected_packet_digest,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &launch_input.launch.cwd,
+                launch_provider_config_dir.as_deref(),
+                Some(&expected_worker),
+                true,
+            )?;
+            store_worker_start_launch_phase_locked(
+                &mut locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                WORKER_START_PHASE_PROMPT_DELIVERED,
+                Some(&expected_worker),
+            )?;
+            locked.save()
+        };
+        let mut definitive_failure_guard = |worker: &SessionRecord| {
+            let worker_incarnation = worker
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+            let expected_worker = session_ref(context, worker, worker_incarnation);
+            rollback_prebound_canary_worker_start(
+                context,
+                &record,
+                &incarnation,
+                &assignment_id,
+                &worker_session_id,
+                &expected_packet_digest,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &launch_input.launch.cwd,
+                launch_provider_config_dir.as_deref(),
+                &expected_worker,
+            )
+        };
+        let pre_runtime_release_guard: crate::PreRuntimeReleaseGuard<'_> = launch_input
+            .provider_stop_canary
+            .is_some()
+            .then_some(&mut pre_runtime_release_guard);
+        let post_runtime_release_guard: SessionStartGuard<'_> = launch_input
+            .provider_stop_canary
+            .is_some()
+            .then_some(&mut post_runtime_release_guard);
+        let definitive_failure_guard: SessionStartGuard<'_> = launch_input
+            .provider_stop_canary
+            .is_some()
+            .then_some(&mut definitive_failure_guard);
+        let post_prompt_delivery_guard: SessionStartGuard<'_> = launch_input
+            .provider_stop_canary
+            .is_some()
+            .then_some(&mut post_prompt_delivery_guard);
         let started = crate::start_session_with_create_guard(
             context,
             cli::StartArgs {
@@ -3506,10 +4095,66 @@ fn run_worker_start_single_input(
             StartFailureDisposition::ReturnError,
             PromptDelivery::ManagedWorkerExactlyOnce,
             Some(&mut create_guard),
+            crate::StartLifecycleGuards {
+                pre_runtime_release: pre_runtime_release_guard,
+                post_runtime_release: post_runtime_release_guard,
+                post_prompt_delivery: post_prompt_delivery_guard,
+                definitive_failure: definitive_failure_guard,
+            },
         );
         let started = match started {
             Ok(started) => started,
             Err(error) => {
+                if launch_input.provider_stop_canary.is_some()
+                    && error.code() == "managed-worker-prompt-delivery-outcome-unknown"
+                {
+                    let phase_update = (|| {
+                        let worker = load_session_record(context, &worker_session_id)?;
+                        let worker_incarnation = worker
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| runtime.launch_id.as_str())
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                invalid_input("worker session incarnation is unavailable")
+                            })?;
+                        let expected_worker = session_ref(context, &worker, worker_incarnation);
+                        ensure_active_claim(context, &record)?;
+                        let mut locked = orchestration::lock_registry(context)?;
+                        validate_worker_start_authority_locked(
+                            &locked.registry,
+                            &record,
+                            &incarnation,
+                            &assignment_id,
+                            &worker_session_id,
+                            &expected_packet_digest,
+                            &args.idempotency_key,
+                            &request_digest,
+                            &legacy_request_digest,
+                            &launch_input.launch.cwd,
+                            launch_provider_config_dir.as_deref(),
+                            Some(&expected_worker),
+                            true,
+                        )?;
+                        store_worker_start_launch_phase_locked(
+                            &mut locked.registry,
+                            &record,
+                            &incarnation,
+                            &args.idempotency_key,
+                            &request_digest,
+                            &legacy_request_digest,
+                            WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN,
+                            Some(&expected_worker),
+                        )?;
+                        locked.save()
+                    })();
+                    if let Err(phase_error) = phase_update {
+                        if let Some(fence) = worker_start_fence.take() {
+                            fence.finish(context, false)?;
+                        }
+                        return Err(phase_error);
+                    }
+                }
                 if let Some(fence) = worker_start_fence.take() {
                     fence.finish(context, false)?;
                 }
@@ -3569,6 +4214,10 @@ fn run_worker_start_single_input(
                         &args.idempotency_key,
                         &request_digest,
                         &value,
+                        input
+                            .provider_stop_canary
+                            .as_ref()
+                            .map(|_| input.assignment_id.as_deref()),
                     )?;
                     return finish_worker_start_readiness(
                         context,
@@ -3589,6 +4238,10 @@ fn run_worker_start_single_input(
                         &args.idempotency_key,
                         &request_digest,
                         &value,
+                        input
+                            .provider_stop_canary
+                            .as_ref()
+                            .map(|_| input.assignment_id.as_deref()),
                     )?;
                     return Ok(value);
                 }
@@ -3651,6 +4304,427 @@ fn run_worker_start_single_input(
             }
         }
     }
+    if launch_input.provider_stop_canary.is_some() && !fresh_launch {
+        enum CanaryReplayAction {
+            Continue,
+            CleanupAndReplay,
+            CleanupAndReturn(CliError),
+        }
+        let recovery = (|| -> Result<CanaryReplayAction, CliError> {
+            let expected_worker_incarnation = worker_record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+            let expected_worker = session_ref(context, &worker_record, expected_worker_incarnation);
+            let mut launch_phase = {
+                let locked = orchestration::lock_registry(context)?;
+                let current = locked
+                    .registry
+                    .assignments
+                    .get(&assignment_id)
+                    .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+                let attachment = resumable_worker_start_attachment(
+                    current,
+                    &worker_session_id,
+                    true,
+                    Some(&expected_worker),
+                )?;
+                let pending = worker_start_idempotency_replay(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                )?
+                .filter(worker_start_is_pending)
+                .ok_or_else(|| {
+                    CliError::data(
+                        "assignment-start-conflict",
+                        "persisted worker start authority is unavailable",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    )
+                })?;
+                let phase = pending["launch_phase"].as_str().unwrap_or_default();
+                let phase_matches = (phase == WORKER_START_PHASE_ASSIGNMENT_CREATED
+                    && attachment.is_none())
+                    || (matches!(
+                        phase,
+                        WORKER_START_PHASE_RUNTIME_HELD
+                            | WORKER_START_PHASE_CANARY_STARTUP_PENDING
+                            | WORKER_START_PHASE_CANARY_STARTUP_FAILED
+                            | WORKER_START_PHASE_PROMPT_ATTEMPTING
+                            | WORKER_START_PHASE_PROMPT_DELIVERED
+                            | WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN
+                    ) && attachment.as_ref() == Some(&expected_worker));
+                if phase_matches {
+                    phase.to_string()
+                } else {
+                    return Err(CliError::data(
+                        "assignment-start-conflict",
+                        "persisted canary launch phase does not match its exact worker binding",
+                        Some(json!({ "assignment_id": assignment_id, "launch_phase": phase })),
+                    ));
+                }
+            };
+            if launch_phase == WORKER_START_PHASE_ASSIGNMENT_CREATED {
+                return Ok(CanaryReplayAction::CleanupAndReplay);
+            }
+            if launch_phase == WORKER_START_PHASE_CANARY_STARTUP_FAILED {
+                let locked = orchestration::lock_registry(context)?;
+                let pending = worker_start_idempotency_replay(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                )?
+                .filter(worker_start_is_pending)
+                .ok_or_else(|| {
+                    CliError::data(
+                        "assignment-start-conflict",
+                        "persisted canary startup failure is unavailable",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    )
+                })?;
+                return Err(worker_start_startup_failure_error(&pending).ok_or_else(|| {
+                    CliError::data(
+                        "assignment-start-conflict",
+                        "persisted canary startup failure is invalid",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    )
+                })?);
+            }
+            if worker_status != "running"
+                && launch_phase == WORKER_START_PHASE_CANARY_STARTUP_PENDING
+            {
+                if !crate::launch_gate_path(&context.state_dir, &worker_record).is_file() {
+                    rollback_prebound_canary_worker_start(
+                        context,
+                        &record,
+                        &incarnation,
+                        &assignment_id,
+                        &worker_session_id,
+                        &expected_packet_digest,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        launch_provider_config_dir.as_deref(),
+                        &expected_worker,
+                    )?;
+                    return Ok(CanaryReplayAction::CleanupAndReplay);
+                }
+                let error = crate::provider_stop_canary_startup_error(
+                    "controller",
+                    "provider-stop-canary-wrapper-stopped",
+                );
+                ensure_active_claim(context, &record)?;
+                let mut locked = orchestration::lock_registry(context)?;
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    Some(&expected_worker),
+                    true,
+                )?;
+                store_worker_start_startup_failure_locked(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &expected_worker,
+                    &error,
+                )?;
+                locked.save()?;
+                return Err(error);
+            }
+            if worker_status != "running" && launch_phase == WORKER_START_PHASE_RUNTIME_HELD {
+                rollback_prebound_canary_worker_start(
+                    context,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    &expected_worker,
+                )?;
+                return Ok(CanaryReplayAction::CleanupAndReplay);
+            }
+            if worker_status != "running" {
+                return Err(CliError::data(
+                    "worker-start-canary-recovery-required",
+                    "the exact prebound canary runtime stopped before worker-start completed",
+                    Some(json!({
+                        "assignment_id": assignment_id,
+                        "worker": expected_worker,
+                        "launch_phase": launch_phase
+                    })),
+                ));
+            }
+            if matches!(
+                launch_phase.as_str(),
+                WORKER_START_PHASE_PROMPT_DELIVERED | WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN
+            ) {
+                return Ok(CanaryReplayAction::Continue);
+            }
+            if launch_phase == WORKER_START_PHASE_PROMPT_ATTEMPTING {
+                return Err(CliError::runtime(
+                    "managed-worker-prompt-delivery-outcome-unknown",
+                    "the canary prompt transaction was interrupted after release; preserve the exact session and do not redeliver",
+                    Some(json!({ "phase": "canary-prompt-attempt" })),
+                ));
+            }
+            let launch_gate = crate::launch_gate_path(&context.state_dir, &worker_record);
+            if launch_phase == WORKER_START_PHASE_RUNTIME_HELD && !launch_gate.is_file() {
+                ensure_active_claim(context, &record)?;
+                let mut locked = orchestration::lock_registry(context)?;
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    Some(&expected_worker),
+                    true,
+                )?;
+                store_worker_start_launch_phase_locked(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    WORKER_START_PHASE_CANARY_STARTUP_PENDING,
+                    Some(&expected_worker),
+                )?;
+                locked.save()?;
+                launch_phase = WORKER_START_PHASE_CANARY_STARTUP_PENDING.to_string();
+            }
+            let release_was_already_observed = launch_gate.is_file();
+            if !release_was_already_observed {
+                crate::release_held_runtime(context, &worker_record)?;
+            }
+            if launch_phase == WORKER_START_PHASE_CANARY_STARTUP_PENDING
+                && provider_stop_canary_startup_admission_required()
+                && let Err(error) = crate::await_provider_stop_canary_startup(
+                    context,
+                    &worker_record,
+                    crate::provider_stop_canary_startup_wait(),
+                )
+            {
+                ensure_active_claim(context, &record)?;
+                let mut locked = orchestration::lock_registry(context)?;
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    &record,
+                    &incarnation,
+                    &assignment_id,
+                    &worker_session_id,
+                    &expected_packet_digest,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    launch_provider_config_dir.as_deref(),
+                    Some(&expected_worker),
+                    true,
+                )?;
+                store_worker_start_startup_failure_locked(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    &request_digest,
+                    &legacy_request_digest,
+                    &expected_worker,
+                    &error,
+                )?;
+                locked.save()?;
+                return Err(error);
+            }
+            ensure_active_claim(context, &record)?;
+            let mut locked = orchestration::lock_registry(context)?;
+            validate_worker_start_authority_locked(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &assignment_id,
+                &worker_session_id,
+                &expected_packet_digest,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &launch_input.launch.cwd,
+                launch_provider_config_dir.as_deref(),
+                Some(&expected_worker),
+                true,
+            )?;
+            store_worker_start_launch_phase_locked(
+                &mut locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                WORKER_START_PHASE_PROMPT_ATTEMPTING,
+                Some(&expected_worker),
+            )?;
+            locked.save()?;
+            drop(locked);
+            if release_was_already_observed
+                && launch_phase != WORKER_START_PHASE_CANARY_STARTUP_PENDING
+            {
+                return Err(CliError::runtime(
+                    "managed-worker-prompt-delivery-outcome-unknown",
+                    "the canary release gate was observed without a durable prompt outcome; preserve the exact session and do not redeliver",
+                    Some(json!({ "phase": "canary-runtime-release" })),
+                ));
+            }
+            match crate::paste_prompt(
+                &resolve_tmux_bin(None),
+                &worker_record,
+                PromptDelivery::ManagedWorkerExactlyOnce,
+            ) {
+                Ok(observation) => {
+                    launch_observation = Some(
+                        serde_json::to_value(observation)
+                            .map_err(|_| invalid_input("worker launch observation is invalid"))?,
+                    );
+                    ensure_active_claim(context, &record)?;
+                    let mut locked = orchestration::lock_registry(context)?;
+                    validate_worker_start_authority_locked(
+                        &locked.registry,
+                        &record,
+                        &incarnation,
+                        &assignment_id,
+                        &worker_session_id,
+                        &expected_packet_digest,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        launch_provider_config_dir.as_deref(),
+                        Some(&expected_worker),
+                        true,
+                    )?;
+                    store_worker_start_launch_phase_locked(
+                        &mut locked.registry,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        WORKER_START_PHASE_PROMPT_DELIVERED,
+                        Some(&expected_worker),
+                    )?;
+                    locked.save()?;
+                    worker_status = session_status(&resolve_tmux_bin(None), &worker_record);
+                    Ok(CanaryReplayAction::Continue)
+                }
+                Err(error) if error.code() == "managed-worker-prompt-delivery-outcome-unknown" => {
+                    ensure_active_claim(context, &record)?;
+                    let mut locked = orchestration::lock_registry(context)?;
+                    validate_worker_start_authority_locked(
+                        &locked.registry,
+                        &record,
+                        &incarnation,
+                        &assignment_id,
+                        &worker_session_id,
+                        &expected_packet_digest,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        launch_provider_config_dir.as_deref(),
+                        Some(&expected_worker),
+                        true,
+                    )?;
+                    store_worker_start_launch_phase_locked(
+                        &mut locked.registry,
+                        &record,
+                        &incarnation,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN,
+                        Some(&expected_worker),
+                    )?;
+                    locked.save()?;
+                    Err(error)
+                }
+                Err(error) => {
+                    rollback_prebound_canary_worker_start(
+                        context,
+                        &record,
+                        &incarnation,
+                        &assignment_id,
+                        &worker_session_id,
+                        &expected_packet_digest,
+                        &args.idempotency_key,
+                        &request_digest,
+                        &legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        launch_provider_config_dir.as_deref(),
+                        &expected_worker,
+                    )?;
+                    Ok(CanaryReplayAction::CleanupAndReturn(error))
+                }
+            }
+        })();
+        match recovery {
+            Ok(CanaryReplayAction::Continue) => {}
+            Ok(CanaryReplayAction::CleanupAndReplay) => {
+                worker_start_fence
+                    .take()
+                    .expect("worker start fence is active before canary retry cleanup")
+                    .finish(context, false)?;
+                pause_batch_lane_for_test("after_canary_rollback_before_session_cleanup")?;
+                delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
+                return run_worker_start_single_input(context, args, input, batch_lane);
+            }
+            Ok(CanaryReplayAction::CleanupAndReturn(error)) => {
+                worker_start_fence
+                    .take()
+                    .expect("worker start fence is active during canary prompt rollback")
+                    .finish(context, false)?;
+                pause_batch_lane_for_test("after_canary_rollback_before_session_cleanup")?;
+                delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
+                return Err(error);
+            }
+            Err(error) => {
+                worker_start_fence
+                    .take()
+                    .expect("worker start fence is active during canary recovery")
+                    .finish(context, false)?;
+                return Err(error);
+            }
+        }
+    }
     if let Err(error) = pause_batch_lane_for_test("before_worker_attachment") {
         worker_start_fence
             .take()
@@ -3659,6 +4733,7 @@ fn run_worker_start_single_input(
         return Err(error);
     }
 
+    let expected_worker = session_ref(context, &worker_record, &worker_incarnation);
     let attachment = (|| {
         ensure_active_claim(context, &record)?;
         let mut locked = orchestration::lock_registry(context)?;
@@ -3680,22 +4755,29 @@ fn run_worker_start_single_input(
             &legacy_request_digest,
             &launch_input.launch.cwd,
             launch_provider_config_dir.as_deref(),
+            Some(&expected_worker),
+            launch_input.provider_stop_canary.is_some(),
         )?;
         let current = locked
             .registry
             .assignments
             .get_mut(&assignment_id)
             .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
-        if current.state != "starting" || current.revision != 1 || current.worker.is_some() {
+        if current.state != "starting"
+            || !((current.revision == 1 && current.worker.is_none())
+                || (current.revision == 2 && current.worker.as_ref() == Some(&expected_worker)))
+        {
             return Err(CliError::data(
                 "assignment-start-conflict",
                 "assignment changed while the worker was starting",
                 Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
             ));
         }
-        current.worker = Some(session_ref(context, &worker_record, &worker_incarnation));
-        current.revision = 2;
-        current.updated_at = timestamp();
+        if current.revision == 1 {
+            current.worker = Some(expected_worker.clone());
+            current.revision = 2;
+            current.updated_at = timestamp();
+        }
         let outcome = json!({
             "schema_version": "main-agent.worker-start-result.v1",
             "assignment": public_assignment_view(current),
@@ -3735,6 +4817,28 @@ fn run_worker_start_single_input(
     })();
     let (outcome, receipt_outcome) = match attachment {
         Ok(result) => {
+            if launch_input.provider_stop_canary.is_some() {
+                pause_batch_lane_for_test("after_canary_final_receipt_before_quarantine_clear")?;
+                pause_canary_authority_release_for_test()?;
+                let runtime_identity_digest = format!(
+                    "sha256:{}",
+                    crate::coordination_runtime_evidence(&worker_record)?.identity_digest
+                );
+                if let Err(error) = orchestration::clear_matching_session_authority_quarantine(
+                    context,
+                    &assignment_id,
+                    2,
+                    &expected_worker,
+                    WORKER_START_QUARANTINE_REASON,
+                    &runtime_identity_digest,
+                    &timestamp(),
+                ) {
+                    if let Some(fence) = worker_start_fence.take() {
+                        fence.finish(context, false)?;
+                    }
+                    return Err(error);
+                }
+            }
             if let Some(fence) = worker_start_fence.take() {
                 fence.finish(context, true)?;
             }
@@ -3812,14 +4916,75 @@ fn finish_retained_worker_start_fence_for_outcome(
     idempotency_key: &str,
     request_digest: &str,
     outcome: &Value,
+    provider_stop_canary: Option<Option<&str>>,
 ) -> Result<(), CliError> {
+    let expected_assignment_id = provider_stop_canary.flatten();
     let outcome = worker_start_fence_outcome(outcome);
-    let Some(assignment_id) = outcome["assignment"]["assignment_id"].as_str() else {
-        return Ok(());
+    let assignment_id = match outcome["assignment"]["assignment_id"].as_str() {
+        Some(assignment_id) => assignment_id,
+        None if provider_stop_canary.is_some() => {
+            return Err(invalid_input(
+                "canary worker-start receipt assignment is unavailable",
+            ));
+        }
+        None => return Ok(()),
     };
-    let Some(worker_session_id) = outcome["worker"]["session_id"].as_str() else {
-        return Ok(());
+    let worker_session_id = match outcome["worker"]["session_id"].as_str() {
+        Some(worker_session_id) => worker_session_id,
+        None if provider_stop_canary.is_some() => {
+            return Err(invalid_input(
+                "canary worker-start receipt session is unavailable",
+            ));
+        }
+        None => return Ok(()),
     };
+    if provider_stop_canary.is_some() {
+        if expected_assignment_id.is_some_and(|expected| assignment_id != expected) {
+            return Err(invalid_input(
+                "canary worker-start receipt assignment is invalid",
+            ));
+        }
+        let assignment_revision = outcome["assignment"]["revision"]
+            .as_u64()
+            .filter(|revision| *revision == 2)
+            .ok_or_else(|| invalid_input("canary worker-start receipt revision is invalid"))?;
+        let worker = serde_json::from_value::<SessionRef>(outcome["assignment"]["worker"].clone())
+            .map_err(|_| invalid_input("canary worker-start receipt identity is invalid"))?;
+        if worker.session_id != worker_session_id {
+            return Err(invalid_input(
+                "canary worker-start receipt worker is inconsistent",
+            ));
+        }
+        let worker_record = crate::load_session_record(context, &worker.session_id)?;
+        let worker_incarnation = worker_record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .unwrap_or_default();
+        if !crate::provider_stop_canary_armed(&worker_record)
+            || crate::provider_stop_canary_assignment_id(&worker_record) != Some(assignment_id)
+            || !orchestration::session_ref_matches(&worker, &worker_record, worker_incarnation)
+        {
+            return Err(CliError::data(
+                "provider-stop-canary-assignment-invalid",
+                "the armed worker-start replay does not match its exact canary identity",
+                Some(json!({ "assignment_id": assignment_id })),
+            ));
+        }
+        let runtime_identity_digest = format!(
+            "sha256:{}",
+            crate::coordination_runtime_evidence(&worker_record)?.identity_digest
+        );
+        orchestration::clear_matching_session_authority_quarantine(
+            context,
+            assignment_id,
+            assignment_revision,
+            &worker,
+            WORKER_START_QUARANTINE_REASON,
+            &runtime_identity_digest,
+            &timestamp(),
+        )?;
+    }
     let fence_key = worker_start_fence_key(
         request_digest,
         idempotency_key,
@@ -4688,32 +5853,63 @@ fn worker_start_batch_lane_lease_until(now: i64) -> i64 {
         .saturating_add(1)
 }
 
+#[cfg(debug_assertions)]
+fn pause_worker_start_test_barrier(directory: &Path, stage: &str) -> Result<(), CliError> {
+    fs::write(directory.join("ready"), stage).map_err(|_| {
+        CliError::runtime(
+            "worker-start-batch-test-barrier",
+            "worker start batch test barrier is unavailable",
+            None,
+        )
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !directory.join("release").is_file() {
+        if Instant::now() >= deadline {
+            return Err(CliError::runtime(
+                "worker-start-batch-test-barrier",
+                "worker start batch test barrier timed out",
+                None,
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn pause_batch_lane_for_test(stage: &str) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_BATCH_LANE_FAIL_STAGES")
+        .ok()
+        .is_some_and(|stages| stages.split(',').any(|candidate| candidate == stage))
+    {
+        return Err(CliError::runtime(
+            "worker-start-batch-test-failure",
+            "worker start batch test failure was injected",
+            None,
+        ));
+    }
     #[cfg(debug_assertions)]
     if env::var("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE").as_deref() == Ok(stage)
         && let Some(directory) =
             env::var_os("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR").map(PathBuf::from)
     {
-        fs::write(directory.join("ready"), stage).map_err(|_| {
-            CliError::runtime(
-                "worker-start-batch-test-barrier",
-                "worker start batch test barrier is unavailable",
-                None,
-            )
-        })?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !directory.join("release").is_file() {
-            if Instant::now() >= deadline {
-                return Err(CliError::runtime(
-                    "worker-start-batch-test-barrier",
-                    "worker start batch test barrier timed out",
-                    None,
-                ));
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        pause_worker_start_test_barrier(&directory, stage)?;
     }
     let _ = stage;
+    Ok(())
+}
+
+fn pause_canary_authority_release_for_test() -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        env::var_os("NILS_AGENT_SESSION_TEST_CANARY_AUTHORITY_RELEASE_BARRIER_DIR")
+            .map(PathBuf::from)
+    {
+        pause_worker_start_test_barrier(
+            &directory,
+            "after_canary_final_receipt_before_authority_release",
+        )?;
+    }
     Ok(())
 }
 
@@ -4772,6 +5968,267 @@ fn worker_start_is_pending(value: &Value) -> bool {
         && value["acceptance"] == "pending"
 }
 
+const WORKER_START_PHASE_ASSIGNMENT_CREATED: &str = "assignment-created";
+const WORKER_START_PHASE_RUNTIME_HELD: &str = "worker-bound-runtime-held";
+const WORKER_START_PHASE_CANARY_STARTUP_PENDING: &str = "worker-bound-canary-startup-pending";
+const WORKER_START_PHASE_CANARY_STARTUP_FAILED: &str = "canary-startup-failed";
+const WORKER_START_PHASE_PROMPT_ATTEMPTING: &str = "runtime-released-prompt-attempting";
+const WORKER_START_PHASE_PROMPT_DELIVERED: &str = "prompt-delivered";
+const WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN: &str = "prompt-outcome-unknown";
+const WORKER_START_QUARANTINE_REASON: &str = "canary worker start transaction pending";
+type SessionStartGuard<'a> = Option<&'a mut dyn FnMut(&SessionRecord) -> Result<(), CliError>>;
+
+fn provider_stop_canary_startup_admission_required() -> bool {
+    #[cfg(debug_assertions)]
+    if env::var_os("AGENT_SESSION_FAKE_TMUX_LOG").is_some()
+        && env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ENFORCE_STARTUP").as_deref()
+            != Ok("1")
+    {
+        return false;
+    }
+    true
+}
+
+fn load_worker_start_attachment(
+    context: &CliContext,
+    worker_session_id: &str,
+) -> Result<SessionRef, CliError> {
+    let worker = load_session_record(context, worker_session_id)?;
+    let worker_incarnation = worker
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+    Ok(session_ref(context, &worker, worker_incarnation))
+}
+
+fn resumable_worker_start_attachment(
+    assignment: &AssignmentRecord,
+    worker_session_id: &str,
+    canary: bool,
+    expected_worker: Option<&SessionRef>,
+) -> Result<Option<SessionRef>, CliError> {
+    if assignment.revision == 1 && assignment.worker.is_none() {
+        return Ok(None);
+    }
+    let attached = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted assignment worker-start phase is invalid",
+            Some(json!({ "assignment_id": assignment.assignment_id, "revision": assignment.revision })),
+        )
+    })?;
+    if !canary || assignment.revision != 2 || attached.session_id != worker_session_id {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "persisted assignment cannot resume worker start",
+            Some(
+                json!({ "assignment_id": assignment.assignment_id, "revision": assignment.revision }),
+            ),
+        ));
+    }
+    let expected = expected_worker.ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted canary worker binding has no exact session evidence",
+            Some(
+                json!({ "assignment_id": assignment.assignment_id, "revision": assignment.revision }),
+            ),
+        )
+    })?;
+    if attached != expected {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "persisted canary worker binding does not match the exact session incarnation",
+            Some(
+                json!({ "assignment_id": assignment.assignment_id, "revision": assignment.revision }),
+            ),
+        ));
+    }
+    Ok(Some(expected.clone()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_worker_start_launch_phase_locked(
+    registry: &mut orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    phase: &str,
+    worker: Option<&SessionRef>,
+) -> Result<(), CliError> {
+    let mut pending = worker_start_idempotency_replay(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+    )?
+    .filter(worker_start_is_pending)
+    .ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted worker start authority is unavailable",
+            None,
+        )
+    })?;
+    pending["launch_phase"] = json!(phase);
+    pending["worker"] = worker.map_or(Value::Null, |worker| json!(worker));
+    store_receipt(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        "worker-start",
+        request_digest,
+        pending,
+    )
+}
+
+fn worker_start_startup_failure_error(pending: &Value) -> Option<CliError> {
+    if pending["launch_phase"] != WORKER_START_PHASE_CANARY_STARTUP_FAILED {
+        return None;
+    }
+    let failure = &pending["startup_failure"];
+    let stage = failure["stage"]
+        .as_str()
+        .filter(|value| matches!(*value, "controller" | "guardian"))?;
+    let failure_code = failure["failure_code"].as_str().filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })?;
+    Some(crate::provider_stop_canary_startup_error(
+        stage,
+        failure_code,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_worker_start_startup_failure_locked(
+    registry: &mut orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    worker: &SessionRef,
+    error: &CliError,
+) -> Result<(), CliError> {
+    if error.code() != "provider-stop-canary-startup-failed" {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "canary startup failure state requires the exact typed startup error",
+            None,
+        ));
+    }
+    let details = error.0.details.as_ref().ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "canary startup failure details are unavailable",
+            None,
+        )
+    })?;
+    let mut pending = worker_start_idempotency_replay(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+    )?
+    .filter(worker_start_is_pending)
+    .ok_or_else(|| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted worker start authority is unavailable",
+            None,
+        )
+    })?;
+    pending["launch_phase"] = json!(WORKER_START_PHASE_CANARY_STARTUP_FAILED);
+    pending["worker"] = json!(worker);
+    pending["startup_failure"] = json!({
+        "stage": details["stage"],
+        "failure_code": details["failure_code"]
+    });
+    if worker_start_startup_failure_error(&pending).is_none() {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "canary startup failure details are invalid",
+            None,
+        ));
+    }
+    store_receipt(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        "worker-start",
+        request_digest,
+        pending,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_prebound_canary_worker_start(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    assignment_id: &str,
+    worker_session_id: &str,
+    expected_packet_digest: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    canonical_launch_cwd: &str,
+    provider_config_dir: Option<&Path>,
+    expected_worker: &SessionRef,
+) -> Result<(), CliError> {
+    ensure_active_claim(context, record)?;
+    let mut locked = orchestration::lock_registry(context)?;
+    validate_worker_start_authority_locked(
+        &locked.registry,
+        record,
+        incarnation,
+        assignment_id,
+        worker_session_id,
+        expected_packet_digest,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+        canonical_launch_cwd,
+        provider_config_dir,
+        Some(expected_worker),
+        true,
+    )?;
+    let current = locked
+        .registry
+        .assignments
+        .get_mut(assignment_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    current.worker = None;
+    current.revision = 1;
+    current.updated_at = timestamp();
+    store_worker_start_launch_phase_locked(
+        &mut locked.registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+        WORKER_START_PHASE_ASSIGNMENT_CREATED,
+        None,
+    )?;
+    pause_batch_lane_for_test("before_canary_rollback_registry_save")?;
+    locked.save()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_worker_start_authority_locked(
     registry: &orchestration::Registry,
@@ -4785,6 +6242,8 @@ fn validate_worker_start_authority_locked(
     legacy_request_digest: &str,
     canonical_launch_cwd: &str,
     provider_config_dir: Option<&Path>,
+    expected_worker: Option<&SessionRef>,
+    allow_prebound: bool,
 ) -> Result<(), CliError> {
     let run = require_current_main(registry, record, incarnation)?;
     let assignment = registry
@@ -4792,12 +6251,22 @@ fn validate_worker_start_authority_locked(
         .get(assignment_id)
         .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
     ensure_primary_manager(assignment, record, incarnation)?;
-    if assignment.run_id != run.run_id
-        || assignment.state != "starting"
-        || assignment.revision != 1
-        || assignment.worker.is_some()
-        || assignment.private_packet_digest != expected_packet_digest
-    {
+    let assignment_identity_matches = assignment.run_id == run.run_id
+        && assignment.state == "starting"
+        && assignment.private_packet_digest == expected_packet_digest;
+    let assignment_start_matches = match expected_worker {
+        Some(expected_worker) => match resumable_worker_start_attachment(
+            assignment,
+            worker_session_id,
+            allow_prebound,
+            Some(expected_worker),
+        )? {
+            None => true,
+            Some(attached) => &attached == expected_worker,
+        },
+        None => assignment.revision == 1 && assignment.worker.is_none(),
+    };
+    if !assignment_identity_matches || !assignment_start_matches {
         return Err(CliError::data(
             "assignment-start-conflict",
             "persisted assignment cannot resume worker start",
@@ -4840,31 +6309,38 @@ fn validate_worker_start_authority_locked(
 }
 
 fn worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
-    worker_start_prompt_for_lifecycle(assignment_id, main_agent_bin, false)
-}
-
-fn previous_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
-    worker_start_prompt_for_lifecycle(assignment_id, main_agent_bin, true)
-}
-
-fn worker_start_prompt_for_lifecycle(
-    assignment_id: &str,
-    main_agent_bin: &Path,
-    previous_completion: bool,
-) -> String {
     let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
     let main_agent_bin = main_agent_bin.to_string_lossy();
     let main_agent_bin = shell_words::quote(&main_agent_bin);
-    let completion = if previous_completion {
-        "After the checkpoint succeeds, release your work-context claim before reporting completion."
-            .to_string()
-    } else {
-        format!(
-            "Free-form assignment task text does not control claim lifecycle. After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim before reporting that checkpoint. If the authenticated Main Agent later requests changes, rerun `{main_agent_bin} bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json` before mutating."
-        )
-    };
     format!(
-        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. {completion}"
+        "Main Agent Mode is explicitly active for this managed worker assignment. Run exactly `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment."
+    )
+}
+
+fn prior_compact_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
+    format!(
+        "Run exactly `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment."
+    )
+}
+
+fn legacy_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
+    format!(
+        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. Free-form assignment task text does not control claim lifecycle. After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim before reporting that checkpoint. If the authenticated Main Agent later requests changes, rerun `{main_agent_bin} bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json` before mutating."
+    )
+}
+
+fn previous_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
+    format!(
+        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion."
     )
 }
 
@@ -8835,13 +10311,71 @@ struct WorktreeProgressSnapshot {
     changed_at_epoch: i64,
 }
 
+enum WorktreeMaterialError {
+    Unavailable,
+    FingerprintUnavailable,
+}
+
 fn inspect_worktree_progress(
     context: &CliContext,
     assignment: &AssignmentRecord,
     path: &Path,
 ) -> Result<Value, CliError> {
+    let (change_count, material_fingerprint) = match inspect_worktree_material(path) {
+        Ok(material) => material,
+        Err(WorktreeMaterialError::Unavailable) => {
+            return Ok(json!({ "available": false, "clean": false, "change_count": Value::Null }));
+        }
+        Err(WorktreeMaterialError::FingerprintUnavailable) => {
+            return Ok(json!({
+                "available": false,
+                "clean": false,
+                "change_count": Value::Null,
+                "reason_code": "material-fingerprint-unavailable"
+            }));
+        }
+    };
+    let now = crate::coordination::now_epoch();
+    let session_absent = assignment
+        .worker
+        .as_ref()
+        .is_some_and(|worker| !session_dir(context, &worker.session_id).is_dir());
+    let (changed_at_epoch, observed_at_epoch) = if session_absent {
+        (now, now)
+    } else {
+        match persist_worktree_progress_snapshot(context, assignment, &material_fingerprint, now) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.code() == "session-not-found" => (now, now),
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(json!({
+        "available": true,
+        "clean": change_count == 0,
+        "change_count": change_count,
+        "status_digest": &material_fingerprint,
+        "material_fingerprint": material_fingerprint,
+        "changed_at_epoch": changed_at_epoch,
+        "observed_at_epoch": observed_at_epoch,
+        "snapshot_age_seconds": now.saturating_sub(changed_at_epoch)
+    }))
+}
+
+fn inspect_worktree_cleanliness(path: &Path) -> Value {
+    let Ok((change_count, material_fingerprint)) = inspect_worktree_material(path) else {
+        return json!({ "available": false, "clean": false, "change_count": Value::Null });
+    };
+    json!({
+        "available": true,
+        "clean": change_count == 0,
+        "change_count": change_count,
+        "status_digest": material_fingerprint
+    })
+}
+
+fn inspect_worktree_material(path: &Path) -> Result<(usize, String), WorktreeMaterialError> {
     if !path.is_dir() {
-        return Ok(json!({ "available": false, "clean": false, "change_count": Value::Null }));
+        return Err(WorktreeMaterialError::Unavailable);
     }
     let mut command = Command::new("git");
     command
@@ -8852,54 +10386,18 @@ fn inspect_worktree_progress(
         WORKTREE_STATUS_TIMEOUT,
         WORKTREE_STATUS_MAX_OUTPUT_BYTES,
     );
-    match output {
-        Ok(output) if output.status.success() => {
-            let change_count = output
-                .stdout
-                .split(|byte| *byte == 0)
-                .filter(|entry| !entry.is_empty())
-                .count();
-            let Some(material_fingerprint) = worktree_material_fingerprint(path, &output.stdout)
-            else {
-                return Ok(json!({
-                    "available": false,
-                    "clean": false,
-                    "change_count": Value::Null,
-                    "reason_code": "material-fingerprint-unavailable"
-                }));
-            };
-            let now = crate::coordination::now_epoch();
-            let session_absent = assignment
-                .worker
-                .as_ref()
-                .is_some_and(|worker| !session_dir(context, &worker.session_id).is_dir());
-            let (changed_at_epoch, observed_at_epoch) = if session_absent {
-                (now, now)
-            } else {
-                match persist_worktree_progress_snapshot(
-                    context,
-                    assignment,
-                    &material_fingerprint,
-                    now,
-                ) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) if error.code() == "session-not-found" => (now, now),
-                    Err(error) => return Err(error),
-                }
-            };
-            Ok(json!({
-                "available": true,
-                "clean": change_count == 0,
-                "change_count": change_count,
-                "status_digest": &material_fingerprint,
-                "material_fingerprint": material_fingerprint,
-                "changed_at_epoch": changed_at_epoch,
-                "observed_at_epoch": observed_at_epoch,
-                "snapshot_age_seconds": now.saturating_sub(changed_at_epoch)
-            }))
-        }
-        _ => Ok(json!({ "available": false, "clean": false, "change_count": Value::Null })),
-    }
+    let output = output
+        .ok()
+        .filter(|output| output.status.success())
+        .ok_or(WorktreeMaterialError::Unavailable)?;
+    let change_count = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .count();
+    let material_fingerprint = worktree_material_fingerprint(path, &output.stdout)
+        .ok_or(WorktreeMaterialError::FingerprintUnavailable)?;
+    Ok((change_count, material_fingerprint))
 }
 
 fn worktree_is_clean(path: &Path) -> bool {
@@ -9804,7 +11302,13 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
             ));
         }
         let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
-        if runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
+        let exact_failed_canary_quiescent = preclaim_runtime_gone
+            && crate::provider_stop_canary_failed_startup_runtime_quiescent(
+                &worker_record,
+                &args.assignment_id,
+            );
+        if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
+            && !exact_failed_canary_quiescent)
             || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
         {
             return Err(CliError::data(
@@ -10775,6 +12279,104 @@ fn current_authoritative_idle_live_evidence(
     }
 }
 
+fn provider_stop_canary_stalled_turn_admissible(
+    activity: &crate::activity::TurnState,
+    packet_scopes_empty: bool,
+    worktree_progress: &Value,
+    now_seconds: i64,
+) -> bool {
+    let Some(current_turn) = activity.current_turn.as_ref() else {
+        return false;
+    };
+    let Some(last_progress) = current_turn
+        .last_progress_at
+        .as_deref()
+        .unwrap_or(&current_turn.started_at)
+        .parse::<jiff::Timestamp>()
+        .ok()
+    else {
+        return false;
+    };
+    packet_scopes_empty
+        && activity.phase == crate::activity::TurnPhase::Working
+        && activity.source.kind == crate::activity::SourceKind::ProviderHook
+        && activity.source.provider.as_deref() == Some("codex")
+        && matches!(
+            activity.source.confidence,
+            crate::activity::Confidence::Authoritative | crate::activity::Confidence::Observed
+        )
+        && current_turn.attention.is_none()
+        && now_seconds.saturating_sub(last_progress.as_second()) >= WORKER_PROVIDER_STALE_SECS
+        && worktree_progress["available"] == true
+        && worktree_progress["clean"] == true
+        && worktree_progress["change_count"].as_u64() == Some(0)
+}
+
+fn current_provider_stop_canary_live_evidence(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    assignment: &AssignmentRecord,
+    packet: &AssignmentInput,
+) -> Result<(u64, String), CliError> {
+    let activity = crate::activity::activity_status_for_record(context, worker_record)?.turn_state;
+    let authoritative_idle = activity.phase == crate::activity::TurnPhase::Waiting
+        && activity.current_turn.is_none()
+        && activity.last_turn.is_some()
+        && activity.source.confidence == crate::activity::Confidence::Authoritative;
+    let worktree_progress = if authoritative_idle {
+        None
+    } else {
+        Some(inspect_worktree_cleanliness(Path::new(&worker_record.cwd)))
+    };
+    let stalled_canary_turn = worktree_progress.as_ref().is_some_and(|progress| {
+        provider_stop_canary_stalled_turn_admissible(
+            &activity,
+            packet.scopes.is_empty(),
+            progress,
+            jiff::Timestamp::now().as_second(),
+        )
+    });
+    if !authoritative_idle && !stalled_canary_turn {
+        return Err(CliError::data(
+            "worker-turn-not-idle",
+            "worker stop-provider-canary requires an authoritatively completed provider turn or an explicitly authorized clean scope-empty stalled canary turn",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "activity_revision": activity.revision
+            })),
+        ));
+    }
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "assignment has no bound worker runtime",
+            None,
+        )
+    })?;
+    let runtime_evidence = crate::coordination_runtime_evidence(worker_record)?;
+    match runtime_evidence.status {
+        crate::CoordinationRuntimeStatus::Running => {
+            Ok((activity.revision, runtime_evidence.identity_digest))
+        }
+        crate::CoordinationRuntimeStatus::Stopped => Err(CliError::data(
+            "worker-runtime-stopped",
+            "worker stop-provider-canary requires the exact worker runtime to still be running; use worker reconcile-stopped for a durably stopped post-claim worker",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": worker.session_incarnation
+            })),
+        )),
+        crate::CoordinationRuntimeStatus::Unknown => Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "worker stop-provider-canary cannot prove the exact worker runtime is still running",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "worker_incarnation": worker.session_incarnation
+            })),
+        )),
+    }
+}
+
 fn pause_revoke_claim_for_test(stage: &str) -> Result<(), CliError> {
     #[cfg(debug_assertions)]
     if env::var("NILS_AGENT_SESSION_TEST_REVOKE_CLAIM_BARRIER_STAGE").as_deref() == Ok(stage)
@@ -11591,12 +13193,7 @@ fn run_worker_provider_stop_canary(
             reservation.runtime_identity_digest.clone(),
         )
     } else {
-        current_authoritative_idle_live_evidence(
-            context,
-            &worker_record,
-            &assignment,
-            "worker stop-provider-canary",
-        )?
+        current_provider_stop_canary_live_evidence(context, &worker_record, &assignment, &packet)?
     };
     if !release_replay_stopped
         && session_status(&resolve_tmux_bin(None), &worker_record) != "running"
@@ -28407,6 +30004,42 @@ mod tests {
     }
 
     #[test]
+    fn worker_start_bootstrap_handshake_fails_closed_until_exact_final_clear() {
+        let pending = WorkerStartBootstrapHandshakeState {
+            transaction_observed: true,
+            final_receipt: false,
+        };
+        let final_receipt = WorkerStartBootstrapHandshakeState {
+            transaction_observed: true,
+            final_receipt: true,
+        };
+        assert_eq!(
+            worker_start_bootstrap_handshake_action(true, pending, true),
+            WorkerStartBootstrapHandshakeAction::Wait
+        );
+        assert_eq!(
+            worker_start_bootstrap_handshake_action(true, pending, false),
+            WorkerStartBootstrapHandshakeAction::InvalidClear
+        );
+        assert_eq!(
+            worker_start_bootstrap_handshake_action(true, final_receipt, true),
+            WorkerStartBootstrapHandshakeAction::Wait
+        );
+        assert_eq!(
+            worker_start_bootstrap_handshake_action(true, final_receipt, false),
+            WorkerStartBootstrapHandshakeAction::Continue
+        );
+        assert_eq!(
+            worker_start_bootstrap_handshake_action(
+                false,
+                WorkerStartBootstrapHandshakeState::default(),
+                false,
+            ),
+            WorkerStartBootstrapHandshakeAction::Reject
+        );
+    }
+
+    #[test]
     fn provider_stop_canary_classification_yields_to_every_durable_mutation_owner() {
         for release_in_progress in [false, true] {
             let base = ProviderStopCanaryClassificationFacts {
@@ -29757,27 +31390,50 @@ mod tests {
         assert!(prompt.contains(" bootstrap "));
         assert!(prompt.contains("--idempotency-key bootstrap-"));
         assert!(prompt.contains("--format json"));
-        assert!(prompt.contains("checkpoint_file"));
-        assert!(prompt.contains("checkpoint --file"));
-        assert!(prompt.contains("Free-form assignment task text does not control claim lifecycle"));
-        assert!(prompt.contains(
-            "After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim"
+        assert!(prompt.contains("worker_instructions"));
+        assert!(prompt.starts_with(
+            "Main Agent Mode is explicitly active for this managed worker assignment."
         ));
-        assert!(prompt.contains("If the authenticated Main Agent later requests changes"));
-        assert!(prompt.contains(
-            "bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json"
-        ));
-        assert!(!prompt.contains(
-            "After the checkpoint succeeds, release your work-context claim before reporting completion."
-        ));
+        assert!(
+            prompt.len() < 384,
+            "prompt was {} bytes: {prompt}",
+            prompt.len()
+        );
+        assert!(!prompt.contains("checkpoint --file"));
+        let prior_compact = prior_compact_worker_start_prompt(
+            "assignment-one",
+            std::path::Path::new("/release path/main-agent"),
+        );
+        let bootstrap_key = worker_bootstrap_idempotency_key("assignment-one");
+        assert_eq!(
+            prior_compact,
+            format!(
+                "Run exactly `'/release path/main-agent' bootstrap --idempotency-key {bootstrap_key} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment."
+            ),
+            "the prior compact prompt is a byte-stable replay contract"
+        );
+        let historical = legacy_worker_start_prompt(
+            "assignment-one",
+            std::path::Path::new("/release path/main-agent"),
+        );
+        assert_eq!(
+            historical,
+            format!(
+                "You are a managed worker for assignment assignment-one. First run `'/release path/main-agent' bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `'/release path/main-agent' checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. Free-form assignment task text does not control claim lifecycle. After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim before reporting that checkpoint. If the authenticated Main Agent later requests changes, rerun `'/release path/main-agent' bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json` before mutating."
+            ),
+            "the immediate historical prompt is a byte-stable replay contract"
+        );
         let previous = previous_worker_start_prompt(
             "assignment-one",
             std::path::Path::new("/release path/main-agent"),
         );
-        assert!(previous.contains(
-            "After the checkpoint succeeds, release your work-context claim before reporting completion."
-        ));
-        assert!(!previous.contains("new-stable-key-for-current-revision"));
+        assert_eq!(
+            previous,
+            format!(
+                "You are a managed worker for assignment assignment-one. First run `'/release path/main-agent' bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `'/release path/main-agent' checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion."
+            ),
+            "the previous historical prompt is a byte-stable replay contract"
+        );
     }
 
     #[test]
@@ -29896,5 +31552,113 @@ mod tests {
         fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("restore mode");
         fs::write(&handler, "#!/bin/sh\nexit 0\n").expect("stale handler");
         assert!(!runtime_checkpoint_handler_supports_capability(&handler));
+    }
+
+    #[test]
+    fn provider_stop_canary_admits_only_clean_scope_empty_stalled_turns() {
+        let activity: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version": "agent-session.turn-state.v1",
+            "phase": "working",
+            "phase_changed_at": "2030-01-01T00:00:00Z",
+            "revision": 6,
+            "source": {
+                "kind": "provider_hook",
+                "provider": "codex",
+                "confidence": "observed"
+            },
+            "semantic_event": {
+                "kind": "progress",
+                "observed_at": "2030-01-01T00:00:00Z"
+            },
+            "current_turn": {
+                "provider_turn_id": "stalled-canary-turn",
+                "started_at": "2030-01-01T00:00:00Z",
+                "last_progress_at": "2030-01-01T00:00:00Z"
+            }
+        }))
+        .expect("stalled activity");
+        let now = "2030-01-01T00:16:00Z"
+            .parse::<jiff::Timestamp>()
+            .expect("current timestamp")
+            .as_second();
+        let clean = json!({
+            "available": true,
+            "clean": true,
+            "change_count": 0
+        });
+
+        assert!(
+            provider_stop_canary_stalled_turn_admissible(&activity, true, &clean, now),
+            "the explicit canary may stop one scope-empty clean worker after provider progress is stale"
+        );
+        assert!(!provider_stop_canary_stalled_turn_admissible(
+            &activity, false, &clean, now
+        ));
+        let dirty = json!({
+            "available": true,
+            "clean": false,
+            "change_count": 1
+        });
+        assert!(!provider_stop_canary_stalled_turn_admissible(
+            &activity, true, &dirty, now
+        ));
+        assert!(!provider_stop_canary_stalled_turn_admissible(
+            &activity,
+            true,
+            &clean,
+            "2030-01-01T00:14:59Z"
+                .parse::<jiff::Timestamp>()
+                .expect("fresh timestamp")
+                .as_second()
+        ));
+
+        let with_attention: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version": "agent-session.turn-state.v1",
+            "phase": "working",
+            "phase_changed_at": "2030-01-01T00:00:00Z",
+            "revision": 6,
+            "source": {
+                "kind": "provider_hook",
+                "provider": "codex",
+                "confidence": "authoritative"
+            },
+            "current_turn": {
+                "provider_turn_id": "attention-canary-turn",
+                "started_at": "2030-01-01T00:00:00Z",
+                "last_progress_at": "2030-01-01T00:00:00Z",
+                "attention": {
+                    "kind": "approval",
+                    "requested_at": "2030-01-01T00:00:00Z",
+                    "pending_count": 1,
+                    "certainty": "exact"
+                }
+            }
+        }))
+        .expect("attention activity");
+        assert!(!provider_stop_canary_stalled_turn_admissible(
+            &with_attention,
+            true,
+            &clean,
+            now
+        ));
+
+        for (source_kind, provider, confidence) in [
+            ("terminal_heuristic", "codex", "observed"),
+            ("provider_hook", "claude", "observed"),
+            ("provider_hook", "codex", "inferred"),
+        ] {
+            let mut untrusted_source = activity.clone();
+            untrusted_source.source.kind =
+                serde_json::from_value(json!(source_kind)).expect("source kind");
+            untrusted_source.source.provider = Some(provider.to_string());
+            untrusted_source.source.confidence =
+                serde_json::from_value(json!(confidence)).expect("confidence");
+            assert!(!provider_stop_canary_stalled_turn_admissible(
+                &untrusted_source,
+                true,
+                &clean,
+                now
+            ));
+        }
     }
 }

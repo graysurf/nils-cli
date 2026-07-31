@@ -8068,6 +8068,8 @@ mod tests {
     use nils_test_support::{EnvGuard, GlobalStateLock};
     use std::fs;
     use std::io::Write;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
     use std::os::unix::process::CommandExt;
     use tokio_tungstenite::connect_async;
@@ -10479,17 +10481,130 @@ mod tests {
         }
     }
 
+    fn live_pane_stub_prelude(dir: &Path) -> String {
+        let start_time_capture = if cfg!(target_os = "linux") {
+            r#"stat = open("/proc/self/stat", encoding="utf-8").read()
+start_time = stat[stat.rfind(") ") + 2:].split()[19]"#
+        } else {
+            r#"start_time = "0""#
+        };
+        format!(
+            r#"NILS_TEST_PANE_PARENT={}
+start_live_pane() {{
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'agent-session live-pane test fixture requires python3' >&2
+    return 127
+  fi
+  ready="$NILS_TEST_PANE_PARENT/.pane-ready-$$"
+  rm -f "$ready"
+  NILS_TEST_PANE_PARENT="$NILS_TEST_PANE_PARENT" NILS_TEST_PANE_READY="$ready" NILS_TEST_PANE_LIFETIME_MS="${{NILS_TEST_PANE_LIFETIME_MS:-30000}}" python3 -c '
+import os
+import time
+os.setsid()
+ready = os.environ["NILS_TEST_PANE_READY"]
+temporary = ready + ".tmp." + str(os.getpid())
+{start_time_capture}
+with open(temporary, "x", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()) + " " + start_time + "\n")
+os.replace(temporary, ready)
+deadline = time.monotonic() + int(os.environ["NILS_TEST_PANE_LIFETIME_MS"]) / 1000
+parent = os.environ["NILS_TEST_PANE_PARENT"]
+while os.path.isdir(parent) and time.monotonic() < deadline:
+    time.sleep(0.02)
+' >/dev/null 2>&1 &
+  launcher=$!
+  attempts=0
+  while [ ! -s "$ready" ]; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 200 ] || ! kill -0 "$launcher" 2>/dev/null; then
+      kill "$launcher" 2>/dev/null || true
+      wait "$launcher" 2>/dev/null || true
+      rm -f "$ready"
+      return 1
+    fi
+    sleep 0.01
+  done
+  set -- $(cat "$ready")
+  NILS_TEST_PANE_PID=$1
+  NILS_TEST_PANE_START_TIME=$2
+  rm -f "$ready"
+  printf '%s %s\n' "$NILS_TEST_PANE_PID" "$NILS_TEST_PANE_START_TIME" > "$NILS_TEST_PANE_PARENT/.pane-identity"
+  [ -n "$NILS_TEST_PANE_PID" ] && [ -n "$NILS_TEST_PANE_START_TIME" ] &&
+    kill -0 "$NILS_TEST_PANE_PID" 2>/dev/null
+}}
+"#,
+            shell_words::quote(&dir.to_string_lossy()),
+            start_time_capture = start_time_capture,
+        )
+    }
+
     fn minimal_tmux(dir: &Path) -> PathBuf {
         let bin = dir.join("tmux");
+        let pane_stub = live_pane_stub_prelude(dir);
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            format!("#!/usr/bin/env sh\n{pane_stub}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; start_live_pane || exit 1; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$NILS_TEST_PANE_PID\"; exit 0 ;;\n  display-message) set -- $(cat \"$NILS_TEST_PANE_PARENT/.pane-identity\"); printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$1\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n"),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         bin
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pane_stub_publishes_private_session_identity_and_exits_with_fixture() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = tmp.path().join("live-pane-stub");
+        let prelude = live_pane_stub_prelude(tmp.path());
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env sh\n{prelude}\nstart_live_pane || exit 1\nprintf '%s %s\\n' \"$NILS_TEST_PANE_PID\" \"$NILS_TEST_PANE_START_TIME\"\n"
+            ),
+        )
+        .expect("stub script");
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let output = ProcessCommand::new(&script).output().expect("run stub");
+        assert!(
+            output.status.success(),
+            "stub failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fields = String::from_utf8(output.stdout)
+            .expect("utf8 output")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        let pid = fields[0].parse::<libc::pid_t>().expect("pane pid");
+        let expected_start_time = fields[1].parse::<u64>().expect("pane start time");
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("pane stat");
+        let observed_start_time = stat
+            .rsplit_once(") ")
+            .expect("stat command boundary")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("stat start-time field")
+            .parse::<u64>()
+            .expect("stat start time");
+        assert_eq!(observed_start_time, expected_start_time);
+
+        drop(tmp);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Path::new(&format!("/proc/{pid}")).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the live pane stub must exit when its TempDir-owned sentinel disappears"
+        );
     }
 
     fn failing_delete_tmux(
@@ -10773,10 +10888,11 @@ esac
     }
 
     fn resume_tmux(dir: &Path, log: &Path) -> PathBuf {
+        let pane_stub = live_pane_stub_prelude(dir);
         executable(
             &dir.join("tmux"),
             &format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\n{pane_stub}\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; start_live_pane || exit 1; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$NILS_TEST_PANE_PID\"; exit 0 ;;\n  display-message) set -- $(cat \"$NILS_TEST_PANE_PARENT/.pane-identity\"); printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$1\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -14274,6 +14390,9 @@ case "$1" in
       printf '%s:%s\n' "$incarnation" "$(date +%s)" > "$heartbeat"
       chmod 600 "$heartbeat"
     fi
+    printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
+    ;;
+  display-message)
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
   *) exit 0 ;;
@@ -18367,10 +18486,11 @@ esac
         let started = tmp.path().join("resume-started");
         let release = tmp.path().join("resume-release");
         let running = tmp.path().join("resume-running");
+        let pane_stub = live_pane_stub_prelude(tmp.path());
         let tmux = executable(
             &tmp.path().join("tmux-resume-lock"),
             &format!(
-                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\n{pane_stub}\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; start_live_pane || exit 1; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$NILS_TEST_PANE_PID\"; exit 0 ;;\n  display-message) set -- $(cat \"$NILS_TEST_PANE_PARENT/.pane-identity\"); printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$1\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 started = shell_words::quote(&started.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
                 running = shell_words::quote(&running.to_string_lossy()),
@@ -21317,10 +21437,11 @@ exit 0
 
     fn logging_tmux(dir: &Path, log: &Path) -> PathBuf {
         let bin = dir.join("tmux");
+        let pane_stub = live_pane_stub_prelude(dir);
         std::fs::write(
             &bin,
             format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\n{pane_stub}\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; start_live_pane || exit 1; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$NILS_TEST_PANE_PID\"; exit 0 ;;\n  display-message) set -- $(cat \"$NILS_TEST_PANE_PARENT/.pane-identity\"); printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$1\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -21653,16 +21774,27 @@ exit 0
             .expect("alpha runtime")
             .launch_id
             .clone();
-        alpha.extra.insert(
-            "delete_tmux_identity".to_string(),
-            json!({
-                "launch_id": incarnation,
-                "session_id": "$77",
-                "pane_id": "%77",
-                "pane_pid": i32::MAX,
-                "process_group_id": i32::MAX
-            }),
-        );
+        let mut stopped_runtime = json!({
+            "launch_id": incarnation,
+            "session_id": "$77",
+            "pane_id": "%77",
+            "pane_pid": i32::MAX,
+            "process_group_id": i32::MAX
+        });
+        #[cfg(target_os = "linux")]
+        {
+            let namespace = fs::metadata("/proc/self/ns/pid").expect("PID namespace metadata");
+            stopped_runtime["pid_namespace"] = json!({
+                "device": namespace.st_dev(),
+                "inode": namespace.st_ino(),
+                "boot_id": fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .expect("boot id")
+                    .trim()
+            });
+        }
+        alpha
+            .extra
+            .insert("delete_tmux_identity".to_string(), stopped_runtime);
         crate::write_session_record(&state.context, &alpha).expect("stopped runtime identity");
         let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
         let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)

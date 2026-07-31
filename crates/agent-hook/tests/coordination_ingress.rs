@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-use support::Fixture;
+use support::{Fixture, now_epoch};
 
 fn policy(first_action: &str) -> String {
     format!(
@@ -75,6 +75,316 @@ fn install_session_mode(fixture: &Fixture, mode: &str) {
     )
     .expect("session record");
     Fixture::set_private(&record);
+}
+
+fn bootstrap_policy(extra_rule: &str) -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.31.1"
+
+[[rules]]
+id = "runtime.owner"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 300 }}
+
+{extra_rule}
+
+[[rules]]
+id = "runtime.coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }}
+"#
+    )
+}
+
+fn install_foreign_owner(fixture: &Fixture) {
+    install_session_mode(fixture, "enforce");
+    let now = now_epoch();
+    let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let fingerprint =
+        nils_common::coordination_projection::worktree_fingerprint(1, key, &fixture.root)
+            .expect("worktree fingerprint");
+    let coordination = fixture.session_state.join("coordination");
+    fs::create_dir_all(&coordination).expect("coordination directory");
+    let registry = coordination.join("registry.json");
+    fs::write(
+        &registry,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.coordination-registry.v1",
+            "fingerprint_epoch": 1,
+            "fingerprint_key": key,
+            "brokers": {
+                "trusted": {
+                    "session_id": "trusted",
+                    "incarnation": "trusted-incarnation",
+                    "state": "ready",
+                    "heartbeat_epoch": now
+                },
+                "peer": {
+                    "session_id": "peer",
+                    "incarnation": "peer-incarnation",
+                    "state": "ready",
+                    "heartbeat_epoch": now
+                }
+            },
+            "claims": [{
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "peer",
+                "session_incarnation": "peer-incarnation",
+                "state": "active",
+                "worktrees": [fingerprint],
+                "repositories": ["owner/repo"],
+                "provider_refs": [],
+                "scopes": [],
+                "expires_at_epoch": now + 300
+            }]
+        }))
+        .expect("registry JSON"),
+    )
+    .expect("registry");
+    Fixture::set_private(&registry);
+    for (session, incarnation) in [
+        ("trusted", "trusted-incarnation"),
+        ("peer", "peer-incarnation"),
+    ] {
+        let heartbeat = fixture
+            .session_state
+            .join("sessions")
+            .join(session)
+            .join("coordination/heartbeat");
+        fs::create_dir_all(heartbeat.parent().expect("heartbeat parent"))
+            .expect("heartbeat directory");
+        fs::write(&heartbeat, format!("{incarnation}:{now}\n")).expect("heartbeat");
+        Fixture::set_private(&heartbeat);
+    }
+}
+
+#[test]
+fn exact_preclaim_bootstrap_defers_foreign_owner_to_typed_coordination() {
+    let fixture = Fixture::new(&bootstrap_policy(""));
+    install_coordination_handler(&fixture);
+    install_foreign_owner(&fixture);
+
+    let exact_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "bootstrap-exact",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "/trusted/bin/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json"
+        }
+    })
+    .to_string();
+    let capture = fixture.root.join("bootstrap-coordination.json");
+    let generic = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&exact_payload),
+        &[
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(generic.code, 1, "stderr={}", generic.stderr_text());
+    assert_eq!(generic.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        generic.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-foreign"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("captured generic allow"),
+        exact_payload
+    );
+
+    install_coordination_handler_with(
+        &fixture,
+        "#!/bin/sh\nset -eu\ndd of=\"$COORDINATION_CAPTURE\" status=none\nprintf '%s\\n' '{\"schema_version\":\"runtime-kit.session-coordination-bootstrap-authorization.v1\",\"authorization\":\"typed-main-agent-bootstrap-authorized\"}'\n",
+    );
+    let exact = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&exact_payload),
+        &[
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(exact.code, 0, "stderr={}", exact.stderr_text());
+    assert_eq!(exact.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        exact.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-liveness-superseded-by-typed-bootstrap"
+    );
+    assert_eq!(
+        exact.stdout_json()["data"]["reasons"][1]["code"],
+        "typed-main-agent-bootstrap-authorized"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("captured exact bootstrap"),
+        exact_payload
+    );
+
+    fs::remove_file(&capture).expect("remove exact capture");
+    let composed_payload =
+        exact_payload.replace("--format json\"", "--format json; touch forbidden\"");
+    let composed = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&composed_payload),
+        &[
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(composed.code, 1, "stderr={}", composed.stderr_text());
+    assert_eq!(
+        composed.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-foreign"
+    );
+    assert!(
+        !capture.exists(),
+        "composed shell input must not reach typed coordination"
+    );
+
+    fs::remove_file(
+        fixture
+            .home
+            .join(".codex/hooks/session-coordination-guard.py"),
+    )
+    .expect("remove coordination handler");
+    let unavailable = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&exact_payload),
+        &[
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+        ],
+    );
+    assert_eq!(unavailable.code, 1, "stderr={}", unavailable.stderr_text());
+    assert_eq!(unavailable.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        unavailable.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-foreign"
+    );
+}
+
+#[test]
+fn typed_bootstrap_does_not_supersede_other_blocks_or_transforms() {
+    let cases = [
+        (
+            "additional block",
+            r#"[[rules]]
+id = "runtime.additional-block"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 15
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "additional-block", message = "still blocked" }"#,
+            "additional-block",
+            "block",
+        ),
+        (
+            "transform",
+            r#"[[rules]]
+id = "runtime.transform"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 15
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.transform.v1", reason_code = "bootstrap-transform", replacement = { command = "safe" } }"#,
+            "bootstrap-transform",
+            "transform",
+        ),
+    ];
+    for (name, extra_rule, extra_code, extra_disposition) in cases {
+        let fixture = Fixture::new(&bootstrap_policy(extra_rule));
+        install_foreign_owner(&fixture);
+        install_coordination_handler_with(
+            &fixture,
+            "#!/bin/sh\nset -eu\ndd of=\"$COORDINATION_CAPTURE\" status=none\nprintf '%s\\n' '{\"schema_version\":\"runtime-kit.session-coordination-bootstrap-authorization.v1\",\"authorization\":\"typed-main-agent-bootstrap-authorized\"}'\n",
+        );
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": format!("bootstrap-{name}"),
+            "cwd": fixture.root,
+            "tool_input": {
+                "command": "/trusted/bin/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json"
+            }
+        })
+        .to_string();
+        let capture = fixture.root.join("bootstrap-coordination.json");
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("AGENT_SESSION_ID", "trusted"),
+                ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+                ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+                (
+                    "COORDINATION_CAPTURE",
+                    capture.to_str().expect("capture path"),
+                ),
+            ],
+        );
+        assert_eq!(
+            output.code,
+            1,
+            "case={name} stderr={}",
+            output.stderr_text()
+        );
+        let decision = output.stdout_json();
+        assert_eq!(decision["data"]["action"], "block");
+        let reasons = decision["data"]["reasons"].as_array().expect("reasons");
+        assert!(
+            reasons.iter().any(|reason| {
+                reason["code"] == "owner-active-foreign" && reason["disposition"] == "block"
+            }),
+            "case={name} owner block must remain authoritative"
+        );
+        assert!(
+            reasons.iter().any(|reason| {
+                reason["code"] == extra_code && reason["disposition"] == extra_disposition
+            }),
+            "case={name} additional decision must remain intact"
+        );
+        assert!(
+            !capture.exists(),
+            "case={name} must not reach typed coordination"
+        );
+    }
 }
 
 #[test]

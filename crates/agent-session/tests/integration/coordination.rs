@@ -4,8 +4,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -87,6 +93,28 @@ fn provider_stop_canary_test_capability() -> Result<(), String> {
         return Err("user, mount, and cgroup namespaces are unavailable".to_string());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_control_address_for_test(
+    state_dir: &Path,
+    session_id: &str,
+    launch_id: &str,
+) -> SocketAddr {
+    let mut identity = state_dir.as_os_str().as_bytes().to_vec();
+    identity.push(0);
+    identity.extend_from_slice(session_id.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(launch_id.as_bytes());
+    let digest = Sha256::digest(&identity)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    SocketAddr::from_abstract_name(format!(
+        "nils-provider-stop-canary-control-{}",
+        &digest[..32]
+    ))
+    .expect("provider stop canary abstract control address")
 }
 
 #[cfg(target_os = "linux")]
@@ -427,6 +455,46 @@ fn seed_activity_state(
     );
 }
 
+fn seed_stalled_codex_provider_hook_activity_state(
+    state_dir: &Path,
+    id: &str,
+    incarnation: &str,
+    revision: u64,
+) {
+    let path = state_dir.join("sessions").join(id).join("activity.json");
+    write_private_json(
+        &path,
+        &json!({
+            "schema_version": "agent-session.activity.v1",
+            "runtime_id": incarnation,
+            "runtime_generation": 1,
+            "state": {
+                "schema_version": "agent-session.turn-state.v1",
+                "phase": "working",
+                "phase_changed_at": "2020-01-01T00:00:00Z",
+                "revision": revision,
+                "source": {
+                    "kind": "provider_hook",
+                    "provider": "codex",
+                    "confidence": "observed"
+                },
+                "semantic_event": {
+                    "kind": "progress",
+                    "observed_at": "2020-01-01T00:00:00Z"
+                },
+                "current_turn": {
+                    "provider_turn_id": "stalled-provider-stop-canary-turn",
+                    "started_at": "2020-01-01T00:00:00Z",
+                    "last_progress_at": "2020-01-01T00:00:00Z"
+                },
+                "last_turn": null
+            },
+            "pending_attention": [],
+            "seen_event_count": 0
+        }),
+    );
+}
+
 fn seed_live_runtime_identity(
     state_dir: &Path,
     id: &str,
@@ -441,7 +509,8 @@ fn seed_live_runtime_identity(
         "pane_id": format!("%{tmux_slot}"),
         "pane_pid": runtime_pid,
         "process_group_id": runtime_pid,
-        "process_session_id": runtime_pid
+        "process_session_id": runtime_pid,
+        "pid_namespace": current_pid_namespace_identity()
     });
     let session_path = state_dir.join("sessions").join(id).join("session.json");
     let mut session: serde_json::Value =
@@ -464,6 +533,24 @@ fn linux_process_start_ticks(pid: u32) -> u64 {
         .expect("Linux process start-time field")
         .parse()
         .expect("Linux process start-time ticks")
+}
+
+fn current_pid_namespace_identity() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    {
+        let namespace = fs::metadata("/proc/self/ns/pid").expect("current PID namespace metadata");
+        json!({
+            "device": namespace.dev(),
+            "inode": namespace.ino(),
+            "boot_id": fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        serde_json::Value::Null
+    }
 }
 
 fn init_checkout(path: &Path, remote: &str) {
@@ -708,6 +795,36 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     )
     .expect("write private json");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
+}
+
+fn assert_authority_quarantine_released(path: &Path) {
+    assert!(
+        !path.exists(),
+        "released worker-start authority must remove its active quarantine"
+    );
+    let release_dir = path.with_file_name("authority-quarantine-releases");
+    let release_paths = fs::read_dir(&release_dir)
+        .expect("authority release directory")
+        .map(|entry| entry.expect("authority release entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        release_paths.len(),
+        1,
+        "worker-start authority must retain one exact immutable release proof"
+    );
+    let marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&release_paths[0]).expect("authority release marker"))
+            .expect("authority release marker JSON");
+    assert_eq!(
+        marker["schema_version"],
+        "agent-session.worker-authority-quarantine-release.v1"
+    );
+    assert!(
+        marker["released_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "released authority marker must carry its typed release timestamp"
+    );
 }
 
 fn provider_stop_canary_reservation_path(state_dir: &Path, assignment_id: &str) -> PathBuf {
@@ -8358,6 +8475,12 @@ fn main_agent_worker_start_rejects_missing_cwd_before_durable_side_effects() {
 
 #[test]
 fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_launch() {
+    for prompt_generation in ["previous", "historical", "prior-compact"] {
+        assert_main_agent_worker_start_replay_converges(prompt_generation);
+    }
+}
+
+fn assert_main_agent_worker_start_replay_converges(prompt_generation: &str) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
@@ -8400,14 +8523,22 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
     let main_agent_bin = main_agent_bin.to_string_lossy();
     let main_agent_bin = shell_words::quote(&main_agent_bin);
     let worker_prompt = state_dir.join(format!("sessions/{worker_id}/prompt.md"));
-    fs::write(
-        &worker_prompt,
-        format!(
+    let prompt = match prompt_generation {
+        "prior-compact" => format!(
+            "Run exactly `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment.",
+            &bootstrap_digest[..32]
+        ),
+        "historical" => format!(
+            "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. Free-form assignment task text does not control claim lifecycle. After each `submitted` or `blocked` task checkpoint succeeds, release your work-context claim before reporting that checkpoint. If the authenticated Main Agent later requests changes, rerun `{main_agent_bin} bootstrap --idempotency-key <new-stable-key-for-current-revision> --format json` before mutating.",
+            &bootstrap_digest[..32]
+        ),
+        "previous" => format!(
             "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json`. Use the returned private assignment packet as your task and the returned literal `checkpoint_file` as the only checkpoint JSON write target; do not mutate before bootstrap succeeds. Write the final checkpoint payload there, then run `{main_agent_bin} checkpoint --file <returned-checkpoint_file> --if-revision <current-revision> --idempotency-key <stable-key> --format json`. After the checkpoint succeeds, release your work-context claim before reporting completion.",
             &bootstrap_digest[..32]
         ),
-    )
-    .expect("worker prompt");
+        other => panic!("unexpected prompt generation: {other}"),
+    };
+    fs::write(&worker_prompt, prompt).expect("worker prompt");
     fs::set_permissions(&worker_prompt, fs::Permissions::from_mode(0o600))
         .expect("worker prompt mode");
     let worker_record_path = state_dir.join(format!("sessions/{worker_id}/session.json"));
@@ -8539,6 +8670,8 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
         "pending-worker-checkpoint"
     );
 
+    fs::remove_dir_all(state_dir.join("sessions").join(worker_id))
+        .expect("simulate completed ordinary worker cleanup");
     let replay = run_main_agent(
         &checkout,
         &args,
@@ -8555,8 +8688,8 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name() == worker_id)
             .count(),
-        1,
-        "replay must not launch a duplicate worker"
+        0,
+        "ordinary completed replay must not require or relaunch a cleaned worker session"
     );
 }
 
@@ -8602,7 +8735,10 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             "worktree": null,
             "base_ref": "main",
             "scopes": ["crates/agent-session"],
-            "durable_refs": []
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
         }),
     );
     write_trusted_codex_config(&codex_home, &[&checkout]);
@@ -8668,6 +8804,16 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             .is_file(),
         "an ambiguous initial Enter must retain the exact worker record"
     );
+    let ambiguous_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        ambiguous_registry["assignments"]["assignment-ambiguous-enter"]["revision"],
+        2
+    );
+    assert_eq!(
+        ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
+            ["outcome"]["launch_phase"],
+        "prompt-outcome-unknown"
+    );
 
     let resumed = run_main_agent(
         &checkout,
@@ -8723,6 +8869,1240 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             .is_file(),
         "the retained worker must remain resumable after a later runtime loss"
     );
+}
+
+#[test]
+fn main_agent_canary_worker_start_cleans_prelock_quarantine_failure_before_retry() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let controller_broker_before =
+        orchestration_registry(&state_dir)["brokers"]["main-one"].clone();
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-canary-prelock-failure.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-prelock-failure",
+            "task_summary": "Clean a pre-lock canary quarantine failure",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-prelock-failure",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-prelock-failure-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+            (
+                "NILS_AGENT_SESSION_TEST_BATCH_LANE_FAIL_STAGES",
+                "after_canary_quarantine_before_registry_lock",
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "worker-start-batch-test-failure"
+    );
+    let cleaned = orchestration_registry(&state_dir);
+    assert_eq!(
+        cleaned["assignments"]["assignment-canary-prelock-failure"]["revision"],
+        1
+    );
+    assert!(cleaned["assignments"]["assignment-canary-prelock-failure"]["worker"].is_null());
+    assert!(
+        cleaned["brokers"]["worker-canary-prelock-failure"].is_null(),
+        "pre-lock cleanup must forget only the revoked empty worker broker"
+    );
+    assert_eq!(
+        cleaned["brokers"]["main-one"], controller_broker_before,
+        "pre-lock cleanup must preserve the unrelated controller broker"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-prelock-failure")
+            .exists(),
+        "pre-lock failure cleanup must remove the failed session and its quarantine"
+    );
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    let final_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        final_registry["assignments"]["assignment-canary-prelock-failure"]["revision"],
+        2
+    );
+    assert_authority_quarantine_released(
+        &state_dir.join("sessions/worker-canary-prelock-failure/authority-quarantine.json"),
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 2),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "pre-lock failure replay must deliver one prompt: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn main_agent_canary_worker_start_rolls_back_post_save_hook_failure_before_retry() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let controller_broker_before =
+        orchestration_registry(&state_dir)["brokers"]["main-one"].clone();
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-canary-hook-failure.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-hook-failure",
+            "task_summary": "Roll back a post-save canary hook failure",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-hook-failure",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-hook-failure-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+            (
+                "NILS_AGENT_SESSION_TEST_BATCH_LANE_FAIL_STAGES",
+                "after_canary_worker_attachment_before_runtime_release",
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
+    assert_ne!(
+        failed.stdout_json()["error"]["code"],
+        "managed-worker-prompt-delivery-outcome-unknown"
+    );
+    let rolled_back = orchestration_registry(&state_dir);
+    assert_eq!(
+        rolled_back["assignments"]["assignment-canary-hook-failure"]["revision"],
+        1
+    );
+    assert!(rolled_back["assignments"]["assignment-canary-hook-failure"]["worker"].is_null());
+    assert!(
+        rolled_back["brokers"]["worker-canary-hook-failure"].is_null(),
+        "failed-launch cleanup must forget only the revoked empty worker broker"
+    );
+    assert_eq!(
+        rolled_back["brokers"]["main-one"], controller_broker_before,
+        "failed-launch cleanup must preserve the unrelated controller broker"
+    );
+    assert_eq!(
+        rolled_back["receipts"]["main-one:main-incarnation-one:worker-start-canary-hook-failure-0001"]
+            ["outcome"]["launch_phase"],
+        "assignment-created"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-hook-failure")
+            .exists(),
+        "a post-save hook failure must roll back before the failed session is removed"
+    );
+
+    let resumed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(resumed.code, 0, "outcome={}", resumed.stdout_text());
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 2),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "retry must deliver exactly one prompt after rollback: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn main_agent_canary_worker_start_preserves_committed_attachment_when_rollback_fails() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-canary-rollback-failure.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-rollback-failure",
+            "task_summary": "Preserve a committed canary attachment when rollback fails",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-rollback-failure",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home_arg = codex_home.to_string_lossy().into_owned();
+    let args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-rollback-failure-0001",
+        "--format",
+        "json",
+    ];
+    let failed = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+            (
+                "NILS_AGENT_SESSION_TEST_BATCH_LANE_FAIL_STAGES",
+                "after_canary_worker_attachment_before_runtime_release,before_canary_rollback_registry_save",
+            ),
+        ],
+    );
+    assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "worker-start-batch-test-failure"
+    );
+    let retained = orchestration_registry(&state_dir);
+    assert_eq!(
+        retained["assignments"]["assignment-canary-rollback-failure"]["revision"],
+        2
+    );
+    assert_eq!(
+        retained["assignments"]["assignment-canary-rollback-failure"]["worker"]["session_id"],
+        "worker-canary-rollback-failure"
+    );
+    assert_eq!(
+        retained["receipts"]["main-one:main-incarnation-one:worker-start-canary-rollback-failure-0001"]
+            ["outcome"]["launch_phase"],
+        "worker-bound-canary-startup-pending"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-rollback-failure/session.json")
+            .is_file(),
+        "an unproven rollback must retain the exact session for durable replay"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-rollback-failure/authority-quarantine.json")
+            .is_file(),
+        "an unproven rollback must retain its exact-incarnation quarantine"
+    );
+    let failed_calls = tmux_calls(&tmux_log);
+    assert_eq!(
+        failed_calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1
+    );
+    for operation in ["load-buffer", "paste-buffer", "send-keys"] {
+        assert_eq!(
+            failed_calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            0,
+            "a held committed attachment must not attempt prompt transport"
+        );
+    }
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    let replayed = orchestration_registry(&state_dir);
+    assert_eq!(
+        replayed["assignments"]["assignment-canary-rollback-failure"]["revision"],
+        2
+    );
+    assert_authority_quarantine_released(
+        &state_dir.join("sessions/worker-canary-rollback-failure/authority-quarantine.json"),
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "exact replay must reuse one runtime and deliver one prompt: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn main_agent_canary_bootstrap_waits_for_matching_startup_quarantine_clear() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&worker_checkout]);
+    let worker_id = "worker-canary-bootstrap-handshake";
+    let assignment_path = tmp
+        .path()
+        .join("assignment-canary-bootstrap-handshake.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "task_summary": "Wait for the exact worker-start quarantine clear",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let barrier = tmp.path().join("canary-prompt-delivery-handshake");
+    fs::create_dir(&barrier).expect("prompt delivery handshake barrier");
+    let bootstrap_barrier = tmp.path().join("canary-bootstrap-observed");
+    fs::create_dir(&bootstrap_barrier).expect("bootstrap observation barrier");
+    let authority_release_barrier = tmp.path().join("canary-authority-release");
+    fs::create_dir(&authority_release_barrier).expect("authority release barrier");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let checkpoint_path = Path::new(&main_capability).with_file_name(format!(
+        "main-agent-checkpoint-{}.json",
+        Path::new(&main_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("main capability name")
+    ));
+    let mut start = Command::new(bin::resolve("main-agent"));
+    start
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-bootstrap-handshake-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_prompt_delivery_before_phase_commit",
+        )
+        .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier)
+        .env(
+            "NILS_AGENT_SESSION_TEST_CANARY_AUTHORITY_RELEASE_BARRIER_DIR",
+            &authority_release_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let start = start.spawn().expect("spawn canary worker start");
+    wait_for_barrier(&barrier);
+    let at_handshake = orchestration_registry(&state_dir);
+    let assignments = at_handshake["assignments"]
+        .as_object()
+        .expect("assignments object");
+    assert_eq!(assignments.len(), 1, "one generated canary assignment");
+    let assignment_id = assignments
+        .keys()
+        .next()
+        .expect("generated assignment")
+        .clone();
+    assert_eq!(
+        at_handshake["assignments"][assignment_id.as_str()]["revision"],
+        2
+    );
+    assert_eq!(
+        at_handshake["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"]["launch_phase"],
+        "runtime-released-prompt-attempting"
+    );
+    let quarantine_path = state_dir.join(format!("sessions/{worker_id}/authority-quarantine.json"));
+    assert!(quarantine_path.is_file());
+
+    let worker_capability = capability(&state_dir, worker_id);
+    let worker_checkpoint = Path::new(&worker_capability).with_file_name(format!(
+        "main-agent-checkpoint-{}.json",
+        Path::new(&worker_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("worker capability name")
+    ));
+    let bootstrap_digest = orchestration_request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &json!(assignment_id.as_str()),
+    );
+    let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
+    let timed_out = Command::new(bin::resolve("main-agent"))
+        .current_dir(&worker_checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "bootstrap",
+            "--idempotency-key",
+            &bootstrap_key,
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &worker_checkpoint)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BOOTSTRAP_HANDSHAKE_TIMEOUT_MS",
+            "50",
+        )
+        .output()
+        .expect("run bounded bootstrap handshake");
+    assert!(
+        !timed_out.status.success(),
+        "bootstrap must time out while the exact startup quarantine remains"
+    );
+    let timed_out_json: serde_json::Value =
+        serde_json::from_slice(&timed_out.stdout).expect("timeout JSON");
+    assert_eq!(
+        timed_out_json["error"]["code"],
+        "worker-start-bootstrap-handshake-timeout"
+    );
+    let after_timeout = orchestration_registry(&state_dir);
+    assert_eq!(
+        after_timeout["assignments"][assignment_id.as_str()]["state"],
+        "starting"
+    );
+    assert_eq!(
+        after_timeout["assignments"][assignment_id.as_str()]["revision"],
+        2
+    );
+    assert!(quarantine_path.is_file());
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != worker_id),
+        "timed-out bootstrap must not acquire its claim"
+    );
+    let quarantine: serde_json::Value =
+        serde_json::from_slice(&fs::read(&quarantine_path).expect("read exact startup quarantine"))
+            .expect("startup quarantine JSON");
+    fs::remove_file(&quarantine_path).expect("simulate missing startup quarantine");
+    let invalid_clear = Command::new(bin::resolve("main-agent"))
+        .current_dir(&worker_checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "bootstrap",
+            "--idempotency-key",
+            &bootstrap_key,
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &worker_checkpoint)
+        .output()
+        .expect("run bootstrap without pending quarantine");
+    assert!(
+        !invalid_clear.status.success(),
+        "pending bootstrap must fail closed when its startup quarantine is initially absent"
+    );
+    let invalid_clear_json: serde_json::Value =
+        serde_json::from_slice(&invalid_clear.stdout).expect("invalid-clear JSON");
+    assert_eq!(
+        invalid_clear_json["error"]["code"],
+        "worker-start-bootstrap-handshake-invalid"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != worker_id),
+        "invalid-clear bootstrap must not acquire its claim"
+    );
+    write_private_json(&quarantine_path, &quarantine);
+    let mut bootstrap = Command::new(bin::resolve("main-agent"));
+    bootstrap
+        .current_dir(&worker_checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "bootstrap",
+            "--idempotency-key",
+            &bootstrap_key,
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &worker_checkpoint)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_bootstrap_matching_quarantine_observed",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &bootstrap_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut bootstrap = bootstrap.spawn().expect("spawn exact worker bootstrap");
+    wait_for_barrier(&bootstrap_barrier);
+    assert!(
+        bootstrap
+            .try_wait()
+            .expect("poll exact worker bootstrap")
+            .is_none(),
+        "matching bootstrap must wait instead of failing on startup quarantine"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != worker_id),
+        "bootstrap must not acquire its claim before the startup quarantine clears"
+    );
+
+    fs::write(bootstrap_barrier.join("release"), b"release")
+        .expect("release bootstrap observation barrier");
+    fs::write(barrier.join("release"), b"release").expect("release worker-start finalization");
+    wait_for_barrier(&authority_release_barrier);
+    let at_final_receipt = orchestration_registry(&state_dir);
+    assert_eq!(
+        at_final_receipt["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"]["schema_version"],
+        "main-agent.worker-start-result.v1"
+    );
+    fs::remove_file(&quarantine_path).expect("simulate missing final authority release marker");
+    let bootstrapped = bootstrap
+        .wait_with_output()
+        .expect("wait fail-closed worker bootstrap");
+    assert!(
+        !bootstrapped.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&bootstrapped.stdout),
+        String::from_utf8_lossy(&bootstrapped.stderr)
+    );
+    let bootstrap_json: serde_json::Value =
+        serde_json::from_slice(&bootstrapped.stdout).expect("bootstrap JSON");
+    assert_eq!(
+        bootstrap_json["error"]["code"],
+        "worker-start-bootstrap-handshake-invalid"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .all(|claim| claim["session_id"] != worker_id),
+        "final receipt without typed release proof must remain claim-free"
+    );
+    fs::write(authority_release_barrier.join("release"), b"release")
+        .expect("release fail-closed worker start");
+    let started = start.wait_with_output().expect("wait worker start");
+    assert!(
+        !started.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let started_json: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("failed worker-start JSON");
+    assert_eq!(started_json["error"]["code"], "orchestration-store-invalid");
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"]["worker"] = serde_json::Value::Null;
+    });
+    let malformed_worker_replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-bootstrap-handshake-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("main checkpoint path"),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_CODEX_BIN",
+                codex_bin.to_str().expect("codex bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(malformed_worker_replay.code, 65);
+    assert_eq!(
+        malformed_worker_replay.stdout_json()["error"]["code"],
+        "invalid-orchestration-input"
+    );
+    assert!(
+        !state_dir
+            .join(format!(
+                "sessions/{worker_id}/authority-quarantine-releases"
+            ))
+            .exists(),
+        "a malformed final canary receipt must not create release proof"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"] =
+            at_final_receipt["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+                ["outcome"]
+                .clone();
+        registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"]["assignment"]["revision"] = serde_json::Value::Null;
+    });
+    let malformed_revision_replay = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-bootstrap-handshake-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("main checkpoint path"),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_CODEX_BIN",
+                codex_bin.to_str().expect("codex bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(malformed_revision_replay.code, 65);
+    assert_eq!(
+        malformed_revision_replay.stdout_json()["error"]["code"],
+        "invalid-orchestration-input"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+            ["outcome"] =
+            at_final_receipt["receipts"]["main-one:main-incarnation-one:worker-start-canary-bootstrap-handshake-0001"]
+                ["outcome"]
+                .clone();
+    });
+    write_private_json(&quarantine_path, &quarantine);
+    let proof_barrier = tmp.path().join("canary-release-proof-persisted");
+    fs::create_dir(&proof_barrier).expect("release proof barrier");
+    let mut interrupted_replay = Command::new(bin::resolve("main-agent"));
+    interrupted_replay
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-bootstrap-handshake-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_QUARANTINE_RELEASE_PROOF_BARRIER_DIR",
+            &proof_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut interrupted_replay = interrupted_replay
+        .spawn()
+        .expect("spawn release-proof crash replay");
+    wait_for_barrier(&proof_barrier);
+    assert!(
+        quarantine_path.is_file(),
+        "active authority remains until immutable proof persistence is durable"
+    );
+    let release_dir = quarantine_path.with_file_name("authority-quarantine-releases");
+    let release_path = fs::read_dir(&release_dir)
+        .expect("release proof directory")
+        .map(|entry| entry.expect("release proof entry").path())
+        .next()
+        .expect("release proof");
+    let release_before_replay = fs::read(&release_path).expect("release proof before replay");
+    interrupted_replay
+        .kill()
+        .expect("interrupt after release-proof persistence");
+    interrupted_replay
+        .wait()
+        .expect("reap interrupted release-proof replay");
+    let replayed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-bootstrap-handshake-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("main checkpoint path"),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_CODEX_BIN",
+                codex_bin.to_str().expect("codex bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(
+        replayed.code,
+        0,
+        "stdout={} stderr={}",
+        replayed.stdout_text(),
+        replayed.stderr_text()
+    );
+    assert_authority_quarantine_released(&quarantine_path);
+    assert_eq!(
+        fs::read(&release_path).expect("release proof after replay"),
+        release_before_replay,
+        "release replay must retain the exact immutable proof and timestamp"
+    );
+    for operation in ["load-buffer", "paste-buffer", "send-keys"] {
+        assert_eq!(
+            tmux_calls(&tmux_log)
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            1,
+            "release replay must not redeliver the original prompt"
+        );
+    }
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "bootstrap",
+            "--idempotency-key",
+            &bootstrap_key,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &worker_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                worker_checkpoint.to_str().expect("worker checkpoint path"),
+            ),
+        ],
+    );
+    assert_eq!(
+        bootstrapped.code,
+        0,
+        "stdout={} stderr={}",
+        bootstrapped.stdout_text(),
+        bootstrapped.stderr_text()
+    );
+    assert_eq!(data(&bootstrapped)["claim"], "active");
+    let final_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        final_registry["assignments"][assignment_id.as_str()]["state"],
+        "working"
+    );
+    assert_eq!(
+        final_registry["assignments"][assignment_id.as_str()]["revision"],
+        3
+    );
+    assert_authority_quarantine_released(&quarantine_path);
+    let coordination = load_coordination_registry(&state_dir);
+    assert_eq!(
+        coordination["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .filter(|claim| claim["session_id"] == worker_id && claim["state"] == "active")
+            .count(),
+        1,
+        "exact bootstrap must commit one assignment-derived claim"
+    );
+}
+
+#[test]
+fn main_agent_canary_worker_start_never_completes_an_interrupted_prompt_attempt() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let assignment_path = tmp.path().join("assignment-canary-prompt-crash.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-prompt-crash",
+            "task_summary": "Fence an interrupted canary prompt attempt",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-prompt-crash",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let checkpoint_path = Path::new(&main_capability).with_file_name(format!(
+        "main-agent-checkpoint-{}.json",
+        Path::new(&main_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("main capability name")
+    ));
+    let barrier = tmp.path().join("canary-prompt-attempt");
+    fs::create_dir(&barrier).expect("prompt attempt barrier");
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-prompt-crash-0001",
+        "--format",
+        "json",
+    ];
+    let mut start = Command::new(bin::resolve("main-agent"));
+    start
+        .current_dir(&checkout)
+        .args(args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_runtime_release_before_prompt",
+        )
+        .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = start.spawn().expect("spawn canary prompt transaction");
+    wait_for_barrier(&barrier);
+    let interrupted = orchestration_registry(&state_dir);
+    let interrupted_worker =
+        interrupted["assignments"]["assignment-canary-prompt-crash"]["worker"].clone();
+    assert_eq!(
+        interrupted["receipts"]["main-one:main-incarnation-one:worker-start-canary-prompt-crash-0001"]
+            ["outcome"]["launch_phase"],
+        "runtime-released-prompt-attempting"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-prompt-crash/coordination/launch-ready")
+            .is_file()
+    );
+    for operation in ["load-buffer", "paste-buffer", "send-keys"] {
+        assert_eq!(
+            tmux_calls(&tmux_log)
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            0,
+            "the barrier precedes any prompt transport"
+        );
+    }
+    child.kill().expect("interrupt canary prompt transaction");
+    child.wait().expect("reap interrupted prompt transaction");
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("checkpoint path"),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_CODEX_BIN",
+                codex_bin.to_str().expect("codex bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                tmux_log.to_str().expect("tmux log"),
+            ),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(replay.code, 1, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        replay.stdout_json()["error"]["code"],
+        "managed-worker-prompt-delivery-outcome-unknown"
+    );
+    let after = orchestration_registry(&state_dir);
+    assert_eq!(
+        after["assignments"]["assignment-canary-prompt-crash"]["worker"],
+        interrupted_worker
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-prompt-crash/authority-quarantine.json")
+            .is_file(),
+        "an ambiguous prompt attempt must remain generic-resume quarantined"
+    );
+    let calls = tmux_calls(&tmux_log);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1
+    );
+    for operation in ["load-buffer", "paste-buffer", "send-keys"] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            0,
+            "ambiguous replay must never infer permission to send the prompt"
+        );
+    }
 }
 
 #[test]
@@ -8916,7 +10296,218 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let codex_home = tmp.path().join("codex-home");
-    let started = run_main_agent_with_codex_trust(
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let capability_path = Path::new(&main_capability);
+    let capability_name = capability_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_prefix("capability-"))
+        .expect("main capability name");
+    let checkpoint_path =
+        capability_path.with_file_name(format!("main-agent-checkpoint-{capability_name}.json"));
+    let attachment_barrier = tmp.path().join("canary-pre-release-attachment");
+    fs::create_dir(&attachment_barrier).expect("canary attachment barrier");
+    let mut start_command = Command::new(bin::resolve("main-agent"));
+    start_command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-supervisor-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_worker_attachment_before_runtime_release",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &attachment_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut start_child = start_command.spawn().expect("spawn canary worker start");
+    wait_for_barrier_or_child_exit(
+        &attachment_barrier,
+        &mut start_child,
+        "initial canary attachment",
+    );
+    let attached_registry = orchestration_registry(&state_dir);
+    let attached_assignment = &attached_registry["assignments"]["assignment-canary-supervisor"];
+    let attached_record_path = state_dir.join("sessions/worker-canary-supervisor/session.json");
+    let attached_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&attached_record_path).expect("pre-release worker record"),
+    )
+    .expect("pre-release worker record json");
+    assert_eq!(attached_assignment["revision"], 2);
+    assert_eq!(attached_assignment["state"], "starting");
+    assert_eq!(
+        attached_assignment["worker"]["session_id"],
+        "worker-canary-supervisor"
+    );
+    assert_eq!(
+        attached_assignment["worker"]["session_incarnation"],
+        attached_record["runtime"]["launch_id"]
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-supervisor/coordination/launch-ready")
+            .exists(),
+        "the exact worker binding must commit before the held runtime is released"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-supervisor/authority-quarantine.json")
+            .is_file(),
+        "prebinding must fence generic resume before assignment revision 2 is usable"
+    );
+    start_child
+        .kill()
+        .expect("interrupt worker start after durable pre-release binding");
+    start_child
+        .wait()
+        .expect("reap interrupted canary worker start");
+    let quarantined_resume = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "resume",
+            "worker-canary-supervisor",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(quarantined_resume.code, 65);
+    assert_eq!(
+        quarantined_resume.stdout_json()["error"]["code"],
+        "worker-quarantined"
+    );
+    let rollback_barrier = tmp.path().join("canary-rollback-cleanup");
+    fs::create_dir(&rollback_barrier).expect("rollback cleanup barrier");
+    let mut rollback_command = Command::new(bin::resolve("main-agent"));
+    rollback_command
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-supervisor-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_ABSENT", "1")
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_rollback_before_session_cleanup",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &rollback_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut rollback_child = rollback_command
+        .spawn()
+        .expect("spawn stopped runtime-held rollback");
+    wait_for_barrier_or_child_exit(
+        &rollback_barrier,
+        &mut rollback_child,
+        "canary rollback cleanup",
+    );
+    let rollback_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        rollback_registry["assignments"]["assignment-canary-supervisor"]["revision"],
+        1
+    );
+    assert!(rollback_registry["assignments"]["assignment-canary-supervisor"]["worker"].is_null());
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-supervisor/authority-quarantine.json")
+            .is_file(),
+        "rollback must retain quarantine until exact session cleanup"
+    );
+    let rollback_race_resume = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "resume",
+            "worker-canary-supervisor",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(rollback_race_resume.code, 65);
+    assert_eq!(
+        rollback_race_resume.stdout_json()["error"]["code"],
+        "worker-quarantined"
+    );
+    assert_eq!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        1,
+        "generic resume must not launch through the rollback cleanup window"
+    );
+    rollback_child
+        .kill()
+        .expect("stop rollback race fixture before cleanup");
+    rollback_child.wait().expect("reap rollback race fixture");
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-canary-supervisor"] =
+            attached_registry["assignments"]["assignment-canary-supervisor"].clone();
+        registry["receipts"]
+            ["main-one:main-incarnation-one:worker-start-canary-supervisor-0001"] =
+            attached_registry["receipts"]
+                ["main-one:main-incarnation-one:worker-start-canary-supervisor-0001"]
+                .clone();
+    });
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-canary-supervisor"]["worker"]["session_incarnation"] =
+            json!("wrong-canary-incarnation");
+    });
+    let mismatched_replay = run_main_agent(
         &checkout,
         &[
             "--state-dir",
@@ -8936,14 +10527,97 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         ],
         &[
             ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("checkpoint path"),
+            ),
             ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
             ("AGENT_SESSION_CODEX_BIN", &codex_arg),
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
         ],
-        &codex_home,
-        &[&checkout],
     );
-    assert_eq!(started.code, 0, "outcome={}", started.stdout_text());
+    assert_eq!(mismatched_replay.code, 65);
+    assert_eq!(
+        mismatched_replay.stdout_json()["error"]["code"],
+        "assignment-start-conflict"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-canary-supervisor"]["worker"]["session_incarnation"] =
+            attached_record["runtime"]["launch_id"].clone();
+    });
+    let resumed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-supervisor-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("checkpoint path"),
+            ),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    let resumed_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        resumed_registry["assignments"]["assignment-canary-supervisor"]["revision"],
+        2
+    );
+    assert_eq!(
+        resumed_registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-supervisor-0001"]
+            ["outcome"]["launch_phase"],
+        serde_json::Value::Null,
+        "completed replay must replace the pending launch phase with its final outcome"
+    );
+    assert_eq!(
+        resumed_registry["assignments"]["assignment-canary-supervisor"]["worker"]["session_incarnation"],
+        attached_record["runtime"]["launch_id"],
+        "crash replay must reuse the exact prebound runtime incarnation"
+    );
+    assert_authority_quarantine_released(
+        &state_dir.join("sessions/worker-canary-supervisor/authority-quarantine.json"),
+    );
+    let replay_calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            replay_calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "prebind crash replay must reuse one runtime and one prompt delivery: {replay_calls:?}"
+        );
+    }
     let controller_pid = std::process::id();
     let controller_record_path = state_dir.join("sessions/main-one/session.json");
     let mut controller_record: serde_json::Value =
@@ -8973,6 +10647,13 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         .rposition(|arg| arg == &helper_arg)
         .expect("compiled canary runtime helper executable");
     assert_eq!(
+        launch
+            .get(helper_index.saturating_sub(1))
+            .map(String::as_str),
+        Some("exec"),
+        "the tmux shell must be replaced by the exact canary supervisor"
+    );
+    assert_eq!(
         &launch[helper_index..],
         &[
             helper_arg.clone(),
@@ -9001,7 +10682,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         })
     );
 
-    let spawn_supervisor = || {
+    let spawn_supervisor = |binding_timeout_ms: &str| {
         let mut command = Command::new(&launch[helper_index]);
         command
             .current_dir(&checkout)
@@ -9010,7 +10691,11 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
             .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
             .env(
                 "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS",
-                "500",
+                "15000",
+            )
+            .env(
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ASSIGNMENT_BINDING_MS",
+                binding_timeout_ms,
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -9027,7 +10712,215 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }
         command.spawn().expect("execute emitted canary command")
     };
-    let mut stale_identity_supervisor = spawn_supervisor();
+    let registry_path = state_dir.join("orchestration/registry.json");
+    let write_registry = |value: &serde_json::Value| {
+        let temporary = state_dir.join("orchestration/.registry.binding-test.tmp");
+        write_private_json(&temporary, value);
+        fs::rename(&temporary, &registry_path).expect("atomically replace orchestration registry");
+    };
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("orchestration registry"))
+            .expect("orchestration registry json");
+    let bound_worker = registry["assignments"]["assignment-canary-supervisor"]["worker"].clone();
+    registry["assignments"]["assignment-canary-supervisor"]["worker"] = serde_json::Value::Null;
+    registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(1);
+    write_registry(&registry);
+
+    let unbound_supervisor = spawn_supervisor("500");
+    let unbound_supervisor_pid = unbound_supervisor.id();
+    let mut unbound_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    unbound_record["delete_tmux_identity"] = json!({
+        "launch_id": unbound_record["runtime"]["launch_id"],
+        "session_id": "$93",
+        "pane_id": "%93",
+        "pane_pid": unbound_supervisor_pid,
+        "process_group_id": unbound_supervisor_pid,
+        "process_session_id": unbound_supervisor_pid,
+        "process_session_members": [{
+            "pid": unbound_supervisor_pid,
+            "start_time": linux_process_start_ticks(unbound_supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &unbound_record);
+    let unbound_output = unbound_supervisor
+        .wait_with_output()
+        .expect("wait unbound canary supervisor");
+    assert!(!unbound_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&unbound_output.stderr)
+            .contains("did not observe its exact worker-start binding"),
+        "an unbound worker-start must time out before provider launch"
+    );
+
+    registry["assignments"]["assignment-canary-supervisor"]["worker"] = bound_worker.clone();
+    registry["assignments"]["assignment-canary-supervisor"]["state"] = json!("working");
+    registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(3);
+    write_registry(&registry);
+    let working_supervisor = spawn_supervisor("500");
+    let working_supervisor_pid = working_supervisor.id();
+    let mut working_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    working_record["delete_tmux_identity"] = json!({
+        "launch_id": working_record["runtime"]["launch_id"],
+        "session_id": "$93",
+        "pane_id": "%93",
+        "pane_pid": working_supervisor_pid,
+        "process_group_id": working_supervisor_pid,
+        "process_session_id": working_supervisor_pid,
+        "process_session_members": [{
+            "pid": working_supervisor_pid,
+            "start_time": linux_process_start_ticks(working_supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &working_record);
+    let working_output = working_supervisor
+        .wait_with_output()
+        .expect("wait working-state canary supervisor");
+    assert!(!working_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&working_output.stderr)
+            .contains("assignment does not bind this exact worker incarnation"),
+        "a working revision-3 assignment must fail the exact pre-provider rev2 fence"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-supervisor/.provider-stop-canary-ready.json")
+            .exists()
+    );
+    assert!(
+        !descendant_pid_file.exists(),
+        "working-state rejection must occur before provider execution"
+    );
+    let mut stale_created_worker = bound_worker.clone();
+    stale_created_worker["session_created_at"] = json!("2030-01-02T00:00:00Z");
+    registry["assignments"]["assignment-canary-supervisor"]["worker"] = stale_created_worker;
+    registry["assignments"]["assignment-canary-supervisor"]["state"] = json!("starting");
+    registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(2);
+    write_registry(&registry);
+    let stale_created_supervisor = spawn_supervisor("500");
+    let stale_created_supervisor_pid = stale_created_supervisor.id();
+    let mut stale_created_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    stale_created_record["delete_tmux_identity"] = json!({
+        "launch_id": stale_created_record["runtime"]["launch_id"],
+        "session_id": "$93",
+        "pane_id": "%93",
+        "pane_pid": stale_created_supervisor_pid,
+        "process_group_id": stale_created_supervisor_pid,
+        "process_session_id": stale_created_supervisor_pid,
+        "process_session_members": [{
+            "pid": stale_created_supervisor_pid,
+            "start_time": linux_process_start_ticks(stale_created_supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &stale_created_record);
+    let stale_created_output = stale_created_supervisor
+        .wait_with_output()
+        .expect("wait stale-created-at canary supervisor");
+    assert!(!stale_created_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale_created_output.stderr)
+            .contains("runtime incarnation changed before assignment binding"),
+        "a revision-2 binding with stale session creation identity must fail closed"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-supervisor/.provider-stop-canary-ready.json")
+            .exists()
+    );
+    assert!(
+        !descendant_pid_file.exists(),
+        "stale session creation identity must be rejected before provider execution"
+    );
+    registry["assignments"]["assignment-canary-supervisor"]["worker"] = serde_json::Value::Null;
+    registry["assignments"]["assignment-canary-supervisor"]["state"] = json!("starting");
+    registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(1);
+    write_registry(&registry);
+
+    let mut delayed_binding_supervisor = spawn_supervisor("15000");
+    let delayed_binding_supervisor_pid = delayed_binding_supervisor.id();
+    let mut delayed_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
+            .expect("worker record json");
+    delayed_record["delete_tmux_identity"] = json!({
+        "launch_id": delayed_record["runtime"]["launch_id"],
+        "session_id": "$93",
+        "pane_id": "%93",
+        "pane_pid": delayed_binding_supervisor_pid,
+        "process_group_id": delayed_binding_supervisor_pid,
+        "process_session_id": delayed_binding_supervisor_pid,
+        "process_session_members": [{
+            "pid": delayed_binding_supervisor_pid,
+            "start_time": linux_process_start_ticks(delayed_binding_supervisor_pid)
+        }]
+    });
+    write_private_json(&record_path, &delayed_record);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        delayed_binding_supervisor
+            .try_wait()
+            .expect("observe delayed-binding supervisor")
+            .is_none(),
+        "the compiled canary supervisor must wait for the worker-start transaction to persist its exact assignment binding"
+    );
+
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("orchestration registry"))
+            .expect("orchestration registry json");
+    registry["assignments"]["assignment-canary-supervisor"]["worker"] = bound_worker;
+    registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(2);
+    write_registry(&registry);
+    let ready =
+        state_dir.join("sessions/worker-canary-supervisor/.provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the compiled canary supervisor did not continue after the exact worker binding committed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let delayed_child_pid = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(&ready).expect("canary ready marker"),
+    )
+    .expect("canary ready json")["child_pid"]
+        .as_u64()
+        .expect("provider child pid") as u32;
+    while !descendant_pid_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the delayed-binding provider did not publish its descendant identity"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let delayed_descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("canary descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("canary descendant numeric pid");
+    delayed_binding_supervisor
+        .kill()
+        .expect("stop delayed-binding supervisor");
+    delayed_binding_supervisor
+        .wait()
+        .expect("reap delayed-binding supervisor");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (Path::new(&format!("/proc/{delayed_child_pid}")).exists()
+        || Path::new(&format!("/proc/{delayed_descendant_pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!Path::new(&format!("/proc/{delayed_child_pid}")).exists());
+    assert!(!Path::new(&format!("/proc/{delayed_descendant_pid}")).exists());
+    fs::remove_file(&ready).expect("remove delayed-binding ready marker");
+    fs::remove_file(&descendant_pid_file).expect("remove delayed-binding descendant marker");
+
+    let mut stale_identity_supervisor = spawn_supervisor("500");
     let stale_identity_pid = stale_identity_supervisor.id();
     let mut stale_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -9052,7 +10945,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         !stale_status.success(),
         "a reused numeric pane PID with different start ticks must fail before provider launch"
     );
-    let mut supervisor = spawn_supervisor();
+    let mut supervisor = spawn_supervisor("500");
     let supervisor_pid = supervisor.id();
     let mut record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -9067,7 +10960,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         "process_session_members": [{
             "pid": supervisor_pid,
             "start_time": linux_process_start_ticks(supervisor_pid)
-        }]
+        }],
+        "pid_namespace": current_pid_namespace_identity()
     });
     write_private_json(&record_path, &record);
     let ready =
@@ -9110,10 +11004,33 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         .trim()
         .parse::<u32>()
         .expect("provider descendant numeric pid");
+    let control_address = provider_stop_canary_control_address_for_test(
+        &state_dir,
+        "worker-canary-supervisor",
+        record["runtime"]["launch_id"]
+            .as_str()
+            .expect("worker launch id"),
+    );
+    let mut slowloris =
+        UnixStream::connect_addr(&control_address).expect("connect authenticated slow client");
+    slowloris
+        .write_all(b"{")
+        .expect("start incomplete authenticated control frame");
+    let slowloris = std::thread::spawn(move || {
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if slowloris.write_all(b" ").is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let crash_started = Instant::now();
     // SAFETY: the test-created supervisor owns this private process group.
     // Killing the complete supervisor group exercises correlated pane/job
-    // teardown while the separately-sessioned guardian must still clean the
-    // provider cgroup.
+    // teardown while the separately-sessioned guardian is reading an
+    // authenticated but incomplete request and must still clean the provider
+    // cgroup within its absolute control-frame bound.
     assert_eq!(
         unsafe { libc::kill(-(supervisor_pid as libc::pid_t), libc::SIGKILL) },
         0
@@ -9134,6 +11051,11 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         !Path::new(&format!("/proc/{descendant_pid}")).exists(),
         "the crash guardian cgroup must stop a descendant that escaped into its own process session"
     );
+    assert!(
+        crash_started.elapsed() < Duration::from_secs(2),
+        "an authenticated trickle request must not extend crash cleanup beyond its bound"
+    );
+    slowloris.join().expect("join authenticated slow client");
     // SAFETY: the exact child PID was the private process-group leader and has
     // been reaped; ESRCH proves no descendant remains in that group.
     let group_status = unsafe { libc::kill(-(child_pid as libc::pid_t), 0) };
@@ -9145,7 +11067,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
 
     fs::remove_file(&ready).expect("remove first ready marker");
     fs::remove_file(&descendant_pid_file).expect("remove first descendant marker");
-    let mut guardian_crash_supervisor = spawn_supervisor();
+    let mut guardian_crash_supervisor = spawn_supervisor("500");
     let guardian_crash_supervisor_pid = guardian_crash_supervisor.id();
     let mut record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -9234,6 +11156,651 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     assert!(
         !guardian_child_cgroup.exists(),
         "supervisor cleanup must remove the exact pinned cgroup after guardian death"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn main_agent_canary_startup_admits_only_authenticated_guardian_status() {
+    use std::os::unix::process::CommandExt;
+
+    if !provider_stop_canary_test_capability_or_skip() {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let capability_path = Path::new(&main_capability);
+    let capability_name = capability_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_prefix("capability-"))
+        .expect("main capability name");
+    let checkpoint_path =
+        capability_path.with_file_name(format!("main-agent-checkpoint-{capability_name}.json"));
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let provider_bin = tmp.path().join("codex-authenticated-startup");
+    let descendant_pid_file = tmp.path().join("authenticated-startup-descendant.pid");
+    fs::write(
+        &provider_bin,
+        "#!/usr/bin/env sh\nsetsid sh -c 'sleep 60' &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CANARY_DESCENDANT_PID_FILE\"\nwait \"$descendant\"\n",
+    )
+    .expect("provider fixture");
+    fs::set_permissions(&provider_bin, fs::Permissions::from_mode(0o700))
+        .expect("provider fixture mode");
+    let assignment_path = tmp.path().join("assignment-authenticated-startup.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-authenticated-startup",
+            "task_summary": "Exercise authenticated canary startup admission",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-authenticated-startup",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let provider_arg = provider_bin.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    write_trusted_codex_config(&codex_home, &[&checkout]);
+    let attachment_barrier = tmp.path().join("authenticated-startup-attachment");
+    fs::create_dir(&attachment_barrier).expect("attachment barrier");
+    let mut initial = Command::new(bin::resolve("main-agent"));
+    initial
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-authenticated-startup-0001",
+            "--format",
+            "json",
+        ])
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_arg)
+        .env("AGENT_SESSION_CODEX_BIN", &provider_arg)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_canary_worker_attachment_before_runtime_release",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &attachment_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut initial = initial.spawn().expect("spawn initial worker-start");
+    wait_for_barrier(&attachment_barrier);
+    initial
+        .kill()
+        .expect("interrupt after durable startup-pending phase");
+    initial.wait().expect("reap interrupted worker-start");
+
+    let pending = orchestration_registry(&state_dir);
+    assert_eq!(
+        pending["receipts"]["main-one:main-incarnation-one:worker-start-authenticated-startup-0001"]
+            ["outcome"]["launch_phase"],
+        "worker-bound-canary-startup-pending"
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"]["main-one:main-incarnation-one:worker-start-authenticated-startup-0001"]
+            ["outcome"]["launch_phase"] = json!("worker-bound-runtime-held");
+    });
+    let launch = tmux_calls(&tmux_log)
+        .into_iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("worker tmux launch");
+    let helper = bin::resolve("agent-session");
+    let helper_arg = helper.to_string_lossy().into_owned();
+    let helper_index = launch
+        .iter()
+        .rposition(|arg| arg == &helper_arg)
+        .expect("compiled canary supervisor executable");
+
+    let controller_pid = std::process::id();
+    let controller_record_path = state_dir.join("sessions/main-one/session.json");
+    let mut controller_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&controller_record_path).expect("controller record"))
+            .expect("controller record json");
+    controller_record["delete_tmux_identity"] = json!({
+        "launch_id": "main-incarnation-one",
+        "session_id": "$97",
+        "pane_id": "%97",
+        "pane_pid": controller_pid,
+        "pane_start_time": linux_process_start_ticks(controller_pid),
+        "process_group_id": controller_pid,
+        "process_session_id": controller_pid
+    });
+    write_private_json(&controller_record_path, &controller_record);
+
+    let mut supervisor_command = Command::new(&launch[helper_index]);
+    supervisor_command
+        .current_dir(&checkout)
+        .args(&launch[helper_index + 1..])
+        .env("AGENT_SESSION_ID", "worker-authenticated-startup")
+        .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS",
+            "15000",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the test-owned child performs only setsid before exec.
+    unsafe {
+        supervisor_command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut supervisor = supervisor_command
+        .spawn()
+        .expect("spawn exact compiled supervisor");
+    let supervisor_pid = supervisor.id();
+    let worker_record_path = state_dir.join("sessions/worker-authenticated-startup/session.json");
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    worker_record["delete_tmux_identity"] = json!({
+        "launch_id": worker_record["runtime"]["launch_id"],
+        "session_id": "$98",
+        "pane_id": "%98",
+        "pane_pid": supervisor_pid,
+        "pane_start_time": linux_process_start_ticks(supervisor_pid),
+        "process_group_id": supervisor_pid,
+        "process_session_id": supervisor_pid,
+        "pid_namespace": current_pid_namespace_identity()
+    });
+    write_private_json(&worker_record_path, &worker_record);
+    #[derive(serde::Serialize)]
+    struct RuntimePidNamespace {
+        device: u64,
+        inode: u64,
+        boot_id: String,
+    }
+    #[derive(serde::Serialize)]
+    struct RuntimeIdentity<'a> {
+        launch_id: &'a str,
+        session_id: &'a str,
+        pane_id: &'a str,
+        pane_pid: libc::pid_t,
+        pane_start_time: u64,
+        process_group_id: libc::pid_t,
+        process_session_id: libc::pid_t,
+        pid_namespace: RuntimePidNamespace,
+    }
+    let pid_namespace = fs::metadata("/proc/self/ns/pid").expect("current PID namespace metadata");
+    let runtime_identity = RuntimeIdentity {
+        launch_id: worker_record["runtime"]["launch_id"]
+            .as_str()
+            .expect("worker launch id"),
+        session_id: "$98",
+        pane_id: "%98",
+        pane_pid: supervisor_pid as libc::pid_t,
+        pane_start_time: linux_process_start_ticks(supervisor_pid),
+        process_group_id: supervisor_pid as libc::pid_t,
+        process_session_id: supervisor_pid as libc::pid_t,
+        pid_namespace: RuntimePidNamespace {
+            device: pid_namespace.dev(),
+            inode: pid_namespace.ino(),
+            boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+                .to_string(),
+        },
+    };
+    let runtime_digest = Sha256::digest(
+        serde_json::to_vec(&runtime_identity).expect("serialize exact runtime identity"),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+    let quarantine_path =
+        state_dir.join("sessions/worker-authenticated-startup/authority-quarantine.json");
+    let mut quarantine: serde_json::Value =
+        serde_json::from_slice(&fs::read(&quarantine_path).expect("startup quarantine"))
+            .expect("startup quarantine json");
+    quarantine["quarantine"]["runtime_identity_digest"] = json!(format!("sha256:{runtime_digest}"));
+    write_private_json(&quarantine_path, &quarantine);
+
+    let resumed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-authenticated-startup-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            (
+                "AGENT_SESSION_CHECKPOINT_FILE",
+                checkpoint_path.to_str().expect("checkpoint path"),
+            ),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &provider_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ENFORCE_STARTUP",
+                "1",
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_STARTUP_MS",
+                "5000",
+            ),
+            ("CODEX_HOME", codex_home.to_str().expect("codex home")),
+        ],
+    );
+    assert_eq!(
+        resumed.code,
+        0,
+        "stdout={} stderr={}",
+        resumed.stdout_text(),
+        resumed.stderr_text()
+    );
+    let calls = tmux_calls(&tmux_log);
+    for operation in ["load-buffer", "paste-buffer", "send-keys"] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            1,
+            "authenticated status must precede exactly one prompt transport: {calls:?}"
+        );
+    }
+    assert_eq!(
+        orchestration_registry(&state_dir)["receipts"]["main-one:main-incarnation-one:worker-start-authenticated-startup-0001"]
+            ["outcome"]["launch_phase"],
+        serde_json::Value::Null
+    );
+
+    let ready =
+        state_dir.join("sessions/worker-authenticated-startup/.provider-stop-canary-ready.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.is_file() || !descendant_pid_file.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "authenticated startup provider did not publish its fixture identity"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let child_pid =
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&ready).expect("ready marker"))
+            .expect("ready json")["child_pid"]
+            .as_u64()
+            .expect("child pid") as u32;
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .expect("descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric descendant pid");
+    // SAFETY: this test owns the exact supervisor process group.
+    assert_eq!(
+        unsafe { libc::kill(-(supervisor_pid as libc::pid_t), libc::SIGKILL) },
+        0
+    );
+    supervisor.wait().expect("reap supervisor");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (Path::new(&format!("/proc/{child_pid}")).exists()
+        || Path::new(&format!("/proc/{descendant_pid}")).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
+    assert!(!Path::new(&format!("/proc/{descendant_pid}")).exists());
+}
+
+#[test]
+fn main_agent_canary_startup_failure_precedes_prompt_transport() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let assignment_path = tmp.path().join("assignment-canary-startup-failure.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-startup-failure",
+            "task_summary": "Fail canary startup before prompt transport",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-startup-failure",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": [],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-canary-startup-failure");
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let runtime = spawn_test_process_group();
+    let runtime_pid_arg = runtime.pid().to_string();
+    let state_runtime_arg = state_dir.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    let failed = run_main_agent_with_codex_trust(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-startup-failure-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
+            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
+                "worker-canary-startup-failure",
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_runtime_arg),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ENFORCE_STARTUP",
+                "1",
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_STARTUP_MS",
+                "25",
+            ),
+        ],
+        &codex_home,
+        &[&checkout],
+    );
+    assert_eq!(failed.code, 65, "stderr={}", failed.stderr_text());
+    assert_eq!(
+        failed.stdout_json()["error"]["code"],
+        "provider-stop-canary-startup-failed"
+    );
+    assert_eq!(
+        failed.stdout_json()["error"]["details"]["failure_code"],
+        "provider-stop-canary-startup-timeout"
+    );
+    let first_error = failed.stdout_json()["error"].clone();
+    let calls = tmux_calls(&tmux_log);
+    let first_new_session_count = calls
+        .iter()
+        .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .count();
+    assert!(
+        calls.iter().all(|call| {
+            !matches!(
+                call.first().map(String::as_str),
+                Some("load-buffer" | "paste-buffer" | "send-keys")
+            )
+        }),
+        "no prompt byte or submit key may be sent before canary startup readiness: {calls:?}"
+    );
+    let replay = run_main_agent_with_codex_trust(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "0",
+            "--idempotency-key",
+            "worker-start-canary-startup-failure-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
+            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
+                "worker-canary-startup-failure",
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_runtime_arg),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ENFORCE_STARTUP",
+                "1",
+            ),
+            (
+                "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_STARTUP_MS",
+                "25",
+            ),
+        ],
+        &codex_home,
+        &[&checkout],
+    );
+    assert_eq!(replay.code, 65, "stderr={}", replay.stderr_text());
+    assert_eq!(
+        replay.stdout_json()["error"],
+        first_error,
+        "exact replay must preserve the durable pre-prompt startup failure"
+    );
+    let replay_calls = tmux_calls(&tmux_log);
+    assert_eq!(
+        replay_calls
+            .iter()
+            .filter(|call| call.first().is_some_and(|arg| arg == "new-session"))
+            .count(),
+        first_new_session_count,
+        "exact startup-failure replay must not relaunch the retained worker"
+    );
+    assert!(
+        replay_calls.iter().all(|call| {
+            !matches!(
+                call.first().map(String::as_str),
+                Some("load-buffer" | "paste-buffer" | "send-keys")
+            )
+        }),
+        "exact startup-failure replay must remain before prompt transport: {replay_calls:?}"
+    );
+    let registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-canary-startup-failure"]["revision"],
+        2
+    );
+    assert_eq!(
+        registry["assignments"]["assignment-canary-startup-failure"]["state"],
+        "starting"
+    );
+    let receipt = &registry["receipts"]["main-one:main-incarnation-one:worker-start-canary-startup-failure-0001"]
+        ["outcome"];
+    assert_eq!(receipt["launch_phase"], "canary-startup-failed");
+    assert_eq!(
+        receipt["startup_failure"],
+        json!({
+            "stage": "controller",
+            "failure_code": "provider-stop-canary-startup-timeout"
+        })
+    );
+    assert!(
+        load_coordination_registry(&state_dir)["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .all(|operation| !matches!(operation["status"].as_str(), Some("active" | "uncertain"))),
+        "worker-start operation fencing must be quiescent after startup failure"
+    );
+    let worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions/worker-canary-startup-failure/session.json"))
+            .expect("retained worker record"),
+    )
+    .expect("retained worker record json");
+    assert_eq!(
+        receipt["worker"]["session_incarnation"], worker_record["runtime"]["launch_id"],
+        "startup failure must retain the exact bound incarnation"
+    );
+    assert!(
+        state_dir
+            .join("sessions/worker-canary-startup-failure/authority-quarantine.json")
+            .is_file(),
+        "startup failure must retain its exact authority quarantine"
+    );
+
+    drop(runtime);
+    let recovery_env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+    ];
+    let cancelled = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "cancel",
+            "assignment-canary-startup-failure",
+            "--if-revision",
+            "2",
+            "--reason",
+            "typed canary startup failure recovery",
+            "--idempotency-key",
+            "cancel-canary-startup-failure-0001",
+            "--format",
+            "json",
+        ],
+        &recovery_env,
+    );
+    assert_eq!(
+        cancelled.code,
+        0,
+        "stdout={} stderr={}",
+        cancelled.stdout_text(),
+        cancelled.stderr_text()
+    );
+    assert_eq!(data(&cancelled)["assignment"]["state"], "cancelled");
+    assert_eq!(data(&cancelled)["assignment"]["revision"], 3);
+    let retired = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "retire",
+            "assignment-canary-startup-failure",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "retire-canary-startup-failure-0001",
+            "--format",
+            "json",
+        ],
+        &recovery_env,
+    );
+    assert_eq!(
+        retired.code,
+        0,
+        "stdout={} stderr={}",
+        retired.stdout_text(),
+        retired.stderr_text()
+    );
+    assert_eq!(data(&retired)["retired"], true);
+    assert_eq!(data(&retired)["cleanup_pending"], false);
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-startup-failure")
+            .exists(),
+        "typed cancellation and retirement must remove the retained worker"
     );
 }
 
@@ -11749,6 +14316,304 @@ fn main_agent_worker_bootstrap_rejects_assignment_checkout_mismatch_before_grant
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn main_agent_failed_canary_preclaim_cancels_with_exact_collected_scope_proof() {
+    let uid = unsafe { libc::geteuid() };
+    if !Path::new("/usr/bin/systemctl").is_file()
+        || !Path::new("/usr/bin/systemd-run").is_file()
+        || !PathBuf::from(format!("/run/user/{uid}/systemd/private")).exists()
+    {
+        eprintln!("SKIP: exact systemd user manager proof is unavailable");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    let unrelated_checkout = tmp.path().join("unrelated-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [&main_checkout, &worker_checkout, &unrelated_checkout] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-failed-canary",
+                "worker-failed-canary-incarnation",
+                "worker-failed-canary-capability-000000001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-unrelated",
+                "worker-unrelated-incarnation",
+                "worker-unrelated-capability-00000000001",
+                unrelated_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-failed-canary",
+        "task_summary": "Clean up an exact failed provider-stop canary",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-failed-canary",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": [],
+        "provider_stop_canary": {
+            "schema_version": "main-agent.provider-process-stop-canary.v1"
+        }
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-failed-canary",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-failed-canary",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Clean up an exact failed provider-stop canary",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-failed-canary",
+                "session_incarnation": "worker-failed-canary-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &packet,
+    );
+
+    let collected_unit = format!("tmux-spawn-{}.scope", uuid::Uuid::new_v4());
+    let collected_scope =
+        format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{collected_unit}");
+    let worker_record_path = state_dir.join("sessions/worker-failed-canary/session.json");
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    worker_record["runtime"]["provider_stop_canary"] = json!({
+        "schema_version": "agent-session.provider-stop-canary.v1",
+        "hold_seconds": 120,
+        "launch_id": "worker-failed-canary-incarnation",
+        "assignment_id": "assignment-failed-canary"
+    });
+    worker_record["startup"] = json!({
+        "schema_version": "agent-session.startup.v1",
+        "state": "failed",
+        "stage": "tmux",
+        "started_at": "2030-01-01T00:00:00Z",
+        "failure_code": "terminal-runtime-create-failed",
+        "message": "The terminal runtime could not be created.",
+        "occurred_at": "2030-01-01T00:00:01Z",
+        "retry_safe": true
+    });
+    worker_record["delete_tmux_identity"] = json!({
+        "launch_id": "worker-failed-canary-incarnation",
+        "session_id": "$404",
+        "pane_id": "%404",
+        "pane_pid": 2_000_000_000u32,
+        "process_group_id": 2_000_000_000u32,
+        "process_session_id": 2_000_000_000u32,
+        "control_group": {
+            "path": collected_scope,
+            "device": 1,
+            "inode": 1,
+            "boot_id": fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .expect("boot id")
+                .trim()
+        }
+    });
+    write_private_json(&worker_record_path, &worker_record);
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]
+            .as_object_mut()
+            .expect("brokers")
+            .remove("worker-failed-canary");
+    });
+
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+    ];
+    let cancelled = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "cancel",
+            "assignment-failed-canary",
+            "--if-revision",
+            "2",
+            "--reason",
+            "typed cleanup of failed pre-claim provider-stop canary",
+            "--idempotency-key",
+            "failed-canary-cancel-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(cancelled.code, 0, "outcome={}", cancelled.stdout_text());
+    assert_eq!(data(&cancelled)["assignment"]["state"], "cancelled");
+    assert_eq!(data(&cancelled)["assignment"]["revision"], 3);
+    assert_eq!(data(&cancelled)["claim_absent"], true);
+    assert_eq!(data(&cancelled)["operation_quiescent"], true);
+    let mut occupied_scope = Command::new("/usr/bin/systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
+        .arg(&collected_unit)
+        .args(["--", "/usr/bin/sleep", "3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("occupy the collected unit before replay");
+    let occupied_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = Command::new("/usr/bin/systemctl")
+            .args(["--user", "--no-pager", "show"])
+            .arg(&collected_unit)
+            .arg("--property=ActiveState")
+            .arg("--value")
+            .output()
+            .expect("observe occupied unit");
+        if status.status.success() && status.stdout == b"active\n" {
+            break;
+        }
+        assert!(
+            Instant::now() < occupied_deadline,
+            "the exact unit did not become active before replay"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let replay = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "cancel",
+            "assignment-failed-canary",
+            "--if-revision",
+            "2",
+            "--reason",
+            "typed cleanup of failed pre-claim provider-stop canary",
+            "--idempotency-key",
+            "failed-canary-cancel-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(replay.code, 0, "outcome={}", replay.stdout_text());
+    assert_eq!(
+        replay.stdout_json(),
+        cancelled.stdout_json(),
+        "identical cancellation replay must return the committed receipt even when a fresh manager proof would now fail"
+    );
+    assert!(
+        occupied_scope
+            .wait()
+            .expect("wait occupied scope")
+            .success(),
+        "the bounded replay guard scope must exit normally"
+    );
+    assert!(
+        state_dir.join("sessions/worker-unrelated").exists(),
+        "exact canary cancellation must preserve unrelated sessions"
+    );
+    let coordination = load_coordination_registry(&state_dir);
+    assert!(
+        coordination["brokers"]["main-one"].is_object(),
+        "exact canary cancellation must preserve controller authority"
+    );
+    assert!(
+        coordination["brokers"]["worker-unrelated"].is_object(),
+        "exact canary cancellation must preserve unrelated broker authority"
+    );
+
+    let deleted = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "delete",
+            "assignment-failed-canary",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "failed-canary-delete-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(deleted.code, 0, "outcome={}", deleted.stdout_text());
+    assert_eq!(data(&deleted)["deleted"], true);
+    assert_eq!(data(&deleted)["cleanup_pending"], false);
+    assert!(!worker_record_path.exists());
+    assert!(state_dir.join("sessions/worker-unrelated").exists());
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls.iter().all(|call| {
+            call.first().is_none_or(|arg| arg != "kill-session")
+                && (call.first().is_none_or(|arg| arg != "if-shell")
+                    || call.iter().all(|arg| !arg.starts_with("kill-session -t ")))
+        }),
+        "collected-scope cleanup must not gain direct or nested tmux termination authority: {calls:?}"
+    );
+}
+
+#[test]
 fn main_agent_worker_bootstrap_rejects_an_existing_ungranted_claim() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -12120,6 +14985,62 @@ fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
             .to_string_lossy()
             .as_ref(),
         "bootstrap must return the runtime-issued checkpoint path for later authenticated checkpoints"
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["schema_version"],
+        "main-agent.worker-instructions.v1"
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["task_source"],
+        "assignment.assignment_packet.task"
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["checkpoint"]["file"],
+        data(&bootstrapped)["checkpoint_file"]
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["checkpoint"]["write"],
+        json!({
+            "required_before_execute": true,
+            "sole_write_target": true,
+            "payload_schema_version": "main-agent.checkpoint-input.v1"
+        }),
+        "the worker must write the checkpoint payload to only the runtime-issued file before invoking checkpoint"
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["checkpoint"]["argv_template"],
+        json!([
+            bin::resolve("main-agent").to_string_lossy(),
+            "checkpoint",
+            "--file",
+            data(&bootstrapped)["checkpoint_file"],
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "<stable-key>",
+            "--format",
+            "json"
+        ]),
+        "the complete returned checkpoint command must bind the exact executable, file, and post-bootstrap assignment revision"
+    );
+    assert!(
+        data(&bootstrapped)["worker_instructions"]["claim_lifecycle"]
+            .as_str()
+            .is_some_and(|value| value.contains("release the work-context claim"))
+    );
+    assert_eq!(
+        data(&bootstrapped)["worker_instructions"]["request_changes"],
+        json!({
+            "required_before_mutation": true,
+            "argv_template": [
+                bin::resolve("main-agent").to_string_lossy(),
+                "bootstrap",
+                "--idempotency-key",
+                "<new-stable-key-for-current-revision>",
+                "--format",
+                "json"
+            ]
+        })
     );
     let coordination_registry: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
@@ -13334,10 +16255,14 @@ struct StoppedPostClaimFixture {
 
 impl StoppedPostClaimFixture {
     fn new() -> Self {
-        Self::new_with_canary(false)
+        Self::new_with_canary_scopes(false, &["docs/stopped-focused"])
     }
 
     fn new_with_canary(canary: bool) -> Self {
+        Self::new_with_canary_scopes(canary, &["docs/stopped-focused"])
+    }
+
+    fn new_with_canary_scopes(canary: bool, scopes: &[&str]) -> Self {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
         let checkout = tmp.path().join("main-checkout");
@@ -13425,6 +16350,7 @@ impl StoppedPostClaimFixture {
             run_three["controller"]["session_incarnation"] = json!("main-incarnation-three");
             registry["runs"]["run-three"] = run_three;
         });
+        let packet_scopes = json!(scopes);
         let mut packet = json!({
             "schema_version": "main-agent.assignment-input.v1",
             "assignment_id": "assignment-stopped",
@@ -13441,7 +16367,7 @@ impl StoppedPostClaimFixture {
             "repository": "example/repository",
             "worktree": worker_checkout,
             "base_ref": "main",
-            "scopes": ["docs/stopped-focused"],
+            "scopes": packet_scopes.clone(),
             "durable_refs": []
         });
         if canary {
@@ -13475,7 +16401,7 @@ impl StoppedPostClaimFixture {
                 "repository": "example/repository",
                 "worktree": worker_checkout,
                 "base_ref": "main",
-                "scopes": ["docs/stopped-focused"],
+                "scopes": packet_scopes,
                 "durable_refs": [],
                 "checkpoint": null,
                 "result_summary": null,
@@ -13521,7 +16447,8 @@ impl StoppedPostClaimFixture {
             "session_id": "$91",
             "pane_id": "%91",
             "pane_pid": 2_000_000_000u32,
-            "process_group_id": 2_000_000_000u32
+            "process_group_id": 2_000_000_000u32,
+            "pid_namespace": current_pid_namespace_identity()
         });
         if canary {
             record["runtime"]["provider_stop_canary"] = json!({
@@ -13613,6 +16540,29 @@ impl StoppedPostClaimFixture {
         let mut env = self.envs().to_vec();
         env.extend_from_slice(extra);
         run_main_agent(&self.checkout, &self.reconcile_args(), &env)
+    }
+
+    fn set_canary_supervisor_binding_starting(&self) {
+        rewrite_orchestration_registry(&self.state_dir, |registry| {
+            let assignment = &mut registry["assignments"]["assignment-stopped"];
+            assignment["state"] = json!("starting");
+            assignment["revision"] = json!(2);
+            assignment["checkpoint"] = serde_json::Value::Null;
+        });
+    }
+
+    fn set_canary_supervisor_binding_working(&self) {
+        rewrite_orchestration_registry(&self.state_dir, |registry| {
+            let assignment = &mut registry["assignments"]["assignment-stopped"];
+            assignment["state"] = json!("working");
+            assignment["revision"] = json!(3);
+            assignment["checkpoint"] = json!({
+                "revision": 3,
+                "summary": "Focused stopped post-claim worker",
+                "next_action": "Await Main Agent supervision",
+                "updated_at": "2030-01-01T00:00:03Z"
+            });
+        });
     }
 
     fn run_claimed_runtime_stop(
@@ -16305,8 +19255,24 @@ fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn stopped_process_with_live_tmux_is_never_healthy_progress() {
     let fixture = StoppedPostClaimFixture::new();
+    let worker_record_path = fixture
+        .state_dir
+        .join("sessions/worker-stopped/session.json");
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    let pid_namespace = fs::metadata("/proc/self/ns/pid").expect("current PID namespace metadata");
+    worker_record["delete_tmux_identity"]["pid_namespace"] = json!({
+        "device": pid_namespace.dev(),
+        "inode": pid_namespace.ino(),
+        "boot_id": fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .expect("boot id")
+            .trim()
+    });
+    write_private_json(&worker_record_path, &worker_record);
     seed_activity_state(
         &fixture.state_dir,
         "worker-stopped",
@@ -16368,25 +19334,19 @@ fn stopped_process_with_live_tmux_is_never_healthy_progress() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
+fn provider_stop_canary_supervisor_admits_stalled_scope_empty_turn_and_releases() {
     use std::os::unix::process::CommandExt;
 
     if !provider_stop_canary_test_capability_or_skip() {
         return;
     }
-    let fixture = StoppedPostClaimFixture::new_with_canary(true);
-    seed_activity_state(
+    let fixture = StoppedPostClaimFixture::new_with_canary_scopes(true, &[]);
+    fixture.set_canary_supervisor_binding_starting();
+    seed_stalled_codex_provider_hook_activity_state(
         &fixture.state_dir,
         "worker-stopped",
         "worker-stopped-incarnation",
-        "waiting",
-        serde_json::Value::Null,
-        json!({
-            "provider_turn_id": "compiled-provider-stop-canary-turn",
-            "started_at": "2030-01-01T00:00:00Z",
-            "completed_at": "2030-01-01T00:00:01Z",
-            "outcome": "completed"
-        }),
+        6,
     );
     let session_dir = fixture.state_dir.join("sessions/worker-stopped");
     let record_path = session_dir.join("session.json");
@@ -16423,6 +19383,10 @@ fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
             "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_HOLD_MS",
             "5000",
         )
+        .env(
+            "NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_MEMBER_CHURN_ONCE",
+            "1",
+        )
         .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
         .env("CANARY_CONTAINMENT_FILE", &containment_file)
         .stdin(Stdio::null())
@@ -16455,7 +19419,8 @@ fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
         "process_session_members": [{
             "pid": supervisor_pid,
             "start_time": linux_process_start_ticks(supervisor_pid)
-        }]
+        }],
+        "pid_namespace": current_pid_namespace_identity()
     });
     write_private_json(&record_path, &record);
     let ready_path = session_dir.join(".provider-stop-canary-ready.json");
@@ -16480,6 +19445,7 @@ fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
     let ready: serde_json::Value =
         serde_json::from_slice(&fs::read(&ready_path).expect("ready marker"))
             .expect("ready marker json");
+    fixture.set_canary_supervisor_binding_working();
     let child_pid = ready["child_pid"].as_u64().expect("child pid") as u32;
     let child_start_ticks = linux_process_start_ticks(child_pid);
     while !descendant_pid_file.is_file() || !containment_file.is_file() {
@@ -16582,11 +19548,17 @@ fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
     assert_eq!(stopped.code, 0, "outcome={}", stopped.stdout_text());
     assert_eq!(data(&stopped)["provider_process"], "stopped");
     assert_eq!(data(&stopped)["tmux_wrapper"], "running");
+    assert_eq!(
+        data(&stopped)["activity_revision"],
+        6,
+        "the command boundary must retain the exact admitted stale provider-hook revision"
+    );
     let typed_reservation =
         provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped")
             .expect("typed provider stop canary reservation");
     assert_eq!(typed_reservation["child_pid"], child_pid);
     assert_eq!(typed_reservation["child_start_ticks"], child_start_ticks);
+    assert_eq!(typed_reservation["activity_revision"], 6);
     let stopped_path = session_dir.join(".provider-stop-canary-stopped.json");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !stopped_path.is_file() {
@@ -16753,6 +19725,64 @@ fn provider_stop_canary_supervisor_stops_only_its_exact_child_and_releases() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn provider_stop_canary_rejects_stalled_turn_when_scope_empty_worktree_is_dirty() {
+    let fixture = StoppedPostClaimFixture::new_with_canary_scopes(true, &[]);
+    fixture.set_canary_supervisor_binding_working();
+    seed_stalled_codex_provider_hook_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        7,
+    );
+    let assignment =
+        orchestration_registry(&fixture.state_dir)["assignments"]["assignment-stopped"].clone();
+    let worker_checkout = PathBuf::from(
+        assignment["worktree"]
+            .as_str()
+            .expect("worker checkout path"),
+    );
+    fs::write(worker_checkout.join("untracked-canary-change"), "dirty\n")
+        .expect("dirty worker checkout");
+
+    let rejected = run_main_agent(
+        &fixture.checkout,
+        &[
+            "--state-dir",
+            fixture.state_dir.to_str().expect("state dir"),
+            "worker",
+            "stop-provider-canary",
+            "assignment-stopped",
+            "--worker-incarnation",
+            "worker-stopped-incarnation",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "provider-stop-dirty-stalled-turn",
+            "--format",
+            "json",
+        ],
+        &fixture.envs(),
+    );
+    assert_ne!(
+        rejected.code, 0,
+        "a dirty stalled turn must fail before reserving destructive stop authority"
+    );
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "worker-turn-not-idle"
+    );
+    assert!(
+        provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none(),
+        "rejected stale-turn admission must not persist a stop reservation"
+    );
+    assert!(
+        !provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists(),
+        "rejected stale-turn admission must not fence the worker runtime"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
     use std::os::unix::process::CommandExt;
 
@@ -16760,6 +19790,7 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         return;
     }
     let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    fixture.set_canary_supervisor_binding_starting();
     seed_activity_state(
         &fixture.state_dir,
         "worker-stopped",
@@ -16778,9 +19809,10 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
     let provider_fixture = fixture._tmp.path().join("codex-canary-same-uid-attack");
     let attack_result = fixture._tmp.path().join("same-uid-attack-result.json");
     let attack_code = fixture._tmp.path().join("same-uid-attack-code");
+    let working_ready = fixture._tmp.path().join("same-uid-working-ready");
     fs::write(
         &provider_fixture,
-        "#!/usr/bin/env sh\nwhile ! test -f \"$CANARY_READY_PATH\"; do sleep 0.01; done\n\"$CANARY_MAIN_AGENT_BIN\" --state-dir \"$CANARY_STATE_DIR\" worker stop-provider-canary assignment-stopped --worker-incarnation worker-stopped-incarnation --if-revision 3 --idempotency-key provider-same-uid-attack-0001 --format json > \"$CANARY_ATTACK_RESULT\" 2>&1\nprintf '%s\\n' \"$?\" > \"$CANARY_ATTACK_CODE\"\nsleep 10\n",
+        "#!/usr/bin/env sh\nwhile ! test -f \"$CANARY_READY_PATH\" || ! test -f \"$CANARY_WORKING_READY\"; do sleep 0.01; done\n\"$CANARY_MAIN_AGENT_BIN\" --state-dir \"$CANARY_STATE_DIR\" worker stop-provider-canary assignment-stopped --worker-incarnation worker-stopped-incarnation --if-revision 3 --idempotency-key provider-same-uid-attack-0001 --format json > \"$CANARY_ATTACK_RESULT\" 2>&1\nprintf '%s\\n' \"$?\" > \"$CANARY_ATTACK_CODE\"\nsleep 10\n",
     )
     .expect("same-uid attack provider fixture");
     fs::set_permissions(&provider_fixture, fs::Permissions::from_mode(0o700))
@@ -16828,6 +19860,7 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         )
         .env("CANARY_ATTACK_RESULT", &attack_result)
         .env("CANARY_ATTACK_CODE", &attack_code)
+        .env("CANARY_WORKING_READY", &working_ready)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -16858,12 +19891,22 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         "process_session_members": [{
             "pid": supervisor_pid,
             "start_time": linux_process_start_ticks(supervisor_pid)
-        }]
+        }],
+        "pid_namespace": current_pid_namespace_identity()
     });
     write_private_json(&record_path, &record);
 
     let ready_path = session_dir.join(".provider-stop-canary-ready.json");
     let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready_path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "same-uid provider supervisor did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fixture.set_canary_supervisor_binding_working();
+    fs::write(&working_ready, b"ready").expect("release same-uid provider fixture");
     while !attack_code.is_file() {
         if let Some(status) = supervisor.try_wait().expect("poll attack supervisor") {
             let mut stderr = String::new();
@@ -16896,7 +19939,7 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         serde_json::from_slice(&fs::read(&attack_result).expect("same-uid attack result"))
             .expect("same-uid attack result json");
     assert_eq!(
-        attack["error"]["code"], "provider-stop-canary-controller-unauthorized",
+        attack["error"]["code"], "provider-stop-canary-control-unavailable",
         "attack={attack}"
     );
     let ready: serde_json::Value =
@@ -17125,6 +20168,7 @@ fn provider_stop_canary_spontaneous_leader_exit_seals_detached_descendants() {
         return;
     }
     let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    fixture.set_canary_supervisor_binding_starting();
     let session_dir = fixture.state_dir.join("sessions/worker-stopped");
     let record_path = session_dir.join("session.json");
     let provider_fixture = fixture._tmp.path().join("codex-canary-leader-exit");
@@ -17250,6 +20294,7 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
         return;
     }
     let fixture = StoppedPostClaimFixture::new_with_canary(true);
+    fixture.set_canary_supervisor_binding_starting();
     seed_activity_state(
         &fixture.state_dir,
         "worker-stopped",
@@ -17317,7 +20362,8 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
         "process_session_members": [{
             "pid": supervisor_pid,
             "start_time": linux_process_start_ticks(supervisor_pid)
-        }]
+        }],
+        "pid_namespace": current_pid_namespace_identity()
     });
     write_private_json(&record_path, &record);
     let ready = fixture
@@ -17331,6 +20377,7 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    fixture.set_canary_supervisor_binding_working();
     let state_runtime = fixture.state_dir.to_string_lossy().into_owned();
     let live_env = [
         (
@@ -17390,7 +20437,16 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
     let status = supervisor.wait().expect("wait bounded hold expiry");
     assert!(status.success(), "expiry supervisor status={status}");
     let reconciled = fixture.run_reconcile();
-    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    let stopped_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("stopped worker record"))
+            .expect("stopped worker record json");
+    assert_eq!(
+        reconciled.code,
+        0,
+        "outcome={} identity={}",
+        reconciled.stdout_text(),
+        stopped_record["delete_tmux_identity"]
+    );
     assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
     assert!(provider_stop_canary_reservation(&fixture.state_dir, "assignment-stopped").is_none());
     assert!(!provider_stop_canary_fence_path(&fixture.state_dir, "worker-stopped").exists());
@@ -18541,6 +21597,34 @@ fn wait_for_barrier(barrier: &Path) {
         assert!(
             Instant::now() < deadline,
             "reconcile-stopped did not reach its stage barrier"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_barrier_or_child_exit(barrier: &Path, child: &mut Child, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        if let Some(status) = child.try_wait().expect("poll barrier child") {
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(stream) = child.stdout.as_mut() {
+                stream
+                    .read_to_string(&mut stdout)
+                    .expect("read barrier child stdout");
+            }
+            if let Some(stream) = child.stderr.as_mut() {
+                stream
+                    .read_to_string(&mut stderr)
+                    .expect("read barrier child stderr");
+            }
+            panic!(
+                "{label} child exited before barrier: status={status} stdout={stdout} stderr={stderr}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} did not reach its stage barrier"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -20264,7 +23348,8 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
         "session_id": "$73",
         "pane_id": "%73",
         "pane_pid": 2_000_000_000,
-        "process_group_id": 2_000_000_000
+        "process_group_id": 2_000_000_000,
+        "pid_namespace": current_pid_namespace_identity()
     }));
     let stopped_runtime = invoke("3", "worker-f31-incarnation", "f31-stopped-runtime-0001");
     assert_eq!(stopped_runtime.code, 65);
@@ -20583,7 +23668,8 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
         "session_id": "$73",
         "pane_id": "%73",
         "pane_pid": 2_000_000_000,
-        "process_group_id": 2_000_000_000
+        "process_group_id": 2_000_000_000,
+        "pid_namespace": current_pid_namespace_identity()
     });
     set_runtime_identity(stopped_identity);
     let runtime_drift_replay = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
@@ -21784,7 +24870,8 @@ fn main_agent_post_claim_stopped_worker_is_terminalized_without_deleting_the_run
         "session_id": "$91",
         "pane_id": "%91",
         "pane_pid": 2_000_000_000,
-        "process_group_id": 2_000_000_000
+        "process_group_id": 2_000_000_000,
+        "pid_namespace": current_pid_namespace_identity()
     });
     set_runtime_identity(stopped_identity.clone());
 
@@ -29720,7 +32807,8 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     "session_id": "$77",
                     "pane_id": "%77",
                     "pane_pid": 2_000_000_000,
-                    "process_group_id": 2_000_000_000
+                    "process_group_id": 2_000_000_000,
+                    "pid_namespace": current_pid_namespace_identity()
                 });
                 write_private_json(&worker_record_path, &worker_record);
                 for quiescence_case in ["active-claim", "active-operation", "uncertain-operation"] {
@@ -29864,7 +32952,8 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     "session_id": "$77",
                     "pane_id": "%77",
                     "pane_pid": 2_000_000_000,
-                    "process_group_id": 2_000_000_000
+                    "process_group_id": 2_000_000_000,
+                    "pid_namespace": current_pid_namespace_identity()
                 });
                 write_private_json(&worker_record_path, &worker_record);
                 let reconciled = run_main_agent(

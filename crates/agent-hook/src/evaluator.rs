@@ -29,6 +29,9 @@ const MAX_EXECUTABLE_CAPABILITIES: usize = 17;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
 const RULE_CHILD_DEADLINE: Duration = HANDLER_TIMEOUT;
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
+const TYPED_BOOTSTRAP_AUTHORIZATION_SCHEMA: &str =
+    "runtime-kit.session-coordination-bootstrap-authorization.v1";
+const TYPED_BOOTSTRAP_AUTHORIZATION_CODE: &str = "typed-main-agent-bootstrap-authorized";
 pub(crate) const ACTIVITY_STOP_RECONCILIATION_REQUIRED: &str =
     "activity-stop-reconciliation-required";
 const SESSION_COORDINATION_TIMEOUT: Duration = RULE_CHILD_DEADLINE;
@@ -423,6 +426,17 @@ fn evaluate_with_io(
     )
 }
 
+fn exact_bootstrap_candidate_for_session_coordination(
+    request: &NormalizedRequest,
+    raw: &[u8],
+    has_session_coordination: bool,
+) -> bool {
+    has_session_coordination
+        && request.event == "PreToolUse"
+        && request.matcher.as_deref() == Some("Bash")
+        && crate::adapter::exact_main_agent_bootstrap_command(raw)
+}
+
 fn evaluate_shadow(
     capability: &Capability,
     request: &NormalizedRequest,
@@ -575,11 +589,15 @@ pub fn apply_session_coordination(
     let Some(rule) = rule else {
         return Ok(decision);
     };
+    let typed_bootstrap_may_supersede_owner =
+        exact_bootstrap_candidate_for_session_coordination(request, raw, true)
+            && owner_active_foreign_is_only_block(loaded, &decision);
     if decision.action == DecisionAction::Block
         && !matches!(
             request.event.as_str(),
             "PostToolUse" | "PostToolUseFailure" | "Stop"
         )
+        && !typed_bootstrap_may_supersede_owner
     {
         return Ok(decision);
     }
@@ -603,8 +621,71 @@ pub fn apply_session_coordination(
         ),
         Err(_) => failure_outcome(rule.failure_posture, &rule.id),
     };
+    if typed_bootstrap_may_supersede_owner
+        && outcome.action == DecisionAction::Allow
+        && outcome.code == TYPED_BOOTSTRAP_AUTHORIZATION_CODE
+    {
+        supersede_owner_active_foreign(loaded, &mut decision);
+    }
     merge_coordination_outcome(&mut decision, &rule.id, outcome)?;
     Ok(decision)
+}
+
+fn owner_active_foreign_is_only_block(
+    loaded: Option<&LoadedPolicy>,
+    decision: &NormalizedDecision,
+) -> bool {
+    let Some(loaded) = loaded else {
+        return false;
+    };
+    let mut owner_block = false;
+    for reason in &decision.reasons {
+        if reason.disposition == "transform" {
+            return false;
+        }
+        if reason.disposition != "block" {
+            continue;
+        }
+        let owner_rule = loaded.bundle.rules.iter().any(|rule| {
+            rule.id == reason.rule_id && matches!(rule.capability, Capability::OwnerLiveness { .. })
+        });
+        if !owner_rule || reason.code != "owner-active-foreign" {
+            return false;
+        }
+        owner_block = true;
+    }
+    owner_block
+}
+
+fn supersede_owner_active_foreign(
+    loaded: Option<&LoadedPolicy>,
+    decision: &mut NormalizedDecision,
+) {
+    let Some(loaded) = loaded else {
+        return;
+    };
+    for reason in &mut decision.reasons {
+        let owner_rule = loaded.bundle.rules.iter().any(|rule| {
+            rule.id == reason.rule_id && matches!(rule.capability, Capability::OwnerLiveness { .. })
+        });
+        if owner_rule && reason.code == "owner-active-foreign" && reason.disposition == "block" {
+            reason.code = "owner-liveness-superseded-by-typed-bootstrap".to_string();
+            reason.disposition = "allow".to_string();
+        }
+    }
+    decision.action = decision
+        .reasons
+        .iter()
+        .map(|reason| match reason.disposition.as_str() {
+            "allow" => DecisionAction::Allow,
+            "warn" => DecisionAction::Warn,
+            "context" => DecisionAction::Context,
+            "transform" => DecisionAction::Transform,
+            "block" => DecisionAction::Block,
+            _ => DecisionAction::Block,
+        })
+        .max_by_key(|action| rank(*action))
+        .unwrap_or(DecisionAction::Allow);
 }
 
 fn coordination_timeout_outcome(
@@ -1007,7 +1088,28 @@ fn run_session_coordination(product: Product, raw: &[u8]) -> Result<RuleOutcome,
             "session coordination handler returned failure",
         ));
     }
-    handler_outcome(SESSION_COORDINATION_HANDLER, &output.stdout)
+    session_coordination_outcome(&output.stdout)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedBootstrapAuthorization {
+    schema_version: String,
+    authorization: String,
+}
+
+fn session_coordination_outcome(stdout: &[u8]) -> Result<RuleOutcome, HookError> {
+    if let Ok(value) = crate::strict_json::from_slice(stdout)
+        && let Ok(authorization) = serde_json::from_value::<TypedBootstrapAuthorization>(value)
+        && authorization.schema_version == TYPED_BOOTSTRAP_AUTHORIZATION_SCHEMA
+        && authorization.authorization == TYPED_BOOTSTRAP_AUTHORIZATION_CODE
+    {
+        return Ok(simple(
+            DecisionAction::Allow,
+            TYPED_BOOTSTRAP_AUTHORIZATION_CODE,
+        ));
+    }
+    handler_outcome(SESSION_COORDINATION_HANDLER, stdout)
 }
 
 fn handler_outcome(handler_id: &str, stdout: &[u8]) -> Result<RuleOutcome, HookError> {
@@ -1497,6 +1599,51 @@ mod tests {
             target_paths: vec![root.join("target.txt")],
             execution_path: Some(root.to_path_buf()),
             binding_roots: vec![root.to_path_buf()],
+        }
+    }
+
+    #[test]
+    fn exact_bootstrap_candidate_requires_a_selected_coordination_rule() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut request = owner_request(temp.path());
+        request.matcher = Some("Bash".to_string());
+        let exact = br#"{
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Bash",
+          "tool_input": {
+            "command": "'/trusted release/main-agent' bootstrap --idempotency-key bootstrap-12345678 --format json"
+          }
+        }"#;
+        assert!(exact_bootstrap_candidate_for_session_coordination(
+            &request, exact, true
+        ));
+        assert!(!exact_bootstrap_candidate_for_session_coordination(
+            &request, exact, false
+        ));
+
+        for command in [
+            "./main-agent bootstrap --idempotency-key bootstrap-12345678 --format json",
+            "main-agent bootstrap --format json --idempotency-key bootstrap-12345678",
+            "main-agent bootstrap --idempotency-key short --format json",
+            "main-agent bootstrap --idempotency-key bootstrap-12345678 --format json extra",
+            "main-agent bootstrap --idempotency-key bootstrap-12345678 --format json; touch forbidden",
+            "sh -c 'main-agent bootstrap --idempotency-key bootstrap-12345678 --format json'",
+            "/tmp/$(touch>/tmp/owner-bypass)/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json",
+            "/${ATTACKER_BIN}/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json",
+            "/tmp/`touch /tmp/owner-bypass`/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json",
+            "/tmp/$((1+1))/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json",
+            "/trusted/bin/main-agent bootstrap --idempotency-key bootstrap-12345678 --format json > /tmp/result",
+        ] {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            }))
+            .expect("provider request");
+            assert!(
+                !exact_bootstrap_candidate_for_session_coordination(&request, &raw, true),
+                "unexpected deferral for {command}"
+            );
         }
     }
 

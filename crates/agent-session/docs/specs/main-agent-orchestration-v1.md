@@ -438,20 +438,28 @@ completed worker-start stage. A retry may remove and relaunch only an exact
 matching worker record that durably proves tmux never launched; it never treats
 that failed record as a completed launch.
 
-The generated worker prompt starts with one deterministic,
-worker-authenticated `main-agent bootstrap` command. The prompt names the exact
-running `main-agent` executable rather than relying on the worker's `PATH`, so
-bootstrap uses the same release that created the assignment. Bootstrap resolves
+The generated worker prompt starts with an explicit Main Agent Mode activation
+declaration followed by one deterministic, worker-authenticated
+`main-agent bootstrap` command. The prompt names the exact running `main-agent`
+executable rather than relying on the worker's `PATH`, so bootstrap uses the
+same release that created the assignment. Bootstrap resolves
 only the caller's bound assignment, reads that worker's private assignment
 packet, derives the coordination claim from the packet's
 repository/scopes plus the HMAC fingerprint derived from the authenticated
 worker session's canonical `cwd`, and records the initial `working` checkpoint.
 Its private `main-agent.bootstrap-result.v1` response also returns
 `checkpoint_file`, the exact runtime-issued
-`AGENT_SESSION_CHECKPOINT_FILE` for the authenticated session/incarnation.
+`AGENT_SESSION_CHECKPOINT_FILE` for the authenticated session/incarnation, and
+structured `worker_instructions` bound to the exact running `main-agent`
+executable. The compact launch prompt contains only the deterministic bootstrap
+boundary plus an explicit declaration that Main Agent Mode is active for the
+managed worker assignment; the authenticated response carries the ordered
+checkpoint-write, checkpoint-command, claim-release, and request-changes
+rebootstrap lifecycle.
 Workers MUST write later checkpoint JSON to that pre-created owner-only file
 before invoking `main-agent checkpoint --file` with the current revision and a
-stable idempotency key; the generated prompt states this complete sequence.
+stable idempotency key. After a request-changes transition, workers MUST use the
+returned exact bootstrap argv with a new stable key before mutating.
 An arbitrary project output path is not the managed-worker checkpoint-write
 boundary. Before worker launch, compatibility-sensitive callers MUST require
 `main-agent capabilities --provider <codex|claude> --format json` to return
@@ -921,14 +929,102 @@ The packet-level `provider_stop_canary` opt-in authorizes one Linux/Codex
 incarnation to launch through the compiled canary supervisor. This authority
 is not inferred from an existing session and accepts no caller-selected PID,
 signal, executable, timeout, provider input, or tmux selector. The supervisor
-holds a single-incarnation lock and launches a same-release compiled crash
+holds a single-incarnation lock. Before the held tmux runtime is released, the
+worker-start transaction MUST advance the exact `starting` assignment from
+revision 1 with no worker to revision 2 bound to the newly persisted exact
+session and runtime incarnation. The supervisor MUST independently wait without
+launching the provider or consuming terminal input for at most five seconds to
+observe that binding. Every other state, revision, worker identity,
+incarnation, or timeout MUST fail before provider launch. The durable pending
+receipt MUST distinguish `assignment-created`,
+`worker-bound-runtime-held` (prior-version compatibility),
+`worker-bound-canary-startup-pending`, `canary-startup-failed`,
+`runtime-released-prompt-attempting`, `prompt-delivered`, and
+`prompt-outcome-unknown`. Before the rev2 assignment
+commit, an exact worker/session/incarnation execution quarantine MUST be
+durable and generic resume MUST reject it. A proven-pre-delivery failure MUST
+restore the exact assignment to rev1/unbound before deleting its stopped
+session, MUST retain the matching quarantine until exact typed session cleanup
+removes its directory, and MAY forget only the revoked, empty broker for that
+failed incarnation. Quarantined directory removal is the rollback
+authority-release event. If rollback persistence is unproven, the transaction
+MUST preserve the rev2 binding, held exact session, receipt, and quarantine,
+MUST NOT delete that session, and MUST admit only identical idempotency replay.
+The post-release `canary-startup-failed` phase is an explicit exception:
+worker-start MUST retain the rev2 binding, exact session/incarnation, receipt,
+and quarantine so exact replay returns the same non-retryable error. Recovery
+MUST use revision-fenced pre-claim cancellation followed by exact worker
+retirement (or the equivalent closeout stages); neither worker-start replay nor
+generic resume may clean up or relaunch that incarnation.
+Replay MAY release a still-held exact runtime. A supported prior-version
+`worker-bound-runtime-held` receipt with no release gate MUST first migrate
+durably to `worker-bound-canary-startup-pending`; it cannot bypass the
+authenticated startup admission. A prior-version receipt whose release gate already
+exists remains fail-closed as prompt-outcome-unknown. Once
+the release gate or prompt-attempt phase exists
+without a durable delivered or outcome-unknown result, replay MUST NOT deliver
+the prompt again and MUST NOT finalize worker-start success, except that the
+distinct `worker-bound-canary-startup-pending` phase MUST complete its
+authenticated startup admission before the prompt-attempt phase and may then
+continue exactly once. Only after final
+worker-start receipt commit MAY the exact active quarantine gain a separate
+immutable release proof. The proof MUST match assignment, revision, worker
+session/incarnation, reason, and runtime-identity digest, and MUST persist
+before the active marker is removed; missing or mismatched state MUST fail
+closed. Each proof MUST remain in an identity-keyed private proof collection
+until exact session cleanup and MUST NOT prevent a later typed lifecycle
+operation from creating or exactly releasing a new active quarantine into a
+distinct proof. Persist and release MUST share the same per-session
+serialization boundary, and an identity with an immutable release proof MUST
+NOT transition back to active.
+Rollback MUST retain the active startup quarantine until cleanup. Bootstrap
+from the exact authenticated
+session/incarnation MAY wait at most five seconds while that matching
+quarantine remains only when the rev2 assignment and Main-owned worker-start
+receipt prove `runtime-released-prompt-attempting`, `prompt-delivered`,
+`prompt-outcome-unknown`, or an already committed final receipt. The pending
+phase covers prompt transport before its durable outcome phase is saved. It
+MUST NOT acquire a claim before the matching typed release, MUST revalidate the
+final receipt, absent startup quarantine, and immutable release proof, and MUST
+return a typed retryable timeout otherwise.
+Generic resume, unrelated claims, and nonmatching bootstrap remain denied. A
+stopped rev2 runtime MUST fail closed and MUST
+NOT become a successful
+worker-start result, except that a stopped `worker-bound-runtime-held` phase MAY
+perform the exact proven-pre-delivery rollback. A stopped
+`worker-bound-canary-startup-pending` phase with no release gate performs the
+same exact rollback; after the release gate it MUST instead become the retained
+typed startup failure described above. It then launches a same-release
+compiled crash
 guardian as its direct child. The guardian creates the provider's private
 Linux process session inside an incarnation-derived child cgroup v2 and enters
 a process session distinct from the tmux supervisor. The provider receives a
 private user, mount, and cgroup namespace before exec: the exact child cgroup
 is its cgroup namespace root and `/sys/fs/cgroup` is a read-only bind of that
 root. The provider therefore cannot migrate itself or descendants to the
-delegated parent or siblings. Before guardian launch, the supervisor becomes
+delegated parent or siblings. The provider's host UID MUST map only to
+namespace UID zero for private mount setup. Before exec, the guardian MUST lock
+off root and setuid capability reconstruction, clear every capability set and
+bounding entry, set no-new-privileges, and install a native-architecture
+seccomp filter. That filter MUST deny user-namespace creation through
+`unshare` or classic `clone`, MUST deny `setns`, and MUST return `ENOSYS` for
+uninspectable `clone3` so ordinary thread creation can fall back to inspected
+classic `clone`. Every non-standard inherited descriptor MUST be close-on-exec;
+local-domain `socket` and `socketpair` creation MUST be denied, and the
+standard user D-Bus, SSH-agent, and runtime-directory discovery variables MUST
+be removed. `io_uring_setup` MUST also be denied so `IORING_OP_SOCKET` cannot
+bypass the local-domain filter. Internet-domain sockets remain available
+through the ordinary socket syscall. Startup MUST fail closed unless the
+complete privilege seal is installed and verified.
+
+This canary is an exact-process termination contract, not a general same-UID
+host sandbox. A separately pre-existing same-UID process broker reachable over
+an allowed Internet-domain socket, or a deferred host scheduler driven only by
+filesystem writes, is outside its authority and containment boundary. Canary
+assignments MUST use the bounded field-proof prompt and MUST NOT request an
+external process broker or persistence mechanism. Stop proof covers only the
+guardian-authenticated provider identity and its pinned incarnation cgroup
+members. Before guardian launch, the supervisor becomes
 a child subreaper and creates and pins the child cgroup directory, membership,
 freeze, and event handles. The guardian reopens only that exact device/inode
 boundary, becomes the provider tree's child subreaper, records the provider
@@ -955,6 +1051,24 @@ are bounded owner-only
 regular files opened without symlink following and are signals, not bearer
 authority.
 
+After runtime release and before `runtime-released-prompt-attempting`,
+worker-start MUST wait at most fifteen seconds for readiness over the
+guardian/controller authenticated Unix-domain channel. The controller MUST
+authenticate the peer as the live direct child of the persisted exact tmux
+wrapper PID/start-time identity. The guardian MUST authenticate the caller by
+peer UID and ancestry from the persisted exact controller pane identity. The
+response MUST bind the session and launch incarnation and report the guardian's
+exact provider PID/start-time identity; the controller MUST independently
+verify that identity is live inside the incarnation-derived child cgroup.
+Owner-only marker files remain diagnostic signals and MUST NOT authorize
+startup admission. An unverified peer, invalid identity, or timeout returns
+`provider-stop-canary-startup-failed` with no prompt bytes or submit key sent.
+Before returning, worker-start MUST durably record `canary-startup-failed`
+with its bounded `stage` and `failure_code`; exact replay MUST return the same
+typed error without relaunch or prompt transport. The projection exposes only
+those bounded fields and a manual recovery object; it MUST NOT expose stderr,
+commands, PIDs, local paths, or private packet content.
+
 `worker stop-provider-canary` authenticates the current controller and active
 claim, then revalidates the exact run, assignment revision, worker session and
 incarnation, packet opt-in, live tmux/runtime identity, authoritative-idle
@@ -968,6 +1082,13 @@ The sidecar intentionally does not change the released v3 registry or
 assignment wire schema. All other assignment mutations, CLI resume, and HTTP
 resume remain fenced.
 
+On Linux, every successful tmux launch MUST persist the pane start time
+independently beside the pane PID before returning. Canary admission MUST use
+that immutable launch-time tuple for fresh controller and wrapper sessions,
+independently of the dynamic process-session member snapshot. A single
+matching member MAY be accepted only as a read-compatibility fallback for an
+older record; missing, conflicting, zero, or stale evidence MUST fail closed.
+
 Before launching the provider, the guardian MUST require the live controller
 pane to match its already-persisted PID/start-time tuple and MUST retain a
 pidfd for that exact process in guardian memory. Stop and release requests use
@@ -979,7 +1100,13 @@ cannot turn readable or forgeable marker, reservation, claim, or registry
 files into process-termination authority. The guardian still revalidates the
 matching durable reservation after peer admission. Missing, replaced,
 interrupted, or unauthorized channels fail closed and remain replayable by
-the exact controller.
+the exact controller. Each accepted guardian request has one 250-millisecond
+absolute monotonic deadline across the complete frame and response, not a
+per-read inactivity timeout; the guardian checks supervisor parent loss
+between reads. Controller startup, stop, and release requests likewise use one
+absolute deadline across nonblocking connect, write, and response. A full
+socket backlog therefore returns the typed unavailable result within the
+controller bound and cannot suspend guardian crash cleanup.
 
 The guardian freezes its pinned provider cgroup, verifies the stable member
 set against pidfd-pinned provider ancestry, signals only that set, reaps its

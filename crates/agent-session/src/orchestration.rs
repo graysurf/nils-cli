@@ -61,6 +61,51 @@ static GROUP_CLEANUP_PROGRESS_RECYCLE_HOOK: std::sync::OnceLock<
 static GROUP_CLEANUP_PROGRESS_READ_FAILURE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
     std::sync::OnceLock::new();
 #[cfg(test)]
+#[derive(Clone)]
+struct SessionAuthorityClearHook {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+#[cfg(test)]
+static SESSION_AUTHORITY_CLEAR_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, SessionAuthorityClearHook>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+static SESSION_AUTHORITY_LOCK_ATTEMPT_BARRIERS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Barrier>>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+enum SessionAuthorityTestHookKind {
+    Clear,
+    LockAttempt,
+}
+#[cfg(test)]
+struct SessionAuthorityTestHookGuard {
+    session_id: String,
+    kind: SessionAuthorityTestHookKind,
+}
+#[cfg(test)]
+impl Drop for SessionAuthorityTestHookGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            SessionAuthorityTestHookKind::Clear => {
+                SESSION_AUTHORITY_CLEAR_HOOKS
+                    .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+                    .lock()
+                    .expect("authority clear hook lock")
+                    .remove(&self.session_id);
+            }
+            SessionAuthorityTestHookKind::LockAttempt => {
+                SESSION_AUTHORITY_LOCK_ATTEMPT_BARRIERS
+                    .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+                    .lock()
+                    .expect("authority lock-attempt barrier lock")
+                    .remove(&self.session_id);
+            }
+        }
+    }
+}
+#[cfg(test)]
 static GROUP_CLEANUP_PROGRESS_CRASH_AFTER_RECYCLE: std::sync::OnceLock<
     std::sync::Mutex<Option<PathBuf>>,
 > = std::sync::OnceLock::new();
@@ -889,6 +934,8 @@ pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_V2_SCHEMA: &str =
 pub(crate) const LEGACY_ACCOUNT_HANDOFF_RESERVATION_SCHEMA: &str =
     "main-agent.account-handoff-reservation.v1";
 const SESSION_AUTHORITY_QUARANTINE_SCHEMA: &str = "agent-session.worker-authority-quarantine.v1";
+const SESSION_AUTHORITY_QUARANTINE_RELEASE_SCHEMA: &str =
+    "agent-session.worker-authority-quarantine-release.v1";
 const SESSION_GROUP_CLEANUP_FENCE_SCHEMA: &str = "agent-session.group-cleanup-fence.v1";
 const SESSION_RUNTIME_STOP_FENCE_SCHEMA: &str = "agent-session.runtime-stop-fence.v1";
 const SESSION_PROVIDER_STOP_CANARY_FENCE_SCHEMA: &str =
@@ -1086,6 +1133,8 @@ const MAX_GROUP_CLEANUP_PROGRESS_FILES: usize = 128;
 const MAX_GROUP_CLEANUP_PROGRESS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_AUTHORITY_QUARANTINE_BYTES: u64 = 64 * 1024;
 const SESSION_AUTHORITY_QUARANTINE_FILE: &str = "authority-quarantine.json";
+const SESSION_AUTHORITY_QUARANTINE_RELEASES_DIR: &str = "authority-quarantine-releases";
+const SESSION_AUTHORITY_QUARANTINE_LOCKS_DIR: &str = "session-authority-quarantine-locks";
 const SESSION_GROUP_CLEANUP_FENCE_FILE: &str = "group-cleanup-fence.json";
 const SESSION_RUNTIME_STOP_FENCE_FILE: &str = "runtime-stop-fence.json";
 const SESSION_PROVIDER_STOP_CANARY_FENCE_FILE: &str = "provider-stop-canary-fence.json";
@@ -1229,6 +1278,16 @@ struct SessionAuthorityQuarantine {
     assignment_id: String,
     assignment_revision: u64,
     quarantine: WorkerQuarantineRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionAuthorityQuarantineRelease {
+    schema_version: String,
+    assignment_id: String,
+    assignment_revision: u64,
+    quarantine: WorkerQuarantineRecord,
+    released_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -4186,6 +4245,34 @@ pub(crate) fn persist_session_authority_quarantine(
     assignment_revision: u64,
     quarantine: &WorkerQuarantineRecord,
 ) -> Result<WorkerQuarantineRecord, CliError> {
+    let _lock = lock_session_authority_quarantine(context, &quarantine.worker.session_id)?;
+    if let Some(release) = read_session_authority_quarantine_release(
+        context,
+        assignment_id,
+        assignment_revision,
+        &quarantine.worker,
+        &quarantine.reason,
+        &quarantine.runtime_identity_digest,
+    )? {
+        validate_session_authority_quarantine_release(&release)?;
+        if !session_authority_quarantine_release_identity_matches(
+            &release,
+            assignment_id,
+            assignment_revision,
+            &quarantine.worker,
+            &quarantine.reason,
+            &quarantine.runtime_identity_digest,
+        ) {
+            return Err(store_invalid(
+                "session authority quarantine release identity is invalid",
+            ));
+        }
+        return Err(CliError::data(
+            "worker-quarantine-released",
+            "worker execution authority quarantine was already released",
+            None,
+        ));
+    }
     let marker = SessionAuthorityQuarantine {
         schema_version: SESSION_AUTHORITY_QUARANTINE_SCHEMA.to_string(),
         assignment_id: assignment_id.to_string(),
@@ -4224,6 +4311,143 @@ pub(crate) fn persist_session_authority_quarantine(
         .join(SESSION_AUTHORITY_QUARANTINE_FILE);
     write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())?;
     Ok(quarantine.clone())
+}
+
+pub(crate) fn clear_matching_session_authority_quarantine(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+    released_at: &str,
+) -> Result<(), CliError> {
+    let _lock = lock_session_authority_quarantine(context, &worker.session_id)?;
+    let existing_release = read_session_authority_quarantine_release(
+        context,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    )?;
+    if let Some(release) = existing_release.as_ref() {
+        validate_session_authority_quarantine_release(release)?;
+        if !session_authority_quarantine_release_identity_matches(
+            release,
+            assignment_id,
+            assignment_revision,
+            worker,
+            reason,
+            runtime_identity_digest,
+        ) {
+            return Err(CliError::data(
+                "worker-quarantine-conflict",
+                "worker execution authority has a different persistent release proof",
+                None,
+            ));
+        }
+    }
+    let marker = read_session_authority_quarantine(context, &worker.session_id)?;
+    pause_session_authority_quarantine_clear_for_test(&worker.session_id);
+    if existing_release.is_none() {
+        let marker = marker.as_ref().ok_or_else(|| {
+            store_invalid("session authority quarantine is missing before release")
+        })?;
+        validate_session_authority_quarantine(marker)?;
+        if !session_authority_quarantine_identity_matches(
+            marker,
+            assignment_id,
+            assignment_revision,
+            worker,
+            reason,
+            runtime_identity_digest,
+        ) {
+            return Err(CliError::data(
+                "worker-quarantine-conflict",
+                "worker execution authority has a different persistent quarantine",
+                None,
+            ));
+        }
+        let release = SessionAuthorityQuarantineRelease {
+            schema_version: SESSION_AUTHORITY_QUARANTINE_RELEASE_SCHEMA.to_string(),
+            assignment_id: assignment_id.to_string(),
+            assignment_revision,
+            quarantine: marker.quarantine.clone(),
+            released_at: released_at.to_string(),
+        };
+        validate_session_authority_quarantine_release(&release)?;
+        let bytes = serde_json::to_vec_pretty(&release)
+            .map_err(|_| store_invalid("session authority quarantine release is invalid"))?;
+        if bytes.len() as u64 > MAX_SESSION_AUTHORITY_QUARANTINE_BYTES {
+            return Err(store_invalid(
+                "session authority quarantine release exceeds byte limit",
+            ));
+        }
+        let release_root = crate::session_dir(context, &worker.session_id)
+            .join(SESSION_AUTHORITY_QUARANTINE_RELEASES_DIR);
+        ensure_private_directory(&release_root)?;
+        let path = session_authority_quarantine_release_path(
+            context,
+            assignment_id,
+            assignment_revision,
+            worker,
+            reason,
+            runtime_identity_digest,
+        );
+        if !publish_immutable_private_file(&path, &bytes)? {
+            let release = read_session_authority_quarantine_release(
+                context,
+                assignment_id,
+                assignment_revision,
+                worker,
+                reason,
+                runtime_identity_digest,
+            )?
+            .ok_or_else(|| {
+                store_invalid("session authority quarantine release disappeared after publication")
+            })?;
+            validate_session_authority_quarantine_release(&release)?;
+            if !session_authority_quarantine_release_identity_matches(
+                &release,
+                assignment_id,
+                assignment_revision,
+                worker,
+                reason,
+                runtime_identity_digest,
+            ) {
+                return Err(CliError::data(
+                    "worker-quarantine-conflict",
+                    "worker execution authority has a different persistent release proof",
+                    None,
+                ));
+            }
+        }
+    }
+    pause_session_authority_quarantine_release_for_test()?;
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+    validate_session_authority_quarantine(&marker)?;
+    if !session_authority_quarantine_identity_matches(
+        &marker,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    ) {
+        // A later typed lifecycle fence may coexist with the immutable startup
+        // release proof. Exact release replay must preserve that newer fence.
+        return Ok(());
+    }
+    match fs::remove_file(
+        crate::session_dir(context, &worker.session_id).join(SESSION_AUTHORITY_QUARANTINE_FILE),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_unavailable()),
+    }
 }
 
 pub(crate) fn require_session_authority_quarantine(
@@ -4279,6 +4503,41 @@ pub(crate) fn session_authority_quarantine_matches(
     Ok(true)
 }
 
+pub(crate) fn session_authority_quarantine_released(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> Result<bool, CliError> {
+    let Some(release) = read_session_authority_quarantine_release(
+        context,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    )?
+    else {
+        return Ok(false);
+    };
+    validate_session_authority_quarantine_release(&release)?;
+    if !session_authority_quarantine_release_identity_matches(
+        &release,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    ) {
+        return Err(store_invalid(
+            "session authority quarantine release identity is invalid",
+        ));
+    }
+    Ok(true)
+}
+
 fn session_authority_quarantine_identity_matches(
     marker: &SessionAuthorityQuarantine,
     assignment_id: &str,
@@ -4292,6 +4551,21 @@ fn session_authority_quarantine_identity_matches(
         && marker.quarantine.worker == *worker
         && marker.quarantine.reason == reason
         && marker.quarantine.runtime_identity_digest == runtime_identity_digest
+}
+
+fn session_authority_quarantine_release_identity_matches(
+    release: &SessionAuthorityQuarantineRelease,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> bool {
+    release.assignment_id == assignment_id
+        && release.assignment_revision == assignment_revision
+        && release.quarantine.worker == *worker
+        && release.quarantine.reason == reason
+        && release.quarantine.runtime_identity_digest == runtime_identity_digest
 }
 
 fn read_session_authority_quarantine(
@@ -4314,6 +4588,189 @@ fn read_session_authority_quarantine(
         .map_err(|_| store_invalid("session authority quarantine is invalid"))
 }
 
+fn session_authority_quarantine_release_path(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> PathBuf {
+    let key = crate::coordination::request_digest(
+        "session-authority-quarantine-release-v1",
+        &(
+            assignment_id,
+            assignment_revision,
+            worker,
+            reason,
+            runtime_identity_digest,
+        ),
+    );
+    crate::session_dir(context, &worker.session_id)
+        .join(SESSION_AUTHORITY_QUARANTINE_RELEASES_DIR)
+        .join(format!("{key}.json"))
+}
+
+fn read_session_authority_quarantine_release(
+    context: &CliContext,
+    assignment_id: &str,
+    assignment_revision: u64,
+    worker: &SessionRef,
+    reason: &str,
+    runtime_identity_digest: &str,
+) -> Result<Option<SessionAuthorityQuarantineRelease>, CliError> {
+    let release_root = crate::session_dir(context, &worker.session_id)
+        .join(SESSION_AUTHORITY_QUARANTINE_RELEASES_DIR);
+    match fs::symlink_metadata(&release_root) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0 =>
+        {
+            return Err(store_invalid(
+                "session authority quarantine release directory is unsafe",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(store_unavailable()),
+    }
+    let path = session_authority_quarantine_release_path(
+        context,
+        assignment_id,
+        assignment_revision,
+        worker,
+        reason,
+        runtime_identity_digest,
+    );
+    let Some(snapshot) = read_private_bounded_file_with_limit(
+        &path,
+        MAX_SESSION_AUTHORITY_QUARANTINE_BYTES,
+        "session authority quarantine release permissions are unsafe",
+        "session authority quarantine release exceeds byte limit",
+        "session authority quarantine release changed while it was being read",
+    )?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&snapshot.bytes)
+        .map(Some)
+        .map_err(|_| store_invalid("session authority quarantine release is invalid"))
+}
+
+fn pause_session_authority_quarantine_release_for_test() -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) =
+        std::env::var_os("NILS_AGENT_SESSION_TEST_QUARANTINE_RELEASE_PROOF_BARRIER_DIR")
+            .map(PathBuf::from)
+    {
+        fs::create_dir_all(&directory).map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "authority quarantine release test barrier could not be created",
+                None,
+            )
+        })?;
+        fs::write(directory.join("ready"), b"release-proof-persisted").map_err(|_| {
+            CliError::runtime(
+                "test-barrier-failed",
+                "authority quarantine release test barrier could not be signalled",
+                None,
+            )
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !directory.join("release").is_file() {
+            if Instant::now() >= deadline {
+                return Err(CliError::runtime(
+                    "test-barrier-timeout",
+                    "authority quarantine release test barrier timed out",
+                    None,
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
+fn pause_session_authority_quarantine_clear_for_test(_session_id: &str) {
+    #[cfg(test)]
+    let hook = {
+        SESSION_AUTHORITY_CLEAR_HOOKS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("authority clear barrier lock")
+            .get(_session_id)
+            .cloned()
+    };
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook.reached.wait();
+        hook.resume.wait();
+    }
+}
+
+#[cfg(test)]
+fn install_session_authority_clear_hook_for_test(
+    session_id: &str,
+    hook: SessionAuthorityClearHook,
+) -> SessionAuthorityTestHookGuard {
+    assert!(
+        SESSION_AUTHORITY_CLEAR_HOOKS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("authority clear hook lock")
+            .insert(session_id.to_string(), hook)
+            .is_none(),
+        "session already has an authority clear hook"
+    );
+    SessionAuthorityTestHookGuard {
+        session_id: session_id.to_string(),
+        kind: SessionAuthorityTestHookKind::Clear,
+    }
+}
+
+fn publish_immutable_private_file(path: &Path, bytes: &[u8]) -> Result<bool, CliError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| store_invalid("session authority quarantine release path is invalid"))?;
+    let temporary = parent.join(format!(
+        ".authority-release-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SECRET_FILE_MODE)
+        .open(&temporary)
+        .map_err(|_| store_unavailable())?;
+    if file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(store_unavailable());
+    }
+    drop(file);
+    let published = match fs::hard_link(&temporary, path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(store_unavailable());
+        }
+    };
+    fs::remove_file(&temporary).map_err(|_| store_unavailable())?;
+    if published {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| store_unavailable())?;
+    }
+    Ok(published)
+}
+
 fn validate_session_authority_quarantine(
     marker: &SessionAuthorityQuarantine,
 ) -> Result<(), CliError> {
@@ -4324,6 +4781,28 @@ fn validate_session_authority_quarantine(
     }
     validate_slug("quarantine assignment id", &marker.assignment_id, 128)?;
     validate_worker_quarantine(&marker.quarantine)
+}
+
+fn validate_session_authority_quarantine_release(
+    release: &SessionAuthorityQuarantineRelease,
+) -> Result<(), CliError> {
+    if release.schema_version != SESSION_AUTHORITY_QUARANTINE_RELEASE_SCHEMA {
+        return Err(store_invalid(
+            "session authority quarantine release schema is invalid",
+        ));
+    }
+    validate_slug(
+        "quarantine release assignment id",
+        &release.assignment_id,
+        128,
+    )?;
+    validate_worker_quarantine(&release.quarantine)?;
+    if release.released_at.trim().is_empty() || release.released_at.len() > 64 {
+        return Err(store_invalid(
+            "session authority quarantine release timestamp is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_worker_quarantine(quarantine: &WorkerQuarantineRecord) -> Result<(), CliError> {
@@ -6507,6 +6986,95 @@ pub(crate) fn ensure_orchestration_root(context: &CliContext) -> Result<PathBuf,
     Ok(root)
 }
 
+struct SessionAuthorityQuarantineLock(File);
+
+impl Drop for SessionAuthorityQuarantineLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid for the lifetime of this guard.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn lock_session_authority_quarantine(
+    context: &CliContext,
+    session_id: &str,
+) -> Result<SessionAuthorityQuarantineLock, CliError> {
+    validate_slug("session authority quarantine id", session_id, 128)?;
+    let root = ensure_orchestration_root(context)?.join(SESSION_AUTHORITY_QUARANTINE_LOCKS_DIR);
+    ensure_private_directory(&root)?;
+    let key =
+        crate::coordination::request_digest("session-authority-quarantine-lock-v1", &session_id);
+    let path = root.join(format!("{key}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(SECRET_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|_| store_unavailable())?;
+    validate_private_file(&file.metadata().map_err(|_| store_unavailable())?)?;
+    let started = Instant::now();
+    let mut blocked_attempt_observed = false;
+    loop {
+        // SAFETY: the descriptor remains open for the duration of the lock guard.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(SessionAuthorityQuarantineLock(file));
+        }
+        if !blocked_attempt_observed {
+            pause_session_authority_quarantine_lock_attempt_for_test(session_id);
+            blocked_attempt_observed = true;
+        }
+        if started.elapsed() >= LOCK_TIMEOUT {
+            return Err(CliError::unavailable(
+                "session-authority-quarantine-busy",
+                "session authority quarantine is busy; replay the exact typed operation",
+                None,
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pause_session_authority_quarantine_lock_attempt_for_test(_session_id: &str) {
+    #[cfg(test)]
+    let barrier = {
+        SESSION_AUTHORITY_LOCK_ATTEMPT_BARRIERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("authority lock-attempt barrier lock")
+            .get(_session_id)
+            .cloned()
+    };
+    #[cfg(test)]
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+#[cfg(test)]
+fn install_session_authority_lock_attempt_barrier_for_test(
+    session_id: &str,
+    barrier: std::sync::Arc<std::sync::Barrier>,
+) -> SessionAuthorityTestHookGuard {
+    assert!(
+        SESSION_AUTHORITY_LOCK_ATTEMPT_BARRIERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("authority lock-attempt barrier lock")
+            .insert(session_id.to_string(), barrier)
+            .is_none(),
+        "session already has an authority lock-attempt barrier"
+    );
+    SessionAuthorityTestHookGuard {
+        session_id: session_id.to_string(),
+        kind: SessionAuthorityTestHookKind::LockAttempt,
+    }
+}
+
 fn ensure_private_directory(path: &Path) -> Result<(), CliError> {
     match fs::create_dir(path) {
         Ok(()) => {}
@@ -7680,6 +8248,531 @@ mod tests {
 
         ensure_session_not_quarantined(&context, &record)
             .expect("an unrelated session has no quarantine marker");
+    }
+
+    #[test]
+    fn authority_quarantine_release_requires_exact_marker_and_digest_then_replays() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: Some("test-host".to_string()),
+        };
+        fs::create_dir_all(crate::session_dir(&context, "worker-one")).expect("worker session dir");
+        let worker = SessionRef {
+            machine: None,
+            session_id: "worker-one".to_string(),
+            session_incarnation: "incarnation-one".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let runtime_identity_digest = format!("sha256:{}", "a".repeat(64));
+        let quarantine = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "worker-start-provider-stop-canary".to_string(),
+            runtime_identity_digest: runtime_identity_digest.clone(),
+            created_at: "2030-01-01T00:00:01Z".to_string(),
+        };
+        let missing = clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+            "2030-01-01T00:00:02Z",
+        )
+        .expect_err("missing first-time release marker must fail closed");
+        assert_eq!(missing.code(), "orchestration-store-invalid");
+
+        persist_session_authority_quarantine(&context, "assignment-one", 2, &quarantine)
+            .expect("persist exact quarantine");
+        let mismatched = clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            2,
+            &worker,
+            &quarantine.reason,
+            &format!("sha256:{}", "b".repeat(64)),
+            "2030-01-01T00:00:02Z",
+        )
+        .expect_err("digest-mismatched release must fail closed");
+        assert_eq!(mismatched.code(), "worker-quarantine-conflict");
+        assert!(
+            session_authority_quarantine_matches(
+                &context,
+                "assignment-one",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("active quarantine check")
+        );
+
+        clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+            "2030-01-01T00:00:02Z",
+        )
+        .expect("exact release");
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-one",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("released marker check")
+        );
+        assert!(
+            !session_authority_quarantine_matches(
+                &context,
+                "assignment-one",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("released quarantine check")
+        );
+        clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+            "2030-01-01T00:00:03Z",
+        )
+        .expect("exact released replay");
+        let later_digest = format!("sha256:{}", "c".repeat(64));
+        let later = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "stopped post-claim worker terminalized without input".to_string(),
+            runtime_identity_digest: later_digest.clone(),
+            created_at: "2030-01-01T00:00:04Z".to_string(),
+        };
+        persist_session_authority_quarantine(&context, "assignment-one", 4, &later)
+            .expect("later typed lifecycle quarantine");
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-one",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("startup release proof remains auditable")
+        );
+        clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+            "2030-01-01T00:00:05Z",
+        )
+        .expect("startup release replay preserves later quarantine");
+        assert!(
+            session_authority_quarantine_matches(
+                &context,
+                "assignment-one",
+                4,
+                &worker,
+                &later.reason,
+                &later_digest,
+            )
+            .expect("later quarantine remains active")
+        );
+        clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-one",
+            4,
+            &worker,
+            &later.reason,
+            &later_digest,
+            "2030-01-01T00:00:06Z",
+        )
+        .expect("later typed lifecycle release");
+        assert!(
+            !session_authority_quarantine_matches(
+                &context,
+                "assignment-one",
+                4,
+                &worker,
+                &later.reason,
+                &later_digest,
+            )
+            .expect("later quarantine is cleared")
+        );
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-one",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("startup release proof remains auditable after later cleanup")
+        );
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-one",
+                4,
+                &worker,
+                &later.reason,
+                &later_digest,
+            )
+            .expect("later release proof remains auditable")
+        );
+        assert_eq!(
+            fs::read_dir(
+                crate::session_dir(&context, "worker-one")
+                    .join(SESSION_AUTHORITY_QUARANTINE_RELEASES_DIR)
+            )
+            .expect("release proof directory")
+            .count(),
+            2,
+            "each exact lifecycle release retains its own immutable proof"
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_authority_release_publishes_one_immutable_proof() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: Some("test-host".to_string()),
+        };
+        fs::create_dir_all(crate::session_dir(&context, "worker-race"))
+            .expect("worker session dir");
+        let worker = SessionRef {
+            machine: None,
+            session_id: "worker-race".to_string(),
+            session_incarnation: "incarnation-race".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let runtime_identity_digest = format!("sha256:{}", "d".repeat(64));
+        let quarantine = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "worker-start-provider-stop-canary".to_string(),
+            runtime_identity_digest: runtime_identity_digest.clone(),
+            created_at: "2030-01-01T00:00:01Z".to_string(),
+        };
+        persist_session_authority_quarantine(&context, "assignment-race", 2, &quarantine)
+            .expect("persist race quarantine");
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                clear_matching_session_authority_quarantine(
+                    &context,
+                    "assignment-race",
+                    2,
+                    &worker,
+                    &quarantine.reason,
+                    &runtime_identity_digest,
+                    "2030-01-01T00:00:02Z",
+                )
+            });
+            let second = scope.spawn(|| {
+                clear_matching_session_authority_quarantine(
+                    &context,
+                    "assignment-race",
+                    2,
+                    &worker,
+                    &quarantine.reason,
+                    &runtime_identity_digest,
+                    "2030-01-01T00:00:03Z",
+                )
+            });
+            (
+                first.join().expect("first release caller"),
+                second.join().expect("second release caller"),
+            )
+        });
+        first.expect("first exact release");
+        second.expect("second exact release");
+        let path = session_authority_quarantine_release_path(
+            &context,
+            "assignment-race",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+        );
+        let winning_bytes = fs::read(&path).expect("winning immutable proof");
+        let winning: SessionAuthorityQuarantineRelease =
+            serde_json::from_slice(&winning_bytes).expect("winning release proof");
+        assert!(matches!(
+            winning.released_at.as_str(),
+            "2030-01-01T00:00:02Z" | "2030-01-01T00:00:03Z"
+        ));
+        clear_matching_session_authority_quarantine(
+            &context,
+            "assignment-race",
+            2,
+            &worker,
+            &quarantine.reason,
+            &runtime_identity_digest,
+            "2030-01-01T00:00:04Z",
+        )
+        .expect("sequential exact release replay");
+        assert_eq!(
+            fs::read(path).expect("replayed immutable proof"),
+            winning_bytes,
+            "neither concurrent loser nor later replay may replace proof bytes"
+        );
+    }
+
+    #[test]
+    fn delayed_exact_release_cannot_remove_a_later_authority_quarantine() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: Some("test-host".to_string()),
+        };
+        fs::create_dir_all(crate::session_dir(&context, "worker-serialized"))
+            .expect("worker session dir");
+        let worker = SessionRef {
+            machine: None,
+            session_id: "worker-serialized".to_string(),
+            session_incarnation: "incarnation-serialized".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let startup_digest = format!("sha256:{}", "e".repeat(64));
+        let startup = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "worker-start-provider-stop-canary".to_string(),
+            runtime_identity_digest: startup_digest.clone(),
+            created_at: "2030-01-01T00:00:01Z".to_string(),
+        };
+        persist_session_authority_quarantine(&context, "assignment-serialized", 2, &startup)
+            .expect("persist startup quarantine");
+        let later_digest = format!("sha256:{}", "f".repeat(64));
+        let later = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "stopped post-claim worker terminalized without input".to_string(),
+            runtime_identity_digest: later_digest.clone(),
+            created_at: "2030-01-01T00:00:04Z".to_string(),
+        };
+        let hook = SessionAuthorityClearHook {
+            reached: std::sync::Arc::new(std::sync::Barrier::new(2)),
+            resume: std::sync::Arc::new(std::sync::Barrier::new(2)),
+        };
+        let clear_hook_guard =
+            install_session_authority_clear_hook_for_test("worker-serialized", hook.clone());
+        std::thread::scope(|scope| {
+            let delayed = scope.spawn(|| {
+                clear_matching_session_authority_quarantine(
+                    &context,
+                    "assignment-serialized",
+                    2,
+                    &worker,
+                    &startup.reason,
+                    &startup_digest,
+                    "2030-01-01T00:00:02Z",
+                )
+            });
+            hook.reached.wait();
+            drop(clear_hook_guard);
+            let attempt_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let attempt_hook_guard = install_session_authority_lock_attempt_barrier_for_test(
+                "worker-serialized",
+                attempt_barrier.clone(),
+            );
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let replay_tx = finished_tx.clone();
+            let replay_context = &context;
+            let replay_worker = &worker;
+            let replay_reason = &startup.reason;
+            let replay_digest = &startup_digest;
+            let replay = scope.spawn(move || {
+                let result = clear_matching_session_authority_quarantine(
+                    replay_context,
+                    "assignment-serialized",
+                    2,
+                    replay_worker,
+                    replay_reason,
+                    replay_digest,
+                    "2030-01-01T00:00:03Z",
+                );
+                replay_tx.send("replay").expect("replay completion");
+                result
+            });
+            let persist_context = &context;
+            let persist_later = &later;
+            let persist = scope.spawn(move || {
+                let result = persist_session_authority_quarantine(
+                    persist_context,
+                    "assignment-serialized",
+                    4,
+                    persist_later,
+                );
+                finished_tx.send("persist").expect("persist completion");
+                result
+            });
+            attempt_barrier.wait();
+            drop(attempt_hook_guard);
+            assert!(
+                finished_rx.try_recv().is_err(),
+                "both observed contenders must remain blocked behind the in-flight clear"
+            );
+            hook.resume.wait();
+            delayed
+                .join()
+                .expect("delayed clear caller")
+                .expect("delayed exact clear");
+            replay
+                .join()
+                .expect("replay clear caller")
+                .expect("serialized exact replay");
+            persist
+                .join()
+                .expect("later persist caller")
+                .expect("serialized later quarantine");
+        });
+        assert!(
+            session_authority_quarantine_matches(
+                &context,
+                "assignment-serialized",
+                4,
+                &worker,
+                &later.reason,
+                &later_digest,
+            )
+            .expect("later quarantine remains active"),
+            "a delayed startup release replay must never unlink a later lifecycle fence"
+        );
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-serialized",
+                2,
+                &worker,
+                &startup.reason,
+                &startup_digest,
+            )
+            .expect("startup proof remains auditable")
+        );
+    }
+
+    #[test]
+    fn delayed_exact_persist_cannot_resurrect_a_released_quarantine() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: Some("test-host".to_string()),
+        };
+        fs::create_dir_all(crate::session_dir(&context, "worker-no-resurrection"))
+            .expect("worker session dir");
+        let worker = SessionRef {
+            machine: None,
+            session_id: "worker-no-resurrection".to_string(),
+            session_incarnation: "incarnation-no-resurrection".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let runtime_identity_digest = format!("sha256:{}", "1".repeat(64));
+        let quarantine = WorkerQuarantineRecord {
+            schema_version: WORKER_QUARANTINE_SCHEMA.to_string(),
+            worker: worker.clone(),
+            reason: "worker-start-provider-stop-canary".to_string(),
+            runtime_identity_digest: runtime_identity_digest.clone(),
+            created_at: "2030-01-01T00:00:01Z".to_string(),
+        };
+        persist_session_authority_quarantine(
+            &context,
+            "assignment-no-resurrection",
+            2,
+            &quarantine,
+        )
+        .expect("persist startup quarantine");
+        let hook = SessionAuthorityClearHook {
+            reached: std::sync::Arc::new(std::sync::Barrier::new(2)),
+            resume: std::sync::Arc::new(std::sync::Barrier::new(2)),
+        };
+        let clear_hook_guard =
+            install_session_authority_clear_hook_for_test("worker-no-resurrection", hook.clone());
+        let persist_error = std::thread::scope(|scope| {
+            let clear = scope.spawn(|| {
+                clear_matching_session_authority_quarantine(
+                    &context,
+                    "assignment-no-resurrection",
+                    2,
+                    &worker,
+                    &quarantine.reason,
+                    &runtime_identity_digest,
+                    "2030-01-01T00:00:02Z",
+                )
+            });
+            hook.reached.wait();
+            drop(clear_hook_guard);
+            let attempt_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let attempt_hook_guard = install_session_authority_lock_attempt_barrier_for_test(
+                "worker-no-resurrection",
+                attempt_barrier.clone(),
+            );
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let persist_context = &context;
+            let persist_quarantine = &quarantine;
+            let persist = scope.spawn(move || {
+                let result = persist_session_authority_quarantine(
+                    persist_context,
+                    "assignment-no-resurrection",
+                    2,
+                    persist_quarantine,
+                );
+                finished_tx.send(()).expect("persist completion");
+                result
+            });
+            attempt_barrier.wait();
+            drop(attempt_hook_guard);
+            assert!(
+                finished_rx.try_recv().is_err(),
+                "observed stale persist must remain blocked behind the in-flight clear"
+            );
+            hook.resume.wait();
+            clear.join().expect("clear caller").expect("exact release");
+            persist
+                .join()
+                .expect("persist caller")
+                .expect_err("stale exact persist must not resurrect released authority")
+        });
+        assert_eq!(persist_error.code(), "worker-quarantine-released");
+        assert!(
+            !session_authority_quarantine_matches(
+                &context,
+                "assignment-no-resurrection",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("released quarantine remains absent")
+        );
+        assert!(
+            session_authority_quarantine_released(
+                &context,
+                "assignment-no-resurrection",
+                2,
+                &worker,
+                &quarantine.reason,
+                &runtime_identity_digest,
+            )
+            .expect("release proof remains authoritative")
+        );
     }
 
     #[test]

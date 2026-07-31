@@ -1900,6 +1900,13 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
     broker::revoke(context, record)
 }
 
+pub(crate) fn forget_revoked_failed_launch(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    broker::forget_revoked_failed_launch(context, record)
+}
+
 pub(crate) fn pending_notifications(
     context: &CliContext,
 ) -> Result<Vec<NotificationCandidate>, CliError> {
@@ -2654,6 +2661,43 @@ pub(crate) fn read_private_text(
     Ok(value.trim().to_string())
 }
 
+fn expire_claims_with_runtime_resolver(
+    claims: &mut [context::WorkContextRecord],
+    operations: &[claims::OperationLease],
+    now: i64,
+    mut runtime_stopped: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    let mut changed = false;
+    let mut stopped_runtime_cache = BTreeMap::new();
+    for claim in claims {
+        let bound_operation = operations.iter().any(|operation| {
+            operation.claim_id == claim.claim_id
+                && matches!(
+                    operation.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                )
+        });
+        let can_expire =
+            claim.state == "active" && claim.expires_at_epoch <= now && !bound_operation;
+        let owner_runtime_stopped = can_expire
+            && *stopped_runtime_cache
+                .entry((claim.session_id.clone(), claim.session_incarnation.clone()))
+                .or_insert_with(|| runtime_stopped(&claim.session_id, &claim.session_incarnation));
+        if can_expire && owner_runtime_stopped {
+            claim.state = "expired".to_string();
+            claim.revision = claim.revision.saturating_add(1);
+            claim.terminal_at_epoch = Some(now);
+            changed = true;
+        } else if matches!(claim.state.as_str(), "released" | "expired" | "stale")
+            && claim.terminal_at_epoch.is_none()
+        {
+            claim.terminal_at_epoch = Some(now);
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     let mut changed = false;
     for operation in &mut registry.operations {
@@ -2671,39 +2715,22 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
             changed = true;
         }
     }
-    for claim in &mut registry.claims {
-        let bound_operation = registry.operations.iter().any(|operation| {
-            operation.claim_id == claim.claim_id
-                && matches!(
-                    operation.state.as_str(),
-                    "active" | "completing" | "reconcile_pending"
-                )
-        });
-        let owner_runtime_stopped = registry
-            .brokers
-            .get(&claim.session_id)
-            .filter(|broker| broker.incarnation == claim.session_incarnation)
-            .and_then(|broker| broker.runtime_identity.as_ref())
-            .is_some_and(|identity| {
-                crate::coordination_runtime_status_for_identity(identity)
-                    == crate::CoordinationRuntimeStatus::Stopped
-            });
-        if claim.state == "active"
-            && claim.expires_at_epoch <= now
-            && !bound_operation
-            && owner_runtime_stopped
-        {
-            claim.state = "expired".to_string();
-            claim.revision = claim.revision.saturating_add(1);
-            claim.terminal_at_epoch = Some(now);
-            changed = true;
-        } else if matches!(claim.state.as_str(), "released" | "expired" | "stale")
-            && claim.terminal_at_epoch.is_none()
-        {
-            claim.terminal_at_epoch = Some(now);
-            changed = true;
-        }
-    }
+    changed |= expire_claims_with_runtime_resolver(
+        &mut registry.claims,
+        &registry.operations,
+        now,
+        |session_id, session_incarnation| {
+            registry
+                .brokers
+                .get(session_id)
+                .filter(|broker| broker.incarnation == session_incarnation)
+                .and_then(|broker| broker.runtime_identity.as_ref())
+                .is_some_and(|identity| {
+                    crate::coordination_runtime_status_for_identity(identity)
+                        == crate::CoordinationRuntimeStatus::Stopped
+                })
+        },
+    );
     for message in &mut registry.messages {
         if !matches!(
             message.state.as_str(),
@@ -3664,5 +3691,158 @@ mod tests {
 
         clean_expired(&mut registry, 2);
         assert_eq!(registry.claims[0].state, "active");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_claim_runtime_cache_is_fenced_by_exact_incarnation() {
+        let pid_namespace =
+            fs::metadata("/proc/self/ns/pid").expect("current PID namespace metadata");
+        let claim = |claim_id: &str, incarnation: &str| {
+            json!({
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "session",
+                "session_incarnation": incarnation,
+                "claim_id": claim_id,
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{
+                    "kind": "repository",
+                    "repository": "example/repository",
+                    "value": ""
+                }],
+                "summary": "fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1
+            })
+        };
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": REGISTRY_VERSION,
+            "brokers": {
+                "session": {
+                    "session_id": "session",
+                    "incarnation": "incarnation-a",
+                    "capability_digest": "digest",
+                    "generation": 1,
+                    "state": "degraded",
+                    "heartbeat_at": "2030-01-01T00:00:00Z",
+                    "heartbeat_epoch": 1,
+                    "runtime_identity": {
+                        "launch_id": "stopped-runtime",
+                        "session_id": "$1",
+                        "pane_id": "%1",
+                        "pane_pid": 2147483647,
+                        "process_group_id": 2147483647,
+                        "pid_namespace": {
+                            "device": pid_namespace.dev(),
+                            "inode": pid_namespace.ino(),
+                            "boot_id": crate::linux_boot_id().expect("boot id")
+                        }
+                    },
+                    "runtime_identity_digest": "runtime"
+                }
+            },
+            "claims": [
+                claim("claim-a-1", "incarnation-a"),
+                claim("claim-a-2", "incarnation-a"),
+                claim("claim-b", "incarnation-b")
+            ]
+        }))
+        .expect("registry");
+
+        clean_expired(&mut registry, 2);
+
+        assert_eq!(registry.claims[0].state, "expired");
+        assert_eq!(registry.claims[1].state, "expired");
+        assert_eq!(
+            registry.claims[2].state, "active",
+            "a cached stopped result must never cross the incarnation fence"
+        );
+    }
+
+    #[test]
+    fn claim_expiry_probes_only_eligible_exact_runtime_pairs_once() {
+        let claim = |claim_id: &str, incarnation: &str, state: &str, expires_at_epoch: i64| {
+            json!({
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "session",
+                "session_incarnation": incarnation,
+                "claim_id": claim_id,
+                "revision": 1,
+                "state": state,
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [],
+                "summary": "fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": expires_at_epoch
+            })
+        };
+        let mut registry: Registry = serde_json::from_value(json!({
+            "claims": [
+                claim("eligible-a-1", "incarnation-a", "active", 1),
+                claim("eligible-a-2", "incarnation-a", "active", 1),
+                claim("eligible-b", "incarnation-b", "active", 1),
+                claim("unexpired", "incarnation-unexpired", "active", i64::MAX),
+                claim("terminal", "incarnation-terminal", "released", 1),
+                claim("bound", "incarnation-bound", "active", 1)
+            ],
+            "operations": [{
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "lease",
+                "session_id": "session",
+                "session_incarnation": "incarnation-bound",
+                "claim_id": "bound",
+                "claim_revision": 1,
+                "operation": "edit",
+                "targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:10:00Z",
+                "expires_at_epoch": i64::MAX,
+                "execution_token_digest": "digest"
+            }]
+        }))
+        .expect("registry");
+        let mut calls = BTreeMap::new();
+
+        assert!(expire_claims_with_runtime_resolver(
+            &mut registry.claims,
+            &registry.operations,
+            2,
+            |session_id, incarnation| {
+                *calls
+                    .entry((session_id.to_string(), incarnation.to_string()))
+                    .or_insert(0) += 1;
+                incarnation == "incarnation-a"
+            }
+        ));
+
+        assert_eq!(
+            calls,
+            BTreeMap::from([
+                (("session".to_string(), "incarnation-a".to_string()), 1),
+                (("session".to_string(), "incarnation-b".to_string()), 1)
+            ])
+        );
+        assert_eq!(registry.claims[0].state, "expired");
+        assert_eq!(registry.claims[1].state, "expired");
+        assert_eq!(registry.claims[2].state, "active");
+        assert_eq!(registry.claims[3].state, "active");
+        assert_eq!(registry.claims[4].state, "released");
+        assert_eq!(registry.claims[5].state, "active");
     }
 }

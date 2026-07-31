@@ -24,6 +24,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -81,10 +83,20 @@ const PROVIDER_STOP_CANARY_READY_FILE: &str = ".provider-stop-canary-ready.json"
 const PROVIDER_STOP_CANARY_REQUEST_FILE: &str = ".provider-stop-canary-stop.json";
 const PROVIDER_STOP_CANARY_STOPPED_FILE: &str = ".provider-stop-canary-stopped.json";
 const PROVIDER_STOP_CANARY_RELEASE_FILE: &str = ".provider-stop-canary-release.json";
+const PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE: &str = ".provider-stop-canary-startup-failed.json";
+const PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE: &str = ".provider-stop-canary-runtime-failed.json";
 const PROVIDER_STOP_CANARY_CONTROL_SOCKET_PREFIX: &str = "nils-provider-stop-canary-control-";
 const PROVIDER_STOP_CANARY_SUPERVISOR_LOCK_FILE: &str = ".provider-stop-canary-supervisor.lock";
 const PROVIDER_STOP_CANARY_HOLD: Duration = Duration::from_secs(120);
 const PROVIDER_STOP_CANARY_MARKER_MAX_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_GUARDIAN_CONTROL_BUDGET: Duration = Duration::from_millis(250);
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_CONTROLLER_CONTROL_BUDGET: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_STOP_RETRY_BUDGET: Duration = Duration::from_secs(8);
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_PARENT_LOSS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
 const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
@@ -129,6 +141,12 @@ const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const DELETE_TERMINATION_IDENTITY_RETRY_LIMIT: usize = 3;
 const DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
+const SYSTEMD_SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const SYSTEMD_SCOPE_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_BIN: &str = "/usr/bin/systemctl";
 const AGENT_HOOK_SETUP_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DELETE_TMUX_IDENTITY_KEY: &str = "delete_tmux_identity";
 const DELETE_TMUX_PRIOR_IDENTITIES_KEY: &str = "delete_tmux_prior_identities";
@@ -1732,13 +1750,70 @@ struct PromptComposerObservation {
     proof: &'static str,
 }
 
+type SessionStartGuard<'a> = Option<&'a mut dyn FnMut(&SessionRecord) -> Result<(), CliError>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreRuntimeReleaseGuardState {
+    Uncommitted,
+    RolledBack,
+    Committed,
+}
+
+struct PreRuntimeReleaseGuardError {
+    error: CliError,
+    state: PreRuntimeReleaseGuardState,
+}
+
+impl PreRuntimeReleaseGuardError {
+    fn rolled_back(error: CliError) -> Self {
+        Self {
+            error,
+            state: PreRuntimeReleaseGuardState::RolledBack,
+        }
+    }
+
+    fn committed(error: CliError) -> Self {
+        Self {
+            error,
+            state: PreRuntimeReleaseGuardState::Committed,
+        }
+    }
+}
+
+impl From<CliError> for PreRuntimeReleaseGuardError {
+    fn from(error: CliError) -> Self {
+        Self {
+            error,
+            state: PreRuntimeReleaseGuardState::Uncommitted,
+        }
+    }
+}
+
+type PreRuntimeReleaseGuard<'a> =
+    Option<&'a mut dyn FnMut(&SessionRecord) -> Result<(), PreRuntimeReleaseGuardError>>;
+
+#[derive(Default)]
+struct StartLifecycleGuards<'a> {
+    pre_runtime_release: PreRuntimeReleaseGuard<'a>,
+    post_runtime_release: SessionStartGuard<'a>,
+    post_prompt_delivery: SessionStartGuard<'a>,
+    definitive_failure: SessionStartGuard<'a>,
+}
+
 fn start_session(
     context: &CliContext,
     args: cli::StartArgs,
     failure_disposition: StartFailureDisposition,
     prompt_delivery: PromptDelivery,
 ) -> Result<StartView, CliError> {
-    start_session_with_create_guard(context, args, failure_disposition, prompt_delivery, None)
+    start_session_with_create_guard(
+        context,
+        args,
+        failure_disposition,
+        prompt_delivery,
+        None,
+        StartLifecycleGuards::default(),
+    )
 }
 
 fn start_session_with_create_guard(
@@ -1747,6 +1822,7 @@ fn start_session_with_create_guard(
     failure_disposition: StartFailureDisposition,
     prompt_delivery: PromptDelivery,
     create_guard: Option<&mut dyn FnMut() -> Result<(), CliError>>,
+    mut lifecycle_guards: StartLifecycleGuards<'_>,
 ) -> Result<StartView, CliError> {
     validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
@@ -1915,6 +1991,32 @@ fn start_session_with_create_guard(
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    let pre_runtime_release_committed =
+        if let Some(guard) = lifecycle_guards.pre_runtime_release.as_mut() {
+            if let Err(failure) = guard(&created.record) {
+                if failure.state == PreRuntimeReleaseGuardState::Committed {
+                    record_workdir_usage(context, &cwd);
+                    if let Some(create_bootstrap) = create_bootstrap {
+                        create_bootstrap.finish(|| created.release_lifecycle_lock());
+                    } else {
+                        created.release_lifecycle_lock();
+                    }
+                    return Err(failure.error);
+                }
+                recover_failed_tmux_launch(
+                    context,
+                    &mut created.record,
+                    &tmux_bin,
+                    Some(&launch_identity),
+                    SessionTerminationOperation::FailedLaunch,
+                )?;
+                cleanup_created_record(context, &created);
+                return Err(failure.error);
+            }
+            true
+        } else {
+            false
+        };
     if let Err(err) = release_held_runtime(context, &created.record) {
         recover_failed_tmux_launch(
             context,
@@ -1923,7 +2025,18 @@ fn start_session_with_create_guard(
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
         )?;
+        if pre_runtime_release_committed
+            && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
+            && let Err(rollback_error) = guard(&created.record)
+        {
+            return Err(rollback_error);
+        }
         cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Some(guard) = lifecycle_guards.post_runtime_release.as_mut()
+        && let Err(err) = guard(&created.record)
+    {
         return Err(err);
     }
     let _ = advance_owned_startup_stage(context, &mut created.record, "runtime");
@@ -1938,6 +2051,12 @@ fn start_session_with_create_guard(
                 Some(&launch_identity),
                 SessionTerminationOperation::FailedLaunch,
             )?;
+            if pre_runtime_release_committed
+                && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
+                && let Err(rollback_error) = guard(&created.record)
+            {
+                return Err(rollback_error);
+            }
             cleanup_created_record(context, &created);
             return Err(err);
         }
@@ -1945,7 +2064,14 @@ fn start_session_with_create_guard(
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
         }
         match paste_prompt(&tmux_bin, &created.record, prompt_delivery) {
-            Ok(observation) => prompt_delivery_observation = Some(observation),
+            Ok(observation) => {
+                if let Some(guard) = lifecycle_guards.post_prompt_delivery.as_mut()
+                    && let Err(err) = guard(&created.record)
+                {
+                    return Err(err);
+                }
+                prompt_delivery_observation = Some(observation);
+            }
             Err(err) => {
                 if prompt_delivery == PromptDelivery::ManagedWorkerExactlyOnce
                     && err.code() == "managed-worker-prompt-delivery-outcome-unknown"
@@ -1959,6 +2085,12 @@ fn start_session_with_create_guard(
                         Some(&launch_identity),
                         SessionTerminationOperation::FailedLaunch,
                     )?;
+                    if pre_runtime_release_committed
+                        && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
+                        && let Err(rollback_error) = guard(&created.record)
+                    {
+                        return Err(rollback_error);
+                    }
                     cleanup_created_record(context, &created);
                     return Err(err);
                 }
@@ -2585,7 +2717,9 @@ fn create_record_with_guard(
 
 fn cleanup_created_record(context: &CliContext, created: &CreatedRecord) {
     if created.validate_session_storage().is_ok() {
-        let _ = coordination::revoke(context, &created.record);
+        if coordination::revoke(context, &created.record).is_ok() {
+            let _ = coordination::forget_revoked_failed_launch(context, &created.record);
+        }
         if created.validate_session_storage().is_ok() {
             let _ = codex_app_server::cleanup_runtime_files(context, &created.record);
         }
@@ -3136,6 +3270,262 @@ fn write_provider_stop_canary_marker(path: &Path, value: &Value) -> Result<(), C
     write_private_file(path, &bytes)
 }
 
+fn provider_stop_canary_failure_code_is_bounded(failure_code: &str) -> bool {
+    !failure_code.is_empty()
+        && failure_code.len() <= 128
+        && failure_code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn write_provider_stop_canary_startup_failure(
+    context: &CliContext,
+    record: &SessionRecord,
+    stage: &str,
+    error: &CliError,
+) -> Result<(), CliError> {
+    let failure_code = error.code();
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-marker-invalid",
+                "the provider stop canary startup failure has no exact launch identity",
+                None,
+            )
+        })?;
+    if !matches!(stage, "supervisor" | "guardian")
+        || !provider_stop_canary_failure_code_is_bounded(failure_code)
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-marker-invalid",
+            "the provider stop canary startup failure is outside its bounded schema",
+            None,
+        ));
+    }
+    write_provider_stop_canary_marker(
+        &provider_stop_canary_file(context, record, PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE),
+        &json!({
+            "schema_version": PROVIDER_STOP_CANARY_SCHEMA,
+            "session_id": record.id,
+            "launch_id": launch_id,
+            "state": "startup_failed",
+            "stage": stage,
+            "failure_code": failure_code
+        }),
+    )
+}
+
+fn read_provider_stop_canary_startup_failure(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Option<(String, String)> {
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())?;
+    let marker = read_provider_stop_canary_marker(
+        context,
+        record,
+        PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE,
+    )?;
+    let object = marker.as_object()?;
+    let expected_keys = [
+        "schema_version",
+        "session_id",
+        "launch_id",
+        "state",
+        "stage",
+        "failure_code",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || marker["schema_version"] != PROVIDER_STOP_CANARY_SCHEMA
+        || marker["session_id"] != record.id
+        || marker["launch_id"].as_str() != Some(launch_id)
+        || marker["state"] != "startup_failed"
+    {
+        return None;
+    }
+    let stage = marker["stage"].as_str()?;
+    if !matches!(stage, "supervisor" | "guardian") {
+        return None;
+    }
+    let failure_code = marker["failure_code"].as_str()?;
+    provider_stop_canary_failure_code_is_bounded(failure_code)
+        .then(|| (stage.to_string(), failure_code.to_string()))
+}
+
+fn write_provider_stop_canary_runtime_failure(
+    context: &CliContext,
+    record: &SessionRecord,
+    stage: &str,
+    error: &CliError,
+) -> Result<(), CliError> {
+    let failure_code = error.code();
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-marker-invalid",
+                "the provider stop canary runtime failure has no exact launch identity",
+                None,
+            )
+        })?;
+    if !matches!(stage, "supervisor" | "guardian")
+        || !provider_stop_canary_failure_code_is_bounded(failure_code)
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-marker-invalid",
+            "the provider stop canary runtime failure is outside its bounded schema",
+            None,
+        ));
+    }
+    write_provider_stop_canary_marker(
+        &provider_stop_canary_file(context, record, PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE),
+        &json!({
+            "schema_version": PROVIDER_STOP_CANARY_SCHEMA,
+            "session_id": record.id,
+            "launch_id": launch_id,
+            "state": "runtime_failed",
+            "stage": stage,
+            "failure_code": failure_code
+        }),
+    )
+}
+
+#[cfg(test)]
+fn read_provider_stop_canary_runtime_failure(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Option<(String, String)> {
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())?;
+    let marker = read_provider_stop_canary_marker(
+        context,
+        record,
+        PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE,
+    )?;
+    let object = marker.as_object()?;
+    let expected_keys = [
+        "schema_version",
+        "session_id",
+        "launch_id",
+        "state",
+        "stage",
+        "failure_code",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || marker["schema_version"] != PROVIDER_STOP_CANARY_SCHEMA
+        || marker["session_id"] != record.id
+        || marker["launch_id"].as_str() != Some(launch_id)
+        || marker["state"] != "runtime_failed"
+    {
+        return None;
+    }
+    let stage = marker["stage"].as_str()?;
+    if !matches!(stage, "supervisor" | "guardian") {
+        return None;
+    }
+    let failure_code = marker["failure_code"].as_str()?;
+    provider_stop_canary_failure_code_is_bounded(failure_code)
+        .then(|| (stage.to_string(), failure_code.to_string()))
+}
+
+pub(crate) fn provider_stop_canary_startup_error(stage: &str, failure_code: &str) -> CliError {
+    CliError::data(
+        "provider-stop-canary-startup-failed",
+        "the exact Codex canary failed before prompt delivery",
+        Some(json!({
+            "retryable": false,
+            "next_action": "diagnose-canary-startup",
+            "recovery": {
+                "kind": "provider-stop-canary-startup-failure",
+                "owner": "main-agent",
+                "automatic": false
+            },
+            "stage": stage,
+            "failure_code": failure_code
+        })),
+    )
+}
+
+pub(crate) fn await_provider_stop_canary_startup(
+    context: &CliContext,
+    record: &SessionRecord,
+    timeout: Duration,
+) -> Result<(u32, u64), CliError> {
+    #[cfg(target_os = "linux")]
+    let ((controller_session_id, controller_session_incarnation), address) = {
+        let controller = provider_stop_canary_controller_reference(context, record)
+            .map_err(|error| provider_stop_canary_startup_error("controller", error.code()))?;
+        let address = provider_stop_canary_control_address(context, record)
+            .map_err(|error| provider_stop_canary_startup_error("controller", error.code()))?;
+        (controller, address)
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((stage, failure_code)) =
+            read_provider_stop_canary_startup_failure(context, record)
+        {
+            return Err(provider_stop_canary_startup_error(&stage, &failure_code));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(provider_stop_canary_startup_error(
+                "controller",
+                "provider-stop-canary-startup-timeout",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        match query_provider_stop_canary_startup(
+            context,
+            record,
+            &controller_session_id,
+            &controller_session_incarnation,
+            &address,
+            remaining,
+        ) {
+            Ok(identity) => return Ok(identity),
+            Err(error) if error.code() == "provider-stop-canary-control-unavailable" => {}
+            Err(error) => {
+                return Err(provider_stop_canary_startup_error("guardian", error.code()));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(provider_stop_canary_startup_error(
+            "controller",
+            "provider-stop-canary-platform-unsupported",
+        ));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        );
+    }
+}
+
+pub(crate) fn provider_stop_canary_startup_wait() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_STARTUP_MS")
+        && let Ok(milliseconds) = value.parse::<u64>()
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    Duration::from_secs(15)
+}
+
 fn provider_stop_canary_request_matches(
     context: &CliContext,
     record: &SessionRecord,
@@ -3388,22 +3778,140 @@ fn provider_stop_canary_wrapper_identity_wait() -> Duration {
     Duration::from_secs(5)
 }
 
+fn wait_for_provider_stop_canary_assignment_binding(
+    context: &CliContext,
+    initial: &SessionRecord,
+) -> Result<SessionRecord, CliError> {
+    let expected_launch_id = initial
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-runtime-missing",
+                "the canary supervisor has no exact runtime incarnation",
+                None,
+            )
+        })?;
+    let assignment_id = provider_stop_canary_assignment_id(initial).ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-assignment-invalid",
+            "the canary supervisor has no exact managed assignment id",
+            None,
+        )
+    })?;
+    let deadline = Instant::now() + provider_stop_canary_assignment_binding_wait();
+    let mut poll_interval = Duration::from_millis(25);
+    loop {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let assignment = registry.assignments.get(assignment_id).ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-assignment-invalid",
+                "the canary supervisor could not resolve its exact assignment",
+                None,
+            )
+        })?;
+        match assignment.worker.as_ref() {
+            Some(worker)
+                if assignment.state == "starting"
+                    && assignment.revision == 2
+                    && worker.session_id == initial.id
+                    && worker.session_incarnation == expected_launch_id =>
+            {
+                let record = load_session_record(context, &initial.id)?;
+                if !provider_stop_canary_armed(&record)
+                    || record
+                        .runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.launch_id != expected_launch_id)
+                    || !orchestration::session_ref_matches(worker, &record, &expected_launch_id)
+                {
+                    return Err(CliError::data(
+                        "provider-stop-canary-wrapper-incarnation-changed",
+                        "the canary supervisor runtime incarnation changed before assignment binding",
+                        None,
+                    ));
+                }
+                return Ok(record);
+            }
+            None if assignment.state == "starting" && assignment.revision == 1 => {}
+            _ => {
+                return Err(CliError::data(
+                    "provider-stop-canary-worker-mismatch",
+                    "the canary supervisor assignment does not bind this exact worker incarnation",
+                    None,
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::runtime(
+                "provider-stop-canary-assignment-binding-timeout",
+                "the canary supervisor did not observe its exact worker-start binding",
+                None,
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(poll_interval));
+        poll_interval = poll_interval
+            .saturating_mul(2)
+            .min(Duration::from_millis(500));
+    }
+}
+
+fn provider_stop_canary_assignment_binding_wait() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) =
+        env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_ASSIGNMENT_BINDING_MS")
+            .as_deref()
+            .map(str::parse::<u64>)
+        && let Ok(value) = value
+        && value > 0
+    {
+        return Duration::from_millis(value);
+    }
+    Duration::from_secs(5)
+}
+
 #[cfg(target_os = "linux")]
 fn provider_stop_canary_wrapper_start_time(
     identity: &TmuxRuntimeIdentity,
 ) -> Result<u64, CliError> {
-    identity
-        .process_session_members
-        .iter()
-        .find(|member| member.pid == identity.pane_pid && member.start_time > 0)
-        .map(|member| member.start_time)
-        .ok_or_else(|| {
+    provider_stop_canary_persisted_pane_start_time(identity).ok_or_else(|| {
+        CliError::runtime(
+            "provider-stop-canary-wrapper-identity-unverified",
+            "the canary supervisor has no persisted Linux PID/start-time identity",
+            None,
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_guardian_wrapper_identity(
+    record: &SessionRecord,
+) -> Result<(TmuxRuntimeIdentity, u64), CliError> {
+    let identity = persisted_tmux_runtime_identity(record)
+        .map_err(|_| {
             CliError::runtime(
-                "provider-stop-canary-wrapper-identity-unverified",
-                "the canary supervisor has no persisted Linux PID/start-time identity",
+                "provider-stop-canary-wrapper-record-invalid",
+                "the canary guardian found an invalid persisted tmux pane identity",
                 None,
             )
-        })
+        })?
+        .ok_or_else(|| {
+            CliError::runtime(
+                "provider-stop-canary-wrapper-record-missing",
+                "the canary guardian has no persisted exact tmux pane identity",
+                None,
+            )
+        })?;
+    let start_time = provider_stop_canary_wrapper_start_time(&identity).map_err(|_| {
+        CliError::runtime(
+            "provider-stop-canary-wrapper-start-time-missing",
+            "the canary guardian has no persisted tmux pane start time",
+            None,
+        )
+    })?;
+    Ok((identity, start_time))
 }
 
 #[cfg(target_os = "linux")]
@@ -3418,7 +3926,42 @@ fn open_provider_stop_canary_pidfd(pid: u32) -> io::Result<OwnedFd> {
 }
 
 #[cfg(target_os = "linux")]
+fn pin_live_linux_process_incarnation(
+    pid: libc::pid_t,
+) -> Result<(u64, OwnedFd), SessionTerminationFailure> {
+    let before = read_linux_process_identity(pid)?
+        .filter(|identity| !identity.zombie)
+        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    let pidfd = open_provider_stop_canary_pidfd(pid as u32)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    verify_pinned_linux_process_incarnation(pid, before.start_time, &pidfd)?;
+    Ok((before.start_time, pidfd))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pinned_linux_process_incarnation(
+    pid: libc::pid_t,
+    expected_start_time: u64,
+    pidfd: &OwnedFd,
+) -> Result<(), SessionTerminationFailure> {
+    if provider_stop_canary_child_exited_unreaped(pidfd)
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?
+    {
+        return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+    }
+    let current = read_linux_process_identity(pid)?
+        .filter(|identity| !identity.zombie && identity.start_time == expected_start_time)
+        .ok_or(SessionTerminationFailure::RuntimeIdentityMismatch)?;
+    if current.pid != pid {
+        return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 static PROVIDER_STOP_CANARY_GUARDIAN_PARENT_LOST: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_os = "linux", debug_assertions))]
+static PROVIDER_STOP_CANARY_TEST_MEMBER_CHURN_INJECTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
 extern "C" fn provider_stop_canary_guardian_parent_died(_: libc::c_int) {
@@ -3441,23 +3984,12 @@ struct ProviderStopCanaryProcessPin {
 }
 
 #[cfg(target_os = "linux")]
-fn provider_stop_canary_cgroup_path(
-    context: &CliContext,
-    record: &SessionRecord,
+fn provider_stop_canary_cgroup_parent_from_wrapper_path(
+    wrapper_cgroup: &Path,
 ) -> Result<PathBuf, CliError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let entry = fs::read_to_string("/proc/self/cgroup").map_err(|_| {
-        CliError::runtime(
-            "provider-stop-canary-cgroup-unavailable",
-            "the canary guardian could not observe its cgroup v2 membership",
-            None,
-        )
-    })?;
-    let relative = entry
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .and_then(|path| Path::new(path).strip_prefix("/").ok())
+    let relative = wrapper_cgroup
+        .strip_prefix("/")
+        .ok()
         .filter(|path| {
             path.components()
                 .all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -3465,11 +3997,64 @@ fn provider_stop_canary_cgroup_path(
         .ok_or_else(|| {
             CliError::runtime(
                 "provider-stop-canary-cgroup-unavailable",
-                "the canary guardian requires one safe unified cgroup v2 membership",
+                "the exact canary wrapper has no safe unified cgroup v2 membership",
                 None,
             )
         })?;
-    let parent = Path::new("/sys/fs/cgroup").join(relative);
+    Ok(Path::new("/sys/fs/cgroup").join(relative))
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_cgroup_path(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<PathBuf, CliError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (wrapper, wrapper_start_time) = provider_stop_canary_guardian_wrapper_identity(record)?;
+    let current = read_linux_process_identity(wrapper.pane_pid)
+        .map_err(|_| {
+            CliError::runtime(
+                "provider-stop-canary-cgroup-unavailable",
+                "the exact canary wrapper identity could not be observed",
+                None,
+            )
+        })?
+        .filter(|identity| !identity.zombie && identity.start_time == wrapper_start_time)
+        .ok_or_else(|| {
+            CliError::runtime(
+                "provider-stop-canary-cgroup-unavailable",
+                "the exact canary wrapper identity changed before cgroup admission",
+                None,
+            )
+        })?;
+    let wrapper_cgroup = linux_process_control_group_path(current.pid)
+        .map_err(|_| {
+            CliError::runtime(
+                "provider-stop-canary-cgroup-unavailable",
+                "the exact canary wrapper cgroup membership could not be observed",
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            CliError::runtime(
+                "provider-stop-canary-cgroup-unavailable",
+                "the exact canary wrapper has no unified cgroup v2 membership",
+                None,
+            )
+        })?;
+    if wrapper
+        .control_group
+        .as_ref()
+        .is_some_and(|captured| Path::new(&captured.path) != wrapper_cgroup)
+    {
+        return Err(CliError::runtime(
+            "provider-stop-canary-cgroup-unavailable",
+            "the exact canary wrapper cgroup identity changed before admission",
+            None,
+        ));
+    }
+    let parent = provider_stop_canary_cgroup_parent_from_wrapper_path(&wrapper_cgroup)?;
     let metadata = fs::symlink_metadata(&parent).map_err(|_| {
         CliError::runtime(
             "provider-stop-canary-cgroup-unavailable",
@@ -3481,6 +4066,15 @@ fn provider_stop_canary_cgroup_path(
         return Err(CliError::runtime(
             "provider-stop-canary-cgroup-unavailable",
             "the canary guardian cgroup v2 parent is not privately delegated",
+            None,
+        ));
+    }
+    if wrapper.control_group.as_ref().is_some_and(|captured| {
+        metadata.dev() != captured.device || metadata.ino() != captured.inode
+    }) {
+        return Err(CliError::runtime(
+            "provider-stop-canary-cgroup-unavailable",
+            "the exact canary wrapper cgroup object changed before admission",
             None,
         ));
     }
@@ -3978,21 +4572,21 @@ fn remove_empty_provider_stop_canary_cgroup(
 ) -> Result<(), CliError> {
     if !provider_stop_canary_cgroup_members(cgroup)?.is_empty() {
         return Err(CliError::runtime(
-            "provider-stop-canary-cgroup-cleanup-failed",
+            "provider-stop-canary-cgroup-still-populated",
             "the exact provider cgroup remains populated",
             None,
         ));
     }
     let pinned = cgroup.directory.metadata().map_err(|_| {
         CliError::runtime(
-            "provider-stop-canary-cgroup-cleanup-failed",
+            "provider-stop-canary-cgroup-identity-unavailable",
             "the pinned provider cgroup identity is unavailable",
             None,
         )
     })?;
     let current = fs::symlink_metadata(&cgroup.path).map_err(|_| {
         CliError::runtime(
-            "provider-stop-canary-cgroup-cleanup-failed",
+            "provider-stop-canary-cgroup-path-unavailable",
             "the provider cgroup path changed before removal",
             None,
         )
@@ -4004,9 +4598,18 @@ fn remove_empty_provider_stop_canary_cgroup(
             None,
         ));
     }
-    fs::remove_dir(&cgroup.path).map_err(|_| {
+    fs::remove_dir(&cgroup.path).map_err(|error| {
+        let code = match error.raw_os_error() {
+            Some(libc::EBUSY) => "provider-stop-canary-cgroup-remove-busy",
+            Some(libc::ENOTEMPTY) => "provider-stop-canary-cgroup-remove-not-empty",
+            Some(libc::EPERM) | Some(libc::EACCES) => {
+                "provider-stop-canary-cgroup-remove-permission-denied"
+            }
+            Some(libc::ENOENT) => "provider-stop-canary-cgroup-remove-path-missing",
+            _ => "provider-stop-canary-cgroup-remove-failed",
+        };
         CliError::runtime(
-            "provider-stop-canary-cgroup-cleanup-failed",
+            code,
             "the exact empty provider cgroup could not be removed",
             None,
         )
@@ -4014,12 +4617,24 @@ fn remove_empty_provider_stop_canary_cgroup(
 }
 
 #[cfg(target_os = "linux")]
-fn stop_provider_stop_canary_cgroup(
+fn stop_provider_stop_canary_cgroup_members(
     cgroup: &ProviderStopCanaryCgroup,
     leader: LinuxProcessIdentity,
     pins: &mut BTreeMap<libc::pid_t, ProviderStopCanaryProcessPin>,
 ) -> Result<(), CliError> {
     freeze_provider_stop_canary_cgroup(cgroup)?;
+    #[cfg(debug_assertions)]
+    if env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_MEMBER_CHURN_ONCE").as_deref()
+        == Ok("1")
+        && !PROVIDER_STOP_CANARY_TEST_MEMBER_CHURN_INJECTED.swap(true, Ordering::SeqCst)
+    {
+        let _ = write_provider_stop_canary_cgroup_control(&cgroup.freeze, b"0");
+        return Err(CliError::runtime(
+            "provider-stop-canary-member-unverified",
+            "the provider cgroup test membership changed during the first stop attempt",
+            None,
+        ));
+    }
     if let Err(error) = observe_provider_stop_canary_members(cgroup, leader, pins) {
         let _ = write_provider_stop_canary_cgroup_control(&cgroup.freeze, b"0");
         return Err(error);
@@ -4048,15 +4663,48 @@ fn stop_provider_stop_canary_cgroup(
     let deadline = Instant::now() + Duration::from_secs(2);
     while !provider_stop_canary_cgroup_members(cgroup)?.is_empty() {
         if Instant::now() >= deadline {
-            return Err(CliError::runtime(
-                "provider-stop-canary-cgroup-cleanup-failed",
-                "the exact provider cgroup did not become empty within its bound",
-                None,
-            ));
+            let members = provider_stop_canary_cgroup_members(cgroup)?;
+            let mut leader_zombie = false;
+            let mut descendant_zombie = false;
+            let mut live_member = false;
+            for pid in members {
+                match read_linux_process_identity(pid).ok().flatten() {
+                    Some(identity) if identity.zombie && pid == leader.pid => {
+                        leader_zombie = true;
+                    }
+                    Some(identity) if identity.zombie => {
+                        descendant_zombie = true;
+                    }
+                    Some(_) => live_member = true,
+                    None => {}
+                }
+            }
+            let (code, message) = if leader_zombie {
+                (
+                    "provider-stop-canary-leader-zombie-retained",
+                    "the exact provider leader remained as a zombie in its cgroup",
+                )
+            } else if descendant_zombie {
+                (
+                    "provider-stop-canary-descendant-zombie-retained",
+                    "an exact provider descendant remained as a zombie in its cgroup",
+                )
+            } else if live_member {
+                (
+                    "provider-stop-canary-member-live-after-signal",
+                    "an exact provider member remained live after its pinned stop signal",
+                )
+            } else {
+                (
+                    "provider-stop-canary-cgroup-not-empty",
+                    "the exact provider cgroup did not become empty within its bound",
+                )
+            };
+            return Err(CliError::runtime(code, message, None));
         }
         thread::sleep(Duration::from_millis(10));
     }
-    remove_empty_provider_stop_canary_cgroup(cgroup)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -4198,6 +4846,67 @@ fn provider_stop_canary_has_only_canonical_cgroup2_mount(mountinfo: &str) -> boo
 }
 
 #[cfg(target_os = "linux")]
+fn canonical_cgroup2_mount_id(mountinfo: &str) -> Option<u64> {
+    let mut mount_id = None;
+    for line in mountinfo.lines() {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        let current_mount_id = fields.next()?.parse::<u64>().ok().filter(|id| *id > 0)?;
+        let _parent_mount_id = fields.next()?;
+        let _device = fields.next()?;
+        let root = fields.next()?;
+        let mountpoint = fields.next()?;
+        if mountpoint.starts_with("/sys/fs/cgroup/") {
+            return None;
+        }
+        let mut filesystem = filesystem.split_whitespace();
+        if filesystem.next()? != "cgroup2" {
+            continue;
+        }
+        if root != "/" || mountpoint != "/sys/fs/cgroup" || mount_id.is_some() {
+            return None;
+        }
+        mount_id = Some(current_mount_id);
+    }
+    mount_id
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_cgroup_mount_identity() -> Option<TmuxCgroupMountIdentity> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mount_id = canonical_cgroup2_mount_id(&mountinfo)?;
+    if !provider_stop_canary_path_is_cgroupfs(Path::new("/sys/fs/cgroup")).ok()? {
+        return None;
+    }
+    let namespace = fs::metadata("/proc/self/ns/cgroup").ok()?;
+    let mount_namespace = fs::metadata("/proc/self/ns/mnt").ok()?;
+    let mount = fs::metadata("/sys/fs/cgroup").ok()?;
+    Some(TmuxCgroupMountIdentity {
+        namespace_device: namespace.dev(),
+        namespace_inode: namespace.ino(),
+        mount_namespace_device: mount_namespace.dev(),
+        mount_namespace_inode: mount_namespace.ino(),
+        mount_device: mount.dev(),
+        mount_inode: mount.ino(),
+        mount_id,
+        boot_id: linux_boot_id().ok()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_mount_identity_matches(identity: &TmuxRuntimeIdentity) -> bool {
+    let Some(expected) = identity.cgroup_mount.as_ref() else {
+        return false;
+    };
+    capture_linux_cgroup_mount_identity().as_ref() == Some(expected)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_absence_is_trusted(identity: &TmuxRuntimeIdentity, root: &Path) -> bool {
+    root == Path::new("/sys/fs/cgroup") && linux_cgroup_mount_identity_matches(identity)
+}
+
+#[cfg(target_os = "linux")]
 fn validate_provider_stop_canary_cgroup_mount_topology() -> Result<(), CliError> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").map_err(|_| {
         CliError::runtime(
@@ -4241,25 +4950,555 @@ fn validate_provider_stop_canary_inherited_paths(
 }
 
 #[cfg(target_os = "linux")]
+fn resolve_provider_stop_canary_agent_bin(agent_bin: &Path) -> Result<PathBuf, CliError> {
+    if agent_bin.is_absolute() || agent_bin.components().count() != 1 {
+        return Ok(agent_bin.to_path_buf());
+    }
+    let name = agent_bin.to_str().ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-agent-binary-unavailable",
+            "the canary provider binary name is not valid UTF-8",
+            None,
+        )
+    })?;
+    binary_on_path(name).ok_or_else(|| {
+        CliError::runtime(
+            "provider-stop-canary-agent-binary-unavailable",
+            "the canary provider binary could not be resolved on PATH",
+            None,
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_MAX_CAPABILITY: u32 = 63;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECUREBITS: libc::c_int = libc::SECBIT_NOROOT
+    | libc::SECBIT_NOROOT_LOCKED
+    | libc::SECBIT_NO_SETUID_FIXUP
+    | libc::SECBIT_NO_SETUID_FIXUP_LOCKED
+    | libc::SECBIT_NO_CAP_AMBIENT_RAISE
+    | libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_BPF_LD_W_ABS: u16 = 0x20;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K: u16 = 0x15;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_BPF_JMP_JSET_K: u16 = 0x45;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_BPF_RET_K: u16 = 0x06;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_DATA_NR_OFFSET: u32 = 0;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_DATA_ARG0_OFFSET: u32 = 16;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+#[cfg(target_os = "linux")]
+const PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const PROVIDER_STOP_CANARY_X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct ProviderStopCanaryCapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct ProviderStopCanaryCapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_namespace_identity_maps(
+    effective_uid: libc::uid_t,
+    effective_gid: libc::gid_t,
+) -> (Vec<u8>, Vec<u8>) {
+    (
+        format!("0 {effective_uid} 1\n").into_bytes(),
+        format!("0 {effective_gid} 1\n").into_bytes(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_last_capability() -> Result<u32, CliError> {
+    let raw = fs::read_to_string("/proc/sys/kernel/cap_last_cap").map_err(|_| {
+        CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the canary guardian could not observe the kernel capability bound",
+            None,
+        )
+    })?;
+    let last_capability = raw.trim().parse::<u32>().map_err(|_| {
+        CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the kernel capability bound is malformed",
+            None,
+        )
+    })?;
+    if last_capability > PROVIDER_STOP_CANARY_MAX_CAPABILITY {
+        return Err(CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the kernel capability bound exceeds the canary privilege seal",
+            None,
+        ));
+    }
+    Ok(last_capability)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_syscall_error(operation: impl std::fmt::Display) -> io::Error {
+    let error = io::Error::last_os_error();
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_prctl_state(
+    result: libc::c_int,
+    expected: libc::c_int,
+    operation: &str,
+) -> io::Result<bool> {
+    if result < 0 {
+        Err(provider_stop_canary_syscall_error(operation))
+    } else {
+        Ok(result == expected)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_bpf_stmt(code: u16, value: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k: value,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_bpf_jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt,
+        jf,
+        k: value,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_push_masked_syscall_rule(
+    filter: &mut Vec<libc::sock_filter>,
+    syscall: libc::c_long,
+    mask: u32,
+    errno: libc::c_int,
+) -> Result<(), CliError> {
+    let body = [
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_ARG0_OFFSET,
+        ),
+        provider_stop_canary_bpf_jump(PROVIDER_STOP_CANARY_BPF_JMP_JSET_K, mask, 0, 1),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO | errno as u32,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW,
+        ),
+    ];
+    let body_len = u8::try_from(body.len()).map_err(|_| {
+        CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the provider stop canary masked syscall filter rule is too large",
+            None,
+        )
+    })?;
+    filter.extend([
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_NR_OFFSET,
+        ),
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K,
+            syscall as u32,
+            0,
+            body_len,
+        ),
+    ]);
+    filter.extend(body);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_push_equal_syscall_rule(
+    filter: &mut Vec<libc::sock_filter>,
+    syscall: libc::c_long,
+    argument: u32,
+    errno: libc::c_int,
+) -> Result<(), CliError> {
+    let body = [
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_ARG0_OFFSET,
+        ),
+        provider_stop_canary_bpf_jump(PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K, argument, 0, 1),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO | errno as u32,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW,
+        ),
+    ];
+    let body_len = u8::try_from(body.len()).map_err(|_| {
+        CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the provider stop canary exact syscall filter rule is too large",
+            None,
+        )
+    })?;
+    filter.extend([
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_NR_OFFSET,
+        ),
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K,
+            syscall as u32,
+            0,
+            body_len,
+        ),
+    ]);
+    filter.extend(body);
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn provider_stop_canary_audit_arch() -> Option<u32> {
+    Some(0xc000_003e)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn provider_stop_canary_audit_arch() -> Option<u32> {
+    Some(0xc000_00b7)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn provider_stop_canary_audit_arch() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_seccomp_filter() -> Result<Vec<libc::sock_filter>, CliError> {
+    let audit_arch = provider_stop_canary_audit_arch().ok_or_else(|| {
+        CliError::runtime(
+            "provider-stop-canary-privilege-seal-unavailable",
+            "the Linux architecture has no provider stop canary seccomp contract",
+            None,
+        )
+    })?;
+    let mut filter = vec![
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_ARCH_OFFSET,
+        ),
+        provider_stop_canary_bpf_jump(PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K, audit_arch, 1, 0),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_KILL_PROCESS,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_LD_W_ABS,
+            PROVIDER_STOP_CANARY_SECCOMP_DATA_NR_OFFSET,
+        ),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    filter.extend([
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JSET_K,
+            PROVIDER_STOP_CANARY_X32_SYSCALL_BIT,
+            0,
+            1,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_KILL_PROCESS,
+        ),
+    ]);
+    filter.extend([
+        // clone3 keeps its flags behind a user pointer, so classic seccomp
+        // cannot safely inspect them. ENOSYS preserves libc's classic-clone
+        // fallback while removing the uninspectable namespace creation path.
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K,
+            libc::SYS_clone3 as u32,
+            0,
+            1,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+        ),
+        // setns accepts zero as "infer the namespace type from the fd"; block
+        // the syscall rather than leaving an untyped user-namespace join path.
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K,
+            libc::SYS_setns as u32,
+            0,
+            1,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        // io_uring can otherwise create local-domain sockets without passing
+        // through the socket syscall and its argument filter.
+        provider_stop_canary_bpf_jump(
+            PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K,
+            libc::SYS_io_uring_setup as u32,
+            0,
+            1,
+        ),
+        provider_stop_canary_bpf_stmt(
+            PROVIDER_STOP_CANARY_BPF_RET_K,
+            PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+    ]);
+    provider_stop_canary_push_masked_syscall_rule(
+        &mut filter,
+        libc::SYS_unshare,
+        libc::CLONE_NEWUSER as u32,
+        libc::EPERM,
+    )?;
+    provider_stop_canary_push_masked_syscall_rule(
+        &mut filter,
+        libc::SYS_clone,
+        libc::CLONE_NEWUSER as u32,
+        libc::EPERM,
+    )?;
+    // The canary closes every inherited non-standard descriptor before exec.
+    // Denying new named local-domain sockets removes the ordinary same-UID
+    // D-Bus, user-systemd, SSH-agent, and container-daemon broker channels
+    // without denying the provider's Internet sockets. Anonymous socketpairs
+    // remain available for provider launchers to supervise their own children;
+    // they cannot connect to a host endpoint or recover a sealed descriptor.
+    provider_stop_canary_push_equal_syscall_rule(
+        &mut filter,
+        libc::SYS_socket,
+        libc::AF_UNIX as u32,
+        libc::EPERM,
+    )?;
+    filter.push(provider_stop_canary_bpf_stmt(
+        PROVIDER_STOP_CANARY_BPF_RET_K,
+        PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW,
+    ));
+    Ok(filter)
+}
+
+#[cfg(target_os = "linux")]
+fn install_provider_stop_canary_seccomp_filter(filter: &mut [libc::sock_filter]) -> io::Result<()> {
+    let mut program = libc::sock_fprog {
+        len: u16::try_from(filter.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider stop canary seccomp filter is too large",
+            )
+        })?,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: no-new-privileges is already set, program points at initialized
+    // classic BPF instructions, and seccomp copies the program before return.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &mut program as *mut libc::sock_fprog,
+        )
+    } != 0
+    {
+        return Err(provider_stop_canary_syscall_error(
+            "seccomp(SECCOMP_SET_MODE_FILTER)",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_privileges_are_sealed(last_capability: u32) -> io::Result<bool> {
+    if last_capability > PROVIDER_STOP_CANARY_MAX_CAPABILITY {
+        return Ok(false);
+    }
+    // SAFETY: every prctl call uses a documented fixed-width Linux argument.
+    if !provider_stop_canary_prctl_state(
+        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+        1,
+        "prctl(PR_GET_NO_NEW_PRIVS)",
+    )? {
+        return Ok(false);
+    }
+    let securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+    if securebits < 0 {
+        return Err(provider_stop_canary_syscall_error(
+            "prctl(PR_GET_SECUREBITS)",
+        ));
+    }
+    if securebits & PROVIDER_STOP_CANARY_SECUREBITS != PROVIDER_STOP_CANARY_SECUREBITS {
+        return Ok(false);
+    }
+    for capability in 0..=last_capability {
+        let bounding = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if bounding < 0 {
+            return Err(provider_stop_canary_syscall_error(format!(
+                "prctl(PR_CAPBSET_READ, capability {capability})"
+            )));
+        }
+        let ambient = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET,
+                capability,
+                0,
+                0,
+            )
+        };
+        if ambient < 0 {
+            return Err(provider_stop_canary_syscall_error(format!(
+                "prctl(PR_CAP_AMBIENT_IS_SET, capability {capability})"
+            )));
+        }
+        if bounding != 0 || ambient != 0 {
+            return Ok(false);
+        }
+    }
+    let mut header = ProviderStopCanaryCapabilityHeader {
+        version: PROVIDER_STOP_CANARY_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [ProviderStopCanaryCapabilityData::default(); 2];
+    // SAFETY: header and the two v3 data words are initialized writable
+    // storage for capget.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(provider_stop_canary_syscall_error("capget"));
+    }
+    let seccomp = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+    if seccomp < 0 {
+        return Err(provider_stop_canary_syscall_error("prctl(PR_GET_SECCOMP)"));
+    }
+    Ok(seccomp == libc::SECCOMP_MODE_FILTER as libc::c_int
+        && data
+            .iter()
+            .all(|entry| entry.effective == 0 && entry.permitted == 0 && entry.inheritable == 0))
+}
+
+#[cfg(target_os = "linux")]
+fn seal_provider_stop_canary_namespace_privileges(
+    last_capability: u32,
+    seccomp_filter: &mut [libc::sock_filter],
+) -> io::Result<()> {
+    if last_capability > PROVIDER_STOP_CANARY_MAX_CAPABILITY {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel capability bound exceeds the canary privilege seal",
+        ));
+    }
+    // Root exists only inside this one-entry user namespace and is required
+    // for the private mount setup above. Lock root semantics off before
+    // clearing every capability set so exec cannot reconstruct privilege.
+    // SAFETY: every prctl call uses a documented fixed-width Linux argument.
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECUREBITS,
+            PROVIDER_STOP_CANARY_SECUREBITS,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(provider_stop_canary_syscall_error(
+            "prctl(PR_SET_SECUREBITS)",
+        ));
+    }
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(provider_stop_canary_syscall_error(
+            "prctl(PR_CAP_AMBIENT_CLEAR_ALL)",
+        ));
+    }
+    for capability in 0..=last_capability {
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+            return Err(provider_stop_canary_syscall_error(format!(
+                "prctl(PR_CAPBSET_DROP, capability {capability})"
+            )));
+        }
+    }
+    let mut header = ProviderStopCanaryCapabilityHeader {
+        version: PROVIDER_STOP_CANARY_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [ProviderStopCanaryCapabilityData::default(); 2];
+    // SAFETY: header and the two v3 data words are initialized storage for
+    // capset, which clears only this process's capability sets.
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0 {
+        return Err(provider_stop_canary_syscall_error("capset"));
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(provider_stop_canary_syscall_error(
+            "prctl(PR_SET_NO_NEW_PRIVS)",
+        ));
+    }
+    install_provider_stop_canary_seccomp_filter(seccomp_filter)?;
+    if !provider_stop_canary_privileges_are_sealed(last_capability)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the canary namespace privilege seal did not converge",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn isolate_provider_stop_canary_child_cgroup_view(
     uid_map: &[u8],
     gid_map: &[u8],
     cgroup_path: &[u8],
+    last_capability: u32,
+    seccomp_filter: &mut [libc::sock_filter],
 ) -> io::Result<()> {
-    // This runs only after the child entered its incarnation-derived cgroup.
-    // That child cgroup therefore becomes the root of the new cgroup
-    // namespace, hiding every writable ancestor and sibling from the provider.
+    // Create the user namespace first: Linux requires its identity map before
+    // this unprivileged child can create the private mount/cgroup namespaces.
     // SAFETY: this runs in the freshly forked child before provider exec.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) }
-        != 0
-    {
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         let error = io::Error::last_os_error();
-        report_provider_stop_canary_preexec_failure(
-            b"provider canary namespace isolation failed\n",
-        );
+        report_provider_stop_canary_preexec_failure(b"provider canary user namespace failed\n");
         return Err(io::Error::new(
             error.kind(),
-            format!("namespace isolation: {error}"),
+            format!("user namespace: {error}"),
         ));
     }
     write_provider_stop_canary_namespace_map(b"/proc/self/uid_map\0", uid_map).map_err(
@@ -4280,6 +5519,18 @@ fn isolate_provider_stop_canary_child_cgroup_view(
             io::Error::new(error.kind(), format!("gid map: {error}"))
         },
     )?;
+    // The child already entered its incarnation-derived cgroup. Creating the
+    // cgroup namespace now makes that exact boundary its namespace root; the
+    // private mount namespace can safely replace the inherited host view.
+    // SAFETY: the mapped namespace root owns both requested child namespaces.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) } != 0 {
+        let error = io::Error::last_os_error();
+        report_provider_stop_canary_preexec_failure(b"provider canary mount namespace failed\n");
+        return Err(io::Error::new(
+            error.kind(),
+            format!("mount/cgroup namespace: {error}"),
+        ));
+    }
 
     // Keep mount changes private, then cover the inherited host cgroup mount
     // with a read-only cgroup-v2 view rooted at the exact child boundary.
@@ -4351,18 +5602,12 @@ fn isolate_provider_stop_canary_child_cgroup_view(
         ));
     }
 
-    // Provider exec must not gain privilege from file capabilities. Its real
-    // nonzero UID is preserved by the one-entry namespace map, so exec clears
-    // the temporary namespace capabilities used for the mount setup.
-    // SAFETY: PR_SET_NO_NEW_PRIVS affects only this child and is inherited.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        let error = io::Error::last_os_error();
-        report_provider_stop_canary_preexec_failure(b"provider canary no-new-privileges failed\n");
-        return Err(io::Error::new(
-            error.kind(),
-            format!("no-new-privileges: {error}"),
-        ));
-    }
+    seal_provider_stop_canary_namespace_privileges(last_capability, seccomp_filter).map_err(
+        |error| {
+            report_provider_stop_canary_preexec_failure(b"provider canary privilege seal failed\n");
+            io::Error::new(error.kind(), format!("privilege seal: {error}"))
+        },
+    )?;
     // Every guardian/control/cgroup descriptor is an implementation detail.
     // Mark all non-standard descriptors close-on-exec after the namespace and
     // cgroup setup has consumed them. CLOEXEC preserves Rust's child-to-parent
@@ -4479,27 +5724,22 @@ struct ProviderStopCanaryControlSocket {
 }
 
 #[cfg(target_os = "linux")]
+fn provider_stop_canary_persisted_pane_start_time(identity: &TmuxRuntimeIdentity) -> Option<u64> {
+    identity.resolved_pane_start_time().ok().flatten()
+}
+
+#[cfg(target_os = "linux")]
 fn pin_provider_stop_canary_controller_process(
     identity: &TmuxRuntimeIdentity,
 ) -> Result<(libc::pid_t, u64, OwnedFd), CliError> {
-    let mut persisted = identity
-        .process_session_members
-        .iter()
-        .filter(|member| member.pid == identity.pane_pid && member.start_time > 0);
-    let expected = persisted.next().ok_or_else(|| {
-        CliError::runtime(
-            "provider-stop-canary-controller-identity-unverified",
-            "the canary guardian has no persisted controller pane PID/start-time identity",
-            None,
-        )
-    })?;
-    if persisted.next().is_some() {
-        return Err(CliError::runtime(
-            "provider-stop-canary-controller-identity-unverified",
-            "the canary guardian has ambiguous persisted controller pane identities",
-            None,
-        ));
-    }
+    let expected_start_time =
+        provider_stop_canary_persisted_pane_start_time(identity).ok_or_else(|| {
+            CliError::runtime(
+                "provider-stop-canary-controller-identity-unverified",
+                "the canary guardian has no unambiguous persisted controller pane PID/start-time identity",
+                None,
+            )
+        })?;
     let pidfd = open_provider_stop_canary_pidfd(identity.pane_pid as u32).map_err(|_| {
         CliError::runtime(
             "provider-stop-canary-controller-identity-unverified",
@@ -4515,7 +5755,7 @@ fn pin_provider_stop_canary_controller_process(
                 None,
             )
         })?
-        .filter(|pane| !pane.zombie && pane.start_time == expected.start_time)
+        .filter(|pane| !pane.zombie && pane.start_time == expected_start_time)
         .ok_or_else(|| {
             CliError::runtime(
                 "provider-stop-canary-controller-identity-unverified",
@@ -4530,7 +5770,7 @@ fn pin_provider_stop_canary_controller_process(
             None,
         ));
     }
-    Ok((current.pid, expected.start_time, pidfd))
+    Ok((current.pid, expected_start_time, pidfd))
 }
 
 #[cfg(target_os = "linux")]
@@ -4737,9 +5977,17 @@ fn provider_stop_canary_accept_authorized_transition(
     context: &CliContext,
     record: &SessionRecord,
     action: &str,
-    child_pid: u32,
+    child_identity: (u32, u64),
     child_cgroup_path: &Path,
 ) -> Result<bool, CliError> {
+    let (child_pid, child_start_ticks) = child_identity;
+    let request_deadline = Instant::now() + PROVIDER_STOP_CANARY_GUARDIAN_CONTROL_BUDGET;
+    enum Admission {
+        Rejected,
+        Status,
+        Transition,
+    }
+
     for _ in 0..8 {
         let (mut stream, _) = match control.listener.accept() {
             Ok(value) => value,
@@ -4752,36 +6000,28 @@ fn provider_stop_canary_accept_authorized_transition(
                 ));
             }
         };
-        let accepted = (|| -> bool {
-            if stream
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .is_err()
-            {
-                return false;
-            }
-            let mut bytes = Vec::new();
-            if Read::by_ref(&mut stream)
-                .take(PROVIDER_STOP_CANARY_MARKER_MAX_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() as u64 > PROVIDER_STOP_CANARY_MARKER_MAX_BYTES
-            {
-                return false;
-            }
-            let Ok(request) = serde_json::from_slice::<Value>(&bytes) else {
-                return false;
-            };
+        let admission = (|| -> Admission {
             let Ok(credentials) = provider_stop_canary_peer_credentials(&stream) else {
-                return false;
+                return Admission::Rejected;
             };
             if credentials.uid != session_effective_uid()
                 || !provider_stop_canary_peer_descends_from_controller(credentials.pid, boundary)
                 || provider_stop_canary_peer_inside_child_cgroup(credentials.pid, child_cgroup_path)
             {
-                return false;
+                return Admission::Rejected;
             }
+            let Ok(bytes) = provider_stop_canary_read_control_frame(
+                &mut stream,
+                PROVIDER_STOP_CANARY_MARKER_MAX_BYTES as usize,
+                request_deadline,
+                true,
+            ) else {
+                return Admission::Rejected;
+            };
+            let Ok(request) = serde_json::from_slice::<Value>(&bytes) else {
+                return Admission::Rejected;
+            };
             if request["schema_version"] != "agent-session.provider-stop-canary-control.v1"
-                || request["action"] != action
                 || request["controller_session_id"] != boundary.session_id
                 || request["controller_session_incarnation"] != boundary.session_incarnation
                 || request["session_id"] != record.id
@@ -4791,31 +6031,475 @@ fn provider_stop_canary_accept_authorized_transition(
                         .as_ref()
                         .map(|runtime| runtime.launch_id.as_str())
             {
-                return false;
+                return Admission::Rejected;
+            }
+            if request["action"] == "status" {
+                return if action == "stop"
+                    && provider_stop_canary_child_matches_reservation(child_pid, child_start_ticks)
+                {
+                    Admission::Status
+                } else {
+                    Admission::Rejected
+                };
+            }
+            if request["action"] != action {
+                return Admission::Rejected;
             }
             let (marker, state, release) = if action == "stop" {
                 (PROVIDER_STOP_CANARY_REQUEST_FILE, "stop_requested", false)
             } else if action == "release" {
                 (PROVIDER_STOP_CANARY_RELEASE_FILE, "release_requested", true)
             } else {
-                return false;
+                return Admission::Rejected;
             };
-            provider_stop_canary_request_matches(context, record, marker, state)
+            if provider_stop_canary_request_matches(context, record, marker, state)
                 && provider_stop_canary_request_is_reserved(
                     context, record, &request, release, child_pid,
                 )
+            {
+                Admission::Transition
+            } else {
+                Admission::Rejected
+            }
         })();
-        let response = if accepted {
-            b"{\"ok\":true}\n".as_slice()
-        } else {
-            b"{\"ok\":false}\n".as_slice()
+        let response = match admission {
+            Admission::Rejected => json!({ "ok": false }),
+            Admission::Status => json!({
+                "schema_version": "agent-session.provider-stop-canary-control.v1",
+                "ok": true,
+                "state": "ready",
+                "session_id": record.id,
+                "launch_id": record.runtime.as_ref().map(|runtime| runtime.launch_id.as_str()),
+                "child_pid": child_pid,
+                "child_start_ticks": child_start_ticks
+            }),
+            Admission::Transition => json!({ "ok": true }),
         };
-        let _ = stream.write_all(response);
-        if accepted {
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            let _ = provider_stop_canary_write_control_frame(&mut stream, &bytes, request_deadline);
+        }
+        if matches!(admission, Admission::Transition) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_controller_reference(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(String, String), CliError> {
+    let assignment_id = provider_stop_canary_assignment_id(record).ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-assignment-invalid",
+            "the exact canary has no managed assignment binding",
+            None,
+        )
+    })?;
+    let registry = orchestration::load_registry_readonly(context)?;
+    let assignment = registry.assignments.get(assignment_id).ok_or_else(|| {
+        CliError::data(
+            "provider-stop-canary-assignment-invalid",
+            "the exact canary assignment is unavailable",
+            None,
+        )
+    })?;
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if assignment.worker.as_ref().is_none_or(|worker| {
+        worker.session_id != record.id || worker.session_incarnation != launch_id
+    }) {
+        return Err(CliError::data(
+            "provider-stop-canary-worker-mismatch",
+            "the exact canary assignment does not bind this worker incarnation",
+            None,
+        ));
+    }
+    Ok((
+        assignment.primary_manager.session_id.clone(),
+        assignment.primary_manager.session_incarnation.clone(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_peer_is_exact_guardian(
+    stream: &UnixStream,
+    record: &SessionRecord,
+) -> bool {
+    let Ok(credentials) = provider_stop_canary_peer_credentials(stream) else {
+        return false;
+    };
+    if credentials.uid != session_effective_uid() {
+        return false;
+    }
+    let Ok(Some(wrapper)) = persisted_tmux_runtime_identity(record) else {
+        return false;
+    };
+    let Ok(expected_wrapper_start) = provider_stop_canary_wrapper_start_time(&wrapper) else {
+        return false;
+    };
+    let Ok(Some(current_wrapper)) = read_linux_process_identity(wrapper.pane_pid) else {
+        return false;
+    };
+    if current_wrapper.zombie || current_wrapper.start_time != expected_wrapper_start {
+        return false;
+    }
+    read_linux_process_identity(credentials.pid)
+        .ok()
+        .flatten()
+        .is_some_and(|guardian| !guardian.zombie && guardian.parent_pid == wrapper.pane_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_child_is_in_exact_cgroup(
+    context: &CliContext,
+    record: &SessionRecord,
+    child_pid: u32,
+) -> bool {
+    let Ok(expected) = provider_stop_canary_cgroup_path(context, record).and_then(|path| {
+        path.strip_prefix("/sys/fs/cgroup")
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                CliError::runtime(
+                    "provider-stop-canary-cgroup-unavailable",
+                    "the exact canary cgroup path is outside cgroup v2",
+                    None,
+                )
+            })
+    }) else {
+        return false;
+    };
+    let Ok(membership) = fs::read_to_string(format!("/proc/{child_pid}/cgroup")) else {
+        return false;
+    };
+    membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .is_some_and(|path| Path::new(path) == Path::new("/").join(expected))
+}
+
+#[cfg(target_os = "linux")]
+fn connect_provider_stop_canary_control(
+    address: &SocketAddr,
+    deadline: Instant,
+) -> Result<UnixStream, CliError> {
+    let name = address.as_abstract_name().ok_or_else(|| {
+        CliError::runtime(
+            "provider-stop-canary-control-unavailable",
+            "the exact canary startup channel address is invalid",
+            None,
+        )
+    })?;
+    let mut unix_address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    if name.len() + 1 > unix_address.sun_path.len() {
+        return Err(CliError::runtime(
+            "provider-stop-canary-control-unavailable",
+            "the exact canary startup channel address is too long",
+            None,
+        ));
+    }
+    // SAFETY: socket returns one owned descriptor on success.
+    let raw_fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(CliError::runtime(
+            "provider-stop-canary-control-unavailable",
+            "the exact canary startup channel could not be opened",
+            None,
+        ));
+    }
+    // SAFETY: raw_fd is newly returned and owned by this function.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    unix_address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in unix_address.sun_path[1..].iter_mut().zip(name.iter()) {
+        *target = *source as libc::c_char;
+    }
+    let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
+    // SAFETY: unix_address contains one bounded abstract AF_UNIX address.
+    let connect_result = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&unix_address as *const libc::sockaddr_un).cast(),
+            address_length as libc::socklen_t,
+        )
+    };
+    if connect_result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-control-unavailable",
+                "the exact canary guardian control channel is unavailable",
+                None,
+            ));
+        }
+        provider_stop_canary_poll_fd(socket.as_raw_fd(), libc::POLLOUT, deadline, false).map_err(
+            |_| {
+                CliError::unavailable(
+                    "provider-stop-canary-control-unavailable",
+                    "the exact canary guardian control channel did not connect within its bound",
+                    None,
+                )
+            },
+        )?;
+        let mut socket_error = 0;
+        let mut socket_error_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: socket_error and its length are valid writable storage for SO_ERROR.
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut libc::c_int).cast(),
+                &mut socket_error_length,
+            )
+        } != 0
+            || socket_error != 0
+        {
+            return Err(CliError::unavailable(
+                "provider-stop-canary-control-unavailable",
+                "the exact canary guardian control channel is unavailable",
+                None,
+            ));
+        }
+    }
+    Ok(UnixStream::from(socket))
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_poll_fd(
+    fd: libc::c_int,
+    events: libc::c_short,
+    deadline: Instant,
+    observe_parent_loss: bool,
+) -> io::Result<()> {
+    loop {
+        if observe_parent_loss && PROVIDER_STOP_CANARY_GUARDIAN_PARENT_LOST.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the exact canary supervisor was lost",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the canary control deadline elapsed",
+            ));
+        }
+        let wait = if observe_parent_loss {
+            remaining.min(PROVIDER_STOP_CANARY_PARENT_LOSS_POLL_INTERVAL)
+        } else {
+            remaining
+        };
+        let timeout_ms = wait.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for the duration
+        // of this call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result > 0 {
+            if descriptor.revents & events != 0 {
+                return Ok(());
+            }
+            return Err(io::Error::other("the canary control socket closed"));
+        }
+        if result == 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_write_control_frame(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "control socket closed",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                provider_stop_canary_poll_fd(stream.as_raw_fd(), libc::POLLOUT, deadline, false)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    stream.shutdown(std::net::Shutdown::Write)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_read_control_frame(
+    stream: &mut UnixStream,
+    max_bytes: usize,
+    deadline: Instant,
+    observe_parent_loss: bool,
+) -> io::Result<Vec<u8>> {
+    stream.set_nonblocking(true)?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 512];
+    loop {
+        if observe_parent_loss && PROVIDER_STOP_CANARY_GUARDIAN_PARENT_LOST.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the exact canary supervisor was lost",
+            ));
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => {
+                if bytes.len().saturating_add(read) > max_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the canary control frame exceeded its bound",
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                provider_stop_canary_poll_fd(
+                    stream.as_raw_fd(),
+                    libc::POLLIN,
+                    deadline,
+                    observe_parent_loss,
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_provider_stop_canary_startup(
+    context: &CliContext,
+    record: &SessionRecord,
+    controller_session_id: &str,
+    controller_session_incarnation: &str,
+    address: &SocketAddr,
+    budget: Duration,
+) -> Result<(u32, u64), CliError> {
+    let deadline = Instant::now() + budget;
+    let mut stream = connect_provider_stop_canary_control(address, deadline)?;
+    if !provider_stop_canary_peer_is_exact_guardian(&stream, record) {
+        return Err(CliError::data(
+            "provider-stop-canary-guardian-identity-unverified",
+            "the canary startup channel is not owned by the exact guardian",
+            None,
+        ));
+    }
+    let request = json!({
+        "schema_version": "agent-session.provider-stop-canary-control.v1",
+        "action": "status",
+        "controller_session_id": controller_session_id,
+        "controller_session_incarnation": controller_session_incarnation,
+        "session_id": record.id,
+        "launch_id": record.runtime.as_ref().map(|runtime| runtime.launch_id.as_str())
+    });
+    let bytes = serde_json::to_vec(&request).map_err(|_| {
+        CliError::data(
+            "provider-stop-canary-control-invalid",
+            "the exact canary startup request could not be rendered",
+            None,
+        )
+    })?;
+    provider_stop_canary_write_control_frame(&mut stream, &bytes, deadline).map_err(|_| {
+        CliError::unavailable(
+            "provider-stop-canary-control-unavailable",
+            "the exact canary startup request could not be delivered",
+            None,
+        )
+    })?;
+    let response = provider_stop_canary_read_control_frame(
+        &mut stream,
+        PROVIDER_STOP_CANARY_MARKER_MAX_BYTES as usize,
+        deadline,
+        false,
+    )
+    .map_err(|_| {
+        CliError::unavailable(
+            "provider-stop-canary-control-unavailable",
+            "the exact canary guardian did not return bounded startup evidence",
+            None,
+        )
+    })?;
+    let response = serde_json::from_slice::<Value>(&response).map_err(|_| {
+        CliError::data(
+            "provider-stop-canary-startup-evidence-invalid",
+            "the exact canary startup evidence is invalid",
+            None,
+        )
+    })?;
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str());
+    if response["schema_version"] != "agent-session.provider-stop-canary-control.v1"
+        || response["ok"] != true
+        || response["state"] != "ready"
+        || response["session_id"] != record.id
+        || response["launch_id"].as_str() != launch_id
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-startup-evidence-invalid",
+            "the exact canary guardian returned mismatched startup evidence",
+            None,
+        ));
+    }
+    let child_pid = response["child_pid"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-startup-evidence-invalid",
+                "the exact canary guardian returned an invalid child PID",
+                None,
+            )
+        })?;
+    let child_start_ticks = response["child_start_ticks"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CliError::data(
+                "provider-stop-canary-startup-evidence-invalid",
+                "the exact canary guardian returned an invalid child start time",
+                None,
+            )
+        })?;
+    if !provider_stop_canary_child_matches_reservation(child_pid, child_start_ticks)
+        || !provider_stop_canary_child_is_in_exact_cgroup(context, record, child_pid)
+    {
+        return Err(CliError::data(
+            "provider-stop-canary-child-identity-unverified",
+            "the exact guardian child is not live in its pinned canary cgroup",
+            None,
+        ));
+    }
+    Ok((child_pid, child_start_ticks))
 }
 
 #[cfg(target_os = "linux")]
@@ -4835,22 +6519,15 @@ pub(crate) fn authorize_provider_stop_canary_transition(
         return Ok(());
     }
     let address = provider_stop_canary_control_address(context, record)?;
-    let mut stream = UnixStream::connect_addr(&address).map_err(|_| {
-        CliError::unavailable(
-            "provider-stop-canary-control-unavailable",
-            "the exact canary guardian control channel is unavailable",
+    let deadline = Instant::now() + PROVIDER_STOP_CANARY_CONTROLLER_CONTROL_BUDGET;
+    let mut stream = connect_provider_stop_canary_control(&address, deadline)?;
+    if !provider_stop_canary_peer_is_exact_guardian(&stream, record) {
+        return Err(CliError::data(
+            "provider-stop-canary-guardian-identity-unverified",
+            "the canary control channel is not owned by the exact guardian",
             None,
-        )
-    })?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|_| {
-            CliError::runtime(
-                "provider-stop-canary-control-unavailable",
-                "the exact canary guardian response could not be bounded",
-                None,
-            )
-        })?;
+        ));
+    }
     let request = json!({
         "schema_version": "agent-session.provider-stop-canary-control.v1",
         "action": action,
@@ -4868,30 +6545,31 @@ pub(crate) fn authorize_provider_stop_canary_transition(
             None,
         )
     })?;
-    stream.write_all(&bytes).map_err(|_| {
+    provider_stop_canary_write_control_frame(&mut stream, &bytes, deadline).map_err(|_| {
         CliError::unavailable(
             "provider-stop-canary-control-unavailable",
             "the exact canary guardian request could not be delivered",
             None,
         )
     })?;
-    stream.shutdown(std::net::Shutdown::Write).map_err(|_| {
-        CliError::unavailable(
-            "provider-stop-canary-control-unavailable",
-            "the exact canary guardian request could not be finalized",
-            None,
-        )
-    })?;
-    let mut response = Vec::new();
-    Read::by_ref(&mut stream)
-        .take(256)
-        .read_to_end(&mut response)
-        .map_err(|_| {
-            CliError::unavailable(
-                "provider-stop-canary-control-unavailable",
-                "the exact canary guardian did not acknowledge the request",
-                None,
-            )
+    let response = provider_stop_canary_read_control_frame(&mut stream, 256, deadline, false)
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ) {
+                CliError::data(
+                    "provider-stop-canary-controller-unauthorized",
+                    "the exact canary guardian rejected the caller process ancestry",
+                    None,
+                )
+            } else {
+                CliError::unavailable(
+                    "provider-stop-canary-control-unavailable",
+                    "the exact canary guardian did not acknowledge the request",
+                    None,
+                )
+            }
         })?;
     if serde_json::from_slice::<Value>(&response)
         .ok()
@@ -4936,6 +6614,7 @@ fn run_provider_stop_canary_supervisor(
         }
         let _supervisor_lock = acquire_provider_stop_canary_supervisor_lock(context, &record)?;
         let record = wait_for_provider_stop_canary_wrapper_identity(context, &record)?;
+        let record = wait_for_provider_stop_canary_assignment_binding(context, &record)?;
         #[cfg(target_os = "linux")]
         enable_provider_stop_canary_subreaper().map_err(|_| {
             CliError::runtime(
@@ -5039,12 +6718,13 @@ fn run_provider_stop_canary_supervisor(
                 if provider_stop_canary_cgroup_members(&provider_cgroup)?.is_empty() {
                     remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                 } else {
-                    stop_provider_stop_canary_cgroup(
+                    stop_provider_stop_canary_cgroup_members(
                         &provider_cgroup,
                         supervisor_identity,
                         &mut pins,
                     )?;
                     reap_provider_stop_canary_subreaper_children(&pins, None)?;
+                    remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                 }
             }
             Err(CliError::runtime(
@@ -5057,6 +6737,23 @@ fn run_provider_stop_canary_supervisor(
     match result {
         Ok(()) => 0,
         Err(error) => {
+            if let Ok(record) = load_session_record(context, &args.id)
+                && !provider_stop_canary_request_matches(
+                    context,
+                    &record,
+                    PROVIDER_STOP_CANARY_READY_FILE,
+                    "ready",
+                )
+                && read_provider_stop_canary_startup_failure(context, &record).is_none()
+                && let Err(marker_error) = write_provider_stop_canary_startup_failure(
+                    context,
+                    &record,
+                    "supervisor",
+                    &error,
+                )
+            {
+                eprintln!("{}", marker_error.message());
+            }
             eprintln!("{}", error.message());
             error.0.exit_code
         }
@@ -5084,32 +6781,16 @@ fn run_provider_stop_canary_guardian(
             ));
         }
         #[cfg(target_os = "linux")]
-        let wrapper_identity = persisted_tmux_runtime_identity(&record)
-            .map_err(|_| {
-                CliError::runtime(
-                    "provider-stop-canary-wrapper-identity-unverified",
-                    "the canary guardian could not verify the recorded tmux pane process",
-                    None,
-                )
-            })?
-            .ok_or_else(|| {
-                CliError::runtime(
-                    "provider-stop-canary-wrapper-identity-unverified",
-                    "the canary guardian has no recorded exact tmux pane process",
-                    None,
-                )
-            })?;
+        let (wrapper_identity, expected_parent_start_time) =
+            provider_stop_canary_guardian_wrapper_identity(&record)?;
         #[cfg(target_os = "linux")]
         let expected_parent = wrapper_identity.pane_pid;
-        #[cfg(target_os = "linux")]
-        let expected_parent_start_time =
-            provider_stop_canary_wrapper_start_time(&wrapper_identity)?;
         #[cfg(target_os = "linux")]
         if unsafe { libc::getppid() } != expected_parent
             || !read_linux_process_identity(expected_parent)
                 .map_err(|_| {
                     CliError::runtime(
-                        "provider-stop-canary-wrapper-identity-unverified",
+                        "provider-stop-canary-wrapper-process-unavailable",
                         "the canary guardian could not read the exact supervisor identity",
                         None,
                     )
@@ -5128,7 +6809,7 @@ fn run_provider_stop_canary_guardian(
         let _parent_pidfd =
             open_provider_stop_canary_pidfd(expected_parent as u32).map_err(|_| {
                 CliError::runtime(
-                    "provider-stop-canary-wrapper-identity-unverified",
+                    "provider-stop-canary-wrapper-pidfd-unavailable",
                     "the canary guardian could not pin the exact supervisor identity",
                     None,
                 )
@@ -5202,13 +6883,22 @@ fn run_provider_stop_canary_guardian(
             )
         })?;
         #[cfg(target_os = "linux")]
-        validate_provider_stop_canary_inherited_paths(&record, Path::new(agent_bin))?;
+        let agent_bin = resolve_provider_stop_canary_agent_bin(Path::new(agent_bin))?;
+        #[cfg(target_os = "linux")]
+        validate_provider_stop_canary_inherited_paths(&record, &agent_bin)?;
+        #[cfg(target_os = "linux")]
+        let last_capability = provider_stop_canary_last_capability()?;
+        #[cfg(target_os = "linux")]
+        let mut seccomp_filter = provider_stop_canary_seccomp_filter()?;
         let mut child = ProcessCommand::new(agent_bin);
         child
             .arg("--cd")
             .arg(&record.cwd)
             .arg("--no-alt-screen")
             .args(&record.agent_args)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("XDG_RUNTIME_DIR")
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -5220,8 +6910,8 @@ fn run_provider_stop_canary_guardian(
             let cgroup_procs_fd = provider_cgroup.procs.as_raw_fd();
             let effective_uid = unsafe { libc::geteuid() };
             let effective_gid = unsafe { libc::getegid() };
-            let uid_map = format!("{effective_uid} {effective_uid} 1\n").into_bytes();
-            let gid_map = format!("{effective_gid} {effective_gid} 1\n").into_bytes();
+            let (uid_map, gid_map) =
+                provider_stop_canary_namespace_identity_maps(effective_uid, effective_gid);
             let cgroup_path = std::ffi::CString::new(provider_cgroup.path.as_os_str().as_bytes())
                 .map_err(|_| {
                 CliError::data(
@@ -5252,6 +6942,8 @@ fn run_provider_stop_canary_guardian(
                         &uid_map,
                         &gid_map,
                         cgroup_path.as_bytes_with_nul(),
+                        last_capability,
+                        &mut seccomp_filter,
                     )?;
                     Ok(())
                 });
@@ -5316,6 +7008,8 @@ fn run_provider_stop_canary_guardian(
                 )
             })?;
         #[cfg(target_os = "linux")]
+        let child_start_ticks = child_identity.start_time;
+        #[cfg(target_os = "linux")]
         let mut provider_process_pins = BTreeMap::from([(
             child_pid as libc::pid_t,
             ProviderStopCanaryProcessPin {
@@ -5366,7 +7060,7 @@ fn run_provider_stop_canary_guardian(
                     context,
                     &record,
                     "stop",
-                    child_pid,
+                    (child_pid, child_start_ticks),
                     &provider_cgroup.path,
                 )?;
                 #[cfg(not(target_os = "linux"))]
@@ -5385,19 +7079,44 @@ fn run_provider_stop_canary_guardian(
                         )
                     })?;
                     #[cfg(target_os = "linux")]
-                    let stopped = stop_provider_stop_canary_cgroup(
-                        &provider_cgroup,
-                        guardian_identity,
-                        &mut provider_process_pins,
-                    );
-                    match stopped {
-                        Ok(()) => {}
-                        Err(error) if error.code() == "provider-stop-canary-member-unverified" => {
-                            thread::sleep(Duration::from_millis(idle_poll_ms));
-                            idle_poll_ms = (idle_poll_ms * 2).min(500);
-                            continue;
+                    {
+                        let deadline = Instant::now() + PROVIDER_STOP_CANARY_STOP_RETRY_BUDGET;
+                        let mut retry_poll_ms = 10;
+                        loop {
+                            if !provider_stop_canary_request_matches(
+                                context,
+                                &record,
+                                PROVIDER_STOP_CANARY_REQUEST_FILE,
+                                "stop_requested",
+                            ) || !provider_stop_canary_request_is_reserved(
+                                context,
+                                &record,
+                                &stop_request,
+                                false,
+                                child_pid,
+                            ) {
+                                return Err(CliError::data(
+                                    "provider-stop-canary-request-conflict",
+                                    "the controller-authenticated stop request no longer owns the exact reservation",
+                                    None,
+                                ));
+                            }
+                            match stop_provider_stop_canary_cgroup_members(
+                                &provider_cgroup,
+                                guardian_identity,
+                                &mut provider_process_pins,
+                            ) {
+                                Ok(()) => break,
+                                Err(error)
+                                    if error.code() == "provider-stop-canary-member-unverified"
+                                        && Instant::now() < deadline =>
+                                {
+                                    thread::sleep(Duration::from_millis(retry_poll_ms));
+                                    retry_poll_ms = (retry_poll_ms * 2).min(250);
+                                }
+                                Err(error) => return Err(error),
+                            }
                         }
-                        Err(error) => return Err(error),
                     }
                     let status = child.wait().map_err(|_| {
                         CliError::runtime(
@@ -5411,6 +7130,7 @@ fn run_provider_stop_canary_guardian(
                         &provider_process_pins,
                         Some(child_pid as libc::pid_t),
                     )?;
+                    remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                     let mut stopped = provider_stop_canary_marker(&record, "stopped", child_pid);
                     stopped["child_exit_success"] = Value::Bool(status.success());
                     stopped["request_digest"] = stop_request["request_digest"].clone();
@@ -5433,7 +7153,7 @@ fn run_provider_stop_canary_guardian(
                             context,
                             &record,
                             "release",
-                            child_pid,
+                            (child_pid, child_start_ticks),
                             &provider_cgroup.path,
                         )?;
                         #[cfg(not(target_os = "linux"))]
@@ -5487,7 +7207,7 @@ fn run_provider_stop_canary_guardian(
                     // A provider leader may exit while leaving descendants.
                     // Seal the private cgroup before reaping the leader; process
                     // groups and sessions cannot escape this descendant boundary.
-                    stop_provider_stop_canary_cgroup(
+                    stop_provider_stop_canary_cgroup_members(
                         &provider_cgroup,
                         guardian_identity,
                         &mut provider_process_pins,
@@ -5497,6 +7217,7 @@ fn run_provider_stop_canary_guardian(
                         &provider_process_pins,
                         Some(child_pid as libc::pid_t),
                     )?;
+                    remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(idle_poll_ms));
@@ -5505,7 +7226,7 @@ fn run_provider_stop_canary_guardian(
         })();
         if let Err(error) = child_result {
             #[cfg(target_os = "linux")]
-            stop_provider_stop_canary_cgroup(
+            stop_provider_stop_canary_cgroup_members(
                 &provider_cgroup,
                 guardian_identity,
                 &mut provider_process_pins,
@@ -5530,6 +7251,8 @@ fn run_provider_stop_canary_guardian(
                 &provider_process_pins,
                 Some(child_pid as libc::pid_t),
             )?;
+            #[cfg(target_os = "linux")]
+            remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
             return Err(error);
         }
         Ok(())
@@ -5537,6 +7260,21 @@ fn run_provider_stop_canary_guardian(
     match result {
         Ok(()) => 0,
         Err(error) => {
+            if let Ok(record) = load_session_record(context, &args.id) {
+                let marker_result = if provider_stop_canary_request_matches(
+                    context,
+                    &record,
+                    PROVIDER_STOP_CANARY_READY_FILE,
+                    "ready",
+                ) {
+                    write_provider_stop_canary_runtime_failure(context, &record, "guardian", &error)
+                } else {
+                    write_provider_stop_canary_startup_failure(context, &record, "guardian", &error)
+                };
+                if let Err(marker_error) = marker_result {
+                    eprintln!("{}", marker_error.message());
+                }
+            }
             eprintln!("{}", error.message());
             error.0.exit_code
         }
@@ -5920,13 +7658,14 @@ fn start_interactive_tmux(
     if provider_stop_canary_armed(record) {
         let supervisor_bin = current_runtime_helper()?;
         command
+            .arg("exec")
             .arg(supervisor_bin)
             .arg("--state-dir")
             .arg(state_dir)
             .arg("provider-stop-canary-supervisor")
             .arg("--id")
             .arg(&record.id);
-        return run_tmux_new_session(command, record);
+        return run_tmux_new_session(command, tmux_bin, record);
     }
 
     if agent == AgentKind::Codex && codex_app_server::runtime_is_supported(record) {
@@ -5979,7 +7718,7 @@ fn start_interactive_tmux(
             command.args(provider_launch_args);
         }
         command.args(agent_args);
-        return run_tmux_new_session(command, record);
+        return run_tmux_new_session(command, tmux_bin, record);
     }
 
     command.arg(agent_bin);
@@ -6003,7 +7742,7 @@ fn start_interactive_tmux(
         }
     }
     command.args(agent_args);
-    run_tmux_new_session(command, record)
+    run_tmux_new_session(command, tmux_bin, record)
 }
 
 fn start_run_tmux(
@@ -6069,11 +7808,12 @@ fn start_run_tmux(
     add_runtime_tmux_environment(&mut command, state_dir, record)?;
     begin_held_runtime(&mut command, state_dir, record)?;
     command.arg("sh").arg("-lc").arg(script);
-    run_tmux_new_session(command, record)
+    run_tmux_new_session(command, tmux_bin, record)
 }
 
 fn run_tmux_new_session(
     command: ProcessCommand,
+    tmux_bin: &Path,
     record: &SessionRecord,
 ) -> Result<TmuxRuntimeIdentity, CliError> {
     let output = run_output_with_timeout(command, PANE_INPUT_COMMAND_TIMEOUT).map_err(|err| {
@@ -6119,6 +7859,19 @@ fn run_tmux_new_session(
         ));
     }
     let pane_pid = pane_pid.expect("checked pane pid");
+    #[cfg(target_os = "linux")]
+    let (pane_start_time_ticks, pane_pidfd) = pin_live_linux_process_incarnation(pane_pid)
+        .map_err(|_| {
+            CliError::runtime(
+                "tmux-runtime-identity-invalid",
+                "tmux new-session returned an unpinnable pane process incarnation",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    #[cfg(target_os = "linux")]
+    let pane_start_time = Some(pane_start_time_ticks);
+    #[cfg(not(target_os = "linux"))]
+    let pane_start_time = None;
     let observed_process_group = unsafe { libc::getpgid(pane_pid) };
     let current_process_group = unsafe { libc::getpgrp() };
     let process_group_id = if observed_process_group > 1 {
@@ -6165,17 +7918,89 @@ fn run_tmux_new_session(
             Some(json!({ "id": record.id })),
         )
     })?;
+    let cgroup_mount = control_group
+        .as_ref()
+        .and_then(|_| capture_linux_cgroup_mount_identity());
+    let pid_namespace = linux_process_identity_namespace(pane_pid).map_err(|_| {
+        CliError::runtime(
+            "tmux-runtime-identity-invalid",
+            "tmux new-session returned a pane outside the caller PID identity namespace",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    if !tmux_pane_identity_matches(
+        tmux_bin,
+        record,
+        session_id,
+        pane_id,
+        pane_pid,
+        PANE_INPUT_COMMAND_TIMEOUT,
+    ) {
+        return Err(CliError::runtime(
+            "tmux-runtime-identity-invalid",
+            "tmux new-session pane identity changed before it could be persisted",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    verify_pinned_linux_process_incarnation(pane_pid, pane_start_time_ticks, &pane_pidfd).map_err(
+        |_| {
+            CliError::runtime(
+                "tmux-runtime-identity-invalid",
+                "tmux new-session pane process incarnation changed before it could be persisted",
+                Some(json!({ "id": record.id })),
+            )
+        },
+    )?;
     Ok(TmuxRuntimeIdentity {
         launch_id,
         session_id: session_id.to_string(),
         pane_id: pane_id.to_string(),
         pane_pid,
+        pane_start_time,
         process_group_id,
         process_session_id,
         process_session_members: Vec::new(),
         control_group_members: Vec::new(),
         control_group,
+        cgroup_mount,
+        pid_namespace,
     })
+}
+
+fn tmux_pane_identity_matches(
+    tmux_bin: &Path,
+    record: &SessionRecord,
+    expected_session_id: &str,
+    expected_pane_id: &str,
+    expected_pane_pid: libc::pid_t,
+    timeout: Duration,
+) -> bool {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .env("LC_ALL", "C")
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(managed_tmux_pane_target(&record.tmux_session))
+        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}");
+    let Ok(output) = run_output_with_timeout(command, timeout) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(output) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let mut fields = output.trim().split('\t');
+    fields.next() == Some(expected_session_id)
+        && fields.next() == Some(expected_pane_id)
+        && fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            == Some(expected_pane_pid)
+        && fields.next().is_none()
 }
 
 fn tmux_launch_may_have_created_runtime(err: &CliError) -> bool {
@@ -7784,7 +9609,7 @@ fn start_resume_tmux(
         .arg(agent_bin)
         .args(resume_args)
         .args(&record.agent_args);
-    run_tmux_new_session(command, record)
+    run_tmux_new_session(command, tmux_bin, record)
 }
 
 fn launch_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
@@ -9815,14 +11640,40 @@ fn delete_session_with_timeouts_for_terminal_assignment(
         &record,
         terminal_assignment,
     )?;
-    delete_session_locked_with_timeouts(
-        context,
-        record,
-        resolved.session_dir,
-        &tmux_bin,
-        kill_timeout,
-        verify_timeout,
-    )
+    let failed_canary_proof = terminal_assignment.and_then(|assignment| {
+        (assignment.state == "cancelled"
+            && assignment.worker.as_ref().is_some_and(|worker| {
+                worker.session_id == record.id
+                    && record
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.launch_id == worker.session_incarnation)
+            }))
+        .then(|| {
+            prove_provider_stop_canary_failed_startup_runtime_quiescent(
+                &record,
+                &assignment.assignment_id,
+            )
+        })
+        .flatten()
+    });
+    match failed_canary_proof {
+        Some(proof) => delete_session_locked_after_failed_canary_proof(
+            context,
+            record,
+            resolved.session_dir,
+            &tmux_bin,
+            proof,
+        ),
+        None => delete_session_locked_with_timeouts(
+            context,
+            record,
+            resolved.session_dir,
+            &tmux_bin,
+            kill_timeout,
+            verify_timeout,
+        ),
+    }
 }
 
 fn delete_session_locked_with_timeouts(
@@ -9846,6 +11697,33 @@ fn delete_session_locked_with_timeouts(
     .map_err(|reason| {
         session_termination_error(&record, reason, SessionTerminationOperation::Delete)
     })?;
+    finish_session_delete(context, record, session_dir, registry_fence)
+}
+
+fn delete_session_locked_after_failed_canary_proof(
+    context: &CliContext,
+    record: SessionRecord,
+    session_dir: PathBuf,
+    tmux_bin: &Path,
+    proof: ProviderStopCanaryFailedStartupQuiescenceProof,
+) -> Result<DeleteResult, CliError> {
+    if !proof.matches(&record) || session_status(tmux_bin, &record) != "stopped" {
+        return Err(session_termination_error(
+            &record,
+            SessionTerminationFailure::StillRunning,
+            SessionTerminationOperation::Delete,
+        ));
+    }
+    let registry_fence = SessionRegistryFence::from_record(&record);
+    finish_session_delete(context, record, session_dir, registry_fence)
+}
+
+fn finish_session_delete(
+    context: &CliContext,
+    record: SessionRecord,
+    session_dir: PathBuf,
+    registry_fence: SessionRegistryFence,
+) -> Result<DeleteResult, CliError> {
     coordination::revoke(context, &record)?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
     let cleanup_pending = commit_session_directory_delete(context, &record.id, &session_dir)?;
@@ -10378,6 +12256,8 @@ struct TmuxRuntimeIdentity {
     pane_id: String,
     pane_pid: libc::pid_t,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pane_start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     process_group_id: Option<libc::pid_t>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_session_id: Option<libc::pid_t>,
@@ -10387,6 +12267,10 @@ struct TmuxRuntimeIdentity {
     control_group_members: Vec<TmuxProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_group: Option<TmuxControlGroupIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_mount: Option<TmuxCgroupMountIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_namespace: Option<TmuxPidNamespaceIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -10404,7 +12288,98 @@ struct TmuxControlGroupIdentity {
     boot_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct TmuxPidNamespaceIdentity {
+    device: u64,
+    inode: u64,
+    boot_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct TmuxCgroupMountIdentity {
+    namespace_device: u64,
+    namespace_inode: u64,
+    mount_namespace_device: u64,
+    mount_namespace_inode: u64,
+    mount_device: u64,
+    mount_inode: u64,
+    mount_id: u64,
+    boot_id: String,
+}
+
 impl TmuxRuntimeIdentity {
+    fn resolved_pane_start_time(&self) -> Result<Option<u64>, ()> {
+        let mut member_start_times = self
+            .process_session_members
+            .iter()
+            .filter(|member| member.pid == self.pane_pid)
+            .map(|member| member.start_time);
+        let member_start_time = member_start_times.next();
+        if member_start_times.next().is_some() {
+            return Err(());
+        }
+        match (self.pane_start_time, member_start_time) {
+            (Some(0), _) => Err(()),
+            (Some(start_time), Some(member_start_time)) if start_time != member_start_time => {
+                Err(())
+            }
+            (Some(start_time), _) => Ok(Some(start_time)),
+            (None, Some(start_time)) if start_time > 0 => Ok(Some(start_time)),
+            (None, Some(_)) => Err(()),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn has_valid_persisted_structure(&self, require_process_group: bool) -> bool {
+        valid_tmux_session_id(&self.session_id)
+            && valid_tmux_pane_id(&self.pane_id)
+            && self.pane_pid > 1
+            && self.resolved_pane_start_time().is_ok()
+            && if require_process_group {
+                self.process_group_id
+                    .is_some_and(|process_group_id| process_group_id > 1)
+            } else {
+                self.process_group_id
+                    .is_none_or(|process_group_id| process_group_id > 1)
+            }
+            && self
+                .process_session_id
+                .is_none_or(|process_session_id| process_session_id > 1)
+            && self
+                .process_session_members
+                .iter()
+                .all(|member| member.pid > 1 && member.start_time > 0)
+            && self
+                .control_group_members
+                .iter()
+                .all(|member| member.pid > 1 && member.start_time > 0)
+            && self.control_group.as_ref().is_none_or(|control_group| {
+                control_group.device > 0
+                    && control_group.inode > 0
+                    && control_group
+                        .boot_id
+                        .as_deref()
+                        .is_none_or(valid_linux_boot_id)
+                    && valid_tmux_spawn_control_group_path(Path::new(&control_group.path))
+            })
+            && self.cgroup_mount.as_ref().is_none_or(|mount| {
+                mount.namespace_device > 0
+                    && mount.namespace_inode > 0
+                    && mount.mount_namespace_device > 0
+                    && mount.mount_namespace_inode > 0
+                    && mount.mount_device > 0
+                    && mount.mount_inode > 0
+                    && mount.mount_id > 0
+                    && valid_linux_boot_id(&mount.boot_id)
+                    && self.control_group.as_ref().is_some_and(|control_group| {
+                        control_group
+                            .boot_id
+                            .as_deref()
+                            .is_none_or(|boot_id| boot_id == mount.boot_id)
+                    })
+            })
+    }
+
     fn same_runtime_target(&self, other: &Self) -> bool {
         self.launch_id == other.launch_id
             && self.session_id == other.session_id
@@ -10413,6 +12388,14 @@ impl TmuxRuntimeIdentity {
 
     fn same_process_identity(&self, other: &Self) -> bool {
         self.pane_pid == other.pane_pid
+            && match (
+                self.resolved_pane_start_time(),
+                other.resolved_pane_start_time(),
+            ) {
+                (Ok(Some(left)), Ok(Some(right))) => left == right,
+                (Ok(_), Ok(_)) => true,
+                _ => false,
+            }
             && self.process_group_id == other.process_group_id
             && (self.process_session_id == other.process_session_id
                 || self.process_session_id.is_none()
@@ -10421,9 +12404,26 @@ impl TmuxRuntimeIdentity {
                 (Some(left), Some(right)) => left.same_runtime_identity(right),
                 _ => true,
             }
+            && match (&self.pid_namespace, &other.pid_namespace) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+            && match (&self.cgroup_mount, &other.cgroup_mount) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
     }
 
     fn merge_process_evidence_from(&mut self, other: &Self) {
+        if self.pane_start_time.is_none() {
+            self.pane_start_time = other.pane_start_time;
+        }
+        if self.pid_namespace.is_none() {
+            self.pid_namespace.clone_from(&other.pid_namespace);
+        }
+        if self.cgroup_mount.is_none() {
+            self.cgroup_mount.clone_from(&other.cgroup_mount);
+        }
         merge_process_identities(
             &mut self.control_group_members,
             &other.control_group_members,
@@ -10546,6 +12546,12 @@ fn capture_tmux_runtime_identity(
         .ok()
         .filter(|pid| *pid > 1)
         .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    #[cfg(target_os = "linux")]
+    let (pane_start_time_ticks, pane_pidfd) = pin_live_linux_process_incarnation(pane_pid)?;
+    #[cfg(target_os = "linux")]
+    let pane_start_time = Some(pane_start_time_ticks);
+    #[cfg(not(target_os = "linux"))]
+    let pane_start_time = None;
 
     let expected_state_dir = display_path(&context.state_dir);
     let expected = [
@@ -10571,17 +12577,29 @@ fn capture_tmux_runtime_identity(
     let process_session_id = process_session_id(pane_pid)?;
     let process_session_members = process_session_members(process_session_id, pane_pid)?;
     let control_group = linux_process_control_group(pane_pid)?;
+    let cgroup_mount = control_group
+        .as_ref()
+        .and_then(|_| capture_linux_cgroup_mount_identity());
+    let pid_namespace = linux_process_identity_namespace(pane_pid)?;
 
+    if !tmux_pane_identity_matches(tmux_bin, record, session_id, pane_id, pane_pid, timeout) {
+        return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+    }
+    #[cfg(target_os = "linux")]
+    verify_pinned_linux_process_incarnation(pane_pid, pane_start_time_ticks, &pane_pidfd)?;
     Ok(TmuxRuntimeProbe::Running(Box::new(TmuxRuntimeIdentity {
         launch_id,
         session_id: session_id.to_string(),
         pane_id: pane_id.to_string(),
         pane_pid,
+        pane_start_time,
         process_group_id: Some(process_group_id),
         process_session_id,
         process_session_members,
         control_group_members: Vec::new(),
         control_group,
+        cgroup_mount,
+        pid_namespace,
     })))
 }
 
@@ -10710,6 +12728,55 @@ fn linux_process_control_group(
         let _ = pane_pid;
         Ok(None)
     }
+}
+
+fn linux_process_pid_namespace(
+    pane_pid: libc::pid_t,
+) -> Result<Option<TmuxPidNamespaceIdentity>, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = fs::metadata(format!("/proc/{pane_pid}/ns/pid"))
+            .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        Ok(Some(TmuxPidNamespaceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: linux_boot_id()?,
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_pid;
+        Ok(None)
+    }
+}
+
+fn linux_process_identity_namespace(
+    pane_pid: libc::pid_t,
+) -> Result<Option<TmuxPidNamespaceIdentity>, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let observer = linux_process_pid_namespace(unsafe { libc::getpid() })?
+            .ok_or(SessionTerminationFailure::VerificationFailed)?;
+        let target = linux_process_pid_namespace(pane_pid)?
+            .ok_or(SessionTerminationFailure::VerificationFailed)?;
+        if !same_pid_namespace_identity(&observer, &target) {
+            return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+        }
+        Ok(Some(observer))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_pid;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn same_pid_namespace_identity(
+    observer: &TmuxPidNamespaceIdentity,
+    target: &TmuxPidNamespaceIdentity,
+) -> bool {
+    observer == target
 }
 
 #[cfg(target_os = "linux")]
@@ -10872,36 +12939,7 @@ fn persisted_tmux_runtime_identity(
     if identity.launch_id.as_deref() != current_launch_id {
         return Ok(None);
     }
-    if !valid_tmux_session_id(&identity.session_id)
-        || !valid_tmux_pane_id(&identity.pane_id)
-        || identity.pane_pid <= 1
-        || identity
-            .process_group_id
-            .is_some_and(|process_group_id| process_group_id <= 1)
-        || identity
-            .process_session_id
-            .is_some_and(|process_session_id| process_session_id <= 1)
-        || identity
-            .process_session_members
-            .iter()
-            .any(|member| member.pid <= 1 || member.start_time == 0)
-        || identity
-            .control_group_members
-            .iter()
-            .any(|member| member.pid <= 1 || member.start_time == 0)
-        || identity
-            .control_group
-            .as_ref()
-            .is_some_and(|control_group| {
-                control_group.device == 0
-                    || control_group.inode == 0
-                    || control_group
-                        .boot_id
-                        .as_deref()
-                        .is_some_and(|boot_id| !valid_linux_boot_id(boot_id))
-                    || !valid_tmux_spawn_control_group_path(Path::new(&control_group.path))
-            })
-    {
+    if !identity.has_valid_persisted_structure(false) {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
     Ok(Some(identity))
@@ -10922,35 +12960,7 @@ fn persisted_prior_tmux_runtime_identities(
         .filter(|launch_id| !launch_id.is_empty());
     if identities.iter().any(|identity| {
         identity.launch_id.as_deref() != current_launch_id
-            || !valid_tmux_session_id(&identity.session_id)
-            || !valid_tmux_pane_id(&identity.pane_id)
-            || identity.pane_pid <= 1
-            || identity
-                .process_group_id
-                .is_none_or(|process_group_id| process_group_id <= 1)
-            || identity
-                .process_session_id
-                .is_some_and(|process_session_id| process_session_id <= 1)
-            || identity
-                .process_session_members
-                .iter()
-                .any(|member| member.pid <= 1 || member.start_time == 0)
-            || identity
-                .control_group_members
-                .iter()
-                .any(|member| member.pid <= 1 || member.start_time == 0)
-            || identity
-                .control_group
-                .as_ref()
-                .is_some_and(|control_group| {
-                    control_group.device == 0
-                        || control_group.inode == 0
-                        || control_group
-                            .boot_id
-                            .as_deref()
-                            .is_some_and(|boot_id| !valid_linux_boot_id(boot_id))
-                        || !valid_tmux_spawn_control_group_path(Path::new(&control_group.path))
-                })
+            || !identity.has_valid_persisted_structure(true)
     }) {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
@@ -11306,13 +13316,18 @@ fn coordination_process_runtime_status(identity: &TmuxRuntimeIdentity) -> Proces
         evidence.push(status);
     }
     if let Some(process_group_id) = identity.process_group_id {
-        let status = process_group_status(process_group_id);
+        let status = linux_process_group_runtime_status(process_group_id);
         if status == ProcessGroupStatus::Running {
             return ProcessGroupStatus::Running;
         }
         evidence.push(status);
     }
-    combine_runtime_status_evidence(&evidence)
+    let status = combine_runtime_status_evidence(&evidence);
+    if status == ProcessGroupStatus::Stopped && !linux_runtime_pid_namespace_matches(identity) {
+        ProcessGroupStatus::Unknown
+    } else {
+        status
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -11343,6 +13358,18 @@ fn combine_runtime_status_evidence(evidence: &[ProcessGroupStatus]) -> ProcessGr
     } else {
         ProcessGroupStatus::Stopped
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_runtime_pid_namespace_matches(identity: &TmuxRuntimeIdentity) -> bool {
+    let Some(expected) = identity.pid_namespace.as_ref() else {
+        return false;
+    };
+    if linux_boot_id().ok().as_deref() != Some(expected.boot_id.as_str()) {
+        return false;
+    }
+    fs::metadata("/proc/self/ns/pid")
+        .is_ok_and(|metadata| metadata.dev() == expected.device && metadata.ino() == expected.inode)
 }
 
 fn process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
@@ -11690,6 +13717,7 @@ fn thaw_owned_process_runtime(
 struct LinuxProcessIdentity {
     pid: libc::pid_t,
     parent_pid: libc::pid_t,
+    process_group_id: libc::pid_t,
     session_id: libc::pid_t,
     start_time: u64,
     zombie: bool,
@@ -11714,6 +13742,9 @@ fn read_linux_process_identity(
     let parent_pid = fields[1]
         .parse()
         .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let process_group_id = fields[2]
+        .parse()
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
     let session_id = fields[3]
         .parse()
         .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
@@ -11723,6 +13754,7 @@ fn read_linux_process_identity(
     Ok(Some(LinuxProcessIdentity {
         pid,
         parent_pid,
+        process_group_id,
         session_id,
         start_time,
         zombie: fields[0] == "Z",
@@ -11755,6 +13787,154 @@ fn linux_process_session_members(
     }
     members.sort_unstable_by_key(|identity| identity.pid);
     Ok(members)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_procfs_process_visibility_is_complete(mountinfo: &str) -> bool {
+    let options_are_process_visible = |options: &str| {
+        options.split(',').all(|option| {
+            option
+                .strip_prefix("hidepid=")
+                .is_none_or(|value| value == "0")
+        })
+    };
+    let proc_mounts = mountinfo.lines().filter_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        let root = fields.nth(3);
+        let mountpoint = fields.next();
+        let mount_options = fields.next();
+        if mountpoint != Some("/proc") {
+            return None;
+        }
+        Some((root, mount_options, filesystem))
+    });
+    let mounts = proc_mounts.collect::<Vec<_>>();
+    let [(root, mount_options, filesystem)] = mounts.as_slice() else {
+        return false;
+    };
+    if *root != Some("/") || !mount_options.is_some_and(options_are_process_visible) {
+        return false;
+    }
+    let mut filesystem = filesystem.split_whitespace();
+    if filesystem.next() != Some("proc") {
+        return false;
+    }
+    let _source = filesystem.next();
+    let Some(super_options) = filesystem.next() else {
+        return false;
+    };
+    options_are_process_visible(super_options)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_procfs_identity_matches_caller(
+    stat: &str,
+    caller_pid: libc::pid_t,
+    caller_process_group_id: libc::pid_t,
+    caller_session_id: libc::pid_t,
+) -> bool {
+    let Some(close) = stat.rfind(") ") else {
+        return false;
+    };
+    let Some(open) = stat[..close].find('(') else {
+        return false;
+    };
+    let Ok(observed_pid) = stat[..open].trim().parse::<libc::pid_t>() else {
+        return false;
+    };
+    let fields = stat[close + 2..].split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 4 {
+        return false;
+    }
+    let Ok(observed_process_group_id) = fields[2].parse::<libc::pid_t>() else {
+        return false;
+    };
+    let Ok(observed_session_id) = fields[3].parse::<libc::pid_t>() else {
+        return false;
+    };
+    observed_pid == caller_pid
+        && observed_process_group_id == caller_process_group_id
+        && observed_session_id == caller_session_id
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_members(
+    process_group_id: libc::pid_t,
+) -> Result<Vec<LinuxProcessIdentity>, SessionTerminationFailure> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    if !linux_procfs_process_visibility_is_complete(&mountinfo) {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let self_stat = fs::read_to_string("/proc/self/stat")
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let caller_pid = unsafe { libc::getpid() };
+    let caller_process_group_id = unsafe { libc::getpgrp() };
+    let caller_session_id = unsafe { libc::getsid(0) };
+    if caller_pid <= 1
+        || caller_process_group_id <= 1
+        || caller_session_id <= 1
+        || !linux_procfs_identity_matches_caller(
+            &self_stat,
+            caller_pid,
+            caller_process_group_id,
+            caller_session_id,
+        )
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let mut members = Vec::new();
+    let entries =
+        fs::read_dir("/proc").map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1)
+        else {
+            continue;
+        };
+        if let Some(identity) = read_linux_process_identity(pid)?
+            && identity.process_group_id == process_group_id
+        {
+            members.push(identity);
+        }
+    }
+    members.sort_unstable_by_key(|identity| identity.pid);
+    Ok(members)
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_process_group_status(
+    raw_status: ProcessGroupStatus,
+    members: Result<Vec<LinuxProcessIdentity>, SessionTerminationFailure>,
+) -> ProcessGroupStatus {
+    match raw_status {
+        ProcessGroupStatus::Stopped => ProcessGroupStatus::Stopped,
+        ProcessGroupStatus::Unknown => ProcessGroupStatus::Unknown,
+        ProcessGroupStatus::Running => match members {
+            Ok(members) if members.is_empty() => ProcessGroupStatus::Unknown,
+            Ok(members) if members.iter().all(|member| member.zombie) => {
+                ProcessGroupStatus::Stopped
+            }
+            Ok(_) => ProcessGroupStatus::Running,
+            Err(_) => ProcessGroupStatus::Unknown,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_runtime_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
+    let raw_status = process_group_status(process_group_id);
+    let members = if raw_status == ProcessGroupStatus::Running {
+        linux_process_group_members(process_group_id)
+    } else {
+        Ok(Vec::new())
+    };
+    classify_linux_process_group_status(raw_status, members)
 }
 
 #[cfg(target_os = "linux")]
@@ -11837,7 +14017,13 @@ fn linux_control_group_runtime_status_at_root(
         };
     let metadata = match fs::metadata(&full_path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return ProcessGroupStatus::Stopped,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return if linux_cgroup_absence_is_trusted(identity, root) {
+                ProcessGroupStatus::Stopped
+            } else {
+                ProcessGroupStatus::Unknown
+            };
+        }
         Err(_) => return ProcessGroupStatus::Unknown,
     };
     if !metadata.is_dir() {
@@ -11858,6 +14044,306 @@ fn linux_control_group_runtime_status_at_root(
         Some("1") => ProcessGroupStatus::Running,
         _ => ProcessGroupStatus::Unknown,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_scope_unit(control_group: &TmuxControlGroupIdentity) -> Option<String> {
+    let uid = unsafe { libc::geteuid() };
+    let path = Path::new(&control_group.path);
+    let unit = path.file_name()?.to_str()?;
+    let identifier = unit.strip_prefix("tmux-spawn-")?.strip_suffix(".scope")?;
+    let parsed_identifier = uuid::Uuid::parse_str(identifier).ok()?;
+    if parsed_identifier.to_string() != identifier {
+        return None;
+    }
+    let unit = format!("tmux-spawn-{parsed_identifier}.scope");
+    let expected = PathBuf::from(format!(
+        "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
+    ));
+    (path == expected).then_some(unit)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_systemctl_binary(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.uid() == 0
+        && metadata.mode() & 0o022 == 0
+        && metadata.mode() & 0o111 != 0
+        && fs::canonicalize(path).ok().as_deref() == Some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_systemd_user_runtime(uid: u32) -> Option<PathBuf> {
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    trusted_systemd_user_runtime_at(&runtime_dir, uid)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_systemd_user_runtime_at(runtime_dir: &Path, uid: u32) -> Option<PathBuf> {
+    let runtime_metadata = fs::symlink_metadata(runtime_dir).ok()?;
+    if !runtime_metadata.file_type().is_dir()
+        || runtime_metadata.uid() != uid
+        || runtime_metadata.mode() & 0o077 != 0
+        || fs::canonicalize(runtime_dir).ok().as_deref() != Some(runtime_dir)
+    {
+        return None;
+    }
+    let private_socket = runtime_dir.join("systemd/private");
+    let socket_metadata = fs::symlink_metadata(private_socket).ok()?;
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.uid() != uid
+        || socket_metadata.mode() & 0o077 != 0
+    {
+        return None;
+    }
+    Some(runtime_dir.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_scope_show_proves_collected(output: &[u8], expected_unit: &str) -> bool {
+    let Ok(output) = std::str::from_utf8(output) else {
+        return false;
+    };
+    let mut properties = BTreeMap::new();
+    for line in output.lines() {
+        let Some((name, value)) = line.split_once('=') else {
+            return false;
+        };
+        if !matches!(
+            name,
+            "Id" | "LoadState" | "ActiveState" | "SubState" | "ControlGroup"
+        ) || properties.insert(name, value).is_some()
+        {
+            return false;
+        }
+    }
+    properties.len() == 5
+        && properties.get("Id") == Some(&expected_unit)
+        && properties.get("LoadState") == Some(&"not-found")
+        && properties.get("ActiveState") == Some(&"inactive")
+        && properties.get("SubState") == Some(&"dead")
+        && properties.get("ControlGroup") == Some(&"")
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_scope_probe_result_proves_collected(
+    result: io::Result<std::process::Output>,
+    expected_unit: &str,
+) -> bool {
+    let Ok(output) = result else {
+        return false;
+    };
+    output.status.success()
+        && output.stderr.is_empty()
+        && systemd_scope_show_proves_collected(&output.stdout, expected_unit)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_manager_proves_scope_collected(control_group: &TmuxControlGroupIdentity) -> bool {
+    let Some(unit) = systemd_user_scope_unit(control_group) else {
+        return false;
+    };
+    let systemctl = Path::new(SYSTEMCTL_BIN);
+    if !trusted_systemctl_binary(systemctl) {
+        return false;
+    }
+    let uid = unsafe { libc::geteuid() };
+    let Some(runtime_dir) = trusted_systemd_user_runtime(uid) else {
+        return false;
+    };
+    let mut command = ProcessCommand::new(systemctl);
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .arg("--user")
+        .arg("--no-pager")
+        .arg("show")
+        .arg(&unit)
+        .arg("--property=Id")
+        .arg("--property=LoadState")
+        .arg("--property=ActiveState")
+        .arg("--property=SubState")
+        .arg("--property=ControlGroup");
+    systemd_scope_probe_result_proves_collected(
+        run_output_with_timeout_and_strict_cap(
+            command,
+            SYSTEMD_SCOPE_PROBE_TIMEOUT,
+            SYSTEMD_SCOPE_PROBE_MAX_OUTPUT_BYTES,
+        ),
+        &unit,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_failed_canary_numeric_runtime_absent(identity: &TmuxRuntimeIdentity) -> bool {
+    if identity.process_group_id.is_none_or(|process_group_id| {
+        linux_process_group_runtime_status(process_group_id) != ProcessGroupStatus::Stopped
+    }) || identity
+        .process_session_id
+        .is_none_or(
+            |process_session_id| match linux_process_session_members(process_session_id) {
+                Ok(members) => !members.is_empty(),
+                Err(_) => true,
+            },
+        )
+    {
+        return false;
+    }
+    identity
+        .process_session_members
+        .iter()
+        .chain(&identity.control_group_members)
+        .all(|captured| {
+            read_linux_process_identity(captured.pid).is_ok_and(|current| {
+                current.is_none_or(|current| {
+                    current.start_time != captured.start_time || current.zombie
+                })
+            })
+        })
+}
+
+struct ProviderStopCanaryFailedStartupQuiescenceProof {
+    session_id: String,
+    launch_id: String,
+    assignment_id: String,
+}
+
+impl ProviderStopCanaryFailedStartupQuiescenceProof {
+    fn matches(&self, record: &SessionRecord) -> bool {
+        self.session_id == record.id
+            && record
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.launch_id == self.launch_id)
+            && provider_stop_canary_assignment_id(record) == Some(self.assignment_id.as_str())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prove_provider_stop_canary_failed_startup_runtime_quiescent(
+    record: &SessionRecord,
+    assignment_id: &str,
+) -> Option<ProviderStopCanaryFailedStartupQuiescenceProof> {
+    if !provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+        record,
+        assignment_id,
+        Path::new("/sys/fs/cgroup"),
+        systemd_user_manager_proves_scope_collected,
+    ) {
+        return None;
+    }
+    Some(ProviderStopCanaryFailedStartupQuiescenceProof {
+        session_id: record.id.clone(),
+        launch_id: record.runtime.as_ref()?.launch_id.clone(),
+        assignment_id: assignment_id.to_string(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prove_provider_stop_canary_failed_startup_runtime_quiescent(
+    _record: &SessionRecord,
+    _assignment_id: &str,
+) -> Option<ProviderStopCanaryFailedStartupQuiescenceProof> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn provider_stop_canary_failed_startup_runtime_quiescent(
+    record: &SessionRecord,
+    assignment_id: &str,
+) -> bool {
+    prove_provider_stop_canary_failed_startup_runtime_quiescent(record, assignment_id).is_some()
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+    record: &SessionRecord,
+    assignment_id: &str,
+    control_group_root: &Path,
+) -> bool {
+    provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+        record,
+        assignment_id,
+        control_group_root,
+        |_| false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+    record: &SessionRecord,
+    assignment_id: &str,
+    control_group_root: &Path,
+    collected_scope_probe: impl FnOnce(&TmuxControlGroupIdentity) -> bool,
+) -> bool {
+    if AgentKind::from_name(&record.agent) != Some(AgentKind::Codex)
+        || !provider_stop_canary_armed(record)
+        || provider_stop_canary_assignment_id(record) != Some(assignment_id)
+        || !startup_projection(record).is_some_and(|startup| {
+            startup.state == "failed"
+                && startup.stage == "tmux"
+                && startup.failure_code.as_deref() == Some("terminal-runtime-create-failed")
+                && startup.retry_safe == Some(true)
+        })
+    {
+        return false;
+    }
+    let Ok(Some(identity)) = persisted_tmux_runtime_identity(record) else {
+        return false;
+    };
+    if identity.pid_namespace.is_some() {
+        return false;
+    }
+    let Some(control_group) = identity.control_group.as_ref() else {
+        return false;
+    };
+    let Some(expected_boot_id) = control_group.boot_id.as_deref() else {
+        return false;
+    };
+    if linux_boot_id().ok().as_deref() != Some(expected_boot_id) {
+        return false;
+    }
+    if !legacy_failed_canary_numeric_runtime_absent(&identity) {
+        return false;
+    }
+    let Ok(full_path) =
+        linux_control_group_full_path_at_root(Path::new(&control_group.path), control_group_root)
+    else {
+        return false;
+    };
+    let metadata = match fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return collected_scope_probe(control_group);
+        }
+        Err(_) => return false,
+    };
+    if !metadata.is_dir()
+        || metadata.dev() != control_group.device
+        || metadata.ino() != control_group.inode
+    {
+        return false;
+    }
+    let Ok(events) = fs::read_to_string(full_path.join("cgroup.events")) else {
+        return false;
+    };
+    let populated = events.lines().filter_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == "populated").then_some(value)
+    });
+    populated.eq(std::iter::once("0"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn provider_stop_canary_failed_startup_runtime_quiescent(
+    _record: &SessionRecord,
+    _assignment_id: &str,
+) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -14209,6 +16695,54 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn provider_stop_canary_control_connect_is_bounded_by_one_absolute_deadline() {
+        use std::os::fd::AsRawFd;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+
+        let address = SocketAddr::from_abstract_name(format!(
+            "nils-provider-stop-canary-backlog-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time after epoch")
+                .as_nanos()
+        ))
+        .expect("abstract backlog test address");
+        let listener = UnixListener::bind_addr(&address).expect("bind backlog test listener");
+        // SAFETY: listener owns a live AF_UNIX stream descriptor; reducing its
+        // listen backlog creates the exact pressure this bounded-connect helper
+        // must tolerate.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let mut queued = Vec::new();
+        let started = std::time::Instant::now();
+        let mut saturation_elapsed = None;
+        for _ in 0..8192 {
+            match super::connect_provider_stop_canary_control(
+                &address,
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            ) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => {
+                    assert_eq!(error.code(), "provider-stop-canary-control-unavailable");
+                    saturation_elapsed = Some(started.elapsed());
+                    break;
+                }
+            }
+        }
+        assert!(
+            saturation_elapsed.is_some(),
+            "the test must fill the non-accepting guardian backlog"
+        );
+        assert!(
+            saturation_elapsed.expect("saturation elapsed") < std::time::Duration::from_millis(500),
+            "the connect attempt must honor its single absolute deadline"
+        );
+        drop(queued);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn provider_stop_canary_rejects_stale_persisted_controller_pane_incarnation() {
         let current_pid = std::process::id() as libc::pid_t;
         let current = super::read_linux_process_identity(current_pid)
@@ -14219,6 +16753,7 @@ mod tests {
             session_id: "controller-tmux".to_string(),
             pane_id: "%1".to_string(),
             pane_pid: current_pid,
+            pane_start_time: Some(current.start_time.saturating_add(1)),
             process_group_id: Some(current_pid),
             process_session_id: Some(current_pid),
             process_session_members: vec![super::TmuxProcessIdentity {
@@ -14227,12 +16762,357 @@ mod tests {
             }],
             control_group_members: Vec::new(),
             control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         let error = super::pin_provider_stop_canary_controller_process(&stale)
             .expect_err("a reused pane PID must not replace the persisted process incarnation");
         assert_eq!(
             error.code(),
             "provider-stop-canary-controller-identity-unverified"
+        );
+    }
+
+    #[test]
+    fn provider_stop_canary_reads_only_exact_bounded_guardian_startup_failure() {
+        let tmp = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("canary-guardian-startup-failure"),
+        );
+        let record = load_session_record(&context, &id).expect("session record");
+        let failure = super::CliError::runtime(
+            "provider-stop-canary-cgroup-unavailable",
+            "sensitive diagnostic that must never be persisted",
+            None,
+        );
+
+        super::write_provider_stop_canary_startup_failure(&context, &record, "guardian", &failure)
+            .expect("write bounded guardian startup failure");
+        assert_eq!(
+            super::read_provider_stop_canary_startup_failure(&context, &record),
+            Some((
+                "guardian".to_string(),
+                "provider-stop-canary-cgroup-unavailable".to_string()
+            ))
+        );
+
+        let path = super::provider_stop_canary_file(
+            &context,
+            &record,
+            super::PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE,
+        );
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("guardian startup failure marker"))
+                .expect("guardian startup failure marker json");
+        assert_eq!(
+            marker
+                .as_object()
+                .expect("marker object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "failure_code".to_string(),
+                "launch_id".to_string(),
+                "schema_version".to_string(),
+                "session_id".to_string(),
+                "stage".to_string(),
+                "state".to_string(),
+            ]),
+            "the private marker must never persist a raw error message or path"
+        );
+
+        let mut stale = marker.clone();
+        stale["launch_id"] = serde_json::Value::String("stale-launch".to_string());
+        super::write_provider_stop_canary_marker(&path, &stale).expect("write stale marker");
+        assert!(
+            super::read_provider_stop_canary_startup_failure(&context, &record).is_none(),
+            "a stale launch must not poison a fresh canary"
+        );
+
+        let mut extended = marker;
+        extended["message"] =
+            serde_json::Value::String("/private/path must not cross the boundary".to_string());
+        super::write_provider_stop_canary_marker(&path, &extended)
+            .expect("write over-broad marker");
+        assert!(
+            super::read_provider_stop_canary_startup_failure(&context, &record).is_none(),
+            "unexpected diagnostic fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn provider_stop_canary_reads_only_exact_bounded_guardian_runtime_failure() {
+        let tmp = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("canary-guardian-runtime-failure"),
+        );
+        let record = load_session_record(&context, &id).expect("session record");
+        let failure = super::CliError::runtime(
+            "provider-stop-canary-member-unverified",
+            "sensitive diagnostic that must never be persisted",
+            None,
+        );
+
+        super::write_provider_stop_canary_runtime_failure(&context, &record, "guardian", &failure)
+            .expect("write bounded guardian runtime failure");
+        assert_eq!(
+            super::read_provider_stop_canary_runtime_failure(&context, &record),
+            Some((
+                "guardian".to_string(),
+                "provider-stop-canary-member-unverified".to_string()
+            ))
+        );
+
+        let path = super::provider_stop_canary_file(
+            &context,
+            &record,
+            super::PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE,
+        );
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("guardian runtime failure marker"))
+                .expect("guardian runtime failure marker json");
+        assert_eq!(
+            marker
+                .as_object()
+                .expect("marker object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "failure_code".to_string(),
+                "launch_id".to_string(),
+                "schema_version".to_string(),
+                "session_id".to_string(),
+                "stage".to_string(),
+                "state".to_string(),
+            ]),
+            "the private marker must never persist a raw error message or path"
+        );
+
+        let mut extended = marker;
+        extended["message"] =
+            serde_json::Value::String("/private/path must not cross the boundary".to_string());
+        super::write_provider_stop_canary_marker(&path, &extended)
+            .expect("write over-broad marker");
+        assert!(
+            super::read_provider_stop_canary_runtime_failure(&context, &record).is_none(),
+            "unexpected diagnostic fields must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_guardian_distinguishes_missing_and_invalid_wrapper_records() {
+        let tmp = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("canary-guardian-wrapper-diagnosis"),
+        );
+        let mut record = load_session_record(&context, &id).expect("session record");
+
+        record.extra.remove(super::DELETE_TMUX_IDENTITY_KEY);
+        let missing = super::provider_stop_canary_guardian_wrapper_identity(&record)
+            .expect_err("a missing wrapper record must fail closed");
+        assert_eq!(
+            missing.code(),
+            "provider-stop-canary-wrapper-record-missing"
+        );
+
+        record.extra.insert(
+            super::DELETE_TMUX_IDENTITY_KEY.to_string(),
+            serde_json::json!({ "launch_id": "malformed" }),
+        );
+        let invalid = super::provider_stop_canary_guardian_wrapper_identity(&record)
+            .expect_err("an invalid wrapper record must fail closed");
+        assert_eq!(
+            invalid.code(),
+            "provider-stop-canary-wrapper-record-invalid"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_resolves_bare_agent_binary_before_path_admission() {
+        let resolved = super::resolve_provider_stop_canary_agent_bin(Path::new("true"))
+            .expect("resolve true on PATH");
+        assert!(
+            resolved.is_absolute(),
+            "the guardian must validate and execute one exact PATH-resolved binary"
+        );
+        assert!(resolved.is_file());
+
+        let explicit = Path::new("/opt/provider/codex");
+        assert_eq!(
+            super::resolve_provider_stop_canary_agent_bin(explicit)
+                .expect("retain explicit provider path"),
+            explicit
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_derives_boundary_from_worker_wrapper_cgroup() {
+        let wrapper_cgroup = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/\
+             tmux-spawn-11111111-2222-3333-4444-555555555555.scope",
+        );
+        let parent = super::provider_stop_canary_cgroup_parent_from_wrapper_path(wrapper_cgroup)
+            .expect("derive worker wrapper cgroup parent");
+
+        assert_eq!(
+            parent,
+            Path::new("/sys/fs/cgroup").join(
+                "user.slice/user-1000.slice/user@1000.service/app.slice/\
+                 tmux-spawn-11111111-2222-3333-4444-555555555555.scope"
+            ),
+            "the boundary parent must follow the exact worker wrapper, not the caller's cgroup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launched_tmux_identity_persists_exact_pane_start_time_for_canary_admission() {
+        let tmp = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("persist-canary-pane-start-time"),
+        );
+        let mut record = load_session_record(&context, &id).expect("session record");
+        let current_pid = std::process::id() as libc::pid_t;
+        let current = super::read_linux_process_identity(current_pid)
+            .expect("current process identity")
+            .expect("live current process");
+        let identity = super::TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().expect("runtime").launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: current.pid,
+            pane_start_time: Some(current.start_time),
+            process_group_id: Some(current.process_group_id),
+            process_session_id: Some(current.session_id),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: None,
+            cgroup_mount: None,
+            pid_namespace: super::linux_process_pid_namespace(current.pid).expect("PID namespace"),
+        };
+
+        super::persist_launched_tmux_identity(&context, &mut record, &identity)
+            .expect("persist launched identity");
+        let persisted = load_session_record(&context, &id).expect("persisted session record");
+
+        assert_eq!(
+            persisted.extra["delete_tmux_identity"]["pane_start_time"],
+            current.start_time
+        );
+        assert_eq!(
+            super::provider_stop_canary_persisted_pane_start_time(&identity),
+            Some(current.start_time),
+            "the immutable launch-time field must admit a fresh empty member snapshot"
+        );
+
+        let mut compatibility_record = identity.clone();
+        compatibility_record.pane_start_time = None;
+        compatibility_record.process_session_members = vec![super::TmuxProcessIdentity {
+            pid: current.pid,
+            start_time: current.start_time,
+        }];
+        assert_eq!(
+            super::provider_stop_canary_persisted_pane_start_time(&compatibility_record),
+            Some(current.start_time),
+            "one exact older-format member remains a read-compatible admission proof"
+        );
+        compatibility_record
+            .process_session_members
+            .push(super::TmuxProcessIdentity {
+                pid: current.pid,
+                start_time: current.start_time.saturating_add(1),
+            });
+        assert_eq!(
+            super::provider_stop_canary_persisted_pane_start_time(&compatibility_record),
+            None,
+            "ambiguous older-format member evidence must fail closed"
+        );
+
+        let mut conflicting = identity.clone();
+        conflicting.process_session_members = vec![super::TmuxProcessIdentity {
+            pid: current.pid,
+            start_time: current.start_time.saturating_add(1),
+        }];
+        assert_eq!(
+            super::provider_stop_canary_persisted_pane_start_time(&conflicting),
+            None,
+            "a dedicated launch-time identity must agree with any matching member evidence"
+        );
+        assert!(
+            !conflicting.has_valid_persisted_structure(false),
+            "contradictory exact process evidence must invalidate the persisted runtime"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_defers_cgroup_removal_until_children_are_reaped() {
+        let tmp = tempfile::TempDir::new().expect("temporary state");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("provider-stop-canary-deferred-removal"),
+        );
+        let record = load_session_record(&context, &id).expect("canary session record");
+        let cgroup = match super::prepare_provider_stop_canary_cgroup(&context, &record) {
+            Ok(cgroup) => cgroup,
+            Err(error) if env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() != Ok("1") => {
+                eprintln!(
+                    "skipping unavailable delegated canary cgroup: {}",
+                    error.code()
+                );
+                return;
+            }
+            Err(error) => panic!("required delegated canary cgroup: {error:?}"),
+        };
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("provider child fixture");
+        fs::write(cgroup.path.join("cgroup.procs"), child.id().to_string())
+            .expect("move child into canary cgroup");
+        let guardian_identity =
+            super::read_linux_process_identity(std::process::id() as libc::pid_t)
+                .expect("guardian identity")
+                .expect("live guardian identity");
+        let mut pins = std::collections::BTreeMap::new();
+
+        super::stop_provider_stop_canary_cgroup_members(&cgroup, guardian_identity, &mut pins)
+            .expect("stop exact provider members");
+        assert!(
+            cgroup.path.is_dir(),
+            "member termination must retain the cgroup boundary until the guardian reaps its children"
+        );
+
+        child.wait().expect("reap provider child fixture");
+        super::remove_empty_provider_stop_canary_cgroup(&cgroup)
+            .expect("remove canary cgroup after child reap");
+        assert!(
+            !cgroup.path.exists(),
+            "the reaped empty provider cgroup must be removed"
         );
     }
 
@@ -14282,8 +17162,9 @@ mod tests {
                     .expect("pin provider leader"),
             },
         )]);
-        let error = super::stop_provider_stop_canary_cgroup(&cgroup, leader_identity, &mut pins)
-            .expect_err("foreign cgroup membership must fail closed");
+        let error =
+            super::stop_provider_stop_canary_cgroup_members(&cgroup, leader_identity, &mut pins)
+                .expect_err("foreign cgroup membership must fail closed");
         assert_eq!(error.code(), "provider-stop-canary-member-unverified");
         assert!(
             leader.try_wait().expect("poll leader").is_none(),
@@ -15518,11 +18399,14 @@ exit 97
             session_id: "$late".to_string(),
             pane_id: "%late".to_string(),
             pane_pid: process.process_group_id,
+            pane_start_time: None,
             process_group_id: Some(process.process_group_id),
             process_session_id: Some(session_id),
             process_session_members: Vec::new(),
             control_group: None,
             control_group_members: Vec::new(),
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         assert_eq!(
             super::coordination_process_runtime_status(&identity),
@@ -15556,6 +18440,758 @@ exit 97
             Unknown,
             "no evidence is never proof of absence"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn coordination_runtime_treats_a_zombie_only_process_group_as_stopped() {
+        use std::os::unix::process::CommandExt;
+
+        struct ReapedChild(Option<Child>);
+
+        impl Drop for ReapedChild {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    if child.try_wait().ok().flatten().is_none() {
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut child = Command::new("true");
+        // SAFETY: the child creates one private process session before exec.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = child.spawn().expect("spawn zombie-only runtime");
+        let pid = child.id() as libc::pid_t;
+        let _reaper = ReapedChild(Some(child));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let zombie = loop {
+            if let Some(identity) =
+                super::read_linux_process_identity(pid).expect("read child process identity")
+                && identity.zombie
+            {
+                break identity;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not reach its unreaped zombie state"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("zombie-only-runtime".to_string()),
+            session_id: "$zombie".to_string(),
+            pane_id: "%zombie".to_string(),
+            pane_pid: pid,
+            pane_start_time: None,
+            process_group_id: Some(pid),
+            process_session_id: Some(pid),
+            process_session_members: vec![TmuxProcessIdentity {
+                pid,
+                start_time: zombie.start_time,
+            }],
+            control_group: None,
+            control_group_members: Vec::new(),
+            cgroup_mount: None,
+            pid_namespace: super::linux_process_pid_namespace(pid)
+                .expect("read zombie PID namespace"),
+        };
+
+        assert_eq!(
+            super::coordination_process_runtime_status(&identity),
+            super::ProcessGroupStatus::Stopped,
+            "an unreaped process/session leader must not keep an otherwise empty runtime alive"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_status_requires_complete_member_visibility() {
+        use super::ProcessGroupStatus::{Running, Stopped, Unknown};
+
+        let member = |pid, zombie| super::LinuxProcessIdentity {
+            pid,
+            parent_pid: 1,
+            process_group_id: 42,
+            session_id: 42,
+            start_time: pid as u64,
+            zombie,
+        };
+
+        assert_eq!(
+            super::classify_linux_process_group_status(
+                Running,
+                Ok(vec![member(42, true), member(43, true)]),
+            ),
+            Stopped,
+            "complete all-zombie membership is affirmative stopped evidence"
+        );
+        assert_eq!(
+            super::classify_linux_process_group_status(
+                Running,
+                Ok(vec![member(42, true), member(43, false)]),
+            ),
+            Running,
+            "any live member dominates zombie evidence"
+        );
+        assert_eq!(
+            super::classify_linux_process_group_status(Running, Ok(Vec::new())),
+            Unknown,
+            "an empty snapshot cannot contradict a positive group probe"
+        );
+        assert_eq!(
+            super::classify_linux_process_group_status(
+                Running,
+                Err(super::SessionTerminationFailure::VerificationFailed),
+            ),
+            Unknown,
+            "incomplete member visibility must fail closed"
+        );
+        assert_eq!(
+            super::classify_linux_process_group_status(Stopped, Ok(Vec::new())),
+            Stopped
+        );
+        assert_eq!(
+            super::classify_linux_process_group_status(Unknown, Ok(Vec::new())),
+            Unknown
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_visibility_rejects_hidden_or_ambiguous_process_mounts() {
+        let canonical = "1 2 0:1 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n";
+        let hidden = "1 2 0:1 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=2\n";
+        let hidden_mount =
+            "1 2 0:1 / /proc rw,nosuid,nodev,noexec,relatime,hidepid=2 - proc proc rw\n";
+        let duplicate = format!("{canonical}{canonical}");
+        let mixed_hidden = format!("{canonical}{hidden}");
+        let overmounted = format!("{canonical}3 2 0:2 / /proc rw,nosuid,nodev - tmpfs tmpfs rw\n");
+
+        assert!(super::linux_procfs_process_visibility_is_complete(
+            canonical
+        ));
+        assert!(!super::linux_procfs_process_visibility_is_complete(hidden));
+        assert!(!super::linux_procfs_process_visibility_is_complete(
+            hidden_mount
+        ));
+        assert!(!super::linux_procfs_process_visibility_is_complete(
+            &duplicate
+        ));
+        assert!(!super::linux_procfs_process_visibility_is_complete(
+            &mixed_hidden
+        ));
+        assert!(!super::linux_procfs_process_visibility_is_complete(
+            &overmounted
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_identity_must_match_the_callers_pid_namespace() {
+        let stat = "123 (worker with spaces) S 1 456 789 0";
+
+        assert!(super::linux_procfs_identity_matches_caller(
+            stat, 123, 456, 789
+        ));
+        assert!(!super::linux_procfs_identity_matches_caller(
+            stat, 321, 456, 789
+        ));
+        assert!(!super::linux_procfs_identity_matches_caller(
+            stat, 123, 654, 789
+        ));
+        assert!(!super::linux_procfs_identity_matches_caller(
+            stat, 123, 456, 987
+        ));
+        assert!(!super::linux_procfs_identity_matches_caller(
+            "malformed",
+            123,
+            456,
+            789
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopped_absence_requires_persisted_pid_namespace_provenance() {
+        let mut identity = TmuxRuntimeIdentity {
+            launch_id: Some("namespace-fenced-stopped-runtime".to_string()),
+            session_id: "$1".to_string(),
+            pane_id: "%1".to_string(),
+            pane_pid: libc::pid_t::MAX,
+            pane_start_time: None,
+            process_group_id: Some(libc::pid_t::MAX),
+            process_session_id: Some(libc::pid_t::MAX),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
+        };
+
+        assert_eq!(
+            super::coordination_process_runtime_status(&identity),
+            super::ProcessGroupStatus::Unknown,
+            "numeric absence without captured namespace provenance is not stopped proof"
+        );
+        identity.pid_namespace =
+            super::linux_process_pid_namespace(unsafe { libc::getpid() }).expect("PID namespace");
+        assert_eq!(
+            super::coordination_process_runtime_status(&identity),
+            super::ProcessGroupStatus::Stopped
+        );
+        identity
+            .pid_namespace
+            .as_mut()
+            .expect("PID namespace")
+            .inode += 1;
+        assert_eq!(
+            super::coordination_process_runtime_status(&identity),
+            super::ProcessGroupStatus::Unknown,
+            "mismatched PID namespace provenance must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn numeric_process_identity_namespace_must_match_observer_and_target() {
+        let observer = super::linux_process_pid_namespace(unsafe { libc::getpid() })
+            .expect("PID namespace")
+            .expect("Linux PID namespace identity");
+        assert_eq!(
+            super::linux_process_identity_namespace(unsafe { libc::getpid() })
+                .expect("matching process identity namespace"),
+            Some(observer.clone())
+        );
+
+        let mut mismatched = observer.clone();
+        mismatched.inode += 1;
+        assert!(!super::same_pid_namespace_identity(&observer, &mismatched));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_preclaim_canary_cleanup_requires_exact_empty_control_group() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = test_context(tmp.path());
+        let mut record = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Enforce,
+            title: Some("failed preclaim canary"),
+            title_state: None,
+            explicit_id: Some("failed-preclaim-canary"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("create record")
+        .record;
+        super::configure_provider_stop_canary(&context, &mut record, true, Some("assignment"))
+            .expect("arm canary");
+        let started_at = record.runtime.as_ref().expect("runtime").started_at.clone();
+        let failed =
+            super::failed_projection(&started_at, "terminal-runtime-create-failed", "tmux", None);
+        super::store_startup_projection(&mut record, &failed);
+
+        let uid = unsafe { libc::geteuid() };
+        let path = PathBuf::from(format!(
+            "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/\
+             tmux-spawn-e856b315-9544-44f4-8f7c-d52fd47d8610.scope"
+        ));
+        let full_path = tmp
+            .path()
+            .join(path.strip_prefix("/").expect("relative cgroup path"));
+        fs::create_dir_all(&full_path).expect("control group fixture");
+        fs::write(full_path.join("cgroup.events"), "populated 0\n").expect("cgroup events");
+        let metadata = fs::metadata(&full_path).expect("cgroup metadata");
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().expect("runtime").launch_id.clone()),
+            session_id: "$1".to_string(),
+            pane_id: "%1".to_string(),
+            pane_pid: libc::pid_t::MAX,
+            pane_start_time: None,
+            process_group_id: Some(libc::pid_t::MAX),
+            process_session_id: Some(libc::pid_t::MAX),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: Some(super::TmuxControlGroupIdentity {
+                path: path.to_string_lossy().into_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                boot_id: Some(super::linux_boot_id().expect("boot id")),
+            }),
+            cgroup_mount: None,
+            pid_namespace: None,
+        };
+        super::persist_tmux_runtime_identity(&mut record, &identity).expect("persist identity");
+
+        assert!(
+            super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &record,
+                "assignment",
+                tmp.path()
+            )
+        );
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &record,
+                "different-assignment",
+                tmp.path()
+            ),
+            "the compatibility proof is fenced to the exact assignment"
+        );
+
+        let mut invalid = record.clone();
+        invalid.agent = "claude".to_string();
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &invalid,
+                "assignment",
+                tmp.path()
+            ),
+            "the compatibility proof is Codex-only"
+        );
+
+        let mut invalid_identity = identity.clone();
+        invalid_identity.pid_namespace =
+            super::linux_process_pid_namespace(unsafe { libc::getpid() }).expect("PID namespace");
+        super::persist_tmux_runtime_identity(&mut invalid, &invalid_identity)
+            .expect("persist namespace-bearing identity");
+        invalid.agent = "codex".to_string();
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &invalid,
+                "assignment",
+                tmp.path()
+            ),
+            "new namespace-bearing records cannot use the pre-upgrade compatibility proof"
+        );
+
+        invalid = record.clone();
+        invalid_identity = identity.clone();
+        invalid_identity
+            .control_group
+            .as_mut()
+            .expect("control group")
+            .boot_id = Some("different-boot".to_string());
+        super::persist_tmux_runtime_identity(&mut invalid, &invalid_identity)
+            .expect("persist different-boot identity");
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &invalid,
+                "assignment",
+                tmp.path()
+            ),
+            "boot mismatch cannot prove runtime quiescence"
+        );
+
+        invalid = record.clone();
+        invalid_identity = identity.clone();
+        invalid_identity
+            .control_group
+            .as_mut()
+            .expect("control group")
+            .inode += 1;
+        super::persist_tmux_runtime_identity(&mut invalid, &invalid_identity)
+            .expect("persist mismatched cgroup identity");
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &invalid,
+                "assignment",
+                tmp.path()
+            ),
+            "device/inode mismatch cannot prove runtime quiescence"
+        );
+
+        let moved_path = full_path.with_extension("moved");
+        fs::rename(&full_path, &moved_path).expect("hide exact control group path");
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &record,
+                "assignment",
+                tmp.path()
+            ),
+            "a missing exact control group path cannot prove runtime quiescence"
+        );
+        assert!(
+            super::provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+                &record,
+                "assignment",
+                tmp.path(),
+                |_| true,
+            ),
+            "an exact manager-owned collected-scope proof closes the pre-provenance visibility gap"
+        );
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+                &record,
+                "different-assignment",
+                tmp.path(),
+                |_| true,
+            ),
+            "manager proof cannot bypass the assignment fence"
+        );
+        let mutations: [fn(&mut super::SessionRecord); 7] = [
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::STARTUP_EXTRA_KEY)
+                    .expect("startup")["retry_safe"] = serde_json::json!(false);
+            },
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::STARTUP_EXTRA_KEY)
+                    .expect("startup")
+                    .as_object_mut()
+                    .expect("startup object")
+                    .remove("retry_safe");
+            },
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::STARTUP_EXTRA_KEY)
+                    .expect("startup")["stage"] = serde_json::json!("runtime");
+            },
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::STARTUP_EXTRA_KEY)
+                    .expect("startup")["failure_code"] = serde_json::json!("different-failure");
+            },
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::STARTUP_EXTRA_KEY)
+                    .expect("startup")["state"] = serde_json::json!("running");
+            },
+            |candidate| {
+                candidate
+                    .runtime
+                    .as_mut()
+                    .expect("runtime")
+                    .extra
+                    .remove(super::PROVIDER_STOP_CANARY_RUNTIME_KEY);
+            },
+            |candidate| {
+                candidate
+                    .extra
+                    .get_mut(super::DELETE_TMUX_IDENTITY_KEY)
+                    .expect("runtime identity")["launch_id"] =
+                    serde_json::json!("different-launch");
+            },
+        ];
+        for mutate in mutations {
+            let mut candidate = record.clone();
+            mutate(&mut candidate);
+            let probe_calls = std::cell::Cell::new(0);
+            assert!(
+                !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+                    &candidate,
+                    "assignment",
+                    tmp.path(),
+                    |_| {
+                        probe_calls.set(probe_calls.get() + 1);
+                        true
+                    },
+                ),
+                "every non-exact startup, canary, and launch fence must fail closed"
+            );
+            assert_eq!(
+                probe_calls.get(),
+                0,
+                "local admission fences must reject before contacting the manager"
+            );
+        }
+        let mut live_process = TestProcessGroup::spawn();
+        let mut live_record = record.clone();
+        let mut live_identity = identity.clone();
+        live_identity.process_group_id = Some(live_process.pid() as libc::pid_t);
+        super::persist_tmux_runtime_identity(&mut live_record, &live_identity)
+            .expect("persist live numeric identity");
+        let probe_calls = std::cell::Cell::new(0);
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root_with_probe(
+                &live_record,
+                "assignment",
+                tmp.path(),
+                |_| {
+                    probe_calls.set(probe_calls.get() + 1);
+                    true
+                },
+            ),
+            "manager absence cannot override a still-live captured numeric process boundary"
+        );
+        assert_eq!(probe_calls.get(), 0);
+        live_process.stop();
+        fs::rename(&moved_path, &full_path).expect("restore exact control group path");
+        fs::write(full_path.join("cgroup.events"), "populated 1\n").expect("live cgroup events");
+        assert!(
+            !super::provider_stop_canary_failed_startup_runtime_quiescent_at_root(
+                &record,
+                "assignment",
+                tmp.path()
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collected_systemd_scope_proof_is_exact_and_fail_closed() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let uid = unsafe { libc::geteuid() };
+        let unit = "tmux-spawn-e856b315-9544-44f4-8f7c-d52fd47d8610.scope";
+        let control_group = super::TmuxControlGroupIdentity {
+            path: format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"),
+            device: 1,
+            inode: 1,
+            boot_id: Some(super::linux_boot_id().expect("boot id")),
+        };
+        assert_eq!(
+            super::systemd_user_scope_unit(&control_group).as_deref(),
+            Some(unit)
+        );
+        assert!(super::systemd_scope_show_proves_collected(
+            format!(
+                "ControlGroup=\nId={unit}\nLoadState=not-found\n\
+                 ActiveState=inactive\nSubState=dead\n"
+            )
+            .as_bytes(),
+            unit,
+        ));
+        for invalid in [
+            format!(
+                "ControlGroup=/user.slice/live\nId={unit}\nLoadState=loaded\n\
+                 ActiveState=active\nSubState=running\n"
+            ),
+            format!(
+                "ControlGroup=\nId={unit}\nLoadState=loaded\n\
+                 ActiveState=inactive\nSubState=dead\n"
+            ),
+            format!(
+                "ControlGroup=\nId={unit}\nId={unit}\nLoadState=not-found\n\
+                 ActiveState=inactive\nSubState=dead\n"
+            ),
+            "ControlGroup=\nId=different.scope\nLoadState=not-found\n\
+             ActiveState=inactive\nSubState=dead\n"
+                .to_string(),
+            format!(
+                "ControlGroup=\nId={unit}\nLoadState=not-found\n\
+                 ActiveState=inactive\n"
+            ),
+        ] {
+            assert!(!super::systemd_scope_show_proves_collected(
+                invalid.as_bytes(),
+                unit
+            ));
+        }
+        assert!(!super::systemd_scope_show_proves_collected(&[0xff], unit));
+
+        let mut wrong_parent = control_group.clone();
+        wrong_parent.path = format!("/user.slice/{unit}");
+        assert!(super::systemd_user_scope_unit(&wrong_parent).is_none());
+        let mut noncanonical_uuid = control_group;
+        noncanonical_uuid.path = noncanonical_uuid.path.to_uppercase();
+        assert!(super::systemd_user_scope_unit(&noncanonical_uuid).is_none());
+
+        let valid_stdout = format!(
+            "ControlGroup=\nId={unit}\nLoadState=not-found\n\
+             ActiveState=inactive\nSubState=dead\n"
+        )
+        .into_bytes();
+        let output = |status, stdout: Vec<u8>, stderr: Vec<u8>| std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout,
+            stderr,
+        };
+        assert!(super::systemd_scope_probe_result_proves_collected(
+            Ok(output(0, valid_stdout.clone(), Vec::new())),
+            unit,
+        ));
+        assert!(!super::systemd_scope_probe_result_proves_collected(
+            Ok(output(1 << 8, valid_stdout.clone(), Vec::new())),
+            unit,
+        ));
+        assert!(!super::systemd_scope_probe_result_proves_collected(
+            Ok(output(0, valid_stdout, b"unexpected diagnostic".to_vec())),
+            unit,
+        ));
+        for error in [
+            io::Error::new(io::ErrorKind::NotFound, "unavailable"),
+            io::Error::new(io::ErrorKind::TimedOut, "timeout"),
+            io::Error::new(io::ErrorKind::InvalidData, "strict output cap"),
+        ] {
+            assert!(!super::systemd_scope_probe_result_proves_collected(
+                Err(error),
+                unit,
+            ));
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let systemd_dir = tmp.path().join("systemd");
+        fs::create_dir(&systemd_dir).expect("systemd dir");
+        let socket_path = systemd_dir.join("private");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("private socket");
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o700))
+            .expect("private socket mode");
+        assert_eq!(
+            super::trusted_systemd_user_runtime_at(tmp.path(), uid),
+            Some(tmp.path().to_path_buf())
+        );
+        drop(listener);
+        fs::remove_file(&socket_path).expect("remove socket");
+        fs::write(&socket_path, "").expect("replace with regular file");
+        assert!(
+            super::trusted_systemd_user_runtime_at(tmp.path(), uid).is_none(),
+            "a non-socket manager endpoint must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collected_systemd_scope_probe_executes_when_exact_manager_is_available() {
+        let uid = unsafe { libc::geteuid() };
+        if !super::trusted_systemctl_binary(Path::new(super::SYSTEMCTL_BIN))
+            || super::trusted_systemd_user_runtime(uid).is_none()
+        {
+            eprintln!("SKIP: trusted systemd user manager probe is unavailable");
+            return;
+        }
+        let unit = format!("tmux-spawn-{}.scope", uuid::Uuid::new_v4());
+        let control_group = super::TmuxControlGroupIdentity {
+            path: format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"),
+            device: 1,
+            inode: 1,
+            boot_id: Some(super::linux_boot_id().expect("boot id")),
+        };
+        assert!(
+            super::systemd_user_manager_proves_scope_collected(&control_group),
+            "the exact user manager must identify an unallocated scope as collected"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_absence_requires_exact_observer_mount_provenance() {
+        let mountinfo =
+            "41 30 0:28 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n";
+        assert_eq!(super::canonical_cgroup2_mount_id(mountinfo), Some(41));
+        assert_eq!(
+            super::canonical_cgroup2_mount_id(&format!(
+                "{mountinfo}42 30 0:28 / /alternate rw - cgroup2 cgroup2 rw\n"
+            )),
+            None
+        );
+        assert_eq!(
+            super::canonical_cgroup2_mount_id(&format!(
+                "{mountinfo}42 41 0:42 / /sys/fs/cgroup/hidden rw - tmpfs tmpfs rw\n"
+            )),
+            None,
+            "a subordinate mount of any filesystem can mask the recorded scope"
+        );
+
+        let Some(mount) = super::capture_linux_cgroup_mount_identity() else {
+            eprintln!("SKIP: canonical cgroup v2 observer mount is unavailable");
+            return;
+        };
+        let control_group = super::TmuxControlGroupIdentity {
+            path: format!("/tmux-spawn-{}.scope", uuid::Uuid::new_v4()),
+            device: 1,
+            inode: 1,
+            boot_id: Some(super::linux_boot_id().expect("boot id")),
+        };
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("mount-provenance".to_string()),
+            session_id: "$1".to_string(),
+            pane_id: "%1".to_string(),
+            pane_pid: libc::pid_t::MAX,
+            pane_start_time: None,
+            process_group_id: Some(libc::pid_t::MAX),
+            process_session_id: None,
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: Some(control_group.clone()),
+            cgroup_mount: Some(mount.clone()),
+            pid_namespace: None,
+        };
+        assert!(super::linux_cgroup_absence_is_trusted(
+            &identity,
+            Path::new("/sys/fs/cgroup")
+        ));
+        assert!(!super::linux_cgroup_absence_is_trusted(
+            &identity,
+            Path::new("/tmp/fake-cgroup")
+        ));
+        let mut mismatched = identity.clone();
+        mismatched
+            .cgroup_mount
+            .as_mut()
+            .expect("mount identity")
+            .namespace_inode += 1;
+        assert!(!super::linux_cgroup_absence_is_trusted(
+            &mismatched,
+            Path::new("/sys/fs/cgroup")
+        ));
+
+        assert_eq!(
+            super::linux_control_group_runtime_status_at_root(
+                &identity,
+                &control_group,
+                Path::new("/sys/fs/cgroup"),
+            ),
+            super::ProcessGroupStatus::Stopped,
+            "only exact current mount provenance may turn a missing cgroup into stopped evidence"
+        );
+        let mut invalid = Vec::new();
+        let mut absent = identity.clone();
+        absent.cgroup_mount = None;
+        invalid.push(absent);
+        for field in 0..8 {
+            let mut candidate = identity.clone();
+            let provenance = candidate.cgroup_mount.as_mut().expect("mount provenance");
+            match field {
+                0 => provenance.namespace_device += 1,
+                1 => provenance.namespace_inode += 1,
+                2 => provenance.mount_namespace_device += 1,
+                3 => provenance.mount_namespace_inode += 1,
+                4 => provenance.mount_device += 1,
+                5 => provenance.mount_inode += 1,
+                6 => provenance.mount_id += 1,
+                7 => provenance.boot_id = uuid::Uuid::new_v4().to_string(),
+                _ => unreachable!(),
+            }
+            invalid.push(candidate);
+        }
+        for candidate in invalid {
+            assert_eq!(
+                super::linux_control_group_runtime_status_at_root(
+                    &candidate,
+                    &control_group,
+                    Path::new("/sys/fs/cgroup"),
+                ),
+                super::ProcessGroupStatus::Unknown,
+                "every missing or mismatched provenance field must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -16061,6 +19697,11 @@ exit 97
             Some(&control_group),
             "captured runtime identity must retain the stabilized pane cgroup"
         );
+        assert_eq!(
+            retained_identity.pid_namespace,
+            super::linux_process_pid_namespace(pane_pid).expect("pane PID namespace"),
+            "captured runtime identity must retain the pane PID namespace"
+        );
         fs::write(&descendant_trigger_path, "spawn").unwrap();
         let started_at = Instant::now();
         let descendant_pid: libc::pid_t = loop {
@@ -16130,6 +19771,14 @@ exit 97
         ];
         persist_tmux_runtime_identity(&mut retained, &retained_identity).unwrap();
         write_session_record(&context, &retained).unwrap();
+        let persisted = load_session_record(&context, &id).unwrap();
+        assert_eq!(
+            super::persisted_tmux_runtime_identity(&persisted)
+                .expect("persisted runtime identity")
+                .expect("runtime identity"),
+            retained_identity,
+            "PID namespace provenance must survive record persistence"
+        );
         fs::write(&force_stopped, b"stopped").unwrap();
 
         let preview = crate::maintenance::preview(
@@ -16291,11 +19940,14 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: 91,
+            pane_start_time: None,
             process_group_id: Some(91),
             process_session_id: Some(91),
             process_session_members: Vec::new(),
             control_group_members: Vec::new(),
             control_group: Some(control_group.clone()),
+            cgroup_mount: None,
+            pid_namespace: None,
         };
 
         assert_eq!(
@@ -16567,6 +20219,7 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: 91,
+            pane_start_time: None,
             process_group_id: Some(91),
             process_session_id: Some(91),
             process_session_members: Vec::new(),
@@ -16577,6 +20230,8 @@ exit 97
                 inode: metadata.ino(),
                 boot_id: Some(super::linux_boot_id().unwrap()),
             }),
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         write_session_record(&context, &record).unwrap();
@@ -16679,6 +20334,7 @@ exit 97
                 session_id: "$91".to_string(),
                 pane_id: "%91".to_string(),
                 pane_pid: 91,
+                pane_start_time: None,
                 process_group_id: Some(91),
                 process_session_id: Some(91),
                 process_session_members: Vec::new(),
@@ -16689,6 +20345,8 @@ exit 97
                     inode: metadata.ino(),
                     boot_id: Some(super::linux_boot_id().unwrap()),
                 }),
+                cgroup_mount: None,
+                pid_namespace: None,
             },
         )
         .unwrap();
@@ -16780,6 +20438,7 @@ exit 97
                     session_id: "$91".to_string(),
                     pane_id: "%91".to_string(),
                     pane_pid: 91,
+                    pane_start_time: None,
                     process_group_id: Some(91),
                     process_session_id: Some(91),
                     process_session_members: Vec::new(),
@@ -16790,6 +20449,8 @@ exit 97
                         inode: metadata.ino(),
                         boot_id: Some(super::linux_boot_id().unwrap()),
                     }),
+                    cgroup_mount: None,
+                    pid_namespace: None,
                 },
             )
             .unwrap();
@@ -16875,6 +20536,7 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: member.pid,
+            pane_start_time: None,
             process_group_id: Some(pane.process_group_id),
             process_session_id: Some(pane_identity.session_id),
             process_session_members: Vec::new(),
@@ -16885,6 +20547,8 @@ exit 97
                 inode: metadata.ino(),
                 boot_id: Some(super::linux_boot_id().unwrap()),
             }),
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         super::set_tmux_termination_state(
@@ -16960,6 +20624,7 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: member.pid,
+            pane_start_time: None,
             process_group_id: Some(pane.process_group_id),
             process_session_id: Some(pane_identity.session_id),
             process_session_members: Vec::new(),
@@ -16970,6 +20635,8 @@ exit 97
                 inode: 1,
                 boot_id: Some(other_boot_id.to_string()),
             }),
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         super::set_tmux_termination_state(
@@ -17024,6 +20691,7 @@ exit 97
                 session_id: "$91".to_string(),
                 pane_id: "%91".to_string(),
                 pane_pid: pane_identity.pid,
+                pane_start_time: None,
                 process_group_id: Some(pane.process_group_id),
                 process_session_id: Some(pane_identity.session_id),
                 process_session_members: Vec::new(),
@@ -17037,6 +20705,8 @@ exit 97
                     inode: 1,
                     boot_id: Some(other_boot_id.to_string()),
                 }),
+                cgroup_mount: None,
+                pid_namespace: None,
             },
         )
         .unwrap();
@@ -17141,6 +20811,7 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: 91,
+            pane_start_time: None,
             process_group_id: Some(91),
             process_session_id: Some(91),
             process_session_members: vec![TmuxProcessIdentity {
@@ -17152,6 +20823,8 @@ exit 97
                 start_time: 920,
             }],
             control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         let mut persisted = current.clone();
         persisted.process_session_members.push(TmuxProcessIdentity {
@@ -17194,6 +20867,35 @@ exit 97
         );
     }
 
+    #[test]
+    fn same_runtime_retry_does_not_merge_conflicting_older_pane_incarnation() {
+        let current = TmuxRuntimeIdentity {
+            launch_id: Some("launch-pane-incarnation".to_string()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: 91,
+            pane_start_time: Some(920),
+            process_group_id: Some(91),
+            process_session_id: Some(91),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
+        };
+        let mut older_format = current.clone();
+        older_format.pane_start_time = None;
+        older_format.process_session_members = vec![TmuxProcessIdentity {
+            pid: 91,
+            start_time: 910,
+        }];
+
+        assert!(
+            !current.same_process_identity(&older_format),
+            "a matching numeric PID with a conflicting captured start time is a prior runtime"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_process_session_pin_rejects_an_uncaptured_member() {
@@ -17213,6 +20915,7 @@ exit 97
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: pane.pid() as libc::pid_t,
+            pane_start_time: None,
             process_group_id: Some(pane.process_group_id),
             process_session_id: Some(leader.session_id),
             process_session_members: vec![TmuxProcessIdentity {
@@ -17221,6 +20924,8 @@ exit 97
             }],
             control_group_members: Vec::new(),
             control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
         };
 
         assert_eq!(
@@ -18119,6 +21824,7 @@ fi
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: pane.pid() as libc::pid_t,
+            pane_start_time: None,
             process_group_id: Some(pane.process_group_id),
             process_session_id: super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
             process_session_members: super::process_session_members(
@@ -18128,6 +21834,8 @@ fi
             .unwrap(),
             control_group_members: Vec::new(),
             control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         super::set_tmux_termination_state(
@@ -18177,6 +21885,7 @@ fi
             session_id: "$91".to_string(),
             pane_id: "%91".to_string(),
             pane_pid: pane.pid() as libc::pid_t,
+            pane_start_time: None,
             process_group_id: Some(pane.process_group_id),
             process_session_id: super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
             process_session_members: super::process_session_members(
@@ -18186,6 +21895,8 @@ fi
             .unwrap(),
             control_group_members: Vec::new(),
             control_group: None,
+            cgroup_mount: None,
+            pid_namespace: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         write_session_record(&context, &record).unwrap();
@@ -18394,6 +22105,356 @@ fi
                 OsStr::new("--"),
                 OsStr::new("/usr/bin/tmux"),
             ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_maps_host_identity_to_namespace_root() {
+        let (uid_map, gid_map) = super::provider_stop_canary_namespace_identity_maps(1000, 1001);
+
+        assert_eq!(uid_map, b"0 1000 1\n");
+        assert_eq!(gid_map, b"0 1001 1\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_prctl_state_distinguishes_failure_from_mismatch() {
+        assert!(
+            super::provider_stop_canary_prctl_state(1, 1, "prctl(test)").expect("matching state")
+        );
+        assert!(
+            !super::provider_stop_canary_prctl_state(0, 1, "prctl(test)")
+                .expect("mismatched state")
+        );
+        let error = super::provider_stop_canary_prctl_state(-1, 1, "prctl(test)")
+            .expect_err("negative syscall result");
+        assert!(error.to_string().contains("prctl(test)"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn evaluate_provider_stop_canary_seccomp_filter(
+        filter: &[libc::sock_filter],
+        arch: u32,
+        syscall: u32,
+        arg0: u32,
+    ) -> u32 {
+        let mut accumulator = 0_u32;
+        let mut program_counter = 0_usize;
+        loop {
+            let instruction = filter
+                .get(program_counter)
+                .expect("seccomp filter must terminate");
+            match instruction.code {
+                super::PROVIDER_STOP_CANARY_BPF_LD_W_ABS => {
+                    accumulator = match instruction.k {
+                        super::PROVIDER_STOP_CANARY_SECCOMP_DATA_ARCH_OFFSET => arch,
+                        super::PROVIDER_STOP_CANARY_SECCOMP_DATA_NR_OFFSET => syscall,
+                        super::PROVIDER_STOP_CANARY_SECCOMP_DATA_ARG0_OFFSET => arg0,
+                        offset => panic!("unexpected seccomp data offset {offset}"),
+                    };
+                    program_counter += 1;
+                }
+                super::PROVIDER_STOP_CANARY_BPF_JMP_JEQ_K => {
+                    let skip = if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    };
+                    program_counter += usize::from(skip) + 1;
+                }
+                super::PROVIDER_STOP_CANARY_BPF_JMP_JSET_K => {
+                    let skip = if accumulator & instruction.k != 0 {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    };
+                    program_counter += usize::from(skip) + 1;
+                }
+                super::PROVIDER_STOP_CANARY_BPF_RET_K => return instruction.k,
+                code => panic!("unexpected seccomp instruction {code:#x}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_seccomp_filter_has_fail_closed_control_flow() {
+        let filter = super::provider_stop_canary_seccomp_filter().expect("canary seccomp filter");
+        let arch = super::provider_stop_canary_audit_arch().expect("supported audit arch");
+        let errno = super::PROVIDER_STOP_CANARY_SECCOMP_RET_ERRNO;
+
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(
+                &filter,
+                arch ^ 1,
+                libc::SYS_getpid as u32,
+                0,
+            ),
+            super::PROVIDER_STOP_CANARY_SECCOMP_RET_KILL_PROCESS
+        );
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(&filter, arch, libc::SYS_clone3 as u32, 0,),
+            errno | libc::ENOSYS as u32
+        );
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(&filter, arch, libc::SYS_setns as u32, 0,),
+            errno | libc::EPERM as u32
+        );
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(
+                &filter,
+                arch,
+                libc::SYS_io_uring_setup as u32,
+                0,
+            ),
+            errno | libc::EPERM as u32
+        );
+        for syscall in [libc::SYS_unshare, libc::SYS_clone] {
+            assert_eq!(
+                evaluate_provider_stop_canary_seccomp_filter(
+                    &filter,
+                    arch,
+                    syscall as u32,
+                    libc::CLONE_NEWUSER as u32,
+                ),
+                errno | libc::EPERM as u32
+            );
+            assert_eq!(
+                evaluate_provider_stop_canary_seccomp_filter(
+                    &filter,
+                    arch,
+                    syscall as u32,
+                    libc::SIGCHLD as u32,
+                ),
+                super::PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW
+            );
+        }
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(
+                &filter,
+                arch,
+                libc::SYS_socket as u32,
+                libc::AF_UNIX as u32,
+            ),
+            errno | libc::EPERM as u32
+        );
+        for syscall in [libc::SYS_socket, libc::SYS_socketpair] {
+            assert_eq!(
+                evaluate_provider_stop_canary_seccomp_filter(
+                    &filter,
+                    arch,
+                    syscall as u32,
+                    libc::AF_INET as u32,
+                ),
+                super::PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW
+            );
+        }
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(
+                &filter,
+                arch,
+                libc::SYS_socketpair as u32,
+                libc::AF_UNIX as u32,
+            ),
+            super::PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW,
+            "anonymous descriptor pairs cannot connect to a host broker and are required by provider launchers"
+        );
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(&filter, arch, libc::SYS_getpid as u32, 0,),
+            super::PROVIDER_STOP_CANARY_SECCOMP_RET_ALLOW
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            evaluate_provider_stop_canary_seccomp_filter(
+                &filter,
+                arch,
+                super::PROVIDER_STOP_CANARY_X32_SYSCALL_BIT | libc::SYS_getpid as u32,
+                0,
+            ),
+            super::PROVIDER_STOP_CANARY_SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn provider_stop_canary_namespace_test_output_or_skip(
+        output: io::Result<std::process::Output>,
+        required: bool,
+    ) -> Option<std::process::Output> {
+        match output {
+            Ok(output) => Some(output),
+            Err(error) if required => {
+                panic!("provider stop canary namespace isolation is required: {error}")
+            }
+            Err(error) => {
+                eprintln!("SKIP: provider stop canary namespace isolation unavailable: {error}");
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_namespace_regression_is_explicitly_skippable() {
+        assert!(
+            provider_stop_canary_namespace_test_output_or_skip(
+                Err(io::Error::from_raw_os_error(libc::EPERM)),
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "provider stop canary namespace isolation is required")]
+    fn provider_stop_canary_namespace_regression_fails_closed_when_ci_requires_it() {
+        let _ = provider_stop_canary_namespace_test_output_or_skip(
+            Err(io::Error::from_raw_os_error(libc::EPERM)),
+            true,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_stop_canary_namespace_setup_irrevocably_drops_privileges() {
+        const CHILD_ENV: &str = "NILS_AGENT_SESSION_TEST_CANARY_PRIVDROP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let last_capability =
+                super::provider_stop_canary_last_capability().expect("kernel capability bound");
+            assert_eq!(unsafe { libc::geteuid() }, 0);
+            assert!(super::provider_stop_canary_privileges_are_sealed(last_capability).unwrap());
+            std::thread::spawn(|| 7)
+                .join()
+                .expect("ordinary provider thread remains available");
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWUSER) },
+                -1,
+                "the provider must not create a nested user namespace"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        libc::CLONE_NEWUSER | libc::SIGCHLD,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                },
+                -1,
+                "classic clone must not create a nested user namespace"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) },
+                -1,
+                "uninspectable clone3 must request libc fallback"
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSYS)
+            );
+            assert_eq!(
+                unsafe { libc::setns(-1, 0) },
+                -1,
+                "the provider must not join an inferred user namespace"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(
+                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) },
+                -1,
+                "the provider must not open a local process-broker channel"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_io_uring_setup,
+                        1_u32,
+                        std::ptr::null_mut::<libc::c_void>(),
+                    )
+                },
+                -1,
+                "the provider must not bypass socket filtering through io_uring"
+            );
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            let mut unix_pair = [-1; 2];
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, unix_pair.as_mut_ptr())
+                },
+                0,
+                "the provider launcher must retain anonymous descriptor pairs"
+            );
+            assert_eq!(unsafe { libc::close(unix_pair[0]) }, 0);
+            assert_eq!(unsafe { libc::close(unix_pair[1]) }, 0);
+            let internet_socket =
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            assert!(
+                internet_socket >= 0,
+                "the provider must retain Internet socket creation: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(unsafe { libc::close(internet_socket) }, 0);
+            assert_ne!(
+                unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                        std::ptr::null(),
+                    )
+                },
+                0,
+                "the provider must not retain mount authority after setup"
+            );
+            return;
+        }
+
+        let current_test = std::env::current_exe().expect("current test binary");
+        let effective_uid = unsafe { libc::geteuid() };
+        let effective_gid = unsafe { libc::getegid() };
+        let (uid_map, gid_map) =
+            super::provider_stop_canary_namespace_identity_maps(effective_uid, effective_gid);
+        let last_capability =
+            super::provider_stop_canary_last_capability().expect("kernel capability bound");
+        let mut seccomp_filter =
+            super::provider_stop_canary_seccomp_filter().expect("canary seccomp filter");
+        let mut command = std::process::Command::new(current_test);
+        command
+            .arg("--exact")
+            .arg("tests::provider_stop_canary_namespace_setup_irrevocably_drops_privileges")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1");
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in Command's freshly forked, single-threaded
+        // child and mirrors the production pre-exec namespace contract.
+        unsafe {
+            command.pre_exec(move || {
+                super::isolate_provider_stop_canary_child_cgroup_view(
+                    &uid_map,
+                    &gid_map,
+                    b"/sys/fs/cgroup\0",
+                    last_capability,
+                    &mut seccomp_filter,
+                )
+            });
+        }
+        let required = env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() == Ok("1");
+        let Some(output) =
+            provider_stop_canary_namespace_test_output_or_skip(command.output(), required)
+        else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "namespace regression failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

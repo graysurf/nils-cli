@@ -220,6 +220,11 @@ jobs:
           systemd-run --user --scope --quiet --collect \
             --unit "nils-provider-stop-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-3" \
             -- cargo test -p nils-agent-session --lib \
+              tests::provider_stop_canary_namespace_setup_irrevocably_drops_privileges \
+              -- --exact --nocapture
+          systemd-run --user --scope --quiet --collect \
+            --unit "nils-provider-stop-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-4" \
+            -- cargo test -p nils-agent-session --lib \
               tests::provider_stop_canary_never_signals_an_injected_same_uid_cgroup_member \
               -- --exact --nocapture
 

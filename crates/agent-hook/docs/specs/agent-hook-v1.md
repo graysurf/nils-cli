@@ -333,6 +333,21 @@ after ordinary aggregation even when that aggregate blocks, because an already
 admitted operation must persist its outcome and complete or remain explicitly
 reconcile-pending. Shadow evaluation never invokes the consumer.
 
+One bounded pre-claim exception preserves that ordering without deadlocking a
+managed worker. When a selected coordination rule exists, a Bash request is
+exactly one canonical bare or absolute `main-agent bootstrap --idempotency-key
+KEY --format json` invocation, and `owner-active-foreign` is the only blocking
+ordinary result, the typed coordination consumer runs while that block remains
+intact. Only its strict
+`runtime-kit.session-coordination-bootstrap-authorization.v1` affirmative
+authorization may replace that specific owner-liveness result. Empty or generic
+allow output, malformed or unavailable coordination, timeout, explicit denial,
+another blocking rule, or a transform preserves the original block. Shell
+composition, wrappers, relative executable spellings, invalid keys,
+non-canonical quoting or spacing, parameter/command/arithmetic expansion,
+redirection, reordered or additional arguments, missing coordination authority,
+and every non-bootstrap request remain subject to ordinary owner-liveness.
+
 Override classes:
 
 - `locked`: user config cannot change mode, priority, posture, or parameters.
