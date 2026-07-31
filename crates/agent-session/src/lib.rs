@@ -6623,7 +6623,7 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
     let submits = codex_app_server::input_contains_submission(text.as_deref(), &args.keys);
     if submits {
         codex_app_server::ensure_manual_input_capability(context, &record)?;
-        codex_account::authorize_input_locked(context, &mut record)?;
+        codex_account::authorize_terminal_input_locked(context, &mut record)?;
     }
     auto_resume::cancel_for_manual_input_locked(
         context,
@@ -6836,7 +6836,7 @@ fn send_input_serialized_with_title_guard(
     }
     if codex_app_server::input_contains_submission(text, keys) {
         codex_app_server::ensure_manual_input_capability(context, &current)?;
-        codex_account::authorize_input_locked(context, &mut current)?;
+        codex_account::authorize_terminal_input_locked(context, &mut current)?;
     }
     auto_resume::cancel_for_manual_input_locked(
         context,

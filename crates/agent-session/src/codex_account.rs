@@ -488,6 +488,14 @@ pub(crate) fn ensure_input_allowed(record: &SessionRecord) -> Result<(), CliErro
         DecodedNext::Absent => {}
         DecodedNext::Valid(_) | DecodedNext::Invalid => return Err(next_pending_error(record)),
     }
+    ensure_terminal_input_allowed(record)
+}
+
+/// Validate the account currently bound to the live runtime without treating a
+/// queued next-account intent as a reason to reject terminal input. The
+/// app-server proxy remains the structured boundary that fences `turn/start`;
+/// this lets an active turn continue to receive `turn/steer`.
+pub(crate) fn ensure_terminal_input_allowed(record: &SessionRecord) -> Result<(), CliError> {
     let binding = match decode_binding(record) {
         DecodedBinding::Absent => return Ok(()),
         DecodedBinding::Invalid => return Err(not_bound_error(record, None)),
@@ -514,16 +522,38 @@ pub(crate) fn authorize_input_locked(
     context: &CliContext,
     record: &mut SessionRecord,
 ) -> Result<(), CliError> {
+    authorize_input_locked_with(context, record, false)
+}
+
+/// Record authorization for terminal input while allowing the currently bound
+/// runtime to receive input during a queued next-account transition.
+pub(crate) fn authorize_terminal_input_locked(
+    context: &CliContext,
+    record: &mut SessionRecord,
+) -> Result<(), CliError> {
+    authorize_input_locked_with(context, record, true)
+}
+
+fn authorize_input_locked_with(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    allow_pending_next: bool,
+) -> Result<(), CliError> {
     if record.agent != "codex" {
         return Ok(());
     }
+    let ensure_allowed = if allow_pending_next {
+        ensure_terminal_input_allowed
+    } else {
+        ensure_input_allowed
+    };
     if binding_is_present(record) {
-        ensure_input_allowed(record)?;
+        ensure_allowed(record)?;
     }
     if !crate::codex_app_server::runtime_is_supported(record) || !broker_is_configured() {
         return Ok(());
     }
-    ensure_input_allowed(record)?;
+    ensure_allowed(record)?;
     let launch_id = record
         .runtime
         .as_ref()
@@ -2110,6 +2140,26 @@ wait "$child"
         )
         .unwrap();
         assert!(ensure_input_allowed(&reload(&context, &record.id)).is_ok());
+    }
+
+    #[test]
+    fn queued_next_allows_terminal_submission_but_still_fences_a_new_turn() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        let queued = reload(&context, &record.id);
+
+        assert!(
+            ensure_terminal_input_allowed(&queued).is_ok(),
+            "terminal input must reach the TUI so an active turn can emit turn/steer"
+        );
+        assert_eq!(
+            ensure_input_allowed(&queued).unwrap_err().code(),
+            "codex-account-next-pending",
+            "the structured turn/start boundary remains fenced"
+        );
     }
 
     #[test]

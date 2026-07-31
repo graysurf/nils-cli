@@ -7567,7 +7567,16 @@ async fn attach_socket(
                                 record.id,
                                 err.code()
                             );
-                            break;
+                            if !terminal_input_error_is_recoverable(&err) {
+                                break;
+                            }
+                            if control_tx
+                                .send(Message::Text(terminal_input_rejected_frame(&err).into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                     Message::Close(_) => break,
@@ -7767,6 +7776,28 @@ fn provider_prompt_capability_frame(capability: ProviderPromptCapabilityState) -
         "prompt_max_bytes": MAX_PROVIDER_PROMPT_BYTES,
     })
     .to_string()
+}
+
+fn terminal_input_rejected_frame(error: &CliError) -> String {
+    json!({
+        "schema_version": ATTACH_EVENT_SCHEMA_VERSION,
+        "type": "input_rejected",
+        "code": error.code(),
+        "retryable": true,
+    })
+    .to_string()
+}
+
+fn terminal_input_error_is_recoverable(error: &CliError) -> bool {
+    matches!(
+        error.code(),
+        "codex-account-next-pending"
+            | "codex-account-not-bound"
+            | "codex-input-section-unavailable"
+            | "codex-input-section-lease-failed"
+            | "session-record-lock-busy"
+            | "session-record-lock-timeout"
+    )
 }
 
 fn provider_prompt_event_frame(provider: ProviderKind, event: ProviderPromptEvent) -> String {
@@ -8711,6 +8742,55 @@ mod tests {
             })
         );
         assert!(!event.to_string().contains("/home/"));
+    }
+
+    #[test]
+    fn terminal_input_rejection_frame_is_versioned_and_secret_free() {
+        let error = CliError::runtime(
+            "codex-account-next-pending",
+            "sensitive provider detail",
+            Some(json!({ "prompt": "must not cross the attach boundary" })),
+        );
+
+        let frame: Value = serde_json::from_str(&terminal_input_rejected_frame(&error)).unwrap();
+
+        assert_eq!(frame["schema_version"], ATTACH_EVENT_SCHEMA_VERSION);
+        assert_eq!(frame["type"], "input_rejected");
+        assert_eq!(frame["code"], "codex-account-next-pending");
+        assert_eq!(frame["retryable"], true);
+        assert!(frame.get("message").is_none());
+        assert!(frame.get("details").is_none());
+    }
+
+    #[test]
+    fn terminal_input_error_recovery_preserves_runtime_failure_closure() {
+        for code in [
+            "codex-account-next-pending",
+            "codex-account-not-bound",
+            "codex-input-section-unavailable",
+            "session-record-lock-timeout",
+        ] {
+            let error = CliError::runtime(code, "retryable input policy", None);
+            assert!(
+                terminal_input_error_is_recoverable(&error),
+                "{code} should keep the attach socket open"
+            );
+        }
+        for code in [
+            "session-not-running",
+            "attach-input-worker-failed",
+            "tmux-send-failed",
+            "session-identity-conflict",
+            "codex-account-runtime-changed",
+            "codex-account-session-incarnation-conflict",
+            "codex-account-binding-invalid",
+        ] {
+            let error = CliError::runtime(code, "terminal failure", None);
+            assert!(
+                !terminal_input_error_is_recoverable(&error),
+                "{code} should retain the attach close/reconnect path"
+            );
+        }
     }
 
     #[test]

@@ -996,7 +996,7 @@ pub(crate) fn ensure_manual_input_capability(
     context: &CliContext,
     record: &SessionRecord,
 ) -> Result<(), CliError> {
-    crate::codex_account::ensure_input_allowed(record)?;
+    crate::codex_account::ensure_terminal_input_allowed(record)?;
     if !runtime_is_supported(record) {
         return Ok(());
     }
@@ -3371,6 +3371,7 @@ impl FreshBootstrap {
 struct MutationAuthorization {
     _bootstrap_gate: Option<CreateBootstrapGate>,
     _manual_input_gate: Option<ManualInputGate>,
+    _account_authority: Option<crate::LockedSessionAuthority>,
 }
 
 fn auto_resume_is_healthy_idle(context: &CliContext, record: &SessionRecord) -> bool {
@@ -3384,6 +3385,56 @@ fn auto_resume_is_healthy_idle(context: &CliContext, record: &SessionRecord) -> 
         && idle_state_matches_enablement
         && view.scheduled_at.is_none()
         && view.failure_reason.is_none()
+}
+
+async fn ensure_turn_start_account_ready(context: &CliContext, record: &SessionRecord) -> bool {
+    // The long-lived control connection is the sole owner of live account
+    // mutation. Hold this exact turn/start while its idle-boundary drive drains
+    // a queued/applying intent, then revalidate under the record lock below.
+    let deadline = Instant::now() + CONTROL_SUBMIT_TOTAL_TIMEOUT;
+    loop {
+        let load_context = context.clone();
+        let id = record.id.clone();
+        let Ok(Ok(current)) =
+            tokio::task::spawn_blocking(move || crate::load_session_record(&load_context, &id))
+                .await
+        else {
+            return false;
+        };
+        if crate::ensure_same_session_identity(record, &current).is_err() {
+            return false;
+        }
+        if crate::codex_account::ensure_input_allowed(&current).is_ok() {
+            return true;
+        }
+        let pending = crate::codex_account::view_for_record(&current)
+            .next
+            .is_some_and(|next| matches!(next.state, "queued" | "applying"));
+        if !pending || Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn lock_turn_start_account_authority(
+    context: &CliContext,
+    expected: &SessionRecord,
+) -> Option<crate::LockedSessionAuthority> {
+    let authority_context = context.clone();
+    let authority_id = expected.id.clone();
+    let expected = expected.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::lock_exact_session_authority(&authority_context, &authority_id)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+    .filter(|authority| {
+        crate::ensure_same_session_identity(&expected, &authority.record).is_ok()
+            && crate::codex_account::ensure_input_allowed(&authority.record).is_ok()
+    })
 }
 
 async fn cancel_before_tui_mutation(
@@ -3407,23 +3458,12 @@ async fn cancel_before_tui_mutation(
         return Some(MutationAuthorization {
             _bootstrap_gate: None,
             _manual_input_gate: None,
+            _account_authority: None,
         });
     }
-    if method == Some("turn/start") {
-        let account_context = context.clone();
-        let account_id = record.id.clone();
-        let allowed = tokio::task::spawn_blocking(move || {
-            let current = crate::load_session_record(&account_context, &account_id)?;
-            crate::codex_account::ensure_input_allowed(&current)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_some();
-        if !allowed {
-            bootstrap.close();
-            return None;
-        }
+    if method == Some("turn/start") && !ensure_turn_start_account_ready(context, record).await {
+        bootstrap.close();
+        return None;
     }
     // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
     // `turn/start`, while the parent create path still owns the lifecycle lock.
@@ -3489,12 +3529,17 @@ async fn cancel_before_tui_mutation(
     .await
     .ok()
     .and_then(Result::ok);
-    match cancellation {
+    // Either gate proves that the outer sender still owns the matching
+    // record/lifecycle authority. Reacquiring the record lock while holding
+    // the gate would invert marker teardown's lock order.
+    let sender_owns_record_authority = bootstrap_gate.is_some() || manual_input_gate.is_some();
+    let mut authorization = match cancellation {
         Some(crate::auto_resume::ManualInputCancelOutcome::Ready) => {
             bootstrap.close();
             Some(MutationAuthorization {
                 _bootstrap_gate: bootstrap_gate,
                 _manual_input_gate: manual_input_gate,
+                _account_authority: None,
             })
         }
         Some(crate::auto_resume::ManualInputCancelOutcome::Busy)
@@ -3504,6 +3549,7 @@ async fn cancel_before_tui_mutation(
             Some(MutationAuthorization {
                 _bootstrap_gate: bootstrap_gate,
                 _manual_input_gate: manual_input_gate,
+                _account_authority: None,
             })
         }
         Some(crate::auto_resume::ManualInputCancelOutcome::Busy) if manual_input_gate.is_some() => {
@@ -3511,6 +3557,7 @@ async fn cancel_before_tui_mutation(
             Some(MutationAuthorization {
                 _bootstrap_gate: bootstrap_gate,
                 _manual_input_gate: manual_input_gate,
+                _account_authority: None,
             })
         }
         Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => None,
@@ -3518,7 +3565,13 @@ async fn cancel_before_tui_mutation(
             bootstrap.close();
             None
         }
+    };
+    if method == Some("turn/start") && !sender_owns_record_authority {
+        let authorization = authorization.as_mut()?;
+        let authority = lock_turn_start_account_authority(context, record).await?;
+        authorization._account_authority = Some(authority);
     }
+    authorization
 }
 
 fn proxy_websocket_config() -> WebSocketConfig {
@@ -3638,6 +3691,7 @@ async fn run_proxy_session(
                     MutationAuthorization {
                         _bootstrap_gate: None,
                         _manual_input_gate: None,
+                        _account_authority: None,
                     }
                 };
                 let closed = matches!(message, Message::Close(_));
@@ -7566,6 +7620,289 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
     }
 
     #[tokio::test]
+    async fn proxy_holds_queued_account_turn_until_apply_then_forwards_once() {
+        let env_lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &env_lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("queued-turn.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("queued-turn", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        crate::codex_account::queue_next_account_with_unbound(
+            &context,
+            &record.id,
+            &record.runtime.as_ref().unwrap().launch_id,
+            "sym",
+        )
+        .unwrap();
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), receive_json(&mut socket))
+                    .await
+                    .is_err(),
+                "turn/start reached the upstream before the queued account applied"
+            );
+            held_tx.send(()).unwrap();
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "turn/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "turn": { "id": "queued-turn", "status": "inProgress" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 2);
+            assert_eq!(
+                request["method"], "thread/read",
+                "the held turn/start must be forwarded exactly once"
+            );
+            respond(&mut socket, &request, json!({ "ok": true })).await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        held_rx.await.unwrap();
+
+        let launch_id = &record.runtime.as_ref().unwrap().launch_id;
+        let applying = crate::codex_account::begin_next_apply(&context, &record.id, launch_id)
+            .unwrap()
+            .expect("the queued account should become applying");
+        crate::codex_account::finish_next_apply(
+            &context,
+            &record.id,
+            launch_id,
+            &applying.account,
+            applying.revision,
+            applying.intent_id.as_deref().unwrap(),
+            Ok(()),
+        )
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut tui))
+            .await
+            .expect("the turn should forward promptly after account apply");
+        assert_eq!(response["result"]["turn"]["id"], "queued-turn");
+        tui.send(Message::Text(
+            json!({ "id": 2, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 2);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_failed_account_apply_without_upstream_forwarding() {
+        let env_lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &env_lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("failed-turn.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("failed-turn", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let launch_id = &record.runtime.as_ref().unwrap().launch_id;
+        crate::codex_account::queue_next_account_with_unbound(
+            &context, &record.id, launch_id, "sym",
+        )
+        .unwrap();
+        let applying = crate::codex_account::begin_next_apply(&context, &record.id, launch_id)
+            .unwrap()
+            .expect("the queued account should become applying");
+        crate::codex_account::finish_next_apply(
+            &context,
+            &record.id,
+            launch_id,
+            &applying.account,
+            applying.revision,
+            applying.intent_id.as_deref().unwrap(),
+            Err("credential_rejected"),
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), receive_json(&mut socket))
+                    .await
+                    .is_err(),
+                "a failed account apply must not forward turn/start"
+            );
+        });
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut tui))
+            .await
+            .expect("failed account apply should reject promptly");
+        assert_eq!(rejected["id"], 1);
+        assert_eq!(rejected["error"]["code"], -32001);
+        server.await.unwrap();
+        proxy.abort();
+        let _ = proxy.await;
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_runtime_replacement_while_account_apply_is_pending() {
+        let env_lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &env_lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("replaced-turn.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("replaced-turn", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        crate::codex_account::queue_next_account_with_unbound(
+            &context,
+            &record.id,
+            &record.runtime.as_ref().unwrap().launch_id,
+            "sym",
+        )
+        .unwrap();
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), receive_json(&mut socket))
+                    .await
+                    .is_err(),
+                "turn/start reached upstream while account apply was pending"
+            );
+            held_tx.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), receive_json(&mut socket))
+                    .await
+                    .is_err(),
+                "a replacement runtime must not receive the held turn/start"
+            );
+        });
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        held_rx.await.unwrap();
+
+        let _record_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let mut replacement = crate::load_session_record(&context, &record.id).unwrap();
+        let runtime = replacement.runtime.as_mut().unwrap();
+        runtime.generation += 1;
+        runtime.launch_id = "replacement-runtime".to_string();
+        crate::write_session_record(&context, &replacement).unwrap();
+        drop(_record_lock);
+
+        let rejected = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut tui))
+            .await
+            .expect("runtime replacement should reject promptly");
+        assert_eq!(rejected["id"], 1);
+        assert_eq!(rejected["error"]["code"], -32001);
+        server.await.unwrap();
+        proxy.abort();
+        let _ = proxy.await;
+    }
+
+    #[tokio::test]
     async fn managed_handoff_boundary_preserves_thread_and_arms_one_continuation() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7699,7 +8036,19 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         .unwrap();
         crate::activity::ingest_event(&context, &record.id, turn_completed).unwrap();
 
+        let readiness = ensure_turn_start_account_ready(&context, &record);
+        tokio::pin!(readiness);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut readiness)
+                .await
+                .is_err(),
+            "turn/start must remain held while the long-lived control owner has not applied the queued account"
+        );
         handle.apply_next().await.unwrap();
+        assert!(
+            readiness.await,
+            "turn/start must become ready only after the control owner durably applies the account"
+        );
         server.await.unwrap();
         let persisted = crate::load_session_record(&context, &record.id).unwrap();
         let view = crate::codex_account::view_for_record(&persisted);
@@ -8315,6 +8664,12 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
 
     #[tokio::test]
     async fn manual_input_section_bypasses_reentrant_lock_until_sender_cleanup() {
+        let env_lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &env_lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
         let tmp = tempfile::TempDir::new().unwrap();
         let upstream = tmp.path().join("owned-input.sock");
         let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
@@ -8356,7 +8711,7 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
             .await
             .unwrap();
-        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let record_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
         for _ in 0..100 {
             if live_proxy_capability(&context, &record) {
                 break;
@@ -8366,6 +8721,22 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let marker = begin_manual_input_section(&context, &record)
             .unwrap()
             .unwrap();
+        let queue_context = context.clone();
+        let queue_id = record.id.clone();
+        let queue_launch_id = record.runtime.as_ref().unwrap().launch_id.clone();
+        let (queue_started_tx, queue_started_rx) = std::sync::mpsc::channel();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let queue = std::thread::spawn(move || {
+            queue_started_tx.send(()).unwrap();
+            let result = crate::codex_account::queue_next_account_with_unbound(
+                &queue_context,
+                &queue_id,
+                &queue_launch_id,
+                "sym",
+            );
+            queued_tx.send(result).unwrap();
+        });
+        queue_started_rx.recv().unwrap();
         tui.send(Message::Text(
             json!({
                 "id": 1,
@@ -8377,13 +8748,33 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         ))
         .await
         .unwrap();
-        let response = receive_json(&mut tui).await;
+        let response = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut tui))
+            .await
+            .expect("the sender-owned record lock must not deadlock proxy authorization");
         assert_eq!(response["result"]["turn"]["id"], "owned-turn");
+        assert!(
+            queued_rx.try_recv().is_err(),
+            "a racing account queue must remain fenced until the forwarded request lands"
+        );
         assert!(
             manual_input_section_path(&context, &record).exists(),
             "manual input section remains live until the sender releases its lock"
         );
-        marker.finish(|| drop(lock));
+        marker.finish(|| drop(record_lock));
+        let queued = queued_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the account queue should proceed after sender cleanup")
+            .unwrap();
+        let next = queued.next.expect("the account intent should be queued");
+        crate::codex_account::cancel_next_account(
+            &context,
+            &record.id,
+            &record.runtime.as_ref().unwrap().launch_id,
+            next.account.as_deref(),
+            Some(next.revision),
+        )
+        .unwrap();
+        queue.join().unwrap();
         let unrelated_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
         tui.send(Message::Text(
             json!({
@@ -9078,6 +9469,79 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
     }
 
     #[tokio::test]
+    async fn turn_start_account_authority_serializes_a_racing_account_queue() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("turn-start-account-fence", &tmp.path().join("app.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        let authority = lock_turn_start_account_authority(&context, &record)
+            .await
+            .expect("the current account must be authorized");
+        let queue_context = context.clone();
+        let queue_id = record.id.clone();
+        let queue_launch_id = record.runtime.as_ref().unwrap().launch_id.clone();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let queue = std::thread::spawn(move || {
+            let result = crate::codex_account::queue_next_account_with_unbound(
+                &queue_context,
+                &queue_id,
+                &queue_launch_id,
+                "sym",
+            );
+            queued_tx.send(result).unwrap();
+        });
+
+        assert!(
+            queued_rx.recv_timeout(Duration::from_millis(10)).is_err(),
+            "a new account intent must not become durable before the authorized turn/start is forwarded"
+        );
+        drop(authority);
+        let queued = queued_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the account queue should proceed after forwarding")
+            .unwrap();
+        assert_eq!(queued.next.as_ref().map(|next| next.state), Some("queued"));
+        queue.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_start_account_authority_rejects_a_replacement_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let expected =
+            record_with_runtime("turn-start-runtime-fence", &tmp.path().join("app.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &expected.id)).unwrap();
+        crate::write_session_record(&context, &expected).unwrap();
+
+        let mut replacement = expected.clone();
+        let runtime = replacement.runtime.as_mut().unwrap();
+        runtime.generation += 1;
+        runtime.launch_id = "replacement-runtime".to_string();
+        crate::write_session_record(&context, &replacement).unwrap();
+
+        assert!(
+            lock_turn_start_account_authority(&context, &expected)
+                .await
+                .is_none(),
+            "final authority from a replacement runtime must not authorize the old proxy socket"
+        );
+    }
+
+    #[tokio::test]
     async fn broker_bound_tui_rejects_account_auth_mutations() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9197,6 +9661,7 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let authorization = MutationAuthorization {
             _bootstrap_gate: acquire_create_bootstrap_gate(&record),
             _manual_input_gate: None,
+            _account_authority: None,
         };
         assert!(authorization._bootstrap_gate.is_some());
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
