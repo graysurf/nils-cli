@@ -1,9 +1,10 @@
 //! Strict metadata-only projection of the Codex app-server v2 protocol.
 //!
 //! The interactive TUI's human-readable error text is intentionally ignored.
-//! Auto-resume is armed only when the live protocol reports both an exact
-//! `usageLimitExceeded` error and a matching terminal `failed` completion for
-//! the same bound thread and turn.
+//! Structured failures are admitted only when the live protocol reports an
+//! allowlisted `codexErrorInfo` and a matching terminal `failed` completion for
+//! the same bound thread and turn. Auto-resume remains exclusive to
+//! `usageLimitExceeded`; `serverOverloaded` is projected as provider capacity.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
@@ -1430,17 +1431,41 @@ pub(crate) fn cleanup_runtime_files(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StructuredFailureKind {
+    UsageExhausted,
+    ProviderCapacity,
+}
+
+impl StructuredFailureKind {
+    pub(crate) fn activity_reason(self) -> &'static str {
+        match self {
+            Self::UsageExhausted => "usage_exhausted",
+            Self::ProviderCapacity => "provider_capacity",
+        }
+    }
+
+    fn from_codex_error_info(value: &str) -> Option<Self> {
+        match value {
+            "usageLimitExceeded" => Some(Self::UsageExhausted),
+            "serverOverloaded" => Some(Self::ProviderCapacity),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UsageFailure {
+pub(crate) struct StructuredFailure {
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
+    pub(crate) kind: StructuredFailureKind,
 }
 
 #[derive(Debug)]
 pub(crate) struct FailureReducer {
     thread_id: String,
-    exhausted_turns: BTreeSet<String>,
-    exhausted_order: VecDeque<String>,
+    pending_turns: BTreeMap<String, Option<StructuredFailureKind>>,
+    pending_order: VecDeque<String>,
     completed_turns: BTreeSet<String>,
     completed_order: VecDeque<String>,
 }
@@ -1449,35 +1474,36 @@ impl FailureReducer {
     pub(crate) fn new(thread_id: impl Into<String>) -> Self {
         Self {
             thread_id: thread_id.into(),
-            exhausted_turns: BTreeSet::new(),
-            exhausted_order: VecDeque::new(),
+            pending_turns: BTreeMap::new(),
+            pending_order: VecDeque::new(),
             completed_turns: BTreeSet::new(),
             completed_order: VecDeque::new(),
         }
     }
 
-    pub(crate) fn ingest(&mut self, message: &Value) -> Option<UsageFailure> {
+    pub(crate) fn ingest(&mut self, message: &Value) -> Option<StructuredFailure> {
         match message.get("method").and_then(Value::as_str) {
             Some("error") => {
                 let params = message.get("params")?;
                 if params.get("threadId").and_then(Value::as_str) != Some(self.thread_id.as_str())
                     || params.get("willRetry").and_then(Value::as_bool) != Some(false)
-                    || params
-                        .pointer("/error/codexErrorInfo")
-                        .and_then(Value::as_str)
-                        != Some("usageLimitExceeded")
                 {
                     return None;
                 }
+                let kind = params
+                    .pointer("/error/codexErrorInfo")
+                    .and_then(Value::as_str)
+                    .and_then(StructuredFailureKind::from_codex_error_info)?;
                 let turn_id = params
                     .get("turnId")
                     .and_then(Value::as_str)
                     .filter(|turn_id| protocol_id_is_valid(turn_id))?;
                 if !self.completed_turns.contains(turn_id) {
-                    insert_bounded_id(
-                        &mut self.exhausted_turns,
-                        &mut self.exhausted_order,
+                    insert_bounded_failure(
+                        &mut self.pending_turns,
+                        &mut self.pending_order,
                         turn_id,
+                        kind,
                     );
                 }
                 None
@@ -1493,28 +1519,67 @@ impl FailureReducer {
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
                     .filter(|turn_id| protocol_id_is_valid(turn_id))?;
-                let embedded_usage_exhaustion = params
+                let embedded_kind = params
                     .pointer("/turn/error/codexErrorInfo")
                     .and_then(Value::as_str)
-                    == Some("usageLimitExceeded");
-                let matched_error = remove_bounded_id(
-                    &mut self.exhausted_turns,
-                    &mut self.exhausted_order,
+                    .and_then(StructuredFailureKind::from_codex_error_info);
+                let matched_kind = remove_bounded_failure(
+                    &mut self.pending_turns,
+                    &mut self.pending_order,
                     turn_id,
-                );
+                )
+                .flatten();
                 insert_bounded_id(
                     &mut self.completed_turns,
                     &mut self.completed_order,
                     turn_id,
                 );
-                (embedded_usage_exhaustion || matched_error).then(|| UsageFailure {
+                let kind = embedded_kind.or(matched_kind);
+                kind.map(|kind| StructuredFailure {
                     thread_id: self.thread_id.clone(),
                     turn_id: turn_id.to_string(),
+                    kind,
                 })
             }
             _ => None,
         }
     }
+}
+
+fn insert_bounded_failure(
+    pending: &mut BTreeMap<String, Option<StructuredFailureKind>>,
+    order: &mut VecDeque<String>,
+    id: &str,
+    kind: StructuredFailureKind,
+) {
+    if let Some(existing) = pending.get_mut(id) {
+        if existing.is_some_and(|existing| existing != kind) {
+            *existing = None;
+        }
+        return;
+    }
+    while pending.len() >= MAX_REDUCER_PENDING_TURNS {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
+    pending.insert(id.to_string(), Some(kind));
+    order.push_back(id.to_string());
+}
+
+fn remove_bounded_failure(
+    pending: &mut BTreeMap<String, Option<StructuredFailureKind>>,
+    order: &mut VecDeque<String>,
+    id: &str,
+) -> Option<Option<StructuredFailureKind>> {
+    let removed = pending.remove(id);
+    if removed.is_some()
+        && let Some(index) = order.iter().position(|candidate| candidate == id)
+    {
+        order.remove(index);
+    }
+    removed
 }
 
 fn insert_bounded_id(set: &mut BTreeSet<String>, order: &mut VecDeque<String>, id: &str) {
@@ -1530,16 +1595,6 @@ fn insert_bounded_id(set: &mut BTreeSet<String>, order: &mut VecDeque<String>, i
     let owned = id.to_string();
     set.insert(owned.clone());
     order.push_back(owned);
-}
-
-fn remove_bounded_id(set: &mut BTreeSet<String>, order: &mut VecDeque<String>, id: &str) -> bool {
-    if !set.remove(id) {
-        return false;
-    }
-    if let Some(index) = order.iter().position(|item| item == id) {
-        order.remove(index);
-    }
-    true
 }
 
 pub(crate) fn initialize_request(id: u64) -> Value {
@@ -4100,12 +4155,13 @@ async fn process_live_message(
         .map(|runtime| runtime.launch_id.clone())
         .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
     tokio::task::spawn_blocking(move || {
-        crate::activity::ingest_codex_app_server_failure(
+        crate::activity::ingest_codex_app_server_failure_with_kind(
             &context,
             &id,
             &runtime_id,
             &failure.thread_id,
             &failure.turn_id,
+            failure.kind,
         )
     })
     .await
@@ -5644,15 +5700,160 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 "method": "turn/completed",
                 "params": { "threadId": "thread-a", "turn": { "id": "turn-a", "status": "failed" } }
             })),
-            Some(UsageFailure {
+            Some(StructuredFailure {
                 thread_id: "thread-a".into(),
-                turn_id: "turn-a".into()
+                turn_id: "turn-a".into(),
+                kind: StructuredFailureKind::UsageExhausted,
             })
         );
         assert_eq!(
             reducer.ingest(&error),
             None,
             "a completed turn cannot be re-armed"
+        );
+    }
+
+    #[test]
+    fn reducer_admits_exact_server_overload_as_a_structured_capacity_failure() {
+        let mut reducer = FailureReducer::new("thread-a");
+        assert_eq!(
+            reducer.ingest(&json!({
+                "method": "error",
+                "params": {
+                    "threadId": "thread-a",
+                    "turnId": "turn-capacity",
+                    "willRetry": false,
+                    "error": {
+                        "message": "Selected model is at capacity",
+                        "codexErrorInfo": "serverOverloaded"
+                    }
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            reducer.ingest(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-a",
+                    "turn": { "id": "turn-capacity", "status": "failed" }
+                }
+            })),
+            Some(StructuredFailure {
+                thread_id: "thread-a".into(),
+                turn_id: "turn-capacity".into(),
+                kind: StructuredFailureKind::ProviderCapacity,
+            }),
+            "the exact structured serverOverloaded enum must survive the matched failed completion",
+        );
+    }
+
+    #[test]
+    fn structured_provider_capacity_is_projected_without_arming_usage_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("provider-capacity", &tmp.path().join("unused.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let result = crate::activity::ingest_codex_app_server_failure_with_kind(
+            &context,
+            &record.id,
+            &record.runtime.as_ref().unwrap().launch_id,
+            "thread-capacity",
+            "turn-capacity",
+            StructuredFailureKind::ProviderCapacity,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .turn_state
+                .last_turn
+                .as_ref()
+                .and_then(crate::activity::LastTurn::provider_failure_kind),
+            Some("provider_capacity")
+        );
+        assert_eq!(
+            crate::auto_resume::view_for_record(&context, &record).state,
+            "enabled",
+            "provider capacity is not account usage exhaustion and must not arm auto-resume"
+        );
+    }
+
+    #[test]
+    fn reducer_fails_closed_for_conflicting_failure_kinds_on_one_turn() {
+        for kinds in [
+            ["usageLimitExceeded", "serverOverloaded"],
+            ["serverOverloaded", "usageLimitExceeded"],
+        ] {
+            let mut reducer = FailureReducer::new("thread-a");
+            for kind in kinds {
+                assert_eq!(
+                    reducer.ingest(&json!({
+                        "method": "error",
+                        "params": {
+                            "threadId": "thread-a",
+                            "turnId": "turn-conflict",
+                            "willRetry": false,
+                            "error": { "codexErrorInfo": kind }
+                        }
+                    })),
+                    None
+                );
+            }
+            assert_eq!(
+                reducer.ingest(&json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turn": { "id": "turn-conflict", "status": "failed" }
+                    }
+                })),
+                None,
+                "conflicting structured evidence must never select the retry-authorizing usage branch"
+            );
+        }
+
+        let mut embedded = FailureReducer::new("thread-a");
+        for kind in ["usageLimitExceeded", "serverOverloaded"] {
+            assert_eq!(
+                embedded.ingest(&json!({
+                    "method": "error",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-embedded",
+                        "willRetry": false,
+                        "error": { "codexErrorInfo": kind }
+                    }
+                })),
+                None
+            );
+        }
+        assert_eq!(
+            embedded.ingest(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-a",
+                    "turn": {
+                        "id": "turn-embedded",
+                        "status": "failed",
+                        "error": { "codexErrorInfo": "serverOverloaded" }
+                    }
+                }
+            })),
+            Some(StructuredFailure {
+                thread_id: "thread-a".into(),
+                turn_id: "turn-embedded".into(),
+                kind: StructuredFailureKind::ProviderCapacity,
+            }),
+            "the terminal completion's embedded structured kind resolves earlier conflicting frames"
         );
     }
 
@@ -5687,9 +5888,10 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                     }
                 }
             })),
-            Some(UsageFailure {
+            Some(StructuredFailure {
                 thread_id: "thread-a".into(),
-                turn_id: "turn-b".into()
+                turn_id: "turn-b".into(),
+                kind: StructuredFailureKind::UsageExhausted,
             })
         );
     }
@@ -5721,7 +5923,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 None
             );
         }
-        assert_eq!(reducer.exhausted_turns.len(), MAX_REDUCER_PENDING_TURNS);
+        assert_eq!(reducer.pending_turns.len(), MAX_REDUCER_PENDING_TURNS);
         assert_eq!(reducer.completed_turns.len(), MAX_REDUCER_PENDING_TURNS);
         let oversized = "x".repeat(MAX_PROTOCOL_ID_BYTES + 1);
         assert_eq!(
@@ -5736,7 +5938,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             })),
             None
         );
-        assert_eq!(reducer.exhausted_turns.len(), MAX_REDUCER_PENDING_TURNS);
+        assert_eq!(reducer.pending_turns.len(), MAX_REDUCER_PENDING_TURNS);
     }
 
     #[test]
@@ -7427,12 +7629,13 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 }
             }))
             .unwrap();
-        crate::activity::ingest_codex_app_server_failure(
+        crate::activity::ingest_codex_app_server_failure_with_kind(
             &context,
             &target.id,
             &target.runtime.as_ref().unwrap().launch_id,
             &failure.thread_id,
             &failure.turn_id,
+            failure.kind,
         )
         .unwrap();
 
@@ -8199,12 +8402,13 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         .unwrap();
         record = crate::load_session_record(&context, &record.id).unwrap();
         crate::activity::activate_runtime(&context, &record).unwrap();
-        crate::activity::ingest_codex_app_server_failure(
+        crate::activity::ingest_codex_app_server_failure_with_kind(
             &context,
             &record.id,
             "runtime-failed-reconnect",
             "thread-failed",
             "turn-failed",
+            StructuredFailureKind::UsageExhausted,
         )
         .unwrap();
         bind_thread(&record, "raw-thread-failed").unwrap();
@@ -8446,12 +8650,13 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         crate::activity::activate_runtime(&context, &record).unwrap();
         crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
             .unwrap();
-        crate::activity::ingest_codex_app_server_failure(
+        crate::activity::ingest_codex_app_server_failure_with_kind(
             &context,
             &record.id,
             &record.runtime.as_ref().unwrap().launch_id,
             "thread-a",
             "failed-turn",
+            StructuredFailureKind::UsageExhausted,
         )
         .unwrap();
         assert_eq!(
@@ -9935,12 +10140,13 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         crate::activity::activate_runtime(&context, &record).unwrap();
         crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
             .unwrap();
-        crate::activity::ingest_codex_app_server_failure(
+        crate::activity::ingest_codex_app_server_failure_with_kind(
             &context,
             &record.id,
             &record.runtime.as_ref().unwrap().launch_id,
             "thread-a",
             "failed-turn",
+            StructuredFailureKind::UsageExhausted,
         )
         .unwrap();
         crate::auto_resume::tick_for_runtime(

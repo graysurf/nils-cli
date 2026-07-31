@@ -390,6 +390,35 @@ evidence and a visible tmux wrapper; its reconciliation action is
 non-executable. Existing v2-v5 classifications retain their exact schema
 identifiers and projections.
 
+`pre_bootstrap_attention_required` and
+`provider_capacity_attention_required` use
+`main-agent.worker-diagnose-result.v7`,
+`main-agent.worker-supervise-result.v7`, and
+`main-agent.worker-recovery-action.v7`. The v7 diagnosis adds an `attention`
+projection with a bounded `kind`, evidence `source`, and explicit false
+`provider_input_authorized` and `account_change_authorized` fields. A live
+`starting` worker with no claim, no exhausted readiness receipt, no operation,
+no recovery reservation, and no blocker or terminal evidence is
+`pre_bootstrap_attention_required`; it MUST NOT be told to renew a claim that
+authenticated bootstrap has not created. An exact Codex app-server
+`codexErrorInfo: serverOverloaded` followed by the matching non-retrying failed
+turn is admitted only through the internal protocol-owned
+`agent-session.turn-event.v2` path. Generic activity ingestion continues to
+accept only v1 and its closed failure-reason union. Reduction persists the
+additive bounded `last_turn.provider_failure_kind: provider_capacity` marker,
+which classifies `provider_capacity_attention_required` only for a bound live
+worker in an eligible `starting`, `working`, or `blocked` assignment at that
+authoritative waiting boundary. A newer active turn or any later submitted,
+accepted, cancelled, or released assignment lifecycle retires the
+classification. Conflicting
+structured failure kinds for one turn fail closed unless the terminal
+completion embeds the resolving kind. Free-form error prose is not admitted.
+This state is distinct from quota or credit exhaustion: it MUST
+NOT arm usage auto-resume, authorize account handoff, resend the prompt, or
+send terminal input. Both v7 actions are Main-owned bounded supervision
+rechecks and are not automatic-retry-safe. Existing v2-v6 classifications
+retain their exact schema identifiers and projections.
+
 `worker stop-runtime` MUST authenticate the exact current Main controller and
 its active, unexpired claim; revalidate run ownership, assignment revision,
 primary manager, worker binding, and the final readiness receipt; and hold the
@@ -887,7 +916,9 @@ The full supervision classification set additionally includes
 `claim_renewal_required`, `guidance_continuity_required`,
 `orphan_guidance_quarantine_required`,
 `account_handoff_capability_gap`, `account_handoff_required`, and
-`stale_provider_activity`. Broker-heartbeat/edit-authority staleness is not
+`stale_provider_activity`. The additive v7 set also includes
+`pre_bootstrap_attention_required` and
+`provider_capacity_attention_required`. Broker-heartbeat/edit-authority staleness is not
 claim-expiry evidence: only `claim_renewal_required` directs the exact worker to
 renew its own claim. `coordination_broker_stale` routes to exact-incarnation
 broker-owner recovery; `edit_authority_stale` requests a bounded recheck while

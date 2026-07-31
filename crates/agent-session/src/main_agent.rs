@@ -8730,6 +8730,7 @@ fn run_worker_diagnose(context: &CliContext, args: WorkerDiagnoseArgs) -> Result
 fn run_worker_supervise(context: &CliContext, args: WorkerDiagnoseArgs) -> Result<Value, CliError> {
     let diagnosis = diagnose_worker(context, &args.assignment_id)?;
     let schema_version = match diagnosis["schema_version"].as_str() {
+        Some("main-agent.worker-diagnose-result.v7") => "main-agent.worker-supervise-result.v7",
         Some("main-agent.worker-diagnose-result.v6") => "main-agent.worker-supervise-result.v6",
         Some("main-agent.worker-diagnose-result.v5") => "main-agent.worker-supervise-result.v5",
         Some("main-agent.worker-diagnose-result.v4") => "main-agent.worker-supervise-result.v4",
@@ -8984,6 +8985,21 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         || activity
             .and_then(|state| state.last_turn.as_ref())
             .is_some_and(|turn| bounded_quota_outcome(&turn.outcome));
+    let provider_capacity_evidence = matches!(
+        assignment.state.as_str(),
+        "starting" | "working" | "blocked"
+    ) && assignment.worker.is_some()
+        && worker_status == "running"
+        && activity.is_some_and(|state| {
+            state.phase == crate::activity::TurnPhase::Waiting
+                && state.current_turn.is_none()
+                && state.source.confidence == crate::activity::Confidence::Authoritative
+                && state.source.kind == crate::activity::SourceKind::ProviderHook
+                && state.last_turn.as_ref().is_some_and(|turn| {
+                    turn.outcome == "failed"
+                        && turn.provider_failure_kind() == Some("provider_capacity")
+                })
+        });
     // Guidance is projected from the same locked coordination snapshot when
     // that snapshot is usable. Any lock/schema failure is already represented
     // by coordination evidence, so it must not create a second, higher
@@ -9175,7 +9191,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     };
     let claimed_runtime_stop_in_flight = claimed_runtime_stop_replay.is_some();
     let claim_revocation_in_flight = assignment.claim_revocation.is_some();
-    let readiness_stop_required = assignment.state == "starting"
+    let readiness_exhausted = assignment.state == "starting"
         && assignment.worker.as_ref().is_some_and(|worker| {
             has_exhausted_worker_start_readiness(
                 &registry,
@@ -9184,7 +9200,9 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
                 &assignment,
                 worker,
             )
-        })
+        });
+    let readiness_stop_required = assignment.state == "starting"
+        && readiness_exhausted
         && worker_status == "running"
         && !claim_active
         && active_operations == 0
@@ -9193,6 +9211,23 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         && !account_handoff_in_flight
         && !runtime_stop_in_flight
         && !claim_revocation_in_flight;
+    let pre_bootstrap_attention_required =
+        worker_pre_bootstrap_attention_required(PreBootstrapEvidence {
+            assignment_state: &assignment.state,
+            worker_bound: assignment.worker.is_some(),
+            worker_status: &worker_status,
+            claim_active,
+            operations_quiescent: active_operations == 0 && uncertain_operations == 0,
+            readiness_exhausted,
+            recovery_in_flight: submit_recovery_in_flight(&assignment)
+                || account_handoff_in_flight
+                || runtime_stop_in_flight
+                || claim_revocation_in_flight,
+            blocker_or_terminal_evidence: preclaim_blocker
+                || provider_terminated
+                || terminal_recovery_reconciled
+                || startup_dialog,
+        });
     let idle_claim_revocation_required =
         matches!(assignment.state.as_str(), "working" | "accepted")
             && assignment.worker.is_some()
@@ -9267,6 +9302,8 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         claim_revocation_in_flight,
         account_handoff_in_flight,
         readiness_stop_required,
+        pre_bootstrap_attention_required,
+        provider_capacity_attention_required: provider_capacity_evidence,
         idle_claim_revocation_required,
         coordination_broker_stale,
         edit_authority_stale,
@@ -9324,6 +9361,11 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         })
     });
     let diagnosis_schema = if matches!(
+        classification,
+        "pre_bootstrap_attention_required" | "provider_capacity_attention_required"
+    ) {
+        "main-agent.worker-diagnose-result.v7"
+    } else if matches!(
         classification,
         "provider_stop_canary_release_in_progress"
             | "provider_process_stopped_wrapper_live"
@@ -9436,7 +9478,22 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
             }
         }
     });
-    if diagnosis_schema == "main-agent.worker-diagnose-result.v6" {
+    if diagnosis_schema == "main-agent.worker-diagnose-result.v7" {
+        diagnosis["attention"] = json!({
+            "kind": if classification == "provider_capacity_attention_required" {
+                "provider_capacity"
+            } else {
+                "pre_bootstrap"
+            },
+            "source": if classification == "provider_capacity_attention_required" {
+                "provider_protocol"
+            } else {
+                "coordination_state"
+            },
+            "provider_input_authorized": false,
+            "account_change_authorized": false
+        });
+    } else if diagnosis_schema == "main-agent.worker-diagnose-result.v6" {
         diagnosis["provider_stop_canary"] = json!({
             "authorized": provider_stop_canary_authorized,
             "provider_process_stopped": provider_process_stopped_wrapper_live,
@@ -9500,6 +9557,16 @@ fn worker_recovery_action(
         "argv": supervise
     });
     match classification {
+        "pre_bootstrap_attention_required" | "provider_capacity_attention_required" => {
+            action["schema_version"] = json!("main-agent.worker-recovery-action.v7");
+            action["kind"] = json!(
+                if classification == "provider_capacity_attention_required" {
+                    "bounded_provider_capacity_recheck"
+                } else {
+                    "bounded_bootstrap_attention_recheck"
+                }
+            );
+        }
         "provider_stop_canary_release_in_progress" => {
             action["schema_version"] = json!("main-agent.worker-recovery-action.v6");
             debug_assert!(provider_stop_canary_authorized);
@@ -9921,6 +9988,14 @@ struct WorkerDiagnosisFacts {
     /// proving bounded authenticated-checkpoint readiness exhausted. It has no
     /// worker claim or operation and no unknown recovery send in flight.
     readiness_stop_required: bool,
+    /// A live starting worker is still inside the authenticated bootstrap
+    /// window: it has no assignment claim yet, but no terminal or readiness
+    /// failure owns the lane. Claim renewal is impossible before bootstrap.
+    pre_bootstrap_attention_required: bool,
+    /// Exact provider-protocol evidence reports temporary model/service
+    /// capacity. This is distinct from account quota and never authorizes an
+    /// account switch or provider input.
+    provider_capacity_attention_required: bool,
     /// A live worker has authoritatively returned to an idle provider boundary
     /// while its exact assignment-derived claim and broker remain active, with
     /// no active or uncertain operation. Main can fence that authority without
@@ -10044,6 +10119,12 @@ fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'st
             "complete the exact reserved account handoff, or run the projected revision-fenced `main-agent worker account-handoff-cancel` action before any runtime stop or assignment transition",
             false,
         )
+    } else if facts.provider_capacity_attention_required {
+        (
+            "provider_capacity_attention_required",
+            "preserve the exact worker and provider conversation, wait for model/service capacity, and continue bounded supervision; do not switch accounts, resend the prompt, or send raw terminal input",
+            false,
+        )
     } else if facts.readiness_stop_required {
         (
             "readiness_stop_required",
@@ -10066,6 +10147,12 @@ fn classify_worker_diagnosis(facts: WorkerDiagnosisFacts) -> (&'static str, &'st
         (
             "edit_authority_stale",
             "preserve the exact worker and perform a bounded supervision recheck so the broker heartbeat sidecar can refresh; if durable broker-lost evidence appears, route to exact-session authenticated broker recovery rather than renewing the work-context claim",
+            false,
+        )
+    } else if facts.pre_bootstrap_attention_required {
+        (
+            "pre_bootstrap_attention_required",
+            "preserve the live starting worker and continue bounded authenticated-bootstrap supervision; no claim exists to renew, and no provider input or replacement is authorized",
             false,
         )
     } else if facts.claim_renewal_required {
@@ -10265,6 +10352,29 @@ fn worker_claim_renewal_required(
             || (!broker_authoritative
                 && claim_expires_in_seconds
                     .is_some_and(|remaining| remaining <= WORKER_CLAIM_RENEWAL_RISK_SECS)))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreBootstrapEvidence<'a> {
+    assignment_state: &'a str,
+    worker_bound: bool,
+    worker_status: &'a str,
+    claim_active: bool,
+    operations_quiescent: bool,
+    readiness_exhausted: bool,
+    recovery_in_flight: bool,
+    blocker_or_terminal_evidence: bool,
+}
+
+fn worker_pre_bootstrap_attention_required(evidence: PreBootstrapEvidence<'_>) -> bool {
+    evidence.assignment_state == "starting"
+        && evidence.worker_bound
+        && evidence.worker_status == "running"
+        && !evidence.claim_active
+        && evidence.operations_quiescent
+        && !evidence.readiness_exhausted
+        && !evidence.recovery_in_flight
+        && !evidence.blocker_or_terminal_evidence
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30160,6 +30270,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_pre_bootstrap_worker_without_claim_requires_attention_before_renewal() {
+        let live_starting = PreBootstrapEvidence {
+            assignment_state: "starting",
+            worker_bound: true,
+            worker_status: "running",
+            claim_active: false,
+            operations_quiescent: true,
+            readiness_exhausted: false,
+            recovery_in_flight: false,
+            blocker_or_terminal_evidence: false,
+        };
+        assert!(worker_pre_bootstrap_attention_required(live_starting));
+        for (guard, evidence) in [
+            (
+                "assignment state",
+                PreBootstrapEvidence {
+                    assignment_state: "working",
+                    ..live_starting
+                },
+            ),
+            (
+                "worker binding",
+                PreBootstrapEvidence {
+                    worker_bound: false,
+                    ..live_starting
+                },
+            ),
+            (
+                "running runtime",
+                PreBootstrapEvidence {
+                    worker_status: "stopped",
+                    ..live_starting
+                },
+            ),
+            (
+                "absent claim",
+                PreBootstrapEvidence {
+                    claim_active: true,
+                    ..live_starting
+                },
+            ),
+            (
+                "quiescent operations",
+                PreBootstrapEvidence {
+                    operations_quiescent: false,
+                    ..live_starting
+                },
+            ),
+            (
+                "unexhausted readiness",
+                PreBootstrapEvidence {
+                    readiness_exhausted: true,
+                    ..live_starting
+                },
+            ),
+            (
+                "absent recovery owner",
+                PreBootstrapEvidence {
+                    recovery_in_flight: true,
+                    ..live_starting
+                },
+            ),
+            (
+                "absent blocker or terminal evidence",
+                PreBootstrapEvidence {
+                    blocker_or_terminal_evidence: true,
+                    ..live_starting
+                },
+            ),
+        ] {
+            assert!(
+                !worker_pre_bootstrap_attention_required(evidence),
+                "pre-bootstrap attention must require {guard}"
+            );
+        }
+    }
+
     /// Neutral supervision facts: every signal absent, so a single flipped
     /// field isolates exactly one classification.
     fn base_diagnosis_facts() -> WorkerDiagnosisFacts {
@@ -30173,6 +30361,8 @@ mod tests {
             claim_revocation_in_flight: false,
             account_handoff_in_flight: false,
             readiness_stop_required: false,
+            pre_bootstrap_attention_required: false,
+            provider_capacity_attention_required: false,
             idle_claim_revocation_required: false,
             coordination_broker_stale: false,
             edit_authority_stale: false,
@@ -31002,6 +31192,26 @@ mod tests {
         assert_eq!(classify_worker_diagnosis(base).0, "healthy_progress");
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
+                pre_bootstrap_attention_required: true,
+                claim_renewal_required: true,
+                ..base
+            })
+            .0,
+            "pre_bootstrap_attention_required",
+            "a claim cannot be renewed before authenticated bootstrap creates it"
+        );
+        assert_eq!(
+            classify_worker_diagnosis(WorkerDiagnosisFacts {
+                provider_capacity_attention_required: true,
+                claim_renewal_required: true,
+                ..base
+            })
+            .0,
+            "provider_capacity_attention_required",
+            "exact provider capacity evidence must outrank generic claim renewal"
+        );
+        assert_eq!(
+            classify_worker_diagnosis(WorkerDiagnosisFacts {
                 evidence_unavailable: true,
                 ..base
             })
@@ -31019,6 +31229,7 @@ mod tests {
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
                 readiness_stop_required: true,
+                pre_bootstrap_attention_required: true,
                 idle_claim_revocation_required: true,
                 claim_renewal_required: true,
                 ..base
@@ -31030,6 +31241,7 @@ mod tests {
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
                 claim_revocation_in_flight: true,
+                pre_bootstrap_attention_required: true,
                 evidence_unavailable: true,
                 worker_unreachable: true,
                 post_claim_runtime_gone: true,
@@ -31167,6 +31379,7 @@ mod tests {
         assert_eq!(
             classify_worker_diagnosis(WorkerDiagnosisFacts {
                 active_or_uncertain_operation: true,
+                pre_bootstrap_attention_required: true,
                 startup_dialog: true,
                 preclaim_blocker: true,
                 ..base
@@ -31204,6 +31417,8 @@ mod tests {
             "evidence_unavailable",
             "worker_unreachable",
             "uncertain_mutation",
+            "pre_bootstrap_attention_required",
+            "provider_capacity_attention_required",
             "readiness_stop_required",
             "idle_claim_revocation_in_progress",
             "idle_claim_revocation_required",
@@ -31231,6 +31446,11 @@ mod tests {
                 None,
             );
             let expected_schema = if matches!(
+                classification,
+                "pre_bootstrap_attention_required" | "provider_capacity_attention_required"
+            ) {
+                "main-agent.worker-recovery-action.v7"
+            } else if matches!(
                 classification,
                 "idle_claim_revocation_required" | "idle_claim_revocation_in_progress"
             ) {

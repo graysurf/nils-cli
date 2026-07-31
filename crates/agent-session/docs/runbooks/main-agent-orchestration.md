@@ -417,7 +417,9 @@ envelopes. `idle_claim_revocation_required` and
 `provider_stop_canary_release_in_progress`,
 `provider_process_stopped_wrapper_live`, and generic
 `process_runtime_stopped_wrapper_live_contradiction` classifications use the
-v6 envelopes. Branch on `classification`, never on prose:
+v6 envelopes. `pre_bootstrap_attention_required` and
+`provider_capacity_attention_required` use v7 envelopes with a bounded
+`attention` projection. Branch on `classification`, never on prose:
 
 | Classification | Deterministic action |
 | --- | --- |
@@ -440,6 +442,8 @@ v6 envelopes. Branch on `classification`, never on prose:
 | `coordination_broker_stale` | Route to the exact worker's authenticated broker owner. Do not copy its capability or renew its claim as a substitute. |
 | `edit_authority_stale` | Preserve the exact worker and perform a bounded supervision recheck; route only durable broker-lost evidence to broker recovery. |
 | `claim_renewal_required` | Ask the exact worker to renew its own current claim and revision using its own capability file. |
+| `pre_bootstrap_attention_required` | Preserve the live starting worker and continue bounded bootstrap supervision. No claim exists to renew; do not send provider input or replace the worker. |
+| `provider_capacity_attention_required` | Preserve the exact worker and conversation, wait for capacity, and continue bounded supervision. Do not switch accounts, resend the prompt, or send raw terminal input. This requires exact structured `serverOverloaded` evidence, not rendered prose. |
 | `guidance_continuity_required` | Run revision-fenced `worker guidance-reconcile`; retain message identity and unread state. |
 | `orphan_guidance_quarantine_required` | Run revision-fenced `worker guidance-quarantine`; quarantine only exact-controller stale-incarnation records when no `previous_worker` exists. |
 | `account_handoff_capability_gap` | Preserve the worker. No public raw restart flag exists; retry only with a daemon-launched managed worker advertising `agent-session.codex-managed-account-handoff.v1`. |
@@ -449,8 +453,8 @@ v6 envelopes. Branch on `classification`, never on prose:
 | `safe_reassignment` | Start only a distinct assignment/session and clean worktree. Never reuse the old prompt. |
 
 `worker diagnose` returns the same evidence without the supervisor wrapper. It
-uses v3 for the same five additive classifications listed above and v2
-otherwise:
+uses the versioned envelopes described above for their additive
+classifications and v2 otherwise:
 
 ```bash
 main-agent worker diagnose ASSIGNMENT_ID --format json

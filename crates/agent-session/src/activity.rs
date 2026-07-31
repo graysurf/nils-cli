@@ -29,6 +29,7 @@ pub(crate) mod shadow;
 use provider::{normalize_provider_hook, normalize_provider_notification};
 
 pub(crate) const TURN_EVENT_VERSION: &str = "agent-session.turn-event.v1";
+const CODEX_PROTOCOL_TURN_EVENT_VERSION: &str = "agent-session.turn-event.v2";
 pub(crate) const TURN_STATE_VERSION: &str = "agent-session.turn-state.v1";
 const ACTIVITY_DOCUMENT_VERSION: &str = "agent-session.activity.v1";
 const ACTIVITY_FILE: &str = "activity.json";
@@ -164,6 +165,14 @@ pub(crate) struct LastTurn {
     pub(crate) outcome: String,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
+}
+
+impl LastTurn {
+    pub(crate) fn provider_failure_kind(&self) -> Option<&str> {
+        self.extra
+            .get("provider_failure_kind")
+            .and_then(Value::as_str)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -423,6 +432,7 @@ pub(crate) struct ActivityResult {
     pub(crate) duplicate: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn ingest_codex_app_server_failure(
     context: &CliContext,
     id: &str,
@@ -430,22 +440,46 @@ pub(crate) fn ingest_codex_app_server_failure(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<ActivityResult, CliError> {
+    ingest_codex_app_server_failure_with_kind(
+        context,
+        id,
+        runtime_id,
+        thread_id,
+        turn_id,
+        crate::codex_app_server::StructuredFailureKind::UsageExhausted,
+    )
+}
+
+pub(crate) fn ingest_codex_app_server_failure_with_kind(
+    context: &CliContext,
+    id: &str,
+    runtime_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    failure_kind: crate::codex_app_server::StructuredFailureKind,
+) -> Result<ActivityResult, CliError> {
     let provider_session_id =
         projected_provider_identifier(runtime_id, AgentKind::Codex, "session", thread_id)?;
     let provider_turn_id =
         projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", turn_id)?;
-    ingest_event_retry(
+    ingest_event_retry_with_admission(
         context,
         id,
         TurnEvent {
-            schema_version: TURN_EVENT_VERSION.to_string(),
+            schema_version: if failure_kind
+                == crate::codex_app_server::StructuredFailureKind::ProviderCapacity
+            {
+                CODEX_PROTOCOL_TURN_EVENT_VERSION.to_string()
+            } else {
+                TURN_EVENT_VERSION.to_string()
+            },
             event_id: format!("codex-app-server-failure:{provider_turn_id}"),
             runtime_id: runtime_id.to_string(),
             provider: AgentKind::Codex.as_str().to_string(),
             provider_session_id: Some(provider_session_id),
             provider_turn_id: Some(provider_turn_id),
             kind: TurnEventKind::TurnFailed,
-            failure_reason: Some("usage_exhausted".to_string()),
+            failure_reason: Some(failure_kind.activity_reason().to_string()),
             attention_id: None,
             attention_kind: None,
             attention_correlation_ambiguous: false,
@@ -456,6 +490,7 @@ pub(crate) fn ingest_codex_app_server_failure(
             source_kind: SourceKind::ProviderHook,
             provider_time: None,
         },
+        EventAdmission::CodexProtocol,
     )
 }
 
@@ -498,7 +533,7 @@ pub(crate) fn ingest_codex_app_server_attention(
         }
         None => (TurnEventKind::AttentionCleared, None, "resolved"),
     };
-    ingest_event_retry(
+    ingest_event_retry_with_admission(
         context,
         id,
         TurnEvent {
@@ -520,6 +555,7 @@ pub(crate) fn ingest_codex_app_server_attention(
             source_kind: SourceKind::ProviderHook,
             provider_time: None,
         },
+        EventAdmission::CodexProtocol,
     )
 }
 
@@ -2421,7 +2457,13 @@ pub(crate) fn ingest_event(
     id: &str,
     event: TurnEvent,
 ) -> Result<ActivityResult, CliError> {
-    ingest_event_with_lock(context, id, event, ActivityLockMode::Blocking)
+    ingest_event_with_lock(
+        context,
+        id,
+        event,
+        ActivityLockMode::Blocking,
+        EventAdmission::Generic,
+    )
 }
 
 fn ingest_event_nonblocking(
@@ -2429,7 +2471,13 @@ fn ingest_event_nonblocking(
     id: &str,
     event: TurnEvent,
 ) -> Result<ActivityResult, CliError> {
-    ingest_event_with_lock(context, id, event, ActivityLockMode::NonBlocking)
+    ingest_event_with_lock(
+        context,
+        id,
+        event,
+        ActivityLockMode::NonBlocking,
+        EventAdmission::Generic,
+    )
 }
 
 pub(crate) fn ingest_event_retry(
@@ -2442,6 +2490,28 @@ pub(crate) fn ingest_event_retry(
         id,
         event,
         ActivityLockMode::Timed(CODEX_COMPLETION_RETRY_TIMEOUT),
+        EventAdmission::Generic,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventAdmission {
+    Generic,
+    CodexProtocol,
+}
+
+fn ingest_event_retry_with_admission(
+    context: &CliContext,
+    id: &str,
+    event: TurnEvent,
+    admission: EventAdmission,
+) -> Result<ActivityResult, CliError> {
+    ingest_event_with_lock(
+        context,
+        id,
+        event,
+        ActivityLockMode::Timed(CODEX_COMPLETION_RETRY_TIMEOUT),
+        admission,
     )
 }
 
@@ -2450,8 +2520,9 @@ fn ingest_event_with_lock(
     id: &str,
     mut event: TurnEvent,
     lock_mode: ActivityLockMode,
+    admission: EventAdmission,
 ) -> Result<ActivityResult, CliError> {
-    validate_event(&event)?;
+    validate_event(&event, admission)?;
     let observed = load_session_record(context, id)?;
     let record_lock = match lock_mode {
         ActivityLockMode::Blocking => crate::acquire_session_record_lock(context, &observed.id)?,
@@ -2475,6 +2546,15 @@ fn ingest_event_with_lock(
             "activity-provider-mismatch",
             "activity event provider does not match the session provider",
             Some(json!({ "id": record.id, "provider": event.provider })),
+        ));
+    }
+    if admission == EventAdmission::CodexProtocol
+        && !crate::codex_app_server::runtime_is_supported(&record)
+    {
+        return Err(CliError::data(
+            "activity-provider-protocol-mismatch",
+            "provider-protocol activity requires the bound Codex app-server runtime",
+            Some(json!({ "id": record.id })),
         ));
     }
     let active_runtime = record.runtime.as_ref();
@@ -7246,7 +7326,7 @@ mod tests {
                 expected
             );
             for event in normalized {
-                validate_event(&event).expect("normalized fixture event");
+                validate_event(&event, EventAdmission::Generic).expect("normalized fixture event");
                 let serialized = serde_json::to_string(&event).expect("normalized event json");
                 assert!(!serialized.contains("codex-session"));
                 assert!(!serialized.contains("claude-session"));
@@ -8190,7 +8270,7 @@ mod tests {
         let events = include_str!("../tests/fixtures/activity/turn-events.jsonl");
         for line in events.lines() {
             let event: TurnEvent = serde_json::from_str(line).expect("turn event fixture");
-            validate_event(&event).expect("valid turn event fixture");
+            validate_event(&event, EventAdmission::Generic).expect("valid turn event fixture");
         }
         let states: Vec<TurnState> =
             serde_json::from_str(include_str!("../tests/fixtures/activity/turn-states.json"))
@@ -8227,10 +8307,32 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn provider_capacity_is_reserved_for_internal_protocol_v2_admission() {
+        let mut capacity = event(TurnEventKind::TurnFailed, "provider-capacity");
+        capacity.confidence = Confidence::Authoritative;
+        capacity.source_kind = SourceKind::ProviderHook;
+        capacity.failure_reason = Some("provider_capacity".to_string());
+
+        let v1_error = validate_event(&capacity, EventAdmission::Generic)
+            .expect_err("the closed public v1 failure union must reject provider capacity");
+        assert_eq!(v1_error.code(), "activity-failure-reason-invalid");
+
+        capacity.schema_version = CODEX_PROTOCOL_TURN_EVENT_VERSION.to_string();
+        let generic_v2_error = validate_event(&capacity, EventAdmission::Generic)
+            .expect_err("generic activity ingress must not impersonate provider protocol v2");
+        assert_eq!(generic_v2_error.code(), "unsupported-turn-event-version");
+        validate_event(&capacity, EventAdmission::CodexProtocol)
+            .expect("internal protocol admission accepts the exact v2 capacity reason");
+    }
 }
 
-fn validate_event(event: &TurnEvent) -> Result<(), CliError> {
-    if event.schema_version != TURN_EVENT_VERSION {
+fn validate_event(event: &TurnEvent, admission: EventAdmission) -> Result<(), CliError> {
+    let schema_supported = event.schema_version == TURN_EVENT_VERSION
+        || (admission == EventAdmission::CodexProtocol
+            && event.schema_version == CODEX_PROTOCOL_TURN_EVENT_VERSION);
+    if !schema_supported {
         return Err(CliError::data(
             "unsupported-turn-event-version",
             format!(
@@ -8298,26 +8400,30 @@ fn validate_event(event: &TurnEvent) -> Result<(), CliError> {
             None,
         ));
     }
-    if let Some(reason) = event.failure_reason.as_deref()
-        && (event.kind != TurnEventKind::TurnFailed
+    if let Some(reason) = event.failure_reason.as_deref() {
+        let reason_allowed = matches!(
+            reason,
+            "usage_exhausted"
+                | "authentication"
+                | "organization"
+                | "billing"
+                | "invalid_request"
+                | "service"
+                | "max_output_tokens"
+                | "unknown"
+        ) || (reason == "provider_capacity"
+            && admission == EventAdmission::CodexProtocol
+            && event.schema_version == CODEX_PROTOCOL_TURN_EVENT_VERSION);
+        if event.kind != TurnEventKind::TurnFailed
             || event.confidence != Confidence::Authoritative
-            || !matches!(
-                reason,
-                "usage_exhausted"
-                    | "authentication"
-                    | "organization"
-                    | "billing"
-                    | "invalid_request"
-                    | "service"
-                    | "max_output_tokens"
-                    | "unknown"
-            ))
-    {
-        return Err(CliError::data(
-            "activity-failure-reason-invalid",
-            "failure_reason requires an authoritative turn_failed event and an allowlisted value",
-            None,
-        ));
+            || !reason_allowed
+        {
+            return Err(CliError::data(
+                "activity-failure-reason-invalid",
+                "failure_reason requires an authoritative turn_failed event and an allowlisted value",
+                None,
+            ));
+        }
     }
     if let Some(provider_time) = event.provider_time.as_deref() {
         let parsed = provider_time.parse::<jiff::Timestamp>().map_err(|_| {
@@ -8553,7 +8659,16 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     } else {
                         "completed".to_string()
                     },
-                    extra,
+                    extra: if event.failure_reason.as_deref() == Some("provider_capacity") {
+                        let mut extra = extra;
+                        extra.insert(
+                            "provider_failure_kind".to_string(),
+                            json!("provider_capacity"),
+                        );
+                        extra
+                    } else {
+                        extra
+                    },
                 });
                 document.pending_attention.clear();
                 document.overflow_attention = None;
