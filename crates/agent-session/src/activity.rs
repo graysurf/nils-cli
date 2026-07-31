@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -1764,6 +1764,75 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
             "activity_state_unavailable",
         )),
     }
+}
+
+/// The turn identity observed immediately before a terminal-delivered prompt.
+/// Acknowledging that prompt means seeing a turn this snapshot did not already
+/// contain, so progress on a turn that was already running can never be
+/// mistaken for the provider accepting new input.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromptTurnBaseline {
+    revision: u64,
+    turn_ids: BTreeSet<String>,
+    turn_in_flight: bool,
+}
+
+pub(crate) fn prompt_turn_baseline(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> PromptTurnBaseline {
+    let Some(state) = state_for_view(context, record) else {
+        return PromptTurnBaseline::default();
+    };
+    PromptTurnBaseline {
+        revision: state.revision,
+        turn_ids: observed_turn_ids(&state)
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect(),
+        turn_in_flight: state.current_turn.is_some(),
+    }
+}
+
+/// True once the provider's own hook has reported a turn the baseline did not
+/// contain. A provider that omits turn ids is accepted only when the baseline
+/// had nothing in flight, so an unidentified turn cannot be double-counted.
+pub(crate) fn prompt_turn_started_since(
+    context: &CliContext,
+    record: &SessionRecord,
+    baseline: &PromptTurnBaseline,
+) -> bool {
+    let Some(state) = state_for_view(context, record) else {
+        return false;
+    };
+    if state.revision <= baseline.revision || state.source.kind != SourceKind::ProviderHook {
+        return false;
+    }
+    let observed = observed_turn_ids(&state);
+    if observed
+        .iter()
+        .flatten()
+        .any(|turn_id| !baseline.turn_ids.contains(*turn_id))
+    {
+        return true;
+    }
+    !baseline.turn_in_flight && state.current_turn.is_some() && observed.iter().all(Option::is_none)
+}
+
+/// The turn a provider is running plus the one it just finished. Both matter
+/// because a short turn can start and complete inside one acknowledgement wait.
+fn observed_turn_ids(state: &TurnState) -> [Option<&str>; 2] {
+    [
+        state
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref()),
+        state
+            .last_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref()),
+    ]
 }
 
 pub(crate) struct OperatorProviderTurnReplaySelector<'a> {

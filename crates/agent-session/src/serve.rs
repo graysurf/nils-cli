@@ -96,6 +96,12 @@ const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(50
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const STRUCTURED_PROMPT_CONTROL_WAIT: Duration = Duration::from_secs(3);
 const STRUCTURED_PROMPT_CONTROL_POLL: Duration = Duration::from_millis(50);
+/// Claude acknowledges a prompt through its own hook, so this wait covers the
+/// provider accepting the pasted text and the hook reaching durable turn state.
+/// Together with the shorter pane-ready wait it stays inside the dashboard's
+/// per-request create deadline, which reports a client-side timeout as unknown.
+const CLAUDE_STRUCTURED_PROMPT_ACK_WAIT: Duration = Duration::from_secs(7);
+const CLAUDE_STRUCTURED_PROMPT_ACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CODEX_ACCOUNT_BINDING_WAIT: Duration = Duration::from_secs(30);
 const CODEX_CREATE_PROMPT_CONTROL_WAIT: Duration = CODEX_ACCOUNT_BINDING_WAIT;
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -3988,7 +3994,7 @@ async fn wait_for_account_binding(
     }
 }
 
-fn structured_prompt_incarnation_conflict(
+pub(crate) fn structured_prompt_incarnation_conflict(
     id: &str,
     expected_session_incarnation: &str,
     actual_session_incarnation: Option<&str>,
@@ -4463,13 +4469,6 @@ async fn submit_structured_prompt_handler_with_fence(
             Ok(record) => record,
             Err(response) => return response,
         };
-    if !codex_app_server::runtime_is_supported(&record) {
-        return status_json(
-            StatusCode::CONFLICT,
-            "structured-prompt-unsupported",
-            "this session does not provide structured prompt submission",
-        );
-    }
     let Some(launch_id) = record
         .runtime
         .as_ref()
@@ -4481,6 +4480,27 @@ async fn submit_structured_prompt_handler_with_fence(
             "this session does not provide structured prompt submission",
         );
     };
+    // Coordination notifications are fenced against the Codex app-server's own
+    // turn state, so a fenced request stays Codex-only until that fence has a
+    // Claude equivalent.
+    if notification_fence.is_none() && crate::claude_structured_prompt_supported(&record) {
+        return submit_claude_structured_prompt(
+            &state,
+            &record,
+            &launch_id,
+            expected_session_incarnation,
+            &text,
+            CLAUDE_STRUCTURED_PROMPT_ACK_WAIT,
+        )
+        .await;
+    }
+    if !codex_app_server::runtime_is_supported(&record) {
+        return status_json(
+            StatusCode::CONFLICT,
+            "structured-prompt-unsupported",
+            "this session does not provide structured prompt submission",
+        );
+    }
 
     let handle = match wait_for_structured_prompt_control(
         &state,
@@ -4516,6 +4536,88 @@ async fn submit_structured_prompt_handler_with_fence(
         })),
         Err(response) => response,
     }
+}
+
+/// Submit one structured prompt to a Claude session and report `submitted` only
+/// once Claude's own `UserPromptSubmit` hook has produced a new turn. A tmux
+/// write that the provider never acknowledged is reported as an unknown
+/// outcome, never as a submission.
+async fn submit_claude_structured_prompt(
+    state: &Arc<ServeState>,
+    record: &SessionRecord,
+    launch_id: &str,
+    expected_session_incarnation: Option<&str>,
+    text: &str,
+    acknowledgement_wait: Duration,
+) -> Response {
+    let baseline = {
+        let context = state.context.clone();
+        let record = record.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::activity::prompt_turn_baseline(&context, &record)
+        })
+        .await
+        {
+            Ok(baseline) => baseline,
+            Err(_) => return join_err(),
+        }
+    };
+
+    let session_incarnation = {
+        let context = state.context.clone();
+        let id = record.id.clone();
+        let expected = expected_session_incarnation
+            .unwrap_or(launch_id)
+            .to_string();
+        let text = text.to_string();
+        let tmux_bin = state.tmux_bin.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::deliver_claude_structured_prompt_locked(
+                &context, &id, &expected, &text, &tmux_bin,
+            )
+        })
+        .await
+        {
+            Ok(Ok(session_incarnation)) => session_incarnation,
+            Ok(Err(err)) => return envelope_err(err),
+            Err(_) => return join_err(),
+        }
+    };
+
+    let deadline = Instant::now() + acknowledgement_wait;
+    loop {
+        let context = state.context.clone();
+        let observed_record = record.clone();
+        let observed_baseline = baseline.clone();
+        let acknowledged = match tokio::task::spawn_blocking(move || {
+            crate::activity::prompt_turn_started_since(
+                &context,
+                &observed_record,
+                &observed_baseline,
+            )
+        })
+        .await
+        {
+            Ok(acknowledged) => acknowledged,
+            Err(_) => return join_err(),
+        };
+        if acknowledged {
+            return envelope_ok(json!({
+                "machine": state.machine,
+                "submitted": true,
+                "session_incarnation": session_incarnation,
+            }));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(CLAUDE_STRUCTURED_PROMPT_ACK_POLL_INTERVAL).await;
+    }
+    status_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "structured-prompt-outcome-unknown",
+        "structured prompt submission outcome is unknown",
+    )
 }
 
 fn structured_prompt_has_unsafe_control(text: &str) -> bool {
@@ -15226,6 +15328,157 @@ esac
         assert_eq!(body["error"]["code"], "structured-prompt-outcome-unknown");
         assert!(body.pointer("/data/submitted").is_none());
         responder.await.unwrap();
+    }
+
+    fn seed_claude_prompt_session(state_dir: &Path, id: &str) -> String {
+        seed_session_with_runtime(state_dir, id, "claude", &format!("hs-claude-{id}"));
+        format!("launch-{id}")
+    }
+
+    fn claude_turn_started_event(
+        launch_id: &str,
+        event_id: &str,
+        turn_id: &str,
+    ) -> crate::activity::TurnEvent {
+        serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": event_id,
+            "runtime_id": launch_id,
+            "provider": "claude",
+            "provider_turn_id": turn_id,
+            "kind": "turn_started",
+            "confidence": "observed"
+        }))
+        .unwrap()
+    }
+
+    async fn response_parts(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn claude_structured_prompt_reports_submitted_after_provider_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_claude_prompt_session(tmp.path(), "claude-structured");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "claude-structured").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+
+        let ack_context = st.context.clone();
+        let ack_id = record.id.clone();
+        let ack_launch_id = launch_id.clone();
+        let acknowledger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::spawn_blocking(move || {
+                crate::activity::ingest_event(
+                    &ack_context,
+                    &ack_id,
+                    claude_turn_started_event(&ack_launch_id, "claude-start", "turn-claude"),
+                )
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        });
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/claude-structured/prompt/v2",
+                Some(TOKEN),
+                json!({
+                    "text": "inspect the created session",
+                    "expected_session_incarnation": launch_id,
+                }),
+            ),
+        )
+        .await;
+        acknowledger.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["submitted"], true);
+        assert_eq!(body["data"]["session_incarnation"], launch_id);
+    }
+
+    #[tokio::test]
+    async fn claude_structured_prompt_without_provider_turn_reports_unknown_outcome() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_claude_prompt_session(tmp.path(), "claude-unacknowledged");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "claude-unacknowledged").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+
+        let (status, body) = response_parts(
+            submit_claude_structured_prompt(
+                &st,
+                &record,
+                &launch_id,
+                Some(&launch_id),
+                "inspect the created session",
+                Duration::from_millis(200),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "structured-prompt-outcome-unknown");
+        assert!(body.pointer("/data/submitted").is_none());
+    }
+
+    #[tokio::test]
+    async fn claude_structured_prompt_ignores_progress_on_an_existing_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_claude_prompt_session(tmp.path(), "claude-in-flight");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "claude-in-flight").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        crate::activity::ingest_event(
+            &st.context,
+            &record.id,
+            claude_turn_started_event(&launch_id, "in-flight-start", "turn-in-flight"),
+        )
+        .unwrap();
+
+        let ack_context = st.context.clone();
+        let ack_id = record.id.clone();
+        let ack_launch_id = launch_id.clone();
+        let progress = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::spawn_blocking(move || {
+                let event: crate::activity::TurnEvent = serde_json::from_value(json!({
+                    "schema_version": crate::activity::TURN_EVENT_VERSION,
+                    "event_id": "in-flight-progress",
+                    "runtime_id": ack_launch_id,
+                    "provider": "claude",
+                    "provider_turn_id": "turn-in-flight",
+                    "kind": "progress",
+                    "confidence": "observed"
+                }))
+                .unwrap();
+                crate::activity::ingest_event(&ack_context, &ack_id, event).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+
+        let (status, body) = response_parts(
+            submit_claude_structured_prompt(
+                &st,
+                &record,
+                &launch_id,
+                Some(&launch_id),
+                "queue another instruction",
+                Duration::from_millis(400),
+            )
+            .await,
+        )
+        .await;
+        progress.await.unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "structured-prompt-outcome-unknown");
     }
 
     #[tokio::test]

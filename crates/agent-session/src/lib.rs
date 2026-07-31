@@ -136,6 +136,11 @@ const SUBMIT_RECOVERY_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const POST_PASTE_KEY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const PANE_PASTE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PANE_PASTE_READY_DEADLINE: Duration = Duration::from_secs(15);
+/// A launch may wait out a slow TUI, but the structured prompt route answers an
+/// HTTP client that gives up first. Keep the pane-ready wait short enough that a
+/// paste, its settle, and the provider acknowledgement all still fit inside one
+/// request.
+const CLAUDE_STRUCTURED_PROMPT_PANE_READY_DEADLINE: Duration = Duration::from_secs(4);
 const DELETE_TERMINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -8231,6 +8236,27 @@ fn paste_prompt(
             None,
         )
     })?;
+    paste_prompt_file(
+        tmux_bin,
+        record,
+        delivery,
+        Path::new(prompt_file),
+        PANE_PASTE_READY_DEADLINE,
+    )
+}
+
+/// Deliver one staged prompt file into the session pane and submit it. The
+/// caller owns the file so that both session startup and the post-start
+/// structured prompt route share exactly one hardened delivery, and it owns the
+/// pane-ready deadline because a request-bound caller must answer its client
+/// sooner than a launch may wait.
+fn paste_prompt_file(
+    tmux_bin: &Path,
+    record: &SessionRecord,
+    delivery: PromptDelivery,
+    prompt_file: &Path,
+    pane_ready_deadline: Duration,
+) -> Result<PromptDeliveryObservation, CliError> {
     let buffer_name = format!("{}-prompt", record.id);
     let target = format!("{}:0.0", record.tmux_session);
 
@@ -8239,7 +8265,7 @@ fn paste_prompt(
     // while the launch shell still owns the tty are echoed into scrollback and
     // lost, and the single-Enter recovery cannot restore a prompt that never
     // reached the provider's input at all.
-    await_pane_drawn_before_paste(tmux_bin, &target);
+    await_pane_drawn_before_paste(tmux_bin, &target, pane_ready_deadline);
 
     // A drawn pane is still not proof that the provider reads stdin yet: Claude
     // Code parks its cursor on the input line before it accepts input. Ordinary
@@ -8248,7 +8274,7 @@ fn paste_prompt(
     // deliberately skip this probe because their private assignment prompt is
     // exactly-once transport and later recovery may only send one guarded Enter.
     let before = capture_pane_digest(tmux_bin, &target);
-    load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
+    load_and_paste_buffer(tmux_bin, &buffer_name, &target, prompt_file)
         .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
 
     // The initial prompt is submitted; `send` deliberately leaves this to
@@ -8267,7 +8293,7 @@ fn paste_prompt(
         proof: "tmux-pane-digest-before-submit",
     };
     if delivery == PromptDelivery::ResilientBeforeSubmit && pane_ignored_paste(before, after) {
-        load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))
+        load_and_paste_buffer(tmux_bin, &buffer_name, &target, prompt_file)
             .map_err(|failure| prompt_delivery_failure(delivery, failure))?;
         thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
     }
@@ -8308,9 +8334,9 @@ fn pane_drawn(cursor: (u32, u32)) -> bool {
 /// Never fails a launch: an unanswerable query returns immediately and the
 /// deadline gives up rather than blocking, leaving the existing post-paste
 /// settle and the runtime-owned single-Enter recovery as the later guards.
-fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str) {
+fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str, deadline: Duration) {
     let started = Instant::now();
-    while started.elapsed() < PANE_PASTE_READY_DEADLINE {
+    while started.elapsed() < deadline {
         let Ok(output) = ProcessCommand::new(tmux_bin)
             .arg("display-message")
             .arg("-p")
@@ -8475,6 +8501,77 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             .map(|key| key.as_str().to_string())
             .collect(),
     })
+}
+
+/// Claude Code exposes no control socket, so its structured prompt submission
+/// is delivered through the live pane rather than a provider RPC. Support is
+/// therefore exactly "this daemon can still address an ordinary tmux runtime for
+/// a Claude session". Delivery alone is never an acknowledgement; the caller
+/// observes the provider's own turn event afterwards.
+pub(crate) fn claude_structured_prompt_supported(record: &SessionRecord) -> bool {
+    record.agent == "claude"
+        && record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.kind == "tmux" && !runtime.launch_id.trim().is_empty())
+}
+
+/// Paste one structured prompt into a Claude pane and submit it while the
+/// session record lock fences the exact runtime, returning the incarnation the
+/// text was written to. The staged file keeps the prompt out of argv, and the
+/// shared start-path delivery keeps the pane-readiness and ignored-paste guards
+/// that a freshly launched provider TUI needs.
+pub(crate) fn deliver_claude_structured_prompt_locked(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    text: &str,
+    tmux_bin: &Path,
+) -> Result<String, CliError> {
+    let _record_lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    let actual_launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .filter(|launch_id| !launch_id.trim().is_empty());
+    if actual_launch_id.as_deref() != Some(expected_launch_id) {
+        return Err(crate::serve::structured_prompt_incarnation_conflict(
+            id,
+            expected_launch_id,
+            actual_launch_id.as_deref(),
+        ));
+    }
+    if live_status(tmux_bin, &record.tmux_session) != "running" {
+        return Err(CliError::runtime(
+            "session-not-running",
+            format!("session is not running: {}", record.id),
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    codex_account::ensure_input_allowed(&record)?;
+    auto_resume::cancel_for_manual_input_locked(
+        context,
+        &record.id,
+        &Timestamp::now().to_string(),
+    )?;
+
+    let nonce = uuid::Uuid::new_v4();
+    let staged = session_dir(context, &record.id).join(format!("structured-prompt-{nonce}"));
+    write_private_file(&staged, text.as_bytes())?;
+    let delivered = paste_prompt_file(
+        tmux_bin,
+        &record,
+        PromptDelivery::ResilientBeforeSubmit,
+        &staged,
+        CLAUDE_STRUCTURED_PROMPT_PANE_READY_DEADLINE,
+    );
+    let _ = fs::remove_file(&staged);
+    delivered?;
+
+    record.updated_at = Zoned::now().timestamp().to_string();
+    write_session_record(context, &record)?;
+    Ok(expected_launch_id.to_string())
 }
 
 /// Push literal text (via a private buffer file, never argv/stdout) and then
