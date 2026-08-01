@@ -3988,7 +3988,9 @@ fn start_creates_session_state_without_printing_prompt() {
             "-d".to_string(),
             "-P".to_string(),
             "-F".to_string(),
-            "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
+            // Space-separated on purpose: some tmux builds rewrite a literal
+            // tab in expanded format output, which rejected valid identities.
+            "#{session_id} #{pane_id} #{pane_pid}".to_string(),
             "-s".to_string(),
             result["tmux_session"].as_str().unwrap().to_string(),
             "-c".to_string(),
@@ -8713,9 +8715,14 @@ fn run_retains_state_when_malformed_launch_identity_cannot_be_stopped() {
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let error = output.stdout_json();
-    assert_eq!(error["error"]["code"], "session-termination-failed");
-    assert_eq!(error["error"]["details"]["reason"], "kill-failed");
-    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    // The malformed launch identity is the primary failure and stays visible.
+    // Cleanup could not stop the runtime, but reporting that instead would hide
+    // why the launch failed at all.
+    assert_eq!(error["error"]["code"], "tmux-runtime-identity-invalid");
+    assert_eq!(
+        error["error"]["details"]["cleanup"],
+        serde_json::json!({ "state": "pending", "reason": "termination_failed" })
+    );
     assert!(
         session_dir.exists(),
         "uncertain live runtime must stay discoverable"
@@ -8854,9 +8861,14 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let error = output.stdout_json();
-    assert_eq!(error["error"]["code"], "session-termination-failed");
-    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
-    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    // Prompt delivery is the primary failure. Cleanup left a live process
+    // boundary, which is reported as bounded secondary state rather than
+    // replacing the error that actually failed the launch.
+    assert_eq!(error["error"]["code"], "command-failed");
+    assert_eq!(
+        error["error"]["details"]["cleanup"],
+        serde_json::json!({ "state": "pending", "reason": "process_boundary_live" })
+    );
     assert!(
         session_dir.exists(),
         "surviving process state must remain discoverable"
@@ -9340,7 +9352,9 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "-d".to_string(),
             "-P".to_string(),
             "-F".to_string(),
-            "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
+            // Space-separated on purpose: some tmux builds rewrite a literal
+            // tab in expanded format output, which rejected valid identities.
+            "#{session_id} #{pane_id} #{pane_pid}".to_string(),
             "-s".to_string(),
             "hs-codex-recoverable".to_string(),
             "-c".to_string(),

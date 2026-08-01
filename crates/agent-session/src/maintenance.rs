@@ -2,8 +2,39 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 pub(crate) const SCHEMA_VERSION: &str = "agent-session.session-maintenance.v1";
+pub(crate) const SCHEMA_VERSION_V2: &str = "agent-session.session-maintenance.v2";
 const MAINTENANCE_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 const MAINTENANCE_TMUX_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maintenance contract version negotiated with the client.
+///
+/// v1 must never gain an action ID. Its clients reject unknown actions outright
+/// rather than degrading, so adding one to a v1 payload would break them
+/// instead of being ignored. New recovery actions are therefore advertised only
+/// on v2, and a v1 client keeps receiving a valid v1 preview. Unknown version
+/// strings fail deserialization, so version skew fails closed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) enum MaintenanceContract {
+    #[default]
+    #[serde(rename = "agent-session.session-maintenance.v1")]
+    V1,
+    #[serde(rename = "agent-session.session-maintenance.v2")]
+    V2,
+}
+
+impl MaintenanceContract {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => SCHEMA_VERSION,
+            Self::V2 => SCHEMA_VERSION_V2,
+        }
+    }
+
+    /// Whether this contract may advertise and accept record-only removal.
+    fn supports_record_only_removal(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +65,8 @@ pub(crate) enum MaintenanceActionId {
     Inspect,
     TerminateRuntimeThenResume,
     TerminateRuntimeThenDelete,
+    /// Last-resort record-only removal. Advertised on v2 only.
+    RemoveConsoleRecord,
 }
 
 impl MaintenanceActionId {
@@ -45,10 +78,25 @@ impl MaintenanceActionId {
             Self::Inspect => "inspect",
             Self::TerminateRuntimeThenResume => "terminate_runtime_then_resume",
             Self::TerminateRuntimeThenDelete => "terminate_runtime_then_delete",
+            Self::RemoveConsoleRecord => "remove_console_record",
         }
     }
 
     fn destructive(self) -> bool {
+        matches!(
+            self,
+            Self::RetryDelete
+                | Self::TerminateRuntimeThenResume
+                | Self::TerminateRuntimeThenDelete
+                | Self::RemoveConsoleRecord
+        )
+    }
+
+    /// Whether this action signals a process or tmux runtime.
+    ///
+    /// Record-only removal deliberately signals nothing, so it must never claim
+    /// a runtime was stopped.
+    fn terminates_runtime(self) -> bool {
         matches!(
             self,
             Self::RetryDelete | Self::TerminateRuntimeThenResume | Self::TerminateRuntimeThenDelete
@@ -85,6 +133,18 @@ pub(crate) struct MaintenanceActionView {
     destructive: bool,
     requires_confirmation: bool,
     preserves_session_metadata: bool,
+    /// Whether the action signals the recorded runtime.
+    ///
+    /// Absent means the v1 default: the action treats the recorded runtime the
+    /// way it always has. `Some(false)` is an explicit promise that nothing is
+    /// signaled, so the UI must not imply termination. Keeping this optional is
+    /// what leaves every v1 action payload byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminates_runtime: Option<bool>,
+    /// Set when the action may leave an unverified process alive. The
+    /// confirmation copy has to say so before the record is removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    may_leave_runtime_running: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +165,10 @@ pub(crate) struct SessionMaintenancePreview {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MaintenanceActionRequest {
+    /// Contract the client is speaking. Absent means v1, so existing clients
+    /// keep working unchanged; an unrecognized version fails deserialization.
+    #[serde(default)]
+    pub(crate) schema_version: MaintenanceContract,
     pub(crate) operation: MaintenanceOperation,
     pub(crate) action: MaintenanceActionId,
     pub(crate) expected_session_incarnation: Option<String>,
@@ -145,11 +209,15 @@ struct PreviewAssessment {
     safe_process_count: usize,
     repairable_identity: Option<TmuxRuntimeIdentity>,
     digest_identities: Vec<TmuxRuntimeIdentity>,
+    /// The evidence class permits record-only removal if the exact managed tmux
+    /// target is also proven absent. Confirmed separately in `preview_locked`.
+    record_only_candidate: bool,
 }
 
 struct PreparedPreview {
     view: SessionMaintenancePreview,
     assessment: PreviewAssessment,
+    record_only_removable: bool,
 }
 
 pub(crate) fn preview(
@@ -157,8 +225,9 @@ pub(crate) fn preview(
     id: &str,
     tmux_bin: &Path,
     operation: MaintenanceOperation,
+    contract: MaintenanceContract,
 ) -> Result<SessionMaintenancePreview, CliError> {
-    preview_inner(context, id, tmux_bin, operation)
+    preview_inner(context, id, tmux_bin, operation, contract)
         .map_err(|error| sanitize_maintenance_error(id, operation, error))
 }
 
@@ -167,13 +236,30 @@ fn preview_inner(
     id: &str,
     tmux_bin: &Path,
     operation: MaintenanceOperation,
+    contract: MaintenanceContract,
 ) -> Result<SessionMaintenancePreview, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
     let _record_lock = acquire_maintenance_lock(context, &canonical_id, operation)?;
     let record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
-    preview_locked(context, &record, tmux_bin, operation).map(|prepared| prepared.view)
+    preview_locked(context, &record, tmux_bin, operation, contract).map(|prepared| prepared.view)
+}
+
+/// Prove the exact managed tmux target is absent.
+///
+/// Record-only removal may only be offered when nothing is left to signal, so
+/// absence must be established from the daemon's own exact-target probe rather
+/// than inferred from a status string. Any probe error keeps the answer `false`.
+fn exact_tmux_target_is_absent(
+    context: &CliContext,
+    record: &SessionRecord,
+    tmux_bin: &Path,
+) -> bool {
+    matches!(
+        capture_tmux_runtime_identity(context, record, tmux_bin, DELETE_TERMINATION_PROBE_TIMEOUT),
+        Ok(TmuxRuntimeProbe::Stopped)
+    )
 }
 
 fn preview_locked(
@@ -181,6 +267,7 @@ fn preview_locked(
     record: &SessionRecord,
     tmux_bin: &Path,
     operation: MaintenanceOperation,
+    contract: MaintenanceContract,
 ) -> Result<PreparedPreview, CliError> {
     let runtime_stop_fenced = operation == MaintenanceOperation::Delete
         && crate::orchestration::session_runtime_stop_fenced(context, record)?;
@@ -196,10 +283,22 @@ fn preview_locked(
     } else {
         assess(record, tmux_bin, operation)?
     };
+    // Record-only removal is a last resort: it needs both an evidence class
+    // with no safe signal boundary and proof that the exact managed tmux target
+    // is gone, so nothing is left that a signal could legitimately reach.
+    let record_only_removable = !runtime_stop_fenced
+        && contract.supports_record_only_removal()
+        && operation == MaintenanceOperation::Delete
+        && assessment.record_only_candidate
+        && exact_tmux_target_is_absent(context, record, tmux_bin);
     let actions = if runtime_stop_fenced {
         Vec::new()
     } else {
-        actions_for(operation, assessment.state == "repairable")
+        actions_for(
+            operation,
+            assessment.state == "repairable",
+            record_only_removable,
+        )
     };
     let session_incarnation = record
         .runtime
@@ -224,9 +323,11 @@ fn preview_locked(
         assessment.boundary_kind,
         assessment.safe_process_count,
         &assessment.digest_identities,
+        contract,
+        record_only_removable,
     )?;
     let view = SessionMaintenancePreview {
-        schema_version: SCHEMA_VERSION,
+        schema_version: contract.as_str(),
         session_id: record.id.clone(),
         operation,
         state: assessment.state,
@@ -240,12 +341,19 @@ fn preview_locked(
         preservation: MaintenancePreservation {
             session_metadata_retained_until_success: true,
             provider_conversation_retained: true,
+            // Still the ceiling for anything this preview can signal. The
+            // record-only caveat is per-action, because the same preview also
+            // offers retry_delete, which does terminate.
             destructive_scope: "verified_recorded_runtime_only",
         },
         actions,
         preview_digest,
     };
-    Ok(PreparedPreview { view, assessment })
+    Ok(PreparedPreview {
+        view,
+        assessment,
+        record_only_removable,
+    })
 }
 
 fn assess(
@@ -271,6 +379,9 @@ fn assess(
                 safe_process_count: 0,
                 repairable_identity: None,
                 digest_identities: Vec::new(),
+                // A live tmux session is exactly what ordinary deletion can
+                // terminate, so there is nothing to fall back from.
+                record_only_candidate: false,
             });
         }
         "unknown" => {
@@ -305,6 +416,8 @@ fn assess(
             safe_process_count: 0,
             repairable_identity: None,
             digest_identities: Vec::new(),
+            // Proven never launched: ordinary deletion already succeeds.
+            record_only_candidate: false,
         });
     }
     let Some(identity) = identity else {
@@ -369,6 +482,8 @@ fn assess(
             safe_process_count: 0,
             repairable_identity: None,
             digest_identities: identities,
+            // Every recorded boundary verified stopped: nothing is stranded.
+            record_only_candidate: false,
         });
     }
     if running.len() != 1 || running[0] != identity {
@@ -393,6 +508,10 @@ fn assess(
             operation,
             MaintenanceOperation::Resume | MaintenanceOperation::Delete
         );
+    // Without a repairable identity the boundary is live but not safely
+    // terminable, and retrying deletion just repeats the same fail-closed
+    // check. That is the retry-only dead end record-only removal exists for.
+    let record_only_candidate = repairable_identity.is_none();
     Ok(PreviewAssessment {
         state: if repairable { "repairable" } else { "blocked" },
         runtime_status: "stopped",
@@ -403,6 +522,7 @@ fn assess(
         safe_process_count,
         repairable_identity,
         digest_identities: identities,
+        record_only_candidate,
     })
 }
 
@@ -417,6 +537,8 @@ fn startup_failed_assessment(digest_identities: Vec<TmuxRuntimeIdentity>) -> Pre
         safe_process_count: 0,
         repairable_identity: None,
         digest_identities,
+        // No boundary was ever established, so ordinary deletion applies.
+        record_only_candidate: false,
     }
 }
 
@@ -458,10 +580,22 @@ fn blocked_assessment(
         safe_process_count,
         repairable_identity: None,
         digest_identities,
+        // Only evidence classes that genuinely have no reachable signal
+        // boundary qualify. A changed runtime identity must keep blocking every
+        // destructive action, and an unverifiable status cannot prove absence,
+        // so neither is a candidate.
+        record_only_candidate: matches!(
+            issue_kind,
+            "runtime_identity_unavailable" | "process_boundary_live"
+        ),
     }
 }
 
-fn actions_for(operation: MaintenanceOperation, repairable: bool) -> Vec<MaintenanceActionView> {
+fn actions_for(
+    operation: MaintenanceOperation,
+    repairable: bool,
+    record_only_removable: bool,
+) -> Vec<MaintenanceActionView> {
     let retry = match operation {
         MaintenanceOperation::Resume => MaintenanceActionId::RetryResume,
         MaintenanceOperation::Delete => MaintenanceActionId::RetryDelete,
@@ -475,6 +609,11 @@ fn actions_for(operation: MaintenanceOperation, repairable: bool) -> Vec<Mainten
             MaintenanceOperation::Delete => MaintenanceActionId::TerminateRuntimeThenDelete,
             MaintenanceOperation::Attach | MaintenanceOperation::Inspect => unreachable!(),
         }));
+    }
+    // Listed last: it is the fallback offered when no signal boundary can be
+    // established, never a peer of the actions that do terminate.
+    if record_only_removable {
+        actions.push(action_view(MaintenanceActionId::RemoveConsoleRecord));
     }
     actions
 }
@@ -491,16 +630,23 @@ fn action_view(id: MaintenanceActionId) -> MaintenanceActionView {
         MaintenanceActionId::TerminateRuntimeThenDelete => {
             ("Terminate recorded runtime, then delete", false)
         }
+        // Deliberately never says "force kill" or "force delete": it stops
+        // nothing, and naming it that way would misrepresent the guarantee.
+        MaintenanceActionId::RemoveConsoleRecord => ("Remove from Console only", false),
     };
+    let record_only = id == MaintenanceActionId::RemoveConsoleRecord;
     MaintenanceActionView {
         id,
         label,
         destructive: id.destructive(),
         requires_confirmation: id.destructive(),
         preserves_session_metadata,
+        terminates_runtime: record_only.then_some(id.terminates_runtime()),
+        may_leave_runtime_running: record_only.then_some(true),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preview_digest(
     record: &SessionRecord,
     operation: MaintenanceOperation,
@@ -509,9 +655,13 @@ fn preview_digest(
     boundary_kind: &str,
     safe_process_count: usize,
     identities: &[TmuxRuntimeIdentity],
+    contract: MaintenanceContract,
+    record_only_removable: bool,
 ) -> Result<String, CliError> {
-    let digest_subject = json!({
-        "domain": SCHEMA_VERSION,
+    // The domain is the negotiated contract, so a v1 digest can never authorize
+    // a v2-only action and vice versa.
+    let mut digest_subject = json!({
+        "domain": contract.as_str(),
         "session_id": record.id,
         "session_created_at": record.created_at,
         "session_incarnation": record.runtime.as_ref().map(|runtime| runtime.launch_id.as_str()),
@@ -523,6 +673,16 @@ fn preview_digest(
         "safe_process_count": safe_process_count,
         "identities": identities,
     });
+    // Bound only into v2 digests. v1 can never advertise record-only removal, so
+    // omitting it there keeps already-published v1 digests byte-identical.
+    if contract.supports_record_only_removal()
+        && let Some(subject) = digest_subject.as_object_mut()
+    {
+        subject.insert(
+            "record_only_removable".to_string(),
+            Value::Bool(record_only_removable),
+        );
+    }
     let encoded = serde_json::to_vec(&digest_subject).map_err(|_| {
         CliError::runtime(
             "maintenance-preview-failed",
@@ -566,7 +726,8 @@ fn execute_inner(
     resume_guard: &impl Fn(&SessionRecord) -> Result<(), CliError>,
 ) -> Result<MaintenanceActionResult, CliError> {
     let requested_operation = request.operation;
-    validate_action_pair(requested_operation, request.action)?;
+    let contract = request.schema_version;
+    validate_action_pair(requested_operation, request.action, contract)?;
     validate_digest(&request.expected_preview_digest)?;
     if request.action.destructive() && !request.confirmed {
         return Err(CliError::data(
@@ -583,12 +744,18 @@ fn execute_inner(
     let _record_lock = acquire_maintenance_lock(context, &canonical_id, requested_operation)?;
     let mut record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
-    let prepared = preview_locked(context, &record, tmux_bin, request.operation)?;
+    let prepared = preview_locked(context, &record, tmux_bin, request.operation, contract)?;
     let prepared_runtime_status = prepared.assessment.runtime_status;
     let preview = &prepared.view;
     if preview.session_incarnation != request.expected_session_incarnation
         || preview.session_generation != request.expected_session_generation
         || preview.preview_digest != request.expected_preview_digest
+    {
+        return Err(stale_preview_error(&record));
+    }
+    // Re-derived under the lock: the record must still have no reachable signal
+    // boundary right now, not merely when the preview was taken.
+    if request.action == MaintenanceActionId::RemoveConsoleRecord && !prepared.record_only_removable
     {
         return Err(stale_preview_error(&record));
     }
@@ -603,7 +770,9 @@ fn execute_inner(
 
     if matches!(
         request.action,
-        MaintenanceActionId::RetryDelete | MaintenanceActionId::TerminateRuntimeThenDelete
+        MaintenanceActionId::RetryDelete
+            | MaintenanceActionId::TerminateRuntimeThenDelete
+            | MaintenanceActionId::RemoveConsoleRecord
     ) {
         crate::orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
             context, &record, None,
@@ -632,10 +801,35 @@ fn execute_inner(
     }
 
     match request.action {
+        MaintenanceActionId::RemoveConsoleRecord => {
+            let resolved = resolve_session_record_path(context, &canonical_id)?;
+            validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+            // Deliberately no signal of any kind. This reuses the same atomic
+            // quarantine commit ordinary deletion uses, so the existing janitor
+            // finishes the physical cleanup and no recursive delete is added.
+            let registry_fence = SessionRegistryFence::from_record(&record);
+            let deleted =
+                finish_session_delete(context, record, resolved.session_dir, registry_fence)?;
+            let deleted_registry_fence = deleted.registry_fence.clone();
+            Ok(MaintenanceActionResult {
+                schema_version: contract.as_str(),
+                session_id: deleted.id,
+                operation: request.operation,
+                action: request.action,
+                // Never "deleted": nothing was stopped, and an unverified
+                // process may still be running.
+                outcome: "record_removed",
+                session_incarnation: None,
+                session_generation: None,
+                status: "record_removed",
+                cleanup_pending: deleted.cleanup_pending,
+                deleted_registry_fence: Some(deleted_registry_fence),
+            })
+        }
         MaintenanceActionId::RetryResume | MaintenanceActionId::TerminateRuntimeThenResume => {
             let resumed = resume_session_locked(context, record, tmux_bin)?;
             Ok(MaintenanceActionResult {
-                schema_version: SCHEMA_VERSION,
+                schema_version: contract.as_str(),
                 session_id: resumed.session.id,
                 operation: request.operation,
                 action: request.action,
@@ -660,7 +854,7 @@ fn execute_inner(
             )?;
             let deleted_registry_fence = deleted.registry_fence.clone();
             Ok(MaintenanceActionResult {
-                schema_version: SCHEMA_VERSION,
+                schema_version: contract.as_str(),
                 session_id: deleted.id,
                 operation: request.operation,
                 action: request.action,
@@ -674,7 +868,7 @@ fn execute_inner(
         }
         MaintenanceActionId::RetryAttach | MaintenanceActionId::Inspect => {
             Ok(MaintenanceActionResult {
-                schema_version: SCHEMA_VERSION,
+                schema_version: contract.as_str(),
                 session_id: record.id,
                 operation: request.operation,
                 action: request.action,
@@ -696,6 +890,7 @@ fn execute_inner(
 fn validate_action_pair(
     operation: MaintenanceOperation,
     action: MaintenanceActionId,
+    contract: MaintenanceContract,
 ) -> Result<(), CliError> {
     let valid = matches!(
         (operation, action),
@@ -715,7 +910,9 @@ fn validate_action_pair(
             MaintenanceOperation::Attach,
             MaintenanceActionId::RetryAttach
         ) | (MaintenanceOperation::Inspect, MaintenanceActionId::Inspect)
-    );
+    ) || (operation == MaintenanceOperation::Delete
+        && action == MaintenanceActionId::RemoveConsoleRecord
+        && contract.supports_record_only_removal());
     if valid {
         Ok(())
     } else {
@@ -725,6 +922,7 @@ fn validate_action_pair(
             Some(json!({
                 "operation": operation.as_str(),
                 "action": action.as_str(),
+                "schema_version": contract.as_str(),
             })),
         ))
     }
@@ -951,5 +1149,198 @@ mod tests {
         .expect("fixture must contain valid JSON");
 
         assert_eq!(serde_json::to_value(projected).unwrap(), fixture);
+    }
+
+    #[test]
+    fn version_one_never_admits_the_record_only_action() {
+        // v1 clients reject unknown actions instead of degrading, so the
+        // producer refuses record-only removal outright on that contract.
+        assert!(
+            validate_action_pair(
+                MaintenanceOperation::Delete,
+                MaintenanceActionId::RemoveConsoleRecord,
+                MaintenanceContract::V1,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_action_pair(
+                MaintenanceOperation::Delete,
+                MaintenanceActionId::RemoveConsoleRecord,
+                MaintenanceContract::V2,
+            )
+            .is_ok()
+        );
+        // Impossible operation/action pairs stay closed on the successor too.
+        for operation in [
+            MaintenanceOperation::Resume,
+            MaintenanceOperation::Attach,
+            MaintenanceOperation::Inspect,
+        ] {
+            assert!(
+                validate_action_pair(
+                    operation,
+                    MaintenanceActionId::RemoveConsoleRecord,
+                    MaintenanceContract::V2,
+                )
+                .is_err(),
+                "record-only removal must not pair with {operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_contract_versions_fail_closed() {
+        assert_eq!(
+            serde_json::from_str::<MaintenanceContract>("\"agent-session.session-maintenance.v1\"")
+                .expect("v1 parses"),
+            MaintenanceContract::V1
+        );
+        assert_eq!(
+            serde_json::from_str::<MaintenanceContract>("\"agent-session.session-maintenance.v2\"")
+                .expect("v2 parses"),
+            MaintenanceContract::V2
+        );
+        assert!(
+            serde_json::from_str::<MaintenanceContract>("\"agent-session.session-maintenance.v3\"")
+                .is_err(),
+            "an unrecognized contract version must not deserialize"
+        );
+        // Absent means v1, so an existing client keeps working unchanged.
+        assert_eq!(MaintenanceContract::default(), MaintenanceContract::V1);
+    }
+
+    #[test]
+    fn record_only_action_states_that_it_stops_nothing() {
+        let actions = actions_for(MaintenanceOperation::Delete, false, true);
+        assert_eq!(
+            actions.iter().map(|action| action.id).collect::<Vec<_>>(),
+            vec![
+                MaintenanceActionId::RetryDelete,
+                MaintenanceActionId::RemoveConsoleRecord,
+            ]
+        );
+        let record_only = actions.last().expect("record-only action");
+        assert_eq!(record_only.label, "Remove from Console only");
+        assert!(record_only.destructive);
+        assert!(record_only.requires_confirmation);
+        assert!(!record_only.preserves_session_metadata);
+        // It signals nothing and says so, and it admits a process may survive.
+        assert_eq!(record_only.terminates_runtime, Some(false));
+        assert_eq!(record_only.may_leave_runtime_running, Some(true));
+        let label = record_only.label.to_ascii_lowercase();
+        assert!(!label.contains("force"), "label must not say force");
+        assert!(!label.contains("kill"), "label must not say kill");
+
+        // Absent evidence means the action is not offered at all.
+        let without = actions_for(MaintenanceOperation::Delete, false, false);
+        assert!(
+            !without
+                .iter()
+                .any(|action| action.id == MaintenanceActionId::RemoveConsoleRecord)
+        );
+    }
+
+    #[test]
+    fn version_one_action_payloads_keep_their_exact_shape() {
+        // The caveat flags must stay absent on every pre-existing action, or a
+        // v1 client would receive a field its contract does not describe.
+        for id in [
+            MaintenanceActionId::RetryResume,
+            MaintenanceActionId::RetryDelete,
+            MaintenanceActionId::RetryAttach,
+            MaintenanceActionId::Inspect,
+            MaintenanceActionId::TerminateRuntimeThenResume,
+            MaintenanceActionId::TerminateRuntimeThenDelete,
+        ] {
+            let rendered = serde_json::to_value(action_view(id)).expect("action json");
+            let fields = rendered.as_object().expect("action object");
+            assert!(
+                !fields.contains_key("terminates_runtime")
+                    && !fields.contains_key("may_leave_runtime_running"),
+                "{id:?} must keep its v1 payload shape"
+            );
+            assert_eq!(fields.len(), 5, "{id:?} gained or lost a field");
+        }
+    }
+
+    #[test]
+    fn only_boundaries_without_a_safe_signal_are_record_only_candidates() {
+        // A changed runtime identity and an unverifiable status must keep
+        // blocking every destructive action rather than degrading to removal.
+        for (issue, expected) in [
+            ("runtime_identity_unavailable", true),
+            ("process_boundary_live", true),
+            ("runtime_identity_changed", false),
+            ("session_still_running", false),
+            ("unknown", false),
+            ("runtime_stop_fenced", false),
+        ] {
+            let assessment =
+                blocked_assessment(issue, "message", "stopped", "unknown", 0, Vec::new());
+            assert_eq!(
+                assessment.record_only_candidate, expected,
+                "{issue} record-only candidacy"
+            );
+        }
+        // A startup that never established a boundary is an ordinary delete.
+        assert!(!startup_failed_assessment(Vec::new()).record_only_candidate);
+    }
+
+    #[test]
+    fn contract_versions_produce_distinct_preview_digests() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let record = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Enforce,
+            title: None,
+            title_state: None,
+            explicit_id: Some("maintenance-contract-digest"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("create record")
+        .record;
+        let digest_for = |contract, record_only| {
+            preview_digest(
+                &record,
+                MaintenanceOperation::Delete,
+                "blocked",
+                Some("process_boundary_live"),
+                "process_group",
+                1,
+                &[],
+                contract,
+                record_only,
+            )
+            .expect("preview digest")
+        };
+
+        // A v1 digest can never authorize a v2-only action, and vice versa.
+        assert_ne!(
+            digest_for(MaintenanceContract::V1, false),
+            digest_for(MaintenanceContract::V2, false)
+        );
+        // v2 binds the record-only evidence, so a preview taken while nothing
+        // was reachable cannot be replayed once a boundary reappears.
+        assert_ne!(
+            digest_for(MaintenanceContract::V2, false),
+            digest_for(MaintenanceContract::V2, true)
+        );
+        // v1 ignores it, which keeps already-published v1 digests stable.
+        assert_eq!(
+            digest_for(MaintenanceContract::V1, false),
+            digest_for(MaintenanceContract::V1, true)
+        );
     }
 }

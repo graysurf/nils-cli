@@ -36,7 +36,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `GET /sessions/{id}/messages/{message_id}/wait/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `GET /sessions/{id}/buffer` | Open | This specification |
 | `POST /sessions/{id}/{send,prompt,prompt/v2,resume}` | Bearer | This specification |
-| `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints) |
+| `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints), successor [v2](session-maintenance-v2.md#negotiation) |
 | `GET and POST /sessions/{id}/orchestration/group-cleanup` | Bearer | [Main Agent orchestration v1](main-agent-orchestration-v1.md#daemon-owned-group-cleanup) |
 | `PUT /sessions/{id}/account` | Bearer | This specification |
 | `GET /sessions/{id}/auto-resume` | Open | This specification |
@@ -133,6 +133,18 @@ idempotency, and stable failure codes are normative in
   `working-directory-unavailable`, `terminal-runtime-create-failed`,
   `app-server-start-failed`, `proxy-start-failed`, `provider-client-exited`,
   `provider-configuration-rejected`, `startup-timeout`, or `startup-exited`.
+  A failure whose cleanup could not finish adds a bounded `cleanup` object with
+  `state` of `pending` or `blocked` and one allowlisted `reason`:
+  `session_still_running`, `process_boundary_live`, `runtime_identity_changed`,
+  `runtime_identity_unavailable`, `termination_failed`, `termination_timeout`,
+  `verification_failed`, `cleanup_unavailable`, or `unknown`. `cleanup`
+  is absent when cleanup completed or was never attempted, so a projection that
+  omits it carries no caveat. Cleanup is strictly secondary: it never replaces
+  the primary startup failure, because the original create/start error is what
+  explains the failure and a termination error would hide it. When cleanup does
+  not complete, the session record is deliberately retained rather than removed —
+  a live boundary with no record would be unreachable from the Console — and the
+  runtime is not marked never-launched.
   Managed launchers retain only bounded stage/failure markers in the record and
   keep stderr in a private, tail-capped local diagnostic file for startup failures
   and non-zero Codex provider-client exits after readiness; clean exits discard it.

@@ -9,6 +9,13 @@ infer process ownership, signal processes, or delete retained session metadata.
 The contract is additive. An older daemon returns 404 for these routes, so a
 consumer must retain its existing Resume, Delete, and Attach behavior.
 
+This contract is frozen against new action IDs. A v1 consumer rejects an
+unrecognized action rather than ignoring it, so an action added here would break
+existing clients instead of degrading for them. New recovery actions live in
+[Session maintenance v2](session-maintenance-v2.md), which a consumer opts into
+with an explicit `schema_version`. A v2-capable daemon still returns exactly the
+payloads described below to any consumer that does not ask for the successor.
+
 ## Authentication and endpoints
 
 Both endpoints require the daemon Bearer token:

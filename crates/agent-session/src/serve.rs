@@ -2733,6 +2733,11 @@ struct GlanceQuery {
 #[serde(deny_unknown_fields)]
 struct MaintenanceQuery {
     operation: MaintenanceOperation,
+    /// Maintenance contract the client understands. Absent means v1, so an
+    /// existing Console keeps receiving a valid v1 preview; an unrecognized
+    /// version fails the query instead of degrading silently.
+    #[serde(default)]
+    schema_version: maintenance::MaintenanceContract,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5840,20 +5845,22 @@ async fn maintenance_handler(
     if let Some(resp) = deny_unauthorized(&state, &headers) {
         return resp;
     }
-    let operation = match query {
-        Ok(Query(query)) => query.operation,
+    let (operation, contract) = match query {
+        Ok(Query(query)) => (query.operation, query.schema_version),
         Err(_) => {
             return envelope_err(CliError::usage(
                 "invalid-maintenance-query",
-                "maintenance query requires one supported operation",
+                "maintenance query requires one supported operation and contract version",
                 Some(json!({ "field": "operation" })),
             ));
         }
     };
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || maintenance::preview(&context, &id, &tmux, operation))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        maintenance::preview(&context, &id, &tmux, operation, contract)
+    })
+    .await
     {
         Ok(Ok(maintenance)) => {
             envelope_ok(json!({ "machine": state.machine, "maintenance": maintenance }))

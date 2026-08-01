@@ -1208,6 +1208,20 @@ fn failed_projection(
     }
 }
 
+/// Record failed-launch cleanup on a startup projection as secondary state.
+///
+/// Only a non-completed outcome is stored. Launch failures that never attempted
+/// cleanup keep their previous projection shape exactly, and "completed" is the
+/// absence of a caveat rather than a claim about a boundary nothing touched.
+fn store_startup_cleanup(startup: &mut StartupProjection, cleanup: FailedLaunchCleanup) {
+    if cleanup == FailedLaunchCleanup::Completed {
+        return;
+    }
+    startup
+        .extra
+        .insert("cleanup".to_string(), cleanup.projection());
+}
+
 fn read_bounded_startup_marker(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > 64 {
@@ -1921,18 +1935,23 @@ fn start_session_with_create_guard(
     ) {
         Ok(identity) => identity,
         Err(err) => {
-            if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) = recover_failed_tmux_launch(
+            // Cleanup is secondary here: the launch already failed, and
+            // returning a termination error instead would hide why. Keep the
+            // startup failure primary and report cleanup alongside it.
+            let cleanup = if tmux_launch_may_have_created_runtime(&err) {
+                recover_failed_tmux_launch_bounded(
                     context,
                     &mut created.record,
                     &tmux_bin,
                     None,
                     SessionTerminationOperation::FailedLaunch,
                 )
-            {
-                return Err(termination_err);
+            } else {
+                FailedLaunchCleanup::Completed
+            };
+            if cleanup == FailedLaunchCleanup::Completed {
+                mark_tmux_runtime_never_launched(&mut created.record);
             }
-            mark_tmux_runtime_never_launched(&mut created.record);
             let started_at = startup_projection(&created.record)
                 .map(|startup| startup.started_at)
                 .unwrap_or_else(|| created.record.created_at.clone());
@@ -1941,7 +1960,8 @@ fn start_session_with_create_guard(
             } else {
                 "terminal-runtime-create-failed"
             };
-            let failed = failed_projection(&started_at, code, "tmux", None);
+            let mut failed = failed_projection(&started_at, code, "tmux", None);
+            store_startup_cleanup(&mut failed, cleanup);
             store_startup_projection(&mut created.record, &failed);
             created.record.updated_at = Zoned::now().timestamp().to_string();
             if let Err(write_err) = write_session_record(context, &created.record) {
@@ -1969,32 +1989,40 @@ fn start_session_with_create_guard(
                     result,
                     prompt_delivery_observation: None,
                 }),
-                None => Err(err),
+                None => Err(with_failed_launch_cleanup(err, cleanup)),
             };
         }
     };
     if let Err(err) = persist_launched_tmux_identity(context, &mut created.record, &launch_identity)
     {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Err(err) = establish_coordination_broker(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     let pre_runtime_release_committed =
         if let Some(guard) = lifecycle_guards.pre_runtime_release.as_mut() {
@@ -2008,36 +2036,45 @@ fn start_session_with_create_guard(
                     }
                     return Err(failure.error);
                 }
-                recover_failed_tmux_launch(
+                let cleanup = recover_failed_tmux_launch_bounded(
                     context,
                     &mut created.record,
                     &tmux_bin,
                     Some(&launch_identity),
                     SessionTerminationOperation::FailedLaunch,
-                )?;
-                cleanup_created_record(context, &created);
-                return Err(failure.error);
+                );
+                if cleanup == FailedLaunchCleanup::Completed {
+                    cleanup_created_record(context, &created);
+                } else {
+                    retain_stranded_failed_launch(context, &mut created, cleanup);
+                }
+                return Err(with_failed_launch_cleanup(failure.error, cleanup));
             }
             true
         } else {
             false
         };
     if let Err(err) = release_held_runtime(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
+        );
+        if cleanup != FailedLaunchCleanup::Completed {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
         if pre_runtime_release_committed
             && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
             && let Err(rollback_error) = guard(&created.record)
         {
             return Err(rollback_error);
         }
-        cleanup_created_record(context, &created);
-        return Err(err);
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Some(guard) = lifecycle_guards.post_runtime_release.as_mut()
         && let Err(err) = guard(&created.record)
@@ -2049,21 +2086,26 @@ fn start_session_with_create_guard(
     let mut prompt_delivery_observation = None;
     if created.prompt_file.is_some() {
         if let Err(err) = created.validate_session_storage() {
-            recover_failed_tmux_launch(
+            let cleanup = recover_failed_tmux_launch_bounded(
                 context,
                 &mut created.record,
                 &tmux_bin,
                 Some(&launch_identity),
                 SessionTerminationOperation::FailedLaunch,
-            )?;
+            );
+            if cleanup != FailedLaunchCleanup::Completed {
+                retain_stranded_failed_launch(context, &mut created, cleanup);
+            }
             if pre_runtime_release_committed
                 && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
                 && let Err(rollback_error) = guard(&created.record)
             {
                 return Err(rollback_error);
             }
-            cleanup_created_record(context, &created);
-            return Err(err);
+            if cleanup == FailedLaunchCleanup::Completed {
+                cleanup_created_record(context, &created);
+            }
+            return Err(with_failed_launch_cleanup(err, cleanup));
         }
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
@@ -2083,21 +2125,26 @@ fn start_session_with_create_guard(
                 {
                     prompt_delivery_error = Some(err);
                 } else {
-                    recover_failed_tmux_launch(
+                    let cleanup = recover_failed_tmux_launch_bounded(
                         context,
                         &mut created.record,
                         &tmux_bin,
                         Some(&launch_identity),
                         SessionTerminationOperation::FailedLaunch,
-                    )?;
+                    );
+                    if cleanup != FailedLaunchCleanup::Completed {
+                        retain_stranded_failed_launch(context, &mut created, cleanup);
+                    }
                     if pre_runtime_release_committed
                         && let Some(guard) = lifecycle_guards.definitive_failure.as_mut()
                         && let Err(rollback_error) = guard(&created.record)
                     {
                         return Err(rollback_error);
                     }
-                    cleanup_created_record(context, &created);
-                    return Err(err);
+                    if cleanup == FailedLaunchCleanup::Completed {
+                        cleanup_created_record(context, &created);
+                    }
+                    return Err(with_failed_launch_cleanup(err, cleanup));
                 }
             }
         }
@@ -2182,54 +2229,74 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
     ) {
         Ok(identity) => identity,
         Err(err) => {
-            if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) = recover_failed_tmux_launch(
+            // The launch already failed, so cleanup is secondary state and must
+            // not replace the primary error. When cleanup cannot finish the
+            // record is retained instead of removed: a live boundary with no
+            // record is unreachable from the Console.
+            let cleanup = if tmux_launch_may_have_created_runtime(&err) {
+                recover_failed_tmux_launch_bounded(
                     context,
                     &mut created.record,
                     &tmux_bin,
                     None,
                     SessionTerminationOperation::FailedLaunch,
                 )
-            {
-                return Err(termination_err);
+            } else {
+                FailedLaunchCleanup::Completed
+            };
+            if cleanup == FailedLaunchCleanup::Completed {
+                cleanup_created_record(context, &created);
+            } else {
+                retain_stranded_failed_launch(context, &mut created, cleanup);
             }
-            cleanup_created_record(context, &created);
-            return Err(err);
+            return Err(with_failed_launch_cleanup(err, cleanup));
         }
     };
     if let Err(err) = persist_launched_tmux_identity(context, &mut created.record, &launch_identity)
     {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Err(err) = establish_coordination_broker(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Err(err) = release_held_runtime(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
 
     let result = session_view(
@@ -2322,54 +2389,74 @@ pub(crate) fn start_provider_resume_session(
     ) {
         Ok(identity) => identity,
         Err(err) => {
-            if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) = recover_failed_tmux_launch(
+            // The launch already failed, so cleanup is secondary state and must
+            // not replace the primary error. When cleanup cannot finish the
+            // record is retained instead of removed: a live boundary with no
+            // record is unreachable from the Console.
+            let cleanup = if tmux_launch_may_have_created_runtime(&err) {
+                recover_failed_tmux_launch_bounded(
                     context,
                     &mut created.record,
                     &tmux_bin,
                     None,
                     SessionTerminationOperation::FailedLaunch,
                 )
-            {
-                return Err(termination_err);
+            } else {
+                FailedLaunchCleanup::Completed
+            };
+            if cleanup == FailedLaunchCleanup::Completed {
+                cleanup_created_record(context, &created);
+            } else {
+                retain_stranded_failed_launch(context, &mut created, cleanup);
             }
-            cleanup_created_record(context, &created);
-            return Err(err);
+            return Err(with_failed_launch_cleanup(err, cleanup));
         }
     };
     if let Err(err) = persist_launched_tmux_identity(context, &mut created.record, &launch_identity)
     {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Err(err) = establish_coordination_broker(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     if let Err(err) = release_held_runtime(context, &created.record) {
-        recover_failed_tmux_launch(
+        let cleanup = recover_failed_tmux_launch_bounded(
             context,
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
             SessionTerminationOperation::FailedLaunch,
-        )?;
-        cleanup_created_record(context, &created);
-        return Err(err);
+        );
+        if cleanup == FailedLaunchCleanup::Completed {
+            cleanup_created_record(context, &created);
+        } else {
+            retain_stranded_failed_launch(context, &mut created, cleanup);
+        }
+        return Err(with_failed_launch_cleanup(err, cleanup));
     }
     advance_owned_startup_stage(context, &mut created.record, "runtime")?;
 
@@ -2718,6 +2805,27 @@ fn create_record_with_guard(
         session_storage,
         _lifecycle_lock: Some(lifecycle_lock),
     })
+}
+
+/// Keep a launch-failed session record whose cleanup could not finish.
+///
+/// The record is deliberately retained rather than removed: a recorded runtime
+/// boundary may still be live, and deleting the session directory would strand
+/// it with no managed way back. Persisting the failed projection plus the
+/// bounded cleanup caveat is what lets the Console still see and inspect it.
+fn retain_stranded_failed_launch(
+    context: &CliContext,
+    created: &mut CreatedRecord,
+    cleanup: FailedLaunchCleanup,
+) {
+    let started_at = startup_projection(&created.record)
+        .map(|startup| startup.started_at)
+        .unwrap_or_else(|| created.record.created_at.clone());
+    let mut failed = failed_projection(&started_at, "terminal-runtime-create-failed", "tmux", None);
+    store_startup_cleanup(&mut failed, cleanup);
+    store_startup_projection(&mut created.record, &failed);
+    created.record.updated_at = Zoned::now().timestamp().to_string();
+    let _ = write_session_record(context, &created.record);
 }
 
 fn cleanup_created_record(context: &CliContext, created: &CreatedRecord) {
@@ -7652,7 +7760,7 @@ fn start_interactive_tmux(
         .arg("-d")
         .arg("-P")
         .arg("-F")
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+        .arg(TMUX_RUNTIME_IDENTITY_FORMAT)
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
@@ -7805,7 +7913,7 @@ fn start_run_tmux(
         .arg("-d")
         .arg("-P")
         .arg("-F")
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+        .arg(TMUX_RUNTIME_IDENTITY_FORMAT)
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
@@ -7848,22 +7956,13 @@ fn run_tmux_new_session(
             Some(json!({ "id": record.id })),
         )
     })?;
-    let mut fields = output.trim().split('\t');
-    let session_id = fields.next().unwrap_or_default();
-    let pane_id = fields.next().unwrap_or_default();
-    let pane_pid = fields
-        .next()
-        .filter(|_| fields.next().is_none())
-        .and_then(|value| value.parse::<libc::pid_t>().ok())
-        .filter(|pid| *pid > 1);
-    if !valid_tmux_session_id(session_id) || !valid_tmux_pane_id(pane_id) || pane_pid.is_none() {
+    let Some((session_id, pane_id, pane_pid)) = parse_tmux_runtime_identity_fields(&output) else {
         return Err(CliError::runtime(
             "tmux-runtime-identity-invalid",
             "tmux new-session did not return a valid session, pane, and process identity",
             Some(json!({ "id": record.id })),
         ));
-    }
-    let pane_pid = pane_pid.expect("checked pane pid");
+    };
     #[cfg(target_os = "linux")]
     let (pane_start_time_ticks, pane_pidfd) = pin_live_linux_process_incarnation(pane_pid)
         .map_err(|_| {
@@ -7973,6 +8072,40 @@ fn run_tmux_new_session(
     })
 }
 
+/// tmux format requesting the exact runtime identity triple.
+///
+/// The fields are separated by a single space rather than a tab because some
+/// deployed tmux builds rewrite literal tab separators in expanded format
+/// output. A tab-delimited request made valid identities unparsable, which
+/// rejected healthy panes as `tmux-runtime-identity-invalid`. Every field in
+/// this triple (`$N`, `%N`, and a decimal pid) is space-free, so whitespace
+/// separation is unambiguous.
+const TMUX_RUNTIME_IDENTITY_FORMAT: &str = "#{session_id} #{pane_id} #{pane_pid}";
+
+/// Parse the exact identity triple produced by [`TMUX_RUNTIME_IDENTITY_FORMAT`].
+///
+/// Returns `None` unless the reply holds exactly three whitespace-delimited
+/// fields and each one is individually valid. Callers map `None` onto their own
+/// fail-closed error, so a mangled or truncated reply never yields a partial
+/// identity.
+fn parse_tmux_runtime_identity_fields(output: &str) -> Option<(&str, &str, libc::pid_t)> {
+    let mut fields = output.split_whitespace();
+    let session_id = fields.next()?;
+    let pane_id = fields.next()?;
+    let pane_pid = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    if !valid_tmux_session_id(session_id) || !valid_tmux_pane_id(pane_id) {
+        return None;
+    }
+    let pane_pid = pane_pid
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 1)?;
+    Some((session_id, pane_id, pane_pid))
+}
+
 fn tmux_pane_identity_matches(
     tmux_bin: &Path,
     record: &SessionRecord,
@@ -7988,7 +8121,7 @@ fn tmux_pane_identity_matches(
         .arg("-p")
         .arg("-t")
         .arg(managed_tmux_pane_target(&record.tmux_session))
-        .arg("#{session_id} #{pane_id} #{pane_pid}");
+        .arg(TMUX_RUNTIME_IDENTITY_FORMAT);
     let Ok(output) = run_output_with_timeout(command, timeout) else {
         return false;
     };
@@ -7998,14 +8131,8 @@ fn tmux_pane_identity_matches(
     let Ok(output) = String::from_utf8(output.stdout) else {
         return false;
     };
-    let mut fields = output.split_whitespace();
-    fields.next() == Some(expected_session_id)
-        && fields.next() == Some(expected_pane_id)
-        && fields
-            .next()
-            .and_then(|value| value.parse::<libc::pid_t>().ok())
-            == Some(expected_pane_pid)
-        && fields.next().is_none()
+    parse_tmux_runtime_identity_fields(&output)
+        == Some((expected_session_id, expected_pane_id, expected_pane_pid))
 }
 
 fn tmux_launch_may_have_created_runtime(err: &CliError) -> bool {
@@ -9695,7 +9822,7 @@ fn start_resume_tmux(
         .arg("-d")
         .arg("-P")
         .arg("-F")
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+        .arg(TMUX_RUNTIME_IDENTITY_FORMAT)
         .arg("-s")
         .arg(&record.tmux_session)
         .arg("-c")
@@ -12061,6 +12188,115 @@ fn session_termination_error(
     )
 }
 
+/// Bounded secondary state describing failed-launch cleanup.
+///
+/// Cleanup runs only after a create or start failure has already been decided,
+/// so it must never replace that primary error. Propagating the termination
+/// error instead hid the real startup cause behind a cleanup symptom, which is
+/// what made a failed create look like a deletion problem. Reason codes are
+/// allowlisted, so no command output, pid, process group, tmux target, or local
+/// path reaches a response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FailedLaunchCleanup {
+    /// Cleanup ran and the recorded runtime boundary is gone.
+    #[default]
+    Completed,
+    /// Cleanup did not finish, but the evidence may still converge on a retry.
+    Pending(&'static str),
+    /// Cleanup cannot proceed without new evidence; nothing was signaled.
+    Blocked(&'static str),
+}
+
+impl FailedLaunchCleanup {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Pending(_) => "pending",
+            Self::Blocked(_) => "blocked",
+        }
+    }
+
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => None,
+            Self::Pending(reason) | Self::Blocked(reason) => Some(reason),
+        }
+    }
+
+    fn projection(self) -> Value {
+        match self.reason() {
+            Some(reason) => json!({ "state": self.state(), "reason": reason }),
+            None => json!({ "state": self.state() }),
+        }
+    }
+}
+
+/// Classify a failed-launch cleanup error into bounded secondary state.
+///
+/// Only the allowlisted `reason` discriminator from `session-termination-failed`
+/// is carried across; the raw message, tmux target, and identifiers are dropped.
+fn failed_launch_cleanup_from_error(error: &CliError) -> FailedLaunchCleanup {
+    if error.code() != "session-termination-failed" {
+        return FailedLaunchCleanup::Blocked("cleanup_unavailable");
+    }
+    let details = error.0.details.as_ref();
+    let reason = match details
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("session-still-running") => "session_still_running",
+        Some("process-still-running") => "process_boundary_live",
+        Some("runtime-identity-changed" | "runtime-identity-mismatch") => {
+            "runtime_identity_changed"
+        }
+        Some("runtime-identity-unavailable") => "runtime_identity_unavailable",
+        Some("kill-failed" | "kill-error") => "termination_failed",
+        Some("kill-timeout") => "termination_timeout",
+        Some("verification-failed") => "verification_failed",
+        _ => "unknown",
+    };
+    let retryable = details
+        .and_then(|details| details.get("retryable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if retryable {
+        FailedLaunchCleanup::Pending(reason)
+    } else {
+        FailedLaunchCleanup::Blocked(reason)
+    }
+}
+
+/// Run failed-launch cleanup and classify the outcome instead of propagating it.
+///
+/// Callers keep their own primary failure and attach the returned state, so a
+/// stranded runtime is reported without erasing the reason the launch failed.
+fn recover_failed_tmux_launch_bounded(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    tmux_bin: &Path,
+    known_identity: Option<&TmuxRuntimeIdentity>,
+    operation: SessionTerminationOperation,
+) -> FailedLaunchCleanup {
+    match recover_failed_tmux_launch(context, record, tmux_bin, known_identity, operation) {
+        Ok(()) => FailedLaunchCleanup::Completed,
+        Err(error) => failed_launch_cleanup_from_error(&error),
+    }
+}
+
+/// Attach bounded cleanup state to a primary failure, preserving code and message.
+fn with_failed_launch_cleanup(mut error: CliError, cleanup: FailedLaunchCleanup) -> CliError {
+    if cleanup == FailedLaunchCleanup::Completed {
+        return error;
+    }
+    let mut details = match error.0.details.take() {
+        Some(Value::Object(details)) => details,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("cleanup".to_string(), cleanup.projection());
+    error.0.details = Some(Value::Object(details));
+    error
+}
+
 fn recover_failed_tmux_launch(
     context: &CliContext,
     record: &mut SessionRecord,
@@ -12601,7 +12837,7 @@ fn capture_tmux_runtime_identity(
         .arg("-p")
         .arg("-t")
         .arg(managed_tmux_pane_target(&record.tmux_session))
-        .arg("#{session_id} #{pane_id} #{pane_pid}");
+        .arg(TMUX_RUNTIME_IDENTITY_FORMAT);
     let output = run_output_with_timeout(command, timeout)
         .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
     if !output.status.success() {
@@ -12623,25 +12859,7 @@ fn capture_tmux_runtime_identity(
             _ => Err(SessionTerminationFailure::VerificationFailed),
         };
     }
-    let mut fields = output.split_whitespace();
-    let session_id = fields
-        .next()
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    let pane_id = fields
-        .next()
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    let pane_pid = fields
-        .next()
-        .filter(|_| fields.next().is_none())
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    if !valid_tmux_session_id(session_id) || !valid_tmux_pane_id(pane_id) {
-        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
-    }
-    let pane_pid = pane_pid
-        .trim()
-        .parse::<libc::pid_t>()
-        .ok()
-        .filter(|pid| *pid > 1)
+    let (session_id, pane_id, pane_pid) = parse_tmux_runtime_identity_fields(&output)
         .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
     #[cfg(target_os = "linux")]
     let (pane_start_time_ticks, pane_pidfd) = pin_live_linux_process_incarnation(pane_pid)?;
@@ -17478,6 +17696,156 @@ fi
     }
 
     #[test]
+    fn tmux_runtime_identity_format_requests_space_separated_fields() {
+        // Pinned literally: a tab-delimited request is what the deployed tmux
+        // mangled, so the wire format itself is the regression surface.
+        assert_eq!(
+            super::TMUX_RUNTIME_IDENTITY_FORMAT,
+            "#{session_id} #{pane_id} #{pane_pid}"
+        );
+    }
+
+    #[test]
+    fn tmux_runtime_identity_parse_fails_closed_on_a_mangled_reply() {
+        // The deployed tmux rewrote literal tab separators, so a tab-delimited
+        // request returned a single unparsable field for a healthy pane. Every
+        // create and verification site now shares this parse, so a mangled
+        // reply must never yield a partial identity.
+        assert_eq!(
+            super::parse_tmux_runtime_identity_fields("$123_%123_4242\n"),
+            None
+        );
+        assert_eq!(
+            super::parse_tmux_runtime_identity_fields("$123 %123 4242\n"),
+            Some(("$123", "%123", 4242))
+        );
+        // Tab-separated replies still parse; only the request format changed.
+        assert_eq!(
+            super::parse_tmux_runtime_identity_fields("$123\t%123\t4242\n"),
+            Some(("$123", "%123", 4242))
+        );
+        for mangled in [
+            "",
+            "$123 %123",
+            "$123 %123 4242 extra",
+            "123 %123 4242",
+            "$123 pane 4242",
+            "$123 %123 notapid",
+            "$123 %123 1",
+        ] {
+            assert_eq!(
+                super::parse_tmux_runtime_identity_fields(mangled),
+                None,
+                "expected {mangled:?} to fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_launch_cleanup_keeps_the_primary_startup_failure_and_stays_bounded() {
+        use super::{
+            CliError, FailedLaunchCleanup, SessionTerminationFailure, SessionTerminationOperation,
+        };
+        use serde_json::json;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("failed-launch-cleanup"),
+        );
+        let record = load_session_record(&context, &id).expect("session record");
+
+        // Cleanup that cannot prove ownership of the remaining boundary is
+        // blocked: no retry can manufacture the missing evidence.
+        let blocked = super::session_termination_error(
+            &record,
+            SessionTerminationFailure::RuntimeIdentityUnavailable,
+            SessionTerminationOperation::FailedLaunch,
+        );
+        assert_eq!(
+            super::failed_launch_cleanup_from_error(&blocked),
+            FailedLaunchCleanup::Blocked("runtime_identity_unavailable")
+        );
+
+        // Cleanup whose evidence may still converge is pending, not blocked.
+        let pending = super::session_termination_error(
+            &record,
+            SessionTerminationFailure::ProcessStillRunning,
+            SessionTerminationOperation::FailedLaunch,
+        );
+        assert_eq!(
+            super::failed_launch_cleanup_from_error(&pending),
+            FailedLaunchCleanup::Pending("process_boundary_live")
+        );
+
+        // The regression: a failing cleanup must not replace the startup error.
+        let primary = CliError::runtime(
+            "terminal-runtime-create-failed",
+            "The terminal runtime could not be created.",
+            Some(json!({ "id": record.id })),
+        );
+        let reported = super::with_failed_launch_cleanup(
+            primary,
+            FailedLaunchCleanup::Blocked("runtime_identity_unavailable"),
+        );
+        assert_eq!(reported.code(), "terminal-runtime-create-failed");
+        assert_eq!(
+            reported.0.message,
+            "The terminal runtime could not be created."
+        );
+        let details = reported.0.details.clone().expect("primary error details");
+        assert_eq!(
+            details["cleanup"],
+            json!({ "state": "blocked", "reason": "runtime_identity_unavailable" })
+        );
+        // Bounded: the caveat carries an allowlisted reason only, never the tmux
+        // target, a pid, a process group, or a local path.
+        assert_eq!(
+            details["cleanup"]
+                .as_object()
+                .expect("cleanup object")
+                .len(),
+            2
+        );
+        let rendered = serde_json::to_string(&details["cleanup"]).expect("cleanup json");
+        assert!(!rendered.contains(&record.tmux_session));
+        assert!(!rendered.contains("/"));
+
+        // A completed cleanup adds no caveat at all.
+        let clean = super::with_failed_launch_cleanup(
+            CliError::runtime("terminal-runtime-create-failed", "boom", None),
+            FailedLaunchCleanup::Completed,
+        );
+        assert!(clean.0.details.is_none());
+
+        // The startup projection keeps its failure code and gains the caveat.
+        let mut projection = super::failed_projection(
+            &record.created_at,
+            "terminal-runtime-create-failed",
+            "tmux",
+            None,
+        );
+        super::store_startup_cleanup(&mut projection, FailedLaunchCleanup::Completed);
+        assert!(projection.extra.is_empty());
+        super::store_startup_cleanup(
+            &mut projection,
+            FailedLaunchCleanup::Pending("process_boundary_live"),
+        );
+        assert_eq!(
+            projection.extra.get("cleanup"),
+            Some(&json!({ "state": "pending", "reason": "process_boundary_live" }))
+        );
+        assert_eq!(
+            projection.failure_code.as_deref(),
+            Some("terminal-runtime-create-failed")
+        );
+        assert_eq!(projection.state, "failed");
+    }
+
+    #[test]
     fn held_launch_keeps_provider_in_foreground_and_tracks_broker_lifecycle() {
         assert!(!super::HELD_LAUNCH_SCRIPT.contains("kill -0"));
         assert!(!super::HELD_LAUNCH_SCRIPT.contains("child=$!"));
@@ -18122,6 +18490,7 @@ exit 97
             &id,
             &false_bin,
             crate::maintenance::MaintenanceOperation::Resume,
+            crate::maintenance::MaintenanceContract::V1,
         )
         .unwrap();
         for (action, confirmed) in [
@@ -18136,6 +18505,7 @@ exit 97
                 &id,
                 &false_bin,
                 crate::maintenance::MaintenanceActionRequest {
+                    schema_version: crate::maintenance::MaintenanceContract::V1,
                     operation: crate::maintenance::MaintenanceOperation::Resume,
                     action,
                     expected_session_incarnation: preview.session_incarnation.clone(),
@@ -18172,6 +18542,7 @@ exit 97
             &id,
             &false_bin,
             crate::maintenance::MaintenanceOperation::Delete,
+            crate::maintenance::MaintenanceContract::V1,
         )
         .unwrap();
         let worker = crate::orchestration::SessionRef {
@@ -18201,6 +18572,7 @@ exit 97
             &id,
             &false_bin,
             crate::maintenance::MaintenanceOperation::Delete,
+            crate::maintenance::MaintenanceContract::V1,
         )
         .unwrap();
         let fenced_json = serde_json::to_value(&fenced).unwrap();
@@ -18214,6 +18586,7 @@ exit 97
             &id,
             &false_bin,
             crate::maintenance::MaintenanceActionRequest {
+                schema_version: crate::maintenance::MaintenanceContract::V1,
                 operation: crate::maintenance::MaintenanceOperation::Delete,
                 action: crate::maintenance::MaintenanceActionId::RetryDelete,
                 expected_session_incarnation: before.session_incarnation,
@@ -19919,6 +20292,7 @@ exit 97
             &id,
             &wrapper,
             crate::maintenance::MaintenanceOperation::Delete,
+            crate::maintenance::MaintenanceContract::V1,
         )
         .unwrap();
         let preview: serde_json::Value = serde_json::to_value(preview).unwrap();
@@ -19936,6 +20310,7 @@ exit 97
             &id,
             &wrapper,
             crate::maintenance::MaintenanceActionRequest {
+                schema_version: crate::maintenance::MaintenanceContract::V1,
                 operation: crate::maintenance::MaintenanceOperation::Delete,
                 action: crate::maintenance::MaintenanceActionId::TerminateRuntimeThenDelete,
                 expected_session_incarnation: preview["session_incarnation"]
