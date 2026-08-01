@@ -18298,7 +18298,21 @@ fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
             "--format",
             "json",
         ],
-        &second_successor_env,
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                fixture.second_successor_capability.as_str(),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                fixture.tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                fixture.tmux_log.to_str().expect("tmux log"),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
     );
     assert_eq!(
         deleted.code,
