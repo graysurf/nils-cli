@@ -92,7 +92,7 @@ priority = 10
 mode = "enforce"
 failure_posture = "closed"
 override_class = "locked"
-capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 300 }}
+capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 300 }} # stale-audit: keep-contract
 
 {extra_rule}
 

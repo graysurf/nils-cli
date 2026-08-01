@@ -18,8 +18,10 @@ use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
@@ -2600,19 +2602,7 @@ impl PrivateSessionDirGuard {
         {
             use std::os::unix::ffi::OsStrExt;
 
-            let descriptor_path = self.session_descriptor_path();
-            if let Ok(entries) = fs::read_dir(&descriptor_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let result = match entry.file_type() {
-                        Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
-                            fs::remove_dir_all(path)
-                        }
-                        _ => fs::remove_file(path),
-                    };
-                    let _ = result;
-                }
-            }
+            clear_private_directory_at(&self.session_directory);
             let name = self
                 .session_path
                 .file_name()
@@ -2627,18 +2617,34 @@ impl PrivateSessionDirGuard {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn session_descriptor_path(&self) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        let descriptor_root = Path::new("/proc/self/fd");
-        #[cfg(not(target_os = "linux"))]
-        let descriptor_root = Path::new("/dev/fd");
-        descriptor_root.join(self.session_directory.as_raw_fd().to_string())
+        Path::new("/proc/self/fd").join(self.session_directory.as_raw_fd().to_string())
     }
 
     #[cfg(not(unix))]
     fn session_descriptor_path(&self) -> PathBuf {
         self.session_path.clone()
+    }
+
+    #[cfg(unix)]
+    fn write_private_file(&self, name: &str, bytes: &[u8]) -> Result<(), CliError> {
+        write_private_file_at(
+            &self.session_directory,
+            &self.session_path.join(name),
+            name,
+            bytes,
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn write_private_file(&self, name: &str, bytes: &[u8]) -> Result<(), CliError> {
+        write_private_file(&self.session_path.join(name), bytes)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn create_private_dir(&self, name: &str) -> Result<(), CliError> {
+        create_private_dir_at(&self.session_directory, &self.session_path.join(name), name)
     }
 }
 
@@ -2716,10 +2722,7 @@ fn create_record_with_guard(
     let prompt_file = match request.prompt {
         Some(prompt) => {
             let path = session_dir.join("prompt.md");
-            if let Err(error) = write_private_file(
-                &session_storage.session_descriptor_path().join("prompt.md"),
-                prompt.as_bytes(),
-            ) {
+            if let Err(error) = session_storage.write_private_file("prompt.md", prompt.as_bytes()) {
                 session_storage.cleanup_if_current();
                 return Err(error);
             }
@@ -2780,9 +2783,17 @@ fn create_record_with_guard(
         session_storage.cleanup_if_current();
         return Err(error);
     }
-    if let Err(err) =
-        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record)
-    {
+    #[cfg(target_os = "linux")]
+    let activity_result =
+        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let activity_result = activity::activate_new_runtime_with(&record, |name, bytes| {
+        session_storage.write_private_file(name, bytes)
+    });
+    #[cfg(not(unix))]
+    let activity_result =
+        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record);
+    if let Err(err) = activity_result {
         session_storage.cleanup_if_current();
         return Err(err);
     }
@@ -2790,9 +2801,15 @@ fn create_record_with_guard(
         session_storage.cleanup_if_current();
         return Err(error);
     }
-    if let Err(err) =
-        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record)
-    {
+    #[cfg(target_os = "linux")]
+    let coordination_result =
+        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let coordination_result = session_storage.create_private_dir("coordination");
+    #[cfg(not(unix))]
+    let coordination_result =
+        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record);
+    if let Err(err) = coordination_result {
         session_storage.cleanup_if_current();
         return Err(err);
     }
@@ -2852,7 +2869,6 @@ fn write_initial_session_record(
             None,
         )
     })?;
-    let directory = storage.session_descriptor_path();
     if let Some(sidecar) = durable_resume_record(record) {
         let sidecar_bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
             CliError::runtime(
@@ -2861,9 +2877,9 @@ fn write_initial_session_record(
                 None,
             )
         })?;
-        write_private_file(&directory.join(SESSION_RESUME_FILE), &sidecar_bytes)?;
+        storage.write_private_file(SESSION_RESUME_FILE, &sidecar_bytes)?;
     }
-    write_private_file(&directory.join("session.json"), &bytes)
+    storage.write_private_file("session.json", &bytes)
 }
 
 #[derive(Debug, Default)]
@@ -16624,6 +16640,174 @@ fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_file_at(
+    directory: &fs::File,
+    display_target: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    use std::ffi::CString;
+
+    let target = CString::new(name).map_err(|_| {
+        CliError::runtime(
+            "file-write-failed",
+            format!(
+                "failed to write {}: invalid file name",
+                display_target.display()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        )
+    })?;
+    let temporary_name = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
+    let temporary = CString::new(temporary_name.as_str()).expect("UUID temp name has no null byte");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            SECRET_FILE_MODE as libc::c_uint,
+        )
+    };
+    if descriptor < 0 {
+        return Err(private_file_io_error(
+            display_target,
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            if unsafe { libc::fchmod(file.as_raw_fd(), SECRET_FILE_MODE as libc::mode_t) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        return Err(private_file_io_error(display_target, error));
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        return Err(private_file_io_error(display_target, error));
+    }
+    let _ = directory.sync_all();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn create_private_dir_at(
+    directory: &fs::File,
+    display_target: &Path,
+    name: &str,
+) -> Result<(), CliError> {
+    use std::ffi::CString;
+
+    let name = CString::new(name).map_err(|_| {
+        CliError::runtime(
+            "directory-create-failed",
+            format!(
+                "failed to create {}: invalid directory name",
+                display_target.display()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        )
+    })?;
+    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(CliError::runtime(
+            "directory-create-failed",
+            format!(
+                "failed to create {}: {}",
+                display_target.display(),
+                io::Error::last_os_error()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        ));
+    }
+    let child = open_session_ancestor_at(directory, &name, "session")?;
+    child
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|error| {
+            CliError::runtime(
+                "directory-permissions-failed",
+                format!(
+                    "failed to set permissions on {}: {error}",
+                    display_target.display()
+                ),
+                Some(json!({ "path": display_path(display_target) })),
+            )
+        })
+}
+
+#[cfg(unix)]
+fn clear_private_directory_at(directory: &fs::File) {
+    use std::ffi::{CStr, CString};
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return;
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let _ = unsafe { libc::close(duplicate) };
+        return;
+    }
+    let mut names = Vec::<CString>::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    let _ = unsafe { libc::closedir(stream) };
+
+    for name in names {
+        let child_descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child_descriptor >= 0 {
+            let child = unsafe { fs::File::from_raw_fd(child_descriptor) };
+            clear_private_directory_at(&child);
+            drop(child);
+            let _ =
+                unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        } else {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn private_file_io_error(path: &Path, error: io::Error) -> CliError {
+    CliError::runtime(
+        "file-write-failed",
+        format!("failed to write {}: {error}", path.display()),
+        Some(json!({ "path": display_path(path) })),
+    )
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {

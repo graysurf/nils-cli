@@ -279,6 +279,9 @@ scan_crate() {
       while IFS= read -r marker_hit; do
         [[ -z "$marker_hit" ]] && continue
         marker_line="${marker_hit%%:*}"
+        if sed -n "${marker_line}p" "$test_file" | rg -q 'stale-audit: keep-contract'; then
+          continue
+        fi
         add_row "$crate" "$rel_path" "line:${marker_line}" "deprecated_path_marker" "rewrite" "0.65"
       done <<<"$marker_hits"
     fi

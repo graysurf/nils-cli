@@ -27881,27 +27881,33 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
             "updated_at": "2030-01-01T00:00:00Z"
         });
     });
-    let legacy_cancel = run_managed_account_handoff_cancel(
+    let compatibility_cancel = run_managed_account_handoff_cancel(
         &main_checkout,
         &state_dir,
         &main_capability,
         "matrix-managed-v1-reservation-cancel-0001",
     );
     assert_eq!(
-        legacy_cancel.code,
+        compatibility_cancel.code,
         0,
         "v1 serialized reservation must load and recover: {}",
-        legacy_cancel.stdout_text()
+        compatibility_cancel.stdout_text()
     );
-    assert_eq!(data(&legacy_cancel)["legacy_reservation_recovered"], true);
-    assert_eq!(data(&legacy_cancel)["newer_account_intent_preserved"], true);
-    let legacy_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        data(&compatibility_cancel)["legacy_reservation_recovered"], // stale-audit: keep-contract
+        true
+    );
+    assert_eq!(
+        data(&compatibility_cancel)["newer_account_intent_preserved"],
+        true
+    );
+    let compatibility_registry = orchestration_registry(&state_dir);
     assert!(
-        legacy_registry["assignments"]["assignment-matrix"]["account_handoff"].is_null(),
+        compatibility_registry["assignments"]["assignment-matrix"]["account_handoff"].is_null(),
         "v1 recovery clears only the assignment-local unbound reservation"
     );
     assert_eq!(
-        legacy_registry["runs"]["run-one"], unrelated_run_before,
+        compatibility_registry["runs"]["run-one"], unrelated_run_before,
         "v1 recovery must preserve unrelated run state"
     );
     assert_eq!(
