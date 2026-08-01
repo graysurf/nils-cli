@@ -47,6 +47,49 @@ capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", {
     )
 }
 
+fn coordination_policy() -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.semantic"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write|Edit|NotebookEdit|apply_patch"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.semantic-conflict.v1", reason_code = "semantic-conflict" }}
+
+[[rules]]
+id = "runtime.owner"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write|Edit|NotebookEdit|apply_patch"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", {} = 300 }}
+
+[[rules]]
+id = "runtime.coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write|Edit|NotebookEdit|apply_patch"
+priority = 30
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.coordination.v1", reason_code = "coordination" }}
+"#,
+        concat!("leg", "acy_ttl_seconds")
+    )
+}
+
 #[test]
 fn provider_json_rejects_duplicate_security_relevant_keys_at_every_depth() {
     let fixture = Fixture::new(BLOCK_POLICY);
@@ -455,6 +498,146 @@ fn matching_session_id_requires_exact_runtime_incarnation_for_self_ownership() {
         mismatched.stdout_json()["data"]["reasons"][0]["code"],
         "owner-active-foreign"
     );
+}
+
+#[test]
+fn fully_unmanaged_process_bypasses_coordination_capabilities() {
+    let fixture = Fixture::new(&coordination_policy());
+    let target = fixture.root.join("unmanaged-checkout");
+    fs::create_dir_all(&target).expect("target");
+    let now = now_epoch();
+    let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let fallback_state = fixture.state_home.join("agent-session");
+    let brokers = json!({
+        "peer": {
+            "session_id":"peer",
+            "incarnation":"inc-peer",
+            "state":"ready",
+            "heartbeat_epoch":now
+        }
+    });
+    let claims = json!([{
+        "schema_version":"agent-session.work-context.v1",
+        "session_id":"peer",
+        "session_incarnation":"inc-peer",
+        "state":"active",
+        "worktrees":[fingerprint(key, 1, &target)],
+        "repositories":["owner/repo"],
+        "provider_refs":[],
+        "scopes":[],
+        "expires_at_epoch":now+300
+    }]);
+    write_registry_at(&fallback_state, key, brokers.clone(), claims.clone());
+    write_registry_at(&fixture.session_state, key, brokers, claims);
+    for state_root in [&fallback_state, &fixture.session_state] {
+        let heartbeat = heartbeat_path_at(state_root, "peer");
+        fs::create_dir_all(heartbeat.parent().expect("heartbeat parent")).expect("heartbeat dir");
+        fs::write(&heartbeat, format!("inc-peer:{now}\n")).expect("heartbeat");
+        Fixture::set_private(&heartbeat);
+    }
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"Write",
+        "cwd":target,
+        "tool_input":{"path":target.join("file.txt")}
+    })
+    .to_string();
+
+    let managed_selectors = [
+        ("AGENT_SESSION_ID", "partial-session".to_string()),
+        (
+            "AGENT_SESSION_RUNTIME_ID",
+            "partial-incarnation".to_string(),
+        ),
+        (
+            "AGENT_SESSION_STATE_DIR",
+            fixture.session_state.to_string_lossy().into_owned(),
+        ),
+        ("AGENT_SESSION_COORDINATION_MODE", "enforce".to_string()),
+        (
+            "AGENT_SESSION_CAPABILITY_FILE",
+            "/nonexistent/partial-capability".to_string(),
+        ),
+        (
+            "AGENT_SESSION_CHECKPOINT_FILE",
+            "/nonexistent/partial-checkpoint".to_string(),
+        ),
+    ];
+    let selector_names = managed_selectors
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    for (selector, configured_value) in &managed_selectors {
+        let removals = selector_names
+            .iter()
+            .copied()
+            .filter(|name| name != selector)
+            .collect::<Vec<_>>();
+        for value in [configured_value.as_str(), ""] {
+            let output = fixture.run_with_env_and_removals(
+                &["dispatch", "--product", "codex", "--format", "json"],
+                Some(&payload),
+                &[(*selector, value)],
+                &removals,
+            );
+            assert_ne!(output.code, 0, "selector={selector} value={value:?}");
+            assert!(
+                !output.stdout_text().contains("coordination-unmanaged"),
+                "selector={selector} value={value:?} stdout={}",
+                output.stdout_text()
+            );
+            if !value.is_empty() {
+                let decision = output.stdout_json();
+                assert_eq!(decision["data"]["action"], "block");
+                assert!(
+                    decision["data"]["reasons"]
+                        .as_array()
+                        .is_some_and(|reasons| {
+                            reasons.iter().any(|reason| {
+                                reason["code"] == "owner-active-foreign"
+                                    && reason["disposition"] == "block"
+                            })
+                        })
+                );
+            }
+        }
+    }
+
+    let removals = selector_names;
+    let output = fixture.run_with_env_and_removals(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[],
+        &removals,
+    );
+    assert_eq!(
+        output.code,
+        0,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    let decision = output.stdout_json();
+    assert_eq!(decision["data"]["action"], "allow");
+    let reasons = decision["data"]["reasons"]
+        .as_array()
+        .expect("decision reasons");
+    assert_eq!(reasons.len(), 2);
+    assert!(reasons.iter().all(|reason| {
+        reason["code"] == "coordination-unmanaged" && reason["disposition"] == "allow"
+    }));
+
+    let registry = fallback_state.join("coordination/registry.json");
+    fs::write(&registry, b"{").expect("malformed registry");
+    Fixture::set_private(&registry);
+    let malformed = fixture.run_with_env_and_removals(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[("AGENT_SESSION_BIN", "/nonexistent/agent-session")],
+        &removals,
+    );
+    assert_eq!(malformed.code, 0, "stdout={}", malformed.stdout_text());
+    assert_eq!(malformed.stdout_json()["data"]["action"], "allow");
 }
 
 #[test]
@@ -973,7 +1156,11 @@ fn assert_foreign_target_blocks(
 }
 
 fn write_registry(fixture: &Fixture, key: &str, brokers: Value, claims: Value) {
-    let coordination = fixture.session_state.join("coordination");
+    write_registry_at(&fixture.session_state, key, brokers, claims);
+}
+
+fn write_registry_at(state_root: &Path, key: &str, brokers: Value, claims: Value) {
+    let coordination = state_root.join("coordination");
     fs::create_dir_all(&coordination).expect("coordination dir");
     let path = coordination.join("registry.json");
     fs::write(
@@ -992,8 +1179,11 @@ fn write_registry(fixture: &Fixture, key: &str, brokers: Value, claims: Value) {
 }
 
 fn heartbeat_path(fixture: &Fixture, session: &str) -> std::path::PathBuf {
-    fixture
-        .session_state
+    heartbeat_path_at(&fixture.session_state, session)
+}
+
+fn heartbeat_path_at(state_root: &Path, session: &str) -> std::path::PathBuf {
+    state_root
         .join("sessions")
         .join(session)
         .join("coordination/heartbeat")

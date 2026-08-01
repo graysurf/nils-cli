@@ -37,6 +37,25 @@ impl CurrentPrincipal {
     }
 }
 
+const MANAGED_METADATA_ENV: [&str; 6] = [
+    "AGENT_SESSION_ID",
+    "AGENT_SESSION_RUNTIME_ID",
+    "AGENT_SESSION_STATE_DIR",
+    "AGENT_SESSION_COORDINATION_MODE",
+    "AGENT_SESSION_CAPABILITY_FILE",
+    "AGENT_SESSION_CHECKPOINT_FILE",
+];
+
+fn managed_metadata_present() -> bool {
+    MANAGED_METADATA_ENV
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+pub(crate) fn current_process_is_unmanaged() -> bool {
+    !managed_metadata_present()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RootInputs {
     dirty: Option<bool>,
@@ -92,6 +111,7 @@ pub(crate) struct DispatchProjection<'snapshot, 'io> {
     mode: Option<CoordinationMode>,
     now: i64,
     principal: Option<CurrentPrincipal>,
+    unmanaged: bool,
     roots: RefCell<BTreeMap<PathBuf, RootInputs>>,
     io: &'io dyn LivenessIo,
 }
@@ -100,6 +120,7 @@ impl<'snapshot, 'io> DispatchProjection<'snapshot, 'io> {
     pub(crate) fn new(
         snapshot: Option<&'snapshot Snapshot>,
         mode_override: Option<CoordinationMode>,
+        unmanaged: bool,
         io: &'io dyn LivenessIo,
     ) -> Self {
         let now = now_epoch();
@@ -110,6 +131,7 @@ impl<'snapshot, 'io> DispatchProjection<'snapshot, 'io> {
             mode,
             now,
             principal,
+            unmanaged,
             roots: RefCell::new(BTreeMap::new()),
             io,
         }
@@ -117,6 +139,10 @@ impl<'snapshot, 'io> DispatchProjection<'snapshot, 'io> {
 
     pub(crate) fn mode(&self) -> Option<CoordinationMode> {
         self.mode
+    }
+
+    pub(crate) fn is_unmanaged(&self) -> bool {
+        self.unmanaged
     }
 
     fn root_inputs(&self, checkout: &Path) -> RootInputs {
@@ -155,7 +181,10 @@ pub struct OwnerLiveness {
     pub dirty: Option<bool>,
 }
 
-pub fn load_snapshot() -> Result<Option<Snapshot>, HookError> {
+pub fn load_snapshot(unmanaged: bool) -> Result<Option<Snapshot>, HookError> {
+    if unmanaged {
+        return Ok(None);
+    }
     let state_root = agent_session_state_root()?;
     coordination_projection::load(&state_root)
         .map(|registry| {
@@ -325,6 +354,15 @@ pub fn classify(
     legacy_ttl_seconds: u64,
     projection: &DispatchProjection<'_, '_>,
 ) -> OwnerLiveness {
+    if projection.is_unmanaged() {
+        return result(
+            LivenessClass::Unclaimed,
+            "clear",
+            DecisionAction::Allow,
+            "coordination-unmanaged",
+            Some(false),
+        );
+    }
     let mode = projection.mode;
     if mode == Some(CoordinationMode::Off) {
         return result(

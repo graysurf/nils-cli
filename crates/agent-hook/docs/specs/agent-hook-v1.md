@@ -143,6 +143,17 @@ Owner-liveness evaluates every distinct target checkout plus the execution
 checkout and returns the strongest result; an active foreign owner therefore
 cannot be masked by a self-owned or unclaimed target.
 
+Built-in semantic-conflict and owner-liveness admission applies only to a
+managed process. When `AGENT_SESSION_ID`, `AGENT_SESSION_RUNTIME_ID`,
+`AGENT_SESSION_STATE_DIR`, `AGENT_SESSION_COORDINATION_MODE`,
+`AGENT_SESSION_CAPABILITY_FILE`, and `AGENT_SESSION_CHECKPOINT_FILE` are all
+absent, both capabilities return `allow` with `coordination-unmanaged` without
+loading or classifying registry owners, and the coordination transaction is not
+invoked. Presence of any of those selectors without a complete session ID and
+runtime incarnation is not unmanaged; it retains the conservative managed
+failure posture. Environment-only advisory or off hints never downgrade an
+untrusted managed identity.
+
 A matcher on any other product/event pair is rejected during policy validation.
 A policy matcher is either
 one literal token or an anchored alternation expression such as
