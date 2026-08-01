@@ -683,6 +683,28 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(provider-stop-canary-supervisor)
+_arguments "${_arguments_options[@]}" : \
+'--id=[Managed session id whose exact Codex child this supervisor owns]:ID:_default' \
+'--cgroup-device=[Internal pinned cgroup device passed only from supervisor to guardian]:CGROUP_DEVICE:_default' \
+'--cgroup-inode=[Internal pinned cgroup inode passed only from supervisor to guardian]:CGROUP_INODE:_default' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(provider-stop-canary-guardian)
+_arguments "${_arguments_options[@]}" : \
+'--id=[Managed session id whose exact Codex child this supervisor owns]:ID:_default' \
+'--cgroup-device=[Internal pinned cgroup device passed only from supervisor to guardian]:CGROUP_DEVICE:_default' \
+'--cgroup-inode=[Internal pinned cgroup inode passed only from supervisor to guardian]:CGROUP_INODE:_default' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (delete)
 _arguments "${_arguments_options[@]}" : \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
@@ -727,6 +749,8 @@ _agent-session_commands() {
 'message:Exchange bounded private coordination mailbox messages' \
 'serve:Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback' \
 'codex-app-server-proxy:Internal metadata-only bridge for a managed Codex remote TUI' \
+'provider-stop-canary-supervisor:Internal exact-child supervisor for an explicitly armed Main Agent canary' \
+'provider-stop-canary-guardian:Internal crash guardian for the exact provider-owned process session' \
 'delete:Delete session state and kill the tmux session if it is still alive' \
 'completion:Print shell completion script' \
     )
@@ -891,6 +915,16 @@ _agent-session__subcmd__message__subcmd__show_commands() {
 _agent-session__subcmd__message__subcmd__wait_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session message wait commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__provider-stop-canary-guardian_commands] )) ||
+_agent-session__subcmd__provider-stop-canary-guardian_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session provider-stop-canary-guardian commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__provider-stop-canary-supervisor_commands] )) ||
+_agent-session__subcmd__provider-stop-canary-supervisor_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session provider-stop-canary-supervisor commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__resume_commands] )) ||
 _agent-session__subcmd__resume_commands() {

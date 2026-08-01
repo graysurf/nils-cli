@@ -49,6 +49,12 @@ _agent-session() {
             agent__session,message)
                 cmd="agent__session__message"
                 ;;
+            agent__session,provider-stop-canary-guardian)
+                cmd="agent__session__provider__stop__canary__guardian"
+                ;;
+            agent__session,provider-stop-canary-supervisor)
+                cmd="agent__session__provider__stop__canary__supervisor"
+                ;;
             agent__session,resume)
                 cmd="agent__session__resume"
                 ;;
@@ -164,7 +170,7 @@ _agent-session() {
 
     case "${cmd}" in
         agent__session)
-            opts="-h -V --state-dir --host --help --version start run list command attach logs send glance resume activity work-context broker message serve codex-app-server-proxy delete completion"
+            opts="-h -V --state-dir --host --help --version start run list command attach logs send glance resume activity work-context broker message serve codex-app-server-proxy provider-stop-canary-supervisor provider-stop-canary-guardian delete completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1447,6 +1453,80 @@ _agent-session() {
                     ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__provider__stop__canary__guardian)
+            opts="-h --id --cgroup-device --cgroup-inode --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cgroup-device)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cgroup-inode)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__provider__stop__canary__supervisor)
+            opts="-h --id --cgroup-device --cgroup-inode --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cgroup-device)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --cgroup-inode)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --state-dir)

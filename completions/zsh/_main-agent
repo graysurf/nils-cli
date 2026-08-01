@@ -315,6 +315,21 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':assignment_id:_default' \
 && ret=0
 ;;
+(reenter)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--if-notification-generation=[Exact existing mailbox notification generation to retry without allocating or sending another message generation]:IF_NOTIFICATION_GENERATION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
 (accept)
 _arguments "${_arguments_options[@]}" : \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
@@ -431,6 +446,34 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 && ret=0
 ;;
 (stop-claimed-runtime)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(stop-provider-canary)
+_arguments "${_arguments_options[@]}" : \
+'--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(release-provider-canary)
 _arguments "${_arguments_options[@]}" : \
 '--worker-incarnation=[Exact worker incarnation currently bound to the assignment]:WORKER_INCARNATION:_default' \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
@@ -575,6 +618,19 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(closeout)
+_arguments "${_arguments_options[@]}" : \
+'--if-run-revision=[Expected run revision before the closeout macro performs any stage]:IF_RUN_REVISION:_default' \
+'--checkpoint-file=[Private final checkpoint JSON file]:PATH:_files' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (quick)
 _arguments "${_arguments_options[@]}" : \
 '--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
@@ -630,6 +686,7 @@ _main-agent_commands() {
 'handoff:Transfer primary assignment routing after quiescence checks' \
 'adopt:Adopt an orphaned assignment into this Main Agent'\''s run' \
 'close:Close this run after all assignments are terminal' \
+'closeout:Persist the final checkpoint, retire terminal workers, close the run, and release only the controller claim bound to this run' \
 'quick:Fast-path\: create an ephemeral run, single assignment, and launch in one call. The run auto-closes once the worker is torn down' \
 'packet-schema:Print an example objective packet (schema, required fields, and the nested work-context) that \`init --packet-file\` accepts' \
 'completion:Print shell completion script' \
@@ -665,6 +722,11 @@ _main-agent__subcmd__checkpoint_commands() {
 _main-agent__subcmd__close_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent close commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__closeout_commands] )) ||
+_main-agent__subcmd__closeout_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent closeout commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__collaborate_commands] )) ||
 _main-agent__subcmd__collaborate_commands() {
@@ -748,6 +810,7 @@ _main-agent__subcmd__worker_commands() {
 'account-handoff:Apply an explicitly authorized account handoff to the exact worker' \
 'account-handoff-cancel:Safely cancel a failed, superseded, or queued account-handoff reservation without changing the bound account' \
 'request-changes:Return a submitted assignment to its exact worker for bounded revisions' \
+'reenter:Re-enter an exact idle Codex worker through its existing unread notification generation without resending assignment content' \
 'accept:Accept a submitted worker result after Main Agent review' \
 'release:Mark an accepted assignment terminal before worker deletion' \
 'delete:Delete a released worker through guarded agent-session cleanup' \
@@ -758,6 +821,8 @@ _main-agent__subcmd__worker_commands() {
 'reconcile-recovery:Terminalize an unknown recovery without sending input after the exact worker runtime is stopped and coordination state is quiescent' \
 'stop-runtime:Stop the exact live runtime after bounded worker-start readiness is durably exhausted, preserving the assignment, session, and worktree' \
 'stop-claimed-runtime:Stop an authoritative-idle working worker'\''s exact live runtime with an active assignment-derived claim, preserving the claim for reconcile-stopped' \
+'stop-provider-canary:Stop only the exact Codex child of an explicitly armed canary worker, leaving its bounded supervisor and tmux runtime live for classification' \
+'release-provider-canary:Release an exact stopped canary wrapper so the worker runtime exits' \
 'reconcile-stopped:Terminalize a working assignment whose exact worker runtime is durably stopped, revoking only that worker'\''s claim without sending input, deleting the run, or touching its managed worktree' \
 'revoke-claim:Revoke only the exact authoritative-idle worker claim when that worker cannot finish its own release, preserving its session and worktree' \
 'cancel:Terminalize only a proven failed pre-claim assignment' \
@@ -830,10 +895,20 @@ _main-agent__subcmd__worker__subcmd__reconcile-stopped_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker reconcile-stopped commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__worker__subcmd__reenter_commands] )) ||
+_main-agent__subcmd__worker__subcmd__reenter_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker reenter commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__worker__subcmd__release_commands] )) ||
 _main-agent__subcmd__worker__subcmd__release_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker release commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__release-provider-canary_commands] )) ||
+_main-agent__subcmd__worker__subcmd__release-provider-canary_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker release-provider-canary commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__request-changes_commands] )) ||
 _main-agent__subcmd__worker__subcmd__request-changes_commands() {
@@ -864,6 +939,11 @@ _main-agent__subcmd__worker__subcmd__start_commands() {
 _main-agent__subcmd__worker__subcmd__stop-claimed-runtime_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker stop-claimed-runtime commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__stop-provider-canary_commands] )) ||
+_main-agent__subcmd__worker__subcmd__stop-provider-canary_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker stop-provider-canary commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__worker__subcmd__stop-runtime_commands] )) ||
 _main-agent__subcmd__worker__subcmd__stop-runtime_commands() {

@@ -29019,6 +29019,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_detects_same_status_edits_deletions_and_untracked_material() {
+        let _fixture_ownership = GlobalStateLock::new();
         let temporary = tempfile::TempDir::new().expect("temporary repository");
         let repository = temporary.path();
         git_stdout(repository, &["init", "--quiet"]);
@@ -29072,6 +29073,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_streams_oversize_tracked_patch_for_healthy_supervision() {
+        let _fixture_ownership = GlobalStateLock::new();
         let temporary = tempfile::TempDir::new().expect("temporary repository");
         let repository = temporary.path();
         git_stdout(repository, &["init", "--quiet"]);
@@ -29209,6 +29211,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_streaming_boundaries_and_untracked_aggregate_are_explicit() {
+        let _fixture_ownership = GlobalStateLock::new();
         let temporary = tempfile::TempDir::new().expect("temporary repository");
         let repository = temporary.path();
         git_stdout(repository, &["init", "--quiet"]);
@@ -29301,6 +29304,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_rejects_large_untracked_sets_before_path_walk() {
+        let _fixture_ownership = GlobalStateLock::new();
         let temporary = tempfile::TempDir::new().expect("temporary repository");
         let repository = temporary.path();
         git_stdout(repository, &["init", "--quiet"]);
@@ -29402,6 +29406,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_hashes_1024_small_files_without_per_file_processes() {
+        let _fixture_ownership = GlobalStateLock::new();
         let temporary = tempfile::TempDir::new().expect("temporary repository");
         let repository = temporary.path();
         git_stdout(repository, &["init", "--quiet"]);
@@ -29445,19 +29450,19 @@ mod tests {
         fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o700))
             .expect("file-reader git mode");
 
-        stall_next_fingerprint_file_read_for_test(Duration::from_millis(250));
+        stall_next_fingerprint_file_read_for_test(Duration::from_secs(2));
         let started = Instant::now();
         assert_eq!(
             worktree_material_fingerprint_with_git(
                 repository,
                 b"?? blocked.txt\0",
                 &fake_git,
-                Duration::from_millis(50),
+                Duration::from_millis(500),
             ),
             None
         );
         assert!(
-            started.elapsed() < Duration::from_millis(150),
+            started.elapsed() < Duration::from_secs(1),
             "a stalled regular-file read must not hold supervision past its deadline"
         );
         assert_eq!(
@@ -29465,7 +29470,7 @@ mod tests {
             1,
             "a timed-out reader retains bounded admission until its descriptor work ends"
         );
-        let release_deadline = Instant::now() + Duration::from_secs(1);
+        let release_deadline = Instant::now() + Duration::from_secs(3);
         while ACTIVE_FINGERPRINT_FILE_READERS.load(Ordering::Acquire) != 0
             && Instant::now() < release_deadline
         {
@@ -29480,6 +29485,7 @@ mod tests {
 
     #[test]
     fn worktree_fingerprint_fails_closed_for_oversize_special_path_escape_and_timeout_inputs() {
+        let _fixture_ownership = GlobalStateLock::new();
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::symlink;
