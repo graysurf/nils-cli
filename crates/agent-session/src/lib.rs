@@ -85,6 +85,7 @@ const PROVIDER_STOP_CANARY_STOPPED_FILE: &str = ".provider-stop-canary-stopped.j
 const PROVIDER_STOP_CANARY_RELEASE_FILE: &str = ".provider-stop-canary-release.json";
 const PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE: &str = ".provider-stop-canary-startup-failed.json";
 const PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE: &str = ".provider-stop-canary-runtime-failed.json";
+#[cfg(target_os = "linux")]
 const PROVIDER_STOP_CANARY_CONTROL_SOCKET_PREFIX: &str = "nils-provider-stop-canary-control-";
 const PROVIDER_STOP_CANARY_SUPERVISOR_LOCK_FILE: &str = ".provider-stop-canary-supervisor.lock";
 const PROVIDER_STOP_CANARY_HOLD: Duration = Duration::from_secs(120);
@@ -3270,6 +3271,7 @@ fn current_runtime_helper() -> Result<PathBuf, CliError> {
     Ok(executable)
 }
 
+#[cfg(target_os = "linux")]
 fn configure_provider_stop_canary(
     context: &CliContext,
     record: &mut SessionRecord,
@@ -3279,12 +3281,6 @@ fn configure_provider_stop_canary(
     if !armed {
         return Ok(());
     }
-    #[cfg(not(target_os = "linux"))]
-    return Err(CliError::usage(
-        "provider-stop-canary-platform-unsupported",
-        "the provider stop canary requires Linux exact-process identity evidence",
-        None,
-    ));
     if AgentKind::from_name(&record.agent) != Some(AgentKind::Codex) {
         return Err(CliError::usage(
             "provider-stop-canary-agent-unsupported",
@@ -3324,6 +3320,23 @@ fn configure_provider_stop_canary(
         }),
     );
     write_session_record(context, record)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_provider_stop_canary(
+    _context: &CliContext,
+    _record: &mut SessionRecord,
+    armed: bool,
+    _assignment_id: Option<&str>,
+) -> Result<(), CliError> {
+    if armed {
+        return Err(CliError::usage(
+            "provider-stop-canary-platform-unsupported",
+            "the provider stop canary requires Linux exact-process identity evidence",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn provider_stop_canary_armed(record: &SessionRecord) -> bool {
@@ -3574,12 +3587,12 @@ pub(crate) fn provider_stop_canary_startup_error(stage: &str, failure_code: &str
     )
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn await_provider_stop_canary_startup(
     context: &CliContext,
     record: &SessionRecord,
     timeout: Duration,
 ) -> Result<(u32, u64), CliError> {
-    #[cfg(target_os = "linux")]
     let ((controller_session_id, controller_session_incarnation), address) = {
         let controller = provider_stop_canary_controller_reference(context, record)
             .map_err(|error| provider_stop_canary_startup_error("controller", error.code()))?;
@@ -3601,7 +3614,6 @@ pub(crate) fn await_provider_stop_canary_startup(
                 "provider-stop-canary-startup-timeout",
             ));
         }
-        #[cfg(target_os = "linux")]
         match query_provider_stop_canary_startup(
             context,
             record,
@@ -3616,17 +3628,24 @@ pub(crate) fn await_provider_stop_canary_startup(
                 return Err(provider_stop_canary_startup_error("guardian", error.code()));
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        return Err(provider_stop_canary_startup_error(
-            "controller",
-            "provider-stop-canary-platform-unsupported",
-        ));
         thread::sleep(
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(25)),
         );
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn await_provider_stop_canary_startup(
+    _context: &CliContext,
+    _record: &SessionRecord,
+    _timeout: Duration,
+) -> Result<(u32, u64), CliError> {
+    Err(provider_stop_canary_startup_error(
+        "controller",
+        "provider-stop-canary-platform-unsupported",
+    ))
 }
 
 pub(crate) fn provider_stop_canary_startup_wait() -> Duration {
@@ -3821,6 +3840,7 @@ fn acquire_provider_stop_canary_supervisor_lock(
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_provider_stop_canary_wrapper_identity(
     context: &CliContext,
     initial: &SessionRecord,
@@ -3878,6 +3898,19 @@ fn wait_for_provider_stop_canary_wrapper_identity(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn wait_for_provider_stop_canary_wrapper_identity(
+    _context: &CliContext,
+    _initial: &SessionRecord,
+) -> Result<SessionRecord, CliError> {
+    Err(CliError::data(
+        "provider-stop-canary-platform-unsupported",
+        "the provider stop canary wrapper is supported only on Linux",
+        None,
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_wrapper_identity_wait() -> Duration {
     #[cfg(debug_assertions)]
     if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS")
@@ -6698,6 +6731,23 @@ pub(crate) fn authorize_provider_stop_canary_transition(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn authorize_provider_stop_canary_transition(
+    _context: &CliContext,
+    _record: &SessionRecord,
+    _controller_session_id: &str,
+    _controller_session_incarnation: &str,
+    _action: &str,
+    _request_digest: &str,
+    _idempotency_key: &str,
+) -> Result<(), CliError> {
+    Err(CliError::data(
+        "provider-stop-canary-platform-unsupported",
+        "provider stop canary transitions are supported only on Linux",
+        None,
+    ))
+}
+
 fn run_provider_stop_canary_supervisor(
     context: &CliContext,
     args: cli::ProviderStopCanarySupervisorArgs,
@@ -7243,6 +7293,7 @@ fn run_provider_stop_canary_guardian(
                         &provider_process_pins,
                         Some(child_pid as libc::pid_t),
                     )?;
+                    #[cfg(target_os = "linux")]
                     remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                     let mut stopped = provider_stop_canary_marker(&record, "stopped", child_pid);
                     stopped["child_exit_success"] = Value::Bool(status.success());
@@ -8022,9 +8073,12 @@ fn run_tmux_new_session(
             Some(json!({ "id": record.id })),
         )
     })?;
+    #[cfg(target_os = "linux")]
     let cgroup_mount = control_group
         .as_ref()
         .and_then(|_| capture_linux_cgroup_mount_identity());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_mount = None;
     let pid_namespace = linux_process_identity_namespace(pane_pid).map_err(|_| {
         CliError::runtime(
             "tmux-runtime-identity-invalid",
@@ -12892,9 +12946,12 @@ fn capture_tmux_runtime_identity(
     let process_session_id = process_session_id(pane_pid)?;
     let process_session_members = process_session_members(process_session_id, pane_pid)?;
     let control_group = linux_process_control_group(pane_pid)?;
+    #[cfg(target_os = "linux")]
     let cgroup_mount = control_group
         .as_ref()
         .and_then(|_| capture_linux_cgroup_mount_identity());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_mount = None;
     let pid_namespace = linux_process_identity_namespace(pane_pid)?;
 
     if !tmux_pane_identity_matches(tmux_bin, record, session_id, pane_id, pane_pid, timeout) {
@@ -13045,24 +13102,17 @@ fn linux_process_control_group(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_process_pid_namespace(
     pane_pid: libc::pid_t,
 ) -> Result<Option<TmuxPidNamespaceIdentity>, SessionTerminationFailure> {
-    #[cfg(target_os = "linux")]
-    {
-        let metadata = fs::metadata(format!("/proc/{pane_pid}/ns/pid"))
-            .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
-        Ok(Some(TmuxPidNamespaceIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            boot_id: linux_boot_id()?,
-        }))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pane_pid;
-        Ok(None)
-    }
+    let metadata = fs::metadata(format!("/proc/{pane_pid}/ns/pid"))
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    Ok(Some(TmuxPidNamespaceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        boot_id: linux_boot_id()?,
+    }))
 }
 
 fn linux_process_identity_namespace(
@@ -17381,6 +17431,35 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn persist_current_process_as_canary_wrapper(
+        context: &CliContext,
+        id: &str,
+    ) -> super::SessionRecord {
+        let mut record = load_session_record(context, id).expect("canary session record");
+        let current = super::read_linux_process_identity(std::process::id() as libc::pid_t)
+            .expect("current process identity")
+            .expect("live current process");
+        let identity = super::TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().expect("runtime").launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: current.pid,
+            pane_start_time: Some(current.start_time),
+            process_group_id: Some(current.process_group_id),
+            process_session_id: Some(current.session_id),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: None,
+            cgroup_mount: None,
+            pid_namespace: super::linux_process_pid_namespace(current.pid)
+                .expect("current process PID namespace"),
+        };
+        super::persist_launched_tmux_identity(context, &mut record, &identity)
+            .expect("persist canary wrapper identity");
+        load_session_record(context, id).expect("persisted canary session record")
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn provider_stop_canary_defers_cgroup_removal_until_children_are_reaped() {
         let tmp = tempfile::TempDir::new().expect("temporary state");
@@ -17391,7 +17470,7 @@ mod tests {
             None,
             Some("provider-stop-canary-deferred-removal"),
         );
-        let record = load_session_record(&context, &id).expect("canary session record");
+        let record = persist_current_process_as_canary_wrapper(&context, &id);
         let cgroup = match super::prepare_provider_stop_canary_cgroup(&context, &record) {
             Ok(cgroup) => cgroup,
             Err(error) if env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() != Ok("1") => {
@@ -17442,7 +17521,7 @@ mod tests {
             None,
             Some("provider-stop-canary-member-injection"),
         );
-        let record = load_session_record(&context, &id).expect("canary session record");
+        let record = persist_current_process_as_canary_wrapper(&context, &id);
         let cgroup = match super::prepare_provider_stop_canary_cgroup(&context, &record) {
             Ok(cgroup) => cgroup,
             Err(error) if env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() != Ok("1") => {

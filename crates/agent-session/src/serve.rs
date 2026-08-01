@@ -22034,7 +22034,7 @@ exit 0
             .expect("alpha runtime")
             .launch_id
             .clone();
-        let mut stopped_runtime = json!({
+        let stopped_runtime = json!({
             "launch_id": incarnation,
             "session_id": "$77",
             "pane_id": "%77",
@@ -22042,7 +22042,8 @@ exit 0
             "process_group_id": i32::MAX
         });
         #[cfg(target_os = "linux")]
-        {
+        let stopped_runtime = {
+            let mut stopped_runtime = stopped_runtime;
             let namespace = fs::metadata("/proc/self/ns/pid").expect("PID namespace metadata");
             stopped_runtime["pid_namespace"] = json!({
                 "device": namespace.st_dev(),
@@ -22051,7 +22052,8 @@ exit 0
                     .expect("boot id")
                     .trim()
             });
-        }
+            stopped_runtime
+        };
         alpha
             .extra
             .insert("delete_tmux_identity".to_string(), stopped_runtime);

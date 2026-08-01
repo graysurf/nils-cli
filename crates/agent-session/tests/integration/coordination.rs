@@ -455,6 +455,7 @@ fn seed_activity_state(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn seed_stalled_codex_provider_hook_activity_state(
     state_dir: &Path,
     id: &str,
@@ -827,12 +828,14 @@ fn assert_authority_quarantine_released(path: &Path) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_reservation_path(state_dir: &Path, assignment_id: &str) -> PathBuf {
     state_dir
         .join("orchestration/provider-stop-canary-reservations")
         .join(digest(assignment_id))
 }
 
+#[cfg(target_os = "linux")]
 fn write_provider_stop_canary_reservation(
     state_dir: &Path,
     assignment_id: &str,
@@ -846,6 +849,7 @@ fn write_provider_stop_canary_reservation(
     write_private_json(&path, value);
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_reservation(
     state_dir: &Path,
     assignment_id: &str,
@@ -857,6 +861,7 @@ fn provider_stop_canary_reservation(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_fence_path(state_dir: &Path, session_id: &str) -> PathBuf {
     state_dir
         .join("sessions")
@@ -16258,6 +16263,7 @@ impl StoppedPostClaimFixture {
         Self::new_with_canary_scopes(false, &["docs/stopped-focused"])
     }
 
+    #[cfg(target_os = "linux")]
     fn new_with_canary(canary: bool) -> Self {
         Self::new_with_canary_scopes(canary, &["docs/stopped-focused"])
     }
@@ -16542,6 +16548,7 @@ impl StoppedPostClaimFixture {
         run_main_agent(&self.checkout, &self.reconcile_args(), &env)
     }
 
+    #[cfg(target_os = "linux")]
     fn set_canary_supervisor_binding_starting(&self) {
         rewrite_orchestration_registry(&self.state_dir, |registry| {
             let assignment = &mut registry["assignments"]["assignment-stopped"];
@@ -16551,6 +16558,7 @@ impl StoppedPostClaimFixture {
         });
     }
 
+    #[cfg(target_os = "linux")]
     fn set_canary_supervisor_binding_working(&self) {
         rewrite_orchestration_registry(&self.state_dir, |registry| {
             let assignment = &mut registry["assignments"]["assignment-stopped"];
@@ -21602,6 +21610,7 @@ fn wait_for_barrier(barrier: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_barrier_or_child_exit(barrier: &Path, child: &mut Child, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !barrier.join("ready").is_file() {

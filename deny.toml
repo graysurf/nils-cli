@@ -49,10 +49,6 @@ skip = [
     { crate = "untrusted@0.7.1", reason = "older untrusted via a TLS dependency path" },
     # wasm bindgen for the image-webp decode path.
     { crate = "wit-bindgen@0.51.0", reason = "image-webp wasm decode; upstream transition" },
-    # clap_complete `unstable-dynamic` needs `shlex ^1`; the workspace already
-    # carries `shlex 2.0.1` (via cc -> cmake -> aws-lc-sys) and the two majors
-    # cannot unify. Skip the duplicate rather than relax `multiple-versions`.
-    { crate = "shlex@1.3.0", reason = "clap_complete unstable-dynamic pulls shlex 1.x; workspace also has shlex 2.x" },
     # `unstable-dynamic` also pulls `is_executable 1.0.6`, whose Windows-target
     # dependency is `windows-sys 0.60`; the workspace mainline is `windows-sys
     # 0.61` (via clap -> anstyle). Skip the lagging 0.60 line (checked across

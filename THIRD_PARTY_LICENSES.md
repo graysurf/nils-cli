@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `2b23ff33436b118d31877a3072a00accd4175f0d654c1cec0c7d655d74df0179`
+- Cargo.lock SHA256: `32b3933a401492235700d4f5acfd44fc35995a372caab62a0960f54b7cd1fd77`
 - Third-party crates (`source != null`): 497
 - Workspace crates (`source == null`, excluded below): 46
 
@@ -148,7 +148,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | crates.io |
 | errno | 0.3.14 | MIT OR Apache-2.0 | crates.io |
 | euclid | 0.22.14 | MIT OR Apache-2.0 | crates.io |
-| event-listener | 5.4.1 | Apache-2.0 OR MIT | crates.io |
+| event-listener | 5.4.2 | Apache-2.0 OR MIT | crates.io |
 | event-listener-strategy | 0.5.4 | Apache-2.0 OR MIT | crates.io |
 | fallible-iterator | 0.3.0 | MIT/Apache-2.0 | crates.io |
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 | crates.io |
