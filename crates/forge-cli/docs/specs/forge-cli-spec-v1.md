@@ -649,8 +649,11 @@ backend mapping, validation rules, and output schema versions.
   reporting each verdict in `data.preflight[]` — the same element shape as
   `pr deliver --dry-run`'s `local_preflight[]`, under a different name because
   these rules include provider reads. `data.preflight_ok` is the conjunction and
-  `data.would_append` reports whether an accepted real run would append a new
-  generation. The sweep does not short-circuit, so the local payload verdict is
+  `data.would_append` reports whether the real run would append a new
+  generation — true for an accepted state-changing transition, and also for an
+  extendable budget error, which appends a durable hard-stop receipt before
+  failing, so predicting only "this fails" would understate it. The sweep does
+  not short-circuit, so the local payload verdict is
   reported even when the provider is unreachable; that is the supported way to
   check a findings file without writing durable provider-visible state, which a
   live `observe` does on success.

@@ -59,8 +59,10 @@ struct ReviewLoopObserveDryRunPayload {
     provider: &'static str,
     plan: Vec<String>,
     preflight_ok: bool,
-    /// Whether an accepted real run would append a new generation, or find the
-    /// chain already current. `None` when the transition was not evaluated.
+    /// Whether the real run would append a new generation. True for an accepted
+    /// transition that changes state, and also for an extendable budget error,
+    /// which appends a durable hard-stop receipt before failing. False when the
+    /// chain is already current. `None` when the transition was not evaluated.
     #[serde(skip_serializing_if = "Option::is_none")]
     would_append: Option<bool>,
     preflight: Vec<RuleVerdict>,
@@ -924,10 +926,21 @@ fn emit_observe_dry_run<R: BackendRunner>(
                                         Ok(()),
                                     ));
                                 }
-                                Err(error) => verdicts.push(RuleVerdict::from_result(
-                                    "observation_transition",
-                                    Err(error),
-                                )),
+                                Err(error) => {
+                                    // An extendable budget error is the one
+                                    // failure the real run still writes for: it
+                                    // appends a durable hard-stop receipt so a
+                                    // restart returns the same stop. Predicting
+                                    // "this fails" without that would understate
+                                    // what the real call does.
+                                    if review_state::stop_budget_field(error.kind()).is_some() {
+                                        would_append = Some(true);
+                                    }
+                                    verdicts.push(RuleVerdict::from_result(
+                                        "observation_transition",
+                                        Err(error),
+                                    ));
+                                }
                             }
                         }
                         None => verdicts.push(RuleVerdict::not_evaluated(
