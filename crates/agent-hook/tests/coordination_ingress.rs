@@ -59,6 +59,14 @@ fn install_coordination_handler_with(fixture: &Fixture, source: &str) {
     fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
 }
 
+fn install_runtime_handler_with(fixture: &Fixture, name: &str, source: &str) {
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hook directory");
+    let handler = hooks.join(name);
+    fs::write(&handler, source).expect("runtime handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+}
+
 fn install_session_mode(fixture: &Fixture, mode: &str) {
     let session = fixture.session_state.join("sessions/trusted");
     fs::create_dir_all(&session).expect("session directory");
@@ -588,6 +596,82 @@ fn pre_tool_payload(fixture: &Fixture) -> String {
         "tool_input": {"path": fixture.root.join("target.txt")}
     })
     .to_string()
+}
+
+#[test]
+fn coordination_never_admits_before_a_later_priority_handler_blocks() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.08.02.1"
+
+[[rules]]
+id = "runtime.pre-tool-coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
+
+[[rules]]
+id = "runtime.later-project-dev-block"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 30
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "pre-edit-intent-gate" }
+"#;
+    let fixture = Fixture::new(policy);
+    install_coordination_handler_with(
+        &fixture,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'admit:codex:trusted:tool-call-transaction:revision-7' >> \"$TRANSACTION_LOG\"\n",
+    );
+    install_runtime_handler_with(
+        &fixture,
+        "pre-edit-intent-gate.py",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'block:codex:trusted:tool-call-transaction' >> \"$TRANSACTION_LOG\"\nprintf '%s\\n' '{\"decision\":\"block\",\"reason\":\"project-dev-prepared\"}'\n",
+    );
+    let transaction_log = fixture.root.join("transaction.log");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "trusted",
+        "tool_name": "Write",
+        "tool_use_id": "tool-call-transaction",
+        "cwd": fixture.root,
+        "tool_input": {"path": fixture.root.join("target.txt")}
+    })
+    .to_string();
+
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[(
+            "TRANSACTION_LOG",
+            transaction_log.to_str().expect("transaction log path"),
+        )],
+    );
+
+    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        fs::read_to_string(transaction_log).expect("transaction call log"),
+        "block:codex:trusted:tool-call-transaction\n",
+        "coordination is an after-policy transaction and must not admit before any ordinary block"
+    );
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"],
+        json!([{
+            "rule_id": "runtime.later-project-dev-block",
+            "code": "pre-edit-intent-gate",
+            "disposition": "block"
+        }]),
+        "a skipped coordination transaction contributes no decision or rollback identity"
+    );
 }
 
 #[test]
