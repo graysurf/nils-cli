@@ -71,6 +71,34 @@ pub struct PreparedEvaluation<'a> {
     session_coordination: Option<&'a crate::model::PolicyRule>,
 }
 
+#[derive(Clone, Copy)]
+struct CoordinationEvaluation<'a> {
+    snapshot: Option<&'a liveness::Snapshot>,
+    mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
+    unmanaged: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CoordinationExecution {
+    mode: Option<nils_common::coordination_projection::CoordinationMode>,
+    operation_effect: OperationEffectClass,
+    unmanaged: bool,
+}
+
+impl CoordinationExecution {
+    pub fn new(
+        mode: Option<nils_common::coordination_projection::CoordinationMode>,
+        operation_effect: OperationEffectClass,
+        unmanaged: bool,
+    ) -> Self {
+        Self {
+            mode,
+            operation_effect,
+            unmanaged,
+        }
+    }
+}
+
 impl PreparedEvaluation<'_> {
     pub fn needs_coordination(&self) -> bool {
         self.needs_coordination
@@ -248,14 +276,18 @@ pub fn evaluate(
     prepared: &PreparedEvaluation<'_>,
     coordination: Option<&liveness::Snapshot>,
     coordination_mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
+    unmanaged: bool,
 ) -> Result<NormalizedDecision, HookError> {
     evaluate_with_io(
         loaded,
         request,
         raw,
         prepared,
-        coordination,
-        coordination_mode_override,
+        CoordinationEvaluation {
+            snapshot: coordination,
+            mode_override: coordination_mode_override,
+            unmanaged,
+        },
         liveness::system_io(),
     )
 }
@@ -265,16 +297,20 @@ fn evaluate_with_io(
     request: &mut NormalizedRequest,
     raw: &[u8],
     prepared: &PreparedEvaluation<'_>,
-    coordination: Option<&liveness::Snapshot>,
-    coordination_mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
+    coordination: CoordinationEvaluation<'_>,
     liveness_io: &dyn liveness::LivenessIo,
 ) -> Result<NormalizedDecision, HookError> {
     // Terminal correlation is evidence maintenance, not an admission gate.
     let _ = crate::degraded::complete_terminal(raw, request);
     let liveness = prepared.needs_coordination.then(|| {
-        liveness::DispatchProjection::new(coordination, coordination_mode_override, liveness_io)
+        liveness::DispatchProjection::new(
+            coordination.snapshot,
+            coordination.mode_override,
+            coordination.unmanaged,
+            liveness_io,
+        )
     });
-    request.semantic_conflict = coordination.map(|_| {
+    request.semantic_conflict = coordination.snapshot.map(|_| {
         liveness::derive_semantic_conflict(
             request,
             liveness
@@ -421,8 +457,7 @@ fn evaluate_with_io(
         request,
         raw,
         prepared.session_coordination,
-        coordination_mode,
-        operation_effect,
+        CoordinationExecution::new(coordination_mode, operation_effect, coordination.unmanaged),
     )
 }
 
@@ -522,13 +557,19 @@ fn evaluate_capability(
             replacement: Some(replacement.clone()),
             provider_output: None,
         },
-        Capability::SemanticConflict { reason_code } => simple(
-            liveness::semantic_conflict_action(
-                request.semantic_conflict,
-                liveness.and_then(liveness::DispatchProjection::mode),
-            ),
-            reason_code,
-        ),
+        Capability::SemanticConflict { reason_code } => {
+            if liveness.is_some_and(liveness::DispatchProjection::is_unmanaged) {
+                simple(DecisionAction::Allow, "coordination-unmanaged")
+            } else {
+                simple(
+                    liveness::semantic_conflict_action(
+                        request.semantic_conflict,
+                        liveness.and_then(liveness::DispatchProjection::mode),
+                    ),
+                    reason_code,
+                )
+            }
+        }
         Capability::OwnerLiveness {
             reason_code: _,
             legacy_ttl_seconds,
@@ -583,12 +624,14 @@ pub fn apply_session_coordination(
     request: &NormalizedRequest,
     raw: &[u8],
     rule: Option<&crate::model::PolicyRule>,
-    coordination_mode: Option<nils_common::coordination_projection::CoordinationMode>,
-    operation_effect: OperationEffectClass,
+    execution: CoordinationExecution,
 ) -> Result<NormalizedDecision, HookError> {
     let Some(rule) = rule else {
         return Ok(decision);
     };
+    if execution.unmanaged {
+        return Ok(decision);
+    }
     let typed_bootstrap_may_supersede_owner =
         exact_bootstrap_candidate_for_session_coordination(request, raw, true)
             && owner_active_foreign_is_only_block(loaded, &decision);
@@ -615,8 +658,8 @@ pub fn apply_session_coordination(
             loaded,
             request,
             rule,
-            coordination_mode,
-            operation_effect,
+            execution.mode,
+            execution.operation_effect,
             raw,
         ),
         Err(_) => failure_outcome(rule.failure_posture, &rule.id),
@@ -1487,9 +1530,19 @@ mod tests {
             let prepared = prepare(&loaded, &request, false, &BTreeSet::new())
                 .expect("valid reason cardinality");
             let io = CountingLivenessIo::default();
-            let decision =
-                evaluate_with_io(&loaded, &mut request, b"{}", &prepared, None, None, &io)
-                    .expect("evaluate owner rules");
+            let decision = evaluate_with_io(
+                &loaded,
+                &mut request,
+                b"{}",
+                &prepared,
+                CoordinationEvaluation {
+                    snapshot: None,
+                    mode_override: None,
+                    unmanaged: false,
+                },
+                &io,
+            )
+            .expect("evaluate owner rules");
             assert_eq!(decision.reasons.len(), cardinality);
             assert_eq!(io.session_reads.get(), 1, "rules={cardinality}");
             assert_eq!(io.dirty_probes.get(), 1, "rules={cardinality}");
@@ -1530,8 +1583,19 @@ mod tests {
             age_seconds: 60,
             ..Default::default()
         };
-        let decision = evaluate_with_io(&loaded, &mut request, b"{}", &prepared, None, None, &io)
-            .expect("evaluate TTL rules");
+        let decision = evaluate_with_io(
+            &loaded,
+            &mut request,
+            b"{}",
+            &prepared,
+            CoordinationEvaluation {
+                snapshot: None,
+                mode_override: None,
+                unmanaged: false,
+            },
+            &io,
+        )
+        .expect("evaluate TTL rules");
         assert_eq!(
             decision.reasons[0].code,
             concat!("leg", "acy-owner-stale-clean-reclaim")

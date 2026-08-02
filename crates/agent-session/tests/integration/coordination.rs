@@ -10966,10 +10966,16 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         })
     );
 
-    let spawn_supervisor = |binding_timeout_ms: &str| {
-        let mut command = Command::new(&launch[helper_index]);
+    let spawn_supervisor = |binding_timeout_ms: &str, gate_name: &str| {
+        let start_gate = state_dir.join(gate_name);
+        let mut command = Command::new("sh");
         command
             .current_dir(&checkout)
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\"")
+            .arg("canary-supervisor-start-gate")
+            .arg(&start_gate)
+            .arg(&launch[helper_index])
             .args(&launch[helper_index + 1..])
             .env("AGENT_SESSION_ID", "worker-canary-supervisor")
             .env("CANARY_DESCENDANT_PID_FILE", &descendant_pid_file)
@@ -10994,7 +11000,13 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
                 }
             });
         }
-        command.spawn().expect("execute emitted canary command")
+        (
+            command.spawn().expect("execute emitted canary command"),
+            start_gate,
+        )
+    };
+    let release_supervisor = |start_gate: &Path| {
+        fs::write(start_gate, b"start").expect("release canary supervisor start gate");
     };
     let registry_path = state_dir.join("orchestration/registry.json");
     let write_registry = |value: &serde_json::Value| {
@@ -11010,7 +11022,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(1);
     write_registry(&registry);
 
-    let unbound_supervisor = spawn_supervisor("500");
+    let (unbound_supervisor, unbound_start_gate) =
+        spawn_supervisor("500", ".unbound-supervisor-start");
     let unbound_supervisor_pid = unbound_supervisor.id();
     let mut unbound_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11028,6 +11041,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &unbound_record);
+    release_supervisor(&unbound_start_gate);
     let unbound_output = unbound_supervisor
         .wait_with_output()
         .expect("wait unbound canary supervisor");
@@ -11042,7 +11056,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     registry["assignments"]["assignment-canary-supervisor"]["state"] = json!("working");
     registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(3);
     write_registry(&registry);
-    let working_supervisor = spawn_supervisor("500");
+    let (working_supervisor, working_start_gate) =
+        spawn_supervisor("500", ".working-supervisor-start");
     let working_supervisor_pid = working_supervisor.id();
     let mut working_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11060,6 +11075,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &working_record);
+    release_supervisor(&working_start_gate);
     let working_output = working_supervisor
         .wait_with_output()
         .expect("wait working-state canary supervisor");
@@ -11084,7 +11100,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     registry["assignments"]["assignment-canary-supervisor"]["state"] = json!("starting");
     registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(2);
     write_registry(&registry);
-    let stale_created_supervisor = spawn_supervisor("500");
+    let (stale_created_supervisor, stale_created_start_gate) =
+        spawn_supervisor("500", ".stale-created-supervisor-start");
     let stale_created_supervisor_pid = stale_created_supervisor.id();
     let mut stale_created_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11102,6 +11119,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &stale_created_record);
+    release_supervisor(&stale_created_start_gate);
     let stale_created_output = stale_created_supervisor
         .wait_with_output()
         .expect("wait stale-created-at canary supervisor");
@@ -11125,7 +11143,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     registry["assignments"]["assignment-canary-supervisor"]["revision"] = json!(1);
     write_registry(&registry);
 
-    let mut delayed_binding_supervisor = spawn_supervisor("15000");
+    let (mut delayed_binding_supervisor, delayed_binding_start_gate) =
+        spawn_supervisor("15000", ".delayed-binding-supervisor-start");
     let delayed_binding_supervisor_pid = delayed_binding_supervisor.id();
     let mut delayed_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11143,6 +11162,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &delayed_record);
+    release_supervisor(&delayed_binding_start_gate);
     std::thread::sleep(Duration::from_millis(100));
     assert!(
         delayed_binding_supervisor
@@ -11204,7 +11224,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
     fs::remove_file(&ready).expect("remove delayed-binding ready marker");
     fs::remove_file(&descendant_pid_file).expect("remove delayed-binding descendant marker");
 
-    let mut stale_identity_supervisor = spawn_supervisor("500");
+    let (mut stale_identity_supervisor, stale_identity_start_gate) =
+        spawn_supervisor("500", ".stale-identity-supervisor-start");
     let stale_identity_pid = stale_identity_supervisor.id();
     let mut stale_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11222,6 +11243,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &stale_record);
+    release_supervisor(&stale_identity_start_gate);
     let stale_status = stale_identity_supervisor
         .wait()
         .expect("wait stale-identity supervisor");
@@ -11229,7 +11251,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         !stale_status.success(),
         "a reused numeric pane PID with different start ticks must fail before provider launch"
     );
-    let mut supervisor = spawn_supervisor("500");
+    let (mut supervisor, supervisor_start_gate) =
+        spawn_supervisor("500", ".emitted-supervisor-start");
     let supervisor_pid = supervisor.id();
     let mut record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11248,6 +11271,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         "pid_namespace": current_pid_namespace_identity()
     });
     write_private_json(&record_path, &record);
+    release_supervisor(&supervisor_start_gate);
     let ready =
         state_dir.join("sessions/worker-canary-supervisor/.provider-stop-canary-ready.json");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -11351,7 +11375,8 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
 
     fs::remove_file(&ready).expect("remove first ready marker");
     fs::remove_file(&descendant_pid_file).expect("remove first descendant marker");
-    let mut guardian_crash_supervisor = spawn_supervisor("500");
+    let (mut guardian_crash_supervisor, guardian_crash_start_gate) =
+        spawn_supervisor("500", ".guardian-crash-supervisor-start");
     let guardian_crash_supervisor_pid = guardian_crash_supervisor.id();
     let mut record: serde_json::Value =
         serde_json::from_slice(&fs::read(&record_path).expect("worker record"))
@@ -11369,6 +11394,7 @@ fn main_agent_worker_start_emits_and_executes_exact_compiled_canary_supervisor()
         }]
     });
     write_private_json(&record_path, &record);
+    release_supervisor(&guardian_crash_start_gate);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready.is_file() || !descendant_pid_file.is_file() {
         assert!(

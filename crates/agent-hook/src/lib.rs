@@ -312,6 +312,7 @@ fn run_dispatch(
         Ok(request) => request,
         Err(error) => return emit_dispatch_error(args.format, &error, None),
     };
+    let unmanaged = liveness::current_process_is_unmanaged();
     let grant = match recovery::consume_for_dispatch(
         &layout.state_root,
         args.capability_file.as_deref(),
@@ -333,8 +334,11 @@ fn run_dispatch(
                 &request,
                 &raw,
                 coordination_rule,
-                None,
-                OperationEffectClass::Unknown,
+                evaluator::CoordinationExecution::new(
+                    None,
+                    OperationEffectClass::Unknown,
+                    unmanaged,
+                ),
             ) {
                 Ok(decision) => decision,
                 Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
@@ -349,7 +353,7 @@ fn run_dispatch(
     };
     let mut coordination_mode_override = None;
     let coordination = if prepared.needs_coordination() {
-        match liveness::load_snapshot() {
+        match liveness::load_snapshot(unmanaged) {
             Ok(snapshot) => snapshot,
             Err(error) => match liveness::coordination_failure_mode() {
                 Some(mode) => {
@@ -369,6 +373,7 @@ fn run_dispatch(
         &prepared,
         coordination.as_ref(),
         coordination_mode_override,
+        unmanaged,
     ) {
         Ok(decision) => decision,
         Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),

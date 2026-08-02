@@ -92,12 +92,19 @@ impl Fixture {
             .with_env(
                 "XDG_STATE_HOME",
                 self.state_home.to_str().expect("state UTF-8"),
-            )
-            .with_env(
+            );
+        let state_overridden = envs
+            .iter()
+            .any(|(name, _)| *name == "AGENT_SESSION_STATE_DIR");
+        let options = if removals.contains(&"AGENT_SESSION_STATE_DIR") || state_overridden {
+            options
+        } else {
+            options.with_env(
                 "AGENT_SESSION_STATE_DIR",
                 self.session_state.to_str().expect("session state UTF-8"),
             )
-            .with_envs(envs);
+        };
+        let options = options.with_envs(envs);
         let options = removals
             .iter()
             .fold(options, |options, name| options.with_env_remove(name));
