@@ -8761,6 +8761,22 @@ mod tests {
         fn pid(&self) -> u32 {
             self.child.as_ref().expect("live test child").id()
         }
+
+        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+            let started_at = Instant::now();
+            loop {
+                match self.child.as_mut().expect("test child").try_wait() {
+                    Ok(Some(_)) => {
+                        self.child.take();
+                        return true;
+                    }
+                    Ok(None) if started_at.elapsed() < timeout => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+        }
     }
 
     impl Drop for TestProcessGroup {
@@ -14504,6 +14520,11 @@ case "$1" in
   display-message)
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
+  if-shell)
+    pid="$(cat {pane_pid})"
+    /bin/kill -KILL -- "-$pid" 2>/dev/null || true
+    rm -f {running}
+    ;;
   kill-session)
     rm -f {running}
     ;;
@@ -14529,7 +14550,7 @@ esac
             .to_string(),
         )
         .unwrap();
-        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        let mut st = state(tmp.path(), Some(TOKEN), tmux.clone());
         Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
         let first_pane = TestProcessGroup::spawn();
         fs::write(&pane_pid, first_pane.pid().to_string()).unwrap();
@@ -14566,7 +14587,7 @@ esac
         assert_eq!(stopped["cwd"], cwd.to_string_lossy().as_ref());
         assert_eq!(stopped["agent_profile"], "codex-profile");
 
-        let resumed_pane = TestProcessGroup::spawn();
+        let mut resumed_pane = TestProcessGroup::spawn();
         fs::write(&pane_pid, resumed_pane.pid().to_string()).unwrap();
         let (resume_status, resume_body) = call(
             router(st),
@@ -14607,6 +14628,27 @@ esac
         assert!(
             calls.contains("resume fresh-provider-id"),
             "managed resume must use the captured provider id: {calls:?}"
+        );
+        let terminate = ProcessCommand::new(&tmux)
+            .args([
+                "if-shell",
+                "-F",
+                "-t",
+                "%77",
+                "true",
+                "kill-session -t $77",
+                "false",
+            ])
+            .status()
+            .unwrap();
+        assert!(terminate.success());
+        assert!(
+            resumed_pane.wait_for_exit(Duration::from_secs(1)),
+            "identity-bound fixture termination must stop the pane process group"
+        );
+        assert!(
+            !running.exists(),
+            "identity-bound fixture termination must clear tmux liveness"
         );
         drop(resumed_pane);
     }
