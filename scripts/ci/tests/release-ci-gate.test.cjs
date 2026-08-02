@@ -31,6 +31,8 @@ if (fs.existsSync(modulePath)) {
   const fullName = `${owner}/${repo}`;
   const releaseSha = "a".repeat(40);
   const baseSha = "b".repeat(40);
+  const pullHeadSha = "c".repeat(40);
+  const releaseTreeSha = "d".repeat(40);
   const branch = "chore/release-1-22-10";
   const context = {
     ref: "refs/tags/v1.22.10",
@@ -100,6 +102,10 @@ if (fs.existsSync(modulePath)) {
         conclusion: "success",
         completed_at: "2026-07-16T12:00:00Z",
       })),
+      commitsByRef: {
+        [releaseSha]: { sha: releaseSha, commit: { tree: { sha: releaseTreeSha } } },
+        [pullHeadSha]: { sha: pullHeadSha, commit: { tree: { sha: releaseTreeSha } } },
+      },
       ...overrides,
     };
     return {
@@ -124,6 +130,9 @@ if (fs.existsSync(modulePath)) {
           checks: {
             listForRef: async () => ({ data: { check_runs: state.checkRuns } }),
           },
+          repos: {
+            getCommit: async ({ ref }) => ({ data: state.commitsByRef[ref] }),
+          },
         },
       },
     };
@@ -144,6 +153,36 @@ if (fs.existsSync(modulePath)) {
       runId: 100,
       runUrl: `https://github.com/${fullName}/actions/runs/100`,
     });
+  });
+
+  test("a squash-merged release PR is trusted when its tested head tree matches the tagged tree", async () => {
+    const { state, github } = fixture();
+    state.pulls[0].head.sha = pullHeadSha;
+    state.workflowRuns[0].head_sha = pullHeadSha;
+    state.workflowRuns[0].pull_requests = [
+      {
+        number: 1253,
+        head: { sha: pullHeadSha },
+        base: { ref: "main" },
+      },
+    ];
+
+    const trusted = await findTrustedPullRequestCi({ github, context, sha: releaseSha });
+
+    assert.deepEqual(trusted, {
+      prNumber: 1253,
+      runId: 100,
+      runUrl: `https://github.com/${fullName}/actions/runs/100`,
+    });
+  });
+
+  test("a squash-merged release PR fails closed when its tested tree differs from the tagged tree", async () => {
+    const { state, github } = fixture();
+    state.pulls[0].head.sha = pullHeadSha;
+    state.workflowRuns[0].head_sha = pullHeadSha;
+    state.commitsByRef[pullHeadSha].commit.tree.sha = "e".repeat(40);
+
+    assert.equal(await findTrustedPullRequestCi({ github, context, sha: releaseSha }), null);
   });
 
   test("ambiguous workflow runs fail closed", async () => {
@@ -182,6 +221,11 @@ if (fs.existsSync(modulePath)) {
             base: { ref: "main" },
           },
         ];
+      },
+      "missing tagged commit evidence": (state) => {
+        state.pulls[0].head.sha = pullHeadSha;
+        state.workflowRuns[0].head_sha = pullHeadSha;
+        delete state.commitsByRef[releaseSha];
       },
     };
 
