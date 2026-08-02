@@ -17313,7 +17313,6 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
     fs::write(&retained_progress, "unaccepted worker output").expect("worker progress");
     let worker_session_dir = fixture.state_dir.join("sessions/worker-stopped");
     let worker_record_path = worker_session_dir.join("session.json");
-    let session_before_unverified = session_authority_snapshot(&worker_session_dir);
 
     let assert_fail_closed_diagnosis = |command: &str| {
         let observed = run_main_agent(
@@ -17361,6 +17360,10 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
         assert_fail_closed_diagnosis(command);
     }
 
+    // Diagnosis may refresh observation evidence and materialize its owner-local
+    // read-only capability. Freeze the complete authority tree immediately
+    // before crossing the rejected reconciliation mutation boundary.
+    let session_before_unverified = session_authority_snapshot(&worker_session_dir);
     let reconciled = fixture.run_reconcile();
     assert_eq!(reconciled.code, 1, "outcome={}", reconciled.stdout_text());
     assert_eq!(
@@ -17381,10 +17384,10 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
         .expect("worker session object")
         .remove("delete_tmux_identity");
     write_private_json(&worker_record_path, &worker_record);
-    let session_before_missing_identity = session_authority_snapshot(&worker_session_dir);
     for command in ["supervise", "diagnose"] {
         assert_fail_closed_diagnosis(command);
     }
+    let session_before_missing_identity = session_authority_snapshot(&worker_session_dir);
     let missing_identity_reconcile = fixture.run_reconcile();
     assert_eq!(
         missing_identity_reconcile.code,
