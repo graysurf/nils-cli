@@ -35171,6 +35171,10 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
 
 #[test]
 fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
+    // Coverage-instrumented same-release subprocess startup can take longer
+    // than ten seconds on macOS. Keep fixture synchronization generous while
+    // preserving the four-second readiness deadline exercised below.
+    let synchronization_timeout = Duration::from_secs(120);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
@@ -35266,7 +35270,7 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
         .spawn()
         .expect("spawn worker start");
 
-    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    let barrier_deadline = Instant::now() + synchronization_timeout;
     while !barrier.join("ready").is_file() {
         assert!(
             Instant::now() < barrier_deadline,
@@ -35296,7 +35300,7 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
         serde_json::Value::Null,
     );
     fs::write(barrier.join("release"), b"continue").expect("release recovery");
-    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    let recovery_deadline = Instant::now() + synchronization_timeout;
     loop {
         let registry = orchestration_registry(&state_dir);
         let assignment = &registry["assignments"][assignment_id];
