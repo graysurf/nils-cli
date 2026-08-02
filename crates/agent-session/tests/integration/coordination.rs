@@ -8764,41 +8764,33 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let codex_home = tmp.path().join("codex-home");
     let codex_session = codex_home.join("sessions/2026/07/26/session.jsonl");
     let assignment_path = tmp.path().join("assignment-ambiguous-enter.json");
-    write_private_json(
-        &assignment_path,
-        &json!({
-            "schema_version": "main-agent.assignment-input.v1",
-            "assignment_id": "assignment-ambiguous-enter",
-            "task_summary": "Preserve an ambiguous initial Enter",
-            "task": {},
-            "launch": {
-                "agent": "codex",
-                "cwd": checkout,
-                "title": null,
-                "session_id": "worker-ambiguous-enter",
-                "coordination_mode": "enforce",
-                "agent_args": []
-            },
-            "repository": "example/repository",
-            "worktree": null,
-            "base_ref": "main",
-            "scopes": ["crates/agent-session"],
-            "durable_refs": [],
-            "provider_stop_canary": {
-                "schema_version": "main-agent.provider-process-stop-canary.v1"
-            }
-        }),
-    );
+    let assignment = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-ambiguous-enter",
+        "task_summary": "Preserve an ambiguous initial Enter",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-ambiguous-enter",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    write_private_json(&assignment_path, &assignment);
     write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let codex_home_arg = codex_home.to_string_lossy().into_owned();
-    let codex_session_arg = codex_session.to_string_lossy().into_owned();
-    let checkout_arg = checkout.to_string_lossy().into_owned();
     let fail_once_dir = tmp.path().join("fail-after-initial-enter-once");
-    let fail_once_arg = fail_once_dir.to_string_lossy().into_owned();
     let args = [
         "--state-dir",
         state_arg.as_str(),
@@ -8813,34 +8805,75 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
         "--format",
         "json",
     ];
-    let failed = run_main_agent(
-        &checkout,
-        &args,
-        &[
-            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
-            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
-            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
-            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
-            ("CODEX_HOME", codex_home_arg.as_str()),
-            (
-                "AGENT_SESSION_FAKE_CODEX_SESSION_FILE",
-                codex_session_arg.as_str(),
-            ),
-            (
-                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
-                "codex-ambiguous-enter-resume",
-            ),
-            ("AGENT_SESSION_FAKE_CODEX_CWD", checkout_arg.as_str()),
-            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
-            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
-            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
-            ("AGENT_SESSION_FAKE_TMUX_FAIL_AFTER", "send-keys"),
-            (
-                "AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR",
-                fail_once_arg.as_str(),
-            ),
-        ],
-    );
+    let checkpoint_path = Path::new(&main_capability).with_file_name(format!(
+        "main-agent-checkpoint-{}.json",
+        Path::new(&main_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("main capability name")
+    ));
+    let identity_race_barrier = tmp.path().join("ambiguous-prompt-identity-race");
+    fs::create_dir(&identity_race_barrier).expect("identity race barrier");
+    let mut start = Command::new(bin::resolve("main-agent"));
+    start
+        .current_dir(&checkout)
+        .args(args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session)
+        .env(
+            "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+            "codex-ambiguous-enter-resume",
+        )
+        .env("AGENT_SESSION_FAKE_CODEX_CWD", &checkout)
+        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250")
+        .env("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10")
+        .env("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40")
+        .env("AGENT_SESSION_FAKE_TMUX_FAIL_AFTER", "send-keys")
+        .env(
+            "AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR",
+            &fail_once_dir,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_STAGE",
+            "ambiguous-prompt-after-resume-capture",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_DIR",
+            &identity_race_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = start.spawn().expect("spawn ambiguous worker start");
+    wait_for_barrier(&identity_race_barrier);
+    let retained_session = state_dir.join("sessions/worker-ambiguous-enter");
+    let session_path = retained_session.join("session.json");
+    let exact_session = fs::read(&session_path).expect("read exact ambiguous worker record");
+    let exact_session_json: serde_json::Value =
+        serde_json::from_slice(&exact_session).expect("ambiguous worker record json");
+    let exact_launch_id = exact_session_json["runtime"]["launch_id"]
+        .as_str()
+        .expect("exact ambiguous worker incarnation")
+        .to_string();
+    let mut changed_session = exact_session_json.clone();
+    changed_session["runtime"]["launch_id"] = json!("changed-ambiguous-worker-incarnation");
+    changed_session["provider_resume"] = serde_json::Value::Null;
+    write_private_json(&session_path, &changed_session);
+    fs::write(identity_race_barrier.join("release"), b"release")
+        .expect("release identity race barrier");
+    let failed_output = child
+        .wait_with_output()
+        .expect("wait ambiguous worker start");
+    let failed = CmdOutput {
+        code: failed_output.status.code().unwrap_or(-1),
+        stdout: failed_output.stdout,
+        stderr: failed_output.stderr,
+    };
     assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
     assert_eq!(
         failed.stdout_json()["error"]["code"],
@@ -8855,15 +8888,29 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let ambiguous_registry = orchestration_registry(&state_dir);
     assert_eq!(
         ambiguous_registry["assignments"]["assignment-ambiguous-enter"]["revision"],
-        2
+        1
     );
     assert_eq!(
         ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
             ["outcome"]["launch_phase"],
         "prompt-outcome-unknown"
     );
+    assert_eq!(
+        ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
+            ["outcome"]["worker"]["session_incarnation"],
+        exact_launch_id,
+        "the ambiguity receipt must retain the pre-race worker identity"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&session_path).expect("changed ambiguous worker record")
+        )
+        .expect("changed ambiguous worker json")["provider_resume"]
+            .is_null(),
+        "resume metadata must not be written onto the replacement identity"
+    );
 
-    let resumed = run_main_agent(
+    let changed_identity_replay = run_main_agent(
         &checkout,
         &args,
         &[
@@ -8874,10 +8921,174 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             ("CODEX_HOME", codex_home_arg.as_str()),
         ],
     );
+    assert_eq!(
+        changed_identity_replay.code,
+        65,
+        "outcome={}",
+        changed_identity_replay.stdout_text()
+    );
+    assert_eq!(
+        changed_identity_replay.stdout_json()["error"]["code"],
+        "assignment-start-conflict"
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "a changed ambiguous worker must fail closed without another {operation}: {calls:?}"
+        );
+    }
+    fs::write(&session_path, &exact_session).expect("restore exact ambiguous worker record");
+
+    let unavailable_session = state_dir.join("worker-ambiguous-enter-unavailable");
+    fs::rename(&retained_session, &unavailable_session)
+        .expect("simulate loss of the retained ambiguous worker");
+    let unavailable_replay = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        unavailable_replay.code,
+        1,
+        "outcome={}",
+        unavailable_replay.stdout_text()
+    );
+    assert_eq!(
+        unavailable_replay.stdout_json()["error"]["code"],
+        "managed-worker-prompt-delivery-outcome-unknown"
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "a missing ambiguous worker must fail closed without another {operation}: {calls:?}"
+        );
+    }
+    fs::rename(&unavailable_session, &retained_session)
+        .expect("restore the retained ambiguous worker");
+
+    let replay_identity_race_barrier = tmp.path().join("ambiguous-replay-identity-race");
+    fs::create_dir(&replay_identity_race_barrier).expect("replay identity race barrier");
+    let mut replay = Command::new(bin::resolve("main-agent"));
+    replay
+        .current_dir(&checkout)
+        .args(args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_ambiguous_resume_backfill",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &replay_identity_race_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let replay_child = replay.spawn().expect("spawn ambiguous worker replay");
+    wait_for_barrier(&replay_identity_race_barrier);
+    let backfilled_session = fs::read(&session_path).expect("backfilled ambiguous worker record");
+    let backfilled_session_json: serde_json::Value =
+        serde_json::from_slice(&backfilled_session).expect("backfilled ambiguous worker json");
+    assert_eq!(
+        backfilled_session_json["provider_resume"]["session_id"], "codex-ambiguous-enter-resume",
+        "exact replay must backfill the captured resume evidence under the identity lock"
+    );
+    let resume_path = retained_session.join("resume.json");
+    let backfilled_resume = fs::read(&resume_path).expect("backfilled ambiguous resume sidecar");
+    let resume_sidecar: serde_json::Value = serde_json::from_slice(&backfilled_resume)
+        .expect("backfilled ambiguous resume sidecar json");
+    assert_eq!(
+        resume_sidecar["runtime"]["launch_id"], exact_launch_id,
+        "resume sidecar evidence must remain bound to the original runtime incarnation"
+    );
+    let mut replay_replacement = backfilled_session_json.clone();
+    replay_replacement["runtime"]["launch_id"] = json!("changed-after-resume-backfill");
+    replay_replacement["provider_resume"] = serde_json::Value::Null;
+    write_private_json(&session_path, &replay_replacement);
+    let replacement_list = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        replacement_list.code,
+        0,
+        "stderr={}",
+        replacement_list.stderr_text()
+    );
+    let replacement_list_data = data(&replacement_list);
+    let replacement_view = replacement_list_data
+        .as_array()
+        .expect("replacement session list")
+        .iter()
+        .find(|session| session["id"] == "worker-ambiguous-enter")
+        .expect("replacement worker view");
+    assert!(
+        replacement_view["provider_resume"].is_null(),
+        "a stale resume sidecar must not bind provider metadata to a replacement runtime"
+    );
+    assert_eq!(
+        replacement_view["resumable"], false,
+        "a replacement runtime must not become resumable through the prior identity's sidecar"
+    );
+    assert!(
+        !resume_path.exists(),
+        "loading and reconciling a replacement must remove the stale resume sidecar"
+    );
+    fs::write(replay_identity_race_barrier.join("release"), b"release")
+        .expect("release replay identity race barrier");
+    let replay_output = replay_child
+        .wait_with_output()
+        .expect("wait ambiguous worker replay");
+    let resumed = CmdOutput {
+        code: replay_output.status.code().unwrap_or(-1),
+        stdout: replay_output.stdout,
+        stderr: replay_output.stderr,
+    };
     assert_eq!(resumed.code, 0, "stderr={}", resumed.stderr_text());
     assert_eq!(
         data(&resumed)["worker"]["session_id"],
         "worker-ambiguous-enter"
+    );
+    assert_eq!(
+        data(&resumed)["worker"]["session_incarnation"],
+        exact_launch_id,
+        "replay must continue with the identity-checked record returned by the locked backfill"
     );
     let calls = tmux_calls(&tmux_log);
     for (operation, expected) in [
@@ -8902,6 +9113,16 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
         }),
         "an outcome-unknown Enter must never tear down its worker: {calls:?}"
     );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&session_path).expect("post-backfill replacement record")
+        )
+        .expect("post-backfill replacement json")["provider_resume"]
+            .is_null(),
+        "replay must not attach metadata to a replacement installed after the locked backfill"
+    );
+    fs::write(&session_path, &backfilled_session).expect("restore backfilled worker record");
+    fs::write(&resume_path, &backfilled_resume).expect("restore backfilled resume sidecar");
     let worker_record: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("sessions/worker-ambiguous-enter/session.json"))
             .expect("retained worker record"),
@@ -32604,20 +32825,59 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
             successor["data"]["readiness"]["prompt_observation"].is_object(),
             "every terminal readiness takeover branch must retain typed prompt evidence: {crash_stage}"
         );
+        let actual_attempt_count =
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"]
+                .as_u64()
+                .expect("typed recovery attempt count");
+        let pre_reservation_recovery_not_admitted =
+            crash_stage == "before_reserve" && actual_attempt_count == 0;
+        if pre_reservation_recovery_not_admitted {
+            assert_eq!(
+                successor["data"]["readiness"]["classification"],
+                "prompt_observation_unavailable"
+            );
+            assert_eq!(
+                successor["data"]["readiness"]["prompt_observation"]["prompt"],
+                json!({
+                    "state": "unavailable",
+                    "proof": "provider-transcript-unavailable"
+                }),
+                "a pre-reservation takeover may decline recovery only when bounded transcript proof is unavailable"
+            );
+        }
+        let expected_attempt_count = if pre_reservation_recovery_not_admitted {
+            0
+        } else {
+            1
+        };
         assert_eq!(
-            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"], 1,
-            "successor must resume the persisted recovery reservation"
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"],
+            expected_attempt_count,
+            "successor recovery attempt must match the durable reservation boundary: {crash_stage}"
         );
         assert_eq!(
             successor["data"]["readiness"]["submit_key_recovery"]["attempted"],
-            true
+            !pre_reservation_recovery_not_admitted,
+            "only a proof-unavailable takeover before reservation may decline recovery: {crash_stage}"
         );
         let registry = orchestration_registry(&state_dir);
-        assert_eq!(
-            registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
-            1
-        );
-        let expected_enter_count = if crash_stage == "sending" { 1 } else { 2 };
+        if pre_reservation_recovery_not_admitted {
+            assert!(
+                registry["assignments"][&assignment_id]["submit_recovery"].is_null(),
+                "proof-unavailable takeover before reservation must not create recovery state"
+            );
+        } else {
+            assert_eq!(
+                registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
+                1
+            );
+        }
+        let expected_enter_count =
+            if crash_stage == "sending" || pre_reservation_recovery_not_admitted {
+                1
+            } else {
+                2
+            };
         assert_eq!(
             tmux_calls(&tmux_log)
                 .iter()
