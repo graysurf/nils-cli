@@ -421,9 +421,15 @@ fn add_worktree(args: &AddArgs) -> Result<AddOutput, CliError> {
     })?;
 
     let path_arg = display_path(&path);
+    // `--no-track` because the default base ref is a remote-tracking branch, and
+    // Git's `branch.autoSetupMerge` default would then record the default branch
+    // as this branch's upstream. A managed worktree branch is unpublished: it has
+    // no upstream until it is pushed, and claiming one makes every `@{upstream}`
+    // reader resolve the default branch instead of this branch's head.
     git_output(&[
         "worktree",
         "add",
+        "--no-track",
         "-b",
         branch.as_str(),
         path_arg.as_str(),
