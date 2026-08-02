@@ -8761,6 +8761,38 @@ mod tests {
         fn pid(&self) -> u32 {
             self.child.as_ref().expect("live test child").id()
         }
+
+        fn into_background_reaper(mut self) -> TestProcessReaper {
+            let mut child = self.child.take().expect("live test child");
+            let process_group_id = self.process_group_id;
+            let (cleanup, cleanup_requested) = std::sync::mpsc::channel();
+            TestProcessReaper {
+                cleanup,
+                reaper: Some(std::thread::spawn(move || {
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status),
+                            Err(error) => return Err(error),
+                            Ok(None) => {}
+                        }
+                        match cleanup_requested.recv_timeout(Duration::from_millis(10)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                if let Some(status) = child.try_wait()? {
+                                    return Ok(status);
+                                }
+                                // SAFETY: this thread still owns the live leader of
+                                // the dedicated test-only process group.
+                                unsafe {
+                                    libc::kill(-process_group_id, libc::SIGKILL);
+                                }
+                                return child.wait();
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                })),
+            }
+        }
     }
 
     impl Drop for TestProcessGroup {
@@ -8773,6 +8805,38 @@ mod tests {
                 libc::kill(-self.process_group_id, libc::SIGKILL);
             }
             let _ = child.wait();
+        }
+    }
+
+    struct TestProcessReaper {
+        cleanup: std::sync::mpsc::Sender<()>,
+        reaper: Option<std::thread::JoinHandle<io::Result<std::process::ExitStatus>>>,
+    }
+
+    impl TestProcessReaper {
+        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+            let started_at = Instant::now();
+            while self
+                .reaper
+                .as_ref()
+                .is_some_and(|reaper| !reaper.is_finished())
+                && started_at.elapsed() < timeout
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let Some(reaper) = self.reaper.take_if(|reaper| reaper.is_finished()) else {
+                return false;
+            };
+            matches!(reaper.join(), Ok(Ok(_)))
+        }
+    }
+
+    impl Drop for TestProcessReaper {
+        fn drop(&mut self) {
+            if let Some(reaper) = self.reaper.take() {
+                let _ = self.cleanup.send(());
+                let _ = reaper.join();
+            }
         }
     }
 
@@ -14447,7 +14511,7 @@ esac
     }
 
     #[tokio::test]
-    async fn fresh_profile_session_stops_and_resumes_with_its_durable_context() {
+    async fn fresh_profile_session_resume_preserves_context_or_fails_closed_without_proof() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("worktrees/issue-362");
         let config_dir = tmp.path().join("codex-profile");
@@ -14504,6 +14568,14 @@ case "$1" in
   display-message)
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
+  if-shell)
+    pid="$(cat {pane_pid})"
+    kill -KILL "$pid" 2>/dev/null || true
+    rm -f {running}
+    ;;
+  kill-session)
+    rm -f {running}
+    ;;
   *) exit 0 ;;
 esac
 "#,
@@ -14526,7 +14598,7 @@ esac
             .to_string(),
         )
         .unwrap();
-        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        let mut st = state(tmp.path(), Some(TOKEN), tmux.clone());
         Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
         let first_pane = TestProcessGroup::spawn();
         fs::write(&pane_pid, first_pane.pid().to_string()).unwrap();
@@ -14565,21 +14637,15 @@ esac
 
         let resumed_pane = TestProcessGroup::spawn();
         fs::write(&pane_pid, resumed_pane.pid().to_string()).unwrap();
+        // Real tmux reaps its pane child after kill-session. Keep a concurrent
+        // waiter so macOS does not report the terminated child as a live zombie
+        // process group while the resume path verifies the boundary is empty.
+        let mut resumed_pane = resumed_pane.into_background_reaper();
         let (resume_status, resume_body) = call(
             router(st),
             post_json("/sessions/fresh-profile/resume", Some(TOKEN), json!({})),
         )
         .await;
-        assert_eq!(resume_status, StatusCode::OK, "body={resume_body}");
-        assert_eq!(
-            resume_body["data"]["session"]["cwd"],
-            cwd.to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            resume_body["data"]["session"]["agent_profile"],
-            "codex-profile"
-        );
-
         let calls = fs::read_to_string(log).unwrap();
         assert_eq!(
             calls
@@ -14605,7 +14671,70 @@ esac
             calls.contains("resume fresh-provider-id"),
             "managed resume must use the captured provider id: {calls:?}"
         );
-        drop(resumed_pane);
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                resume_status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body={resume_body}"
+            );
+            assert_eq!(
+                resume_body["error"]["code"],
+                "coordination-runtime-unverified"
+            );
+            assert!(
+                resumed_pane.wait_for_exit(Duration::from_secs(1)),
+                "failed-launch cleanup must reap the replacement pane"
+            );
+            assert!(
+                !running.exists(),
+                "failed-launch cleanup must clear tmux liveness"
+            );
+            let retained: Value = serde_json::from_str(
+                &fs::read_to_string(tmp.path().join("sessions/fresh-profile/session.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(retained["cwd"], cwd.to_string_lossy().as_ref());
+            assert_eq!(retained["runtime"]["agent_profile"], "codex-profile");
+            assert_eq!(
+                retained["provider_resume"]["session_id"],
+                "fresh-provider-id"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(resume_status, StatusCode::OK, "body={resume_body}");
+            assert_eq!(
+                resume_body["data"]["session"]["cwd"],
+                cwd.to_string_lossy().as_ref()
+            );
+            assert_eq!(
+                resume_body["data"]["session"]["agent_profile"],
+                "codex-profile"
+            );
+            let terminate = ProcessCommand::new(&tmux)
+                .args([
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    "%77",
+                    "true",
+                    "kill-session -t $77",
+                    "false",
+                ])
+                .status()
+                .unwrap();
+            assert!(terminate.success());
+            assert!(
+                resumed_pane.wait_for_exit(Duration::from_secs(1)),
+                "identity-bound fixture termination must stop the pane process group"
+            );
+            assert!(
+                !running.exists(),
+                "identity-bound fixture termination must clear tmux liveness"
+            );
+        }
     }
 
     #[tokio::test]
@@ -22034,7 +22163,7 @@ exit 0
             .expect("alpha runtime")
             .launch_id
             .clone();
-        let mut stopped_runtime = json!({
+        let stopped_runtime = json!({
             "launch_id": incarnation,
             "session_id": "$77",
             "pane_id": "%77",
@@ -22042,7 +22171,8 @@ exit 0
             "process_group_id": i32::MAX
         });
         #[cfg(target_os = "linux")]
-        {
+        let stopped_runtime = {
+            let mut stopped_runtime = stopped_runtime;
             let namespace = fs::metadata("/proc/self/ns/pid").expect("PID namespace metadata");
             stopped_runtime["pid_namespace"] = json!({
                 "device": namespace.st_dev(),
@@ -22051,7 +22181,8 @@ exit 0
                     .expect("boot id")
                     .trim()
             });
-        }
+            stopped_runtime
+        };
         alpha
             .extra
             .insert("delete_tmux_identity".to_string(), stopped_runtime);
@@ -22178,34 +22309,65 @@ exit 0
                 serde_json::to_vec(&request).expect("operator request"),
             ))
             .expect("operator request");
+        #[cfg(not(target_os = "linux"))]
+        let before_operator =
+            fs::read(&registry_path).expect("registry before operator reconciliation");
         let (status, reconciled) = call(router(state.clone()), operator_request).await;
-        assert_eq!(status, StatusCode::OK, "{reconciled}");
-        assert_eq!(
-            reconciled["data"]["coordination"]["operation_reconciliation"]["state"],
-            "abandoned"
-        );
-        assert_eq!(
-            reconciled["data"]["coordination"]["operation_reconciliation"]["revision"],
-            8
-        );
         assert!(
             !reconciled
                 .to_string()
                 .contains("PRIVATE-EXECUTION-TOKEN-DIGEST")
         );
-
-        let replay = Request::builder()
-            .method("POST")
-            .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&request).expect("operator replay"),
-            ))
-            .expect("operator replay");
-        let (status, replayed) = call(router(state), replay).await;
-        assert_eq!(status, StatusCode::OK, "{replayed}");
-        assert_eq!(replayed, reconciled);
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reconciled}");
+            assert_eq!(reconciled["error"]["code"], "operation-still-running");
+            assert_eq!(
+                fs::read(&registry_path).expect("registry after unverified reconciliation"),
+                before_operator,
+                "unknown non-Linux runtime evidence must not mutate the operation"
+            );
+            let replay = Request::builder()
+                .method("POST")
+                .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("operator replay"),
+                ))
+                .expect("operator replay");
+            let (replay_status, replayed) = call(router(state), replay).await;
+            assert_eq!(
+                replay_status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{replayed}"
+            );
+            assert_eq!(replayed, reconciled);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(status, StatusCode::OK, "{reconciled}");
+            assert_eq!(
+                reconciled["data"]["coordination"]["operation_reconciliation"]["state"],
+                "abandoned"
+            );
+            assert_eq!(
+                reconciled["data"]["coordination"]["operation_reconciliation"]["revision"],
+                8
+            );
+            let replay = Request::builder()
+                .method("POST")
+                .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("operator replay"),
+                ))
+                .expect("operator replay");
+            let (replay_status, replayed) = call(router(state), replay).await;
+            assert_eq!(replay_status, StatusCode::OK, "{replayed}");
+            assert_eq!(replayed, reconciled);
+        }
     }
 
     #[tokio::test]

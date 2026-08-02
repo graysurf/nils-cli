@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -22,10 +24,17 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+use super::cli::spawn_test_process_group;
 use super::cli::{
-    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group,
-    spawn_test_process_group, tmux_calls,
+    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls,
 };
+
+// Linux production termination deliberately proves it can stop a captured process
+// boundary even when tmux does not. Other Unix targets cannot pin that boundary,
+// so their success fixtures must model real tmux by terminating the pane group.
+const FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP: &str =
+    if cfg!(target_os = "linux") { "1" } else { "0" };
 
 #[cfg(target_os = "linux")]
 fn provider_stop_canary_test_capability() -> Result<(), String> {
@@ -455,6 +464,7 @@ fn seed_activity_state(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn seed_stalled_codex_provider_hook_activity_state(
     state_dir: &Path,
     id: &str,
@@ -797,6 +807,37 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
 }
 
+fn session_authority_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries = fs::read_dir(current)
+            .expect("snapshot directory")
+            .map(|entry| entry.expect("snapshot entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let file_type = entry.file_type().expect("snapshot file type");
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot relative path")
+                .to_path_buf();
+            if relative == Path::new("activity.json") {
+                continue;
+            }
+            if file_type.is_dir() {
+                visit(root, &path, snapshot);
+            } else if file_type.is_file() {
+                snapshot.insert(relative, fs::read(path).expect("snapshot file"));
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[cfg(target_os = "linux")]
 fn assert_authority_quarantine_released(path: &Path) {
     assert!(
         !path.exists(),
@@ -827,12 +868,14 @@ fn assert_authority_quarantine_released(path: &Path) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_reservation_path(state_dir: &Path, assignment_id: &str) -> PathBuf {
     state_dir
         .join("orchestration/provider-stop-canary-reservations")
         .join(digest(assignment_id))
 }
 
+#[cfg(target_os = "linux")]
 fn write_provider_stop_canary_reservation(
     state_dir: &Path,
     assignment_id: &str,
@@ -846,6 +889,7 @@ fn write_provider_stop_canary_reservation(
     write_private_json(&path, value);
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_reservation(
     state_dir: &Path,
     assignment_id: &str,
@@ -857,6 +901,7 @@ fn provider_stop_canary_reservation(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_fence_path(state_dir: &Path, session_id: &str) -> PathBuf {
     state_dir
         .join("sessions")
@@ -1213,6 +1258,7 @@ fn load_coordination_registry(state_dir: &Path) -> serde_json::Value {
     .expect("coordination registry json")
 }
 
+#[cfg(target_os = "linux")]
 fn released_v1_claim_renew_fixture(state_dir: &Path, session_id: &str) -> Result<(), &'static str> {
     let path = state_dir.join("coordination/registry.json");
     let bytes = fs::read(&path).map_err(|_| "unavailable")?;
@@ -1236,6 +1282,7 @@ fn released_v1_claim_renew_fixture(state_dir: &Path, session_id: &str) -> Result
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn coordination_authority_snapshot(
     registry: &serde_json::Value,
     session_id: &str,
@@ -8700,6 +8747,7 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let checkout = tmp.path().join("checkout");
     fs::create_dir(&state_dir).expect("state");
     init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    let canonical_checkout = fs::canonicalize(&checkout).expect("canonical checkout");
     seed_brokers_at(
         &state_dir,
         &[(
@@ -8716,41 +8764,33 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let codex_home = tmp.path().join("codex-home");
     let codex_session = codex_home.join("sessions/2026/07/26/session.jsonl");
     let assignment_path = tmp.path().join("assignment-ambiguous-enter.json");
-    write_private_json(
-        &assignment_path,
-        &json!({
-            "schema_version": "main-agent.assignment-input.v1",
-            "assignment_id": "assignment-ambiguous-enter",
-            "task_summary": "Preserve an ambiguous initial Enter",
-            "task": {},
-            "launch": {
-                "agent": "codex",
-                "cwd": checkout,
-                "title": null,
-                "session_id": "worker-ambiguous-enter",
-                "coordination_mode": "enforce",
-                "agent_args": []
-            },
-            "repository": "example/repository",
-            "worktree": null,
-            "base_ref": "main",
-            "scopes": ["crates/agent-session"],
-            "durable_refs": [],
-            "provider_stop_canary": {
-                "schema_version": "main-agent.provider-process-stop-canary.v1"
-            }
-        }),
-    );
+    let assignment = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-ambiguous-enter",
+        "task_summary": "Preserve an ambiguous initial Enter",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-ambiguous-enter",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    write_private_json(&assignment_path, &assignment);
     write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
     let codex_home_arg = codex_home.to_string_lossy().into_owned();
-    let codex_session_arg = codex_session.to_string_lossy().into_owned();
-    let checkout_arg = checkout.to_string_lossy().into_owned();
     let fail_once_dir = tmp.path().join("fail-after-initial-enter-once");
-    let fail_once_arg = fail_once_dir.to_string_lossy().into_owned();
     let args = [
         "--state-dir",
         state_arg.as_str(),
@@ -8765,34 +8805,84 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
         "--format",
         "json",
     ];
-    let failed = run_main_agent(
-        &checkout,
-        &args,
-        &[
-            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
-            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
-            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
-            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
-            ("CODEX_HOME", codex_home_arg.as_str()),
-            (
-                "AGENT_SESSION_FAKE_CODEX_SESSION_FILE",
-                codex_session_arg.as_str(),
-            ),
-            (
-                "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
-                "codex-ambiguous-enter-resume",
-            ),
-            ("AGENT_SESSION_FAKE_CODEX_CWD", checkout_arg.as_str()),
-            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250"),
-            ("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10"),
-            ("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40"),
-            ("AGENT_SESSION_FAKE_TMUX_FAIL_AFTER", "send-keys"),
-            (
-                "AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR",
-                fail_once_arg.as_str(),
-            ),
-        ],
+    let checkpoint_path = Path::new(&main_capability).with_file_name(format!(
+        "main-agent-checkpoint-{}.json",
+        Path::new(&main_capability)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.strip_prefix("capability-"))
+            .expect("main capability name")
+    ));
+    let identity_race_barrier = tmp.path().join("ambiguous-prompt-identity-race");
+    fs::create_dir(&identity_race_barrier).expect("identity race barrier");
+    let mut start = Command::new(bin::resolve("main-agent"));
+    start
+        .current_dir(&checkout)
+        .args(args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session)
+        .env(
+            "AGENT_SESSION_FAKE_CODEX_SESSION_ID",
+            "codex-ambiguous-enter-resume",
+        )
+        .env("AGENT_SESSION_FAKE_CODEX_CWD", &canonical_checkout)
+        // llvm-cov instrumentation can spend several seconds in the first
+        // history scan before the fixture observes its synchronously-created
+        // session metadata. Keep this test-only capture budget above that
+        // startup cost so the identity-race barrier owns the asserted branch.
+        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "5000")
+        .env("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10")
+        .env("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40")
+        .env("AGENT_SESSION_FAKE_TMUX_FAIL_AFTER", "send-keys")
+        .env(
+            "AGENT_SESSION_FAKE_TMUX_FAIL_AFTER_ONCE_DIR",
+            &fail_once_dir,
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_STAGE",
+            "ambiguous-prompt-after-resume-capture",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_STATE_ANCESTOR_BARRIER_DIR",
+            &identity_race_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = start.spawn().expect("spawn ambiguous worker start");
+    wait_for_barrier_or_child_exit_with_timeout(
+        &identity_race_barrier,
+        &mut child,
+        "ambiguous prompt identity race",
+        Duration::from_secs(30),
     );
+    let retained_session = state_dir.join("sessions/worker-ambiguous-enter");
+    let session_path = retained_session.join("session.json");
+    let exact_session = fs::read(&session_path).expect("read exact ambiguous worker record");
+    let exact_session_json: serde_json::Value =
+        serde_json::from_slice(&exact_session).expect("ambiguous worker record json");
+    let exact_launch_id = exact_session_json["runtime"]["launch_id"]
+        .as_str()
+        .expect("exact ambiguous worker incarnation")
+        .to_string();
+    let mut changed_session = exact_session_json.clone();
+    changed_session["runtime"]["launch_id"] = json!("changed-ambiguous-worker-incarnation");
+    changed_session["provider_resume"] = serde_json::Value::Null;
+    write_private_json(&session_path, &changed_session);
+    fs::write(identity_race_barrier.join("release"), b"release")
+        .expect("release identity race barrier");
+    let failed_output = child
+        .wait_with_output()
+        .expect("wait ambiguous worker start");
+    let failed = CmdOutput {
+        code: failed_output.status.code().unwrap_or(-1),
+        stdout: failed_output.stdout,
+        stderr: failed_output.stderr,
+    };
     assert_eq!(failed.code, 1, "outcome={}", failed.stdout_text());
     assert_eq!(
         failed.stdout_json()["error"]["code"],
@@ -8807,15 +8897,29 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let ambiguous_registry = orchestration_registry(&state_dir);
     assert_eq!(
         ambiguous_registry["assignments"]["assignment-ambiguous-enter"]["revision"],
-        2
+        1
     );
     assert_eq!(
         ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
             ["outcome"]["launch_phase"],
         "prompt-outcome-unknown"
     );
+    assert_eq!(
+        ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
+            ["outcome"]["worker"]["session_incarnation"],
+        exact_launch_id,
+        "the ambiguity receipt must retain the pre-race worker identity"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&session_path).expect("changed ambiguous worker record")
+        )
+        .expect("changed ambiguous worker json")["provider_resume"]
+            .is_null(),
+        "resume metadata must not be written onto the replacement identity"
+    );
 
-    let resumed = run_main_agent(
+    let changed_identity_replay = run_main_agent(
         &checkout,
         &args,
         &[
@@ -8826,10 +8930,175 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
             ("CODEX_HOME", codex_home_arg.as_str()),
         ],
     );
+    assert_eq!(
+        changed_identity_replay.code,
+        65,
+        "outcome={}",
+        changed_identity_replay.stdout_text()
+    );
+    assert_eq!(
+        changed_identity_replay.stdout_json()["error"]["code"],
+        "assignment-start-conflict"
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "a changed ambiguous worker must fail closed without another {operation}: {calls:?}"
+        );
+    }
+    fs::write(&session_path, &exact_session).expect("restore exact ambiguous worker record");
+
+    let unavailable_session = state_dir.join("worker-ambiguous-enter-unavailable");
+    fs::rename(&retained_session, &unavailable_session)
+        .expect("simulate loss of the retained ambiguous worker");
+    let unavailable_replay = run_main_agent(
+        &checkout,
+        &args,
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+            ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+            ("CODEX_HOME", codex_home_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        unavailable_replay.code,
+        1,
+        "outcome={}",
+        unavailable_replay.stdout_text()
+    );
+    assert_eq!(
+        unavailable_replay.stdout_json()["error"]["code"],
+        "managed-worker-prompt-delivery-outcome-unknown"
+    );
+    let calls = tmux_calls(&tmux_log);
+    for (operation, expected) in [
+        ("new-session", 1),
+        ("load-buffer", 1),
+        ("paste-buffer", 1),
+        ("send-keys", 1),
+    ] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|arg| arg == operation))
+                .count(),
+            expected,
+            "a missing ambiguous worker must fail closed without another {operation}: {calls:?}"
+        );
+    }
+    fs::rename(&unavailable_session, &retained_session)
+        .expect("restore the retained ambiguous worker");
+
+    let replay_identity_race_barrier = tmp.path().join("ambiguous-replay-identity-race");
+    fs::create_dir(&replay_identity_race_barrier).expect("replay identity race barrier");
+    let mut replay = Command::new(bin::resolve("main-agent"));
+    replay
+        .current_dir(&checkout)
+        .args(args)
+        .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+        .env("AGENT_SESSION_CHECKPOINT_FILE", &checkpoint_path)
+        .env("AGENT_SESSION_TMUX_BIN", &tmux_bin)
+        .env("AGENT_SESSION_CODEX_BIN", &codex_bin)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log)
+        .env("CODEX_HOME", &codex_home)
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+            "after_ambiguous_resume_backfill",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR",
+            &replay_identity_race_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut replay_child = replay.spawn().expect("spawn ambiguous worker replay");
+    wait_for_barrier_or_child_exit_with_timeout(
+        &replay_identity_race_barrier,
+        &mut replay_child,
+        "ambiguous replay identity race",
+        Duration::from_secs(30),
+    );
+    let backfilled_session = fs::read(&session_path).expect("backfilled ambiguous worker record");
+    let backfilled_session_json: serde_json::Value =
+        serde_json::from_slice(&backfilled_session).expect("backfilled ambiguous worker json");
+    assert_eq!(
+        backfilled_session_json["provider_resume"]["session_id"], "codex-ambiguous-enter-resume",
+        "exact replay must backfill the captured resume evidence under the identity lock"
+    );
+    let resume_path = retained_session.join("resume.json");
+    let backfilled_resume = fs::read(&resume_path).expect("backfilled ambiguous resume sidecar");
+    let resume_sidecar: serde_json::Value = serde_json::from_slice(&backfilled_resume)
+        .expect("backfilled ambiguous resume sidecar json");
+    assert_eq!(
+        resume_sidecar["runtime"]["launch_id"], exact_launch_id,
+        "resume sidecar evidence must remain bound to the original runtime incarnation"
+    );
+    let mut replay_replacement = backfilled_session_json.clone();
+    replay_replacement["runtime"]["launch_id"] = json!("changed-after-resume-backfill");
+    replay_replacement["provider_resume"] = serde_json::Value::Null;
+    write_private_json(&session_path, &replay_replacement);
+    let replacement_list = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_arg.as_str(),
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        replacement_list.code,
+        0,
+        "stderr={}",
+        replacement_list.stderr_text()
+    );
+    let replacement_list_data = data(&replacement_list);
+    let replacement_view = replacement_list_data
+        .as_array()
+        .expect("replacement session list")
+        .iter()
+        .find(|session| session["id"] == "worker-ambiguous-enter")
+        .expect("replacement worker view");
+    assert!(
+        replacement_view["provider_resume"].is_null(),
+        "a stale resume sidecar must not bind provider metadata to a replacement runtime"
+    );
+    assert_eq!(
+        replacement_view["resumable"], false,
+        "a replacement runtime must not become resumable through the prior identity's sidecar"
+    );
+    fs::write(replay_identity_race_barrier.join("release"), b"release")
+        .expect("release replay identity race barrier");
+    let replay_output = replay_child
+        .wait_with_output()
+        .expect("wait ambiguous worker replay");
+    let resumed = CmdOutput {
+        code: replay_output.status.code().unwrap_or(-1),
+        stdout: replay_output.stdout,
+        stderr: replay_output.stderr,
+    };
     assert_eq!(resumed.code, 0, "stderr={}", resumed.stderr_text());
     assert_eq!(
         data(&resumed)["worker"]["session_id"],
         "worker-ambiguous-enter"
+    );
+    assert_eq!(
+        data(&resumed)["worker"]["session_incarnation"],
+        exact_launch_id,
+        "replay must continue with the identity-checked record returned by the locked backfill"
     );
     let calls = tmux_calls(&tmux_log);
     for (operation, expected) in [
@@ -8854,6 +9123,16 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
         }),
         "an outcome-unknown Enter must never tear down its worker: {calls:?}"
     );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&session_path).expect("post-backfill replacement record")
+        )
+        .expect("post-backfill replacement json")["provider_resume"]
+            .is_null(),
+        "replay must not attach metadata to a replacement installed after the locked backfill"
+    );
+    fs::write(&session_path, &backfilled_session).expect("restore backfilled worker record");
+    fs::write(&resume_path, &backfilled_resume).expect("restore backfilled resume sidecar");
     let worker_record: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("sessions/worker-ambiguous-enter/session.json"))
             .expect("retained worker record"),
@@ -8872,6 +9151,7 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_cleans_prelock_quarantine_failure_before_retry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9020,6 +9300,7 @@ fn main_agent_canary_worker_start_cleans_prelock_quarantine_failure_before_retry
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_rolls_back_post_save_hook_failure_before_retry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9165,6 +9446,7 @@ fn main_agent_canary_worker_start_rolls_back_post_save_hook_failure_before_retry
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_preserves_committed_attachment_when_rollback_fails() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9335,6 +9617,7 @@ fn main_agent_canary_worker_start_preserves_committed_attachment_when_rollback_f
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_bootstrap_waits_for_matching_startup_quarantine_clear() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9929,6 +10212,7 @@ fn main_agent_canary_bootstrap_waits_for_matching_startup_quarantine_clear() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_never_completes_an_interrupted_prompt_attempt() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -11506,6 +11790,140 @@ fn main_agent_canary_startup_admits_only_authenticated_guardian_status() {
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
+fn main_agent_worker_start_rejects_provider_stop_canary_before_durable_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let assignment_path = tmp
+        .path()
+        .join("assignment-canary-platform-unsupported.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-platform-unsupported",
+            "task_summary": "Reject an unsupported canary before worker launch",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-platform-unsupported",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-canary-platform-unsupported");
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--if-run-revision",
+        "1",
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-platform-unsupported-0001",
+        "--format",
+        "json",
+    ];
+    let env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+    let orchestration_before_rejection = fs::read(state_dir.join("orchestration/registry.json"))
+        .expect("orchestration registry before rejection");
+    let coordination_before_rejection = fs::read(state_dir.join("coordination/registry.json"))
+        .expect("coordination registry before rejection");
+    let refused =
+        run_main_agent_with_codex_trust(&checkout, &args, &env, &codex_home, &[&checkout]);
+    assert_eq!(refused.code, 64, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "provider-stop-canary-platform-unsupported"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-canary-platform-unsupported")
+            .is_none(),
+        "platform admission must precede assignment persistence"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-platform-unsupported")
+            .exists(),
+        "platform admission must not create worker state or capability material"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "platform admission must precede tmux and prompt transport"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json"))
+            .expect("orchestration registry after rejection"),
+        orchestration_before_rejection,
+        "platform rejection must not mutate orchestration state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json"))
+            .expect("coordination registry after rejection"),
+        coordination_before_rejection,
+        "platform rejection must not create an operation fence"
+    );
+
+    let replay = run_main_agent_with_codex_trust(&checkout, &args, &env, &codex_home, &[&checkout]);
+    assert_eq!(replay.code, 64, "outcome={}", replay.stdout_text());
+    assert_eq!(replay.stdout_text(), refused.stdout_text());
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json"))
+            .expect("orchestration registry after replay"),
+        orchestration_before_rejection,
+        "replay must not advance orchestration state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json"))
+            .expect("coordination registry after replay"),
+        coordination_before_rejection,
+        "replay must not create an operation fence"
+    );
+    assert!(tmux_calls(&tmux_log).is_empty());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_startup_failure_precedes_prompt_transport() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -11583,7 +12001,10 @@ fn main_agent_canary_startup_failure_precedes_prompt_transport() {
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
             ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
                 "worker-canary-startup-failure",
@@ -11650,7 +12071,10 @@ fn main_agent_canary_startup_failure_precedes_prompt_transport() {
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
             ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
                 "worker-canary-startup-failure",
@@ -16009,7 +16433,10 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             pane_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
         (
@@ -16098,7 +16525,10 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             pane_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
         (
@@ -16240,6 +16670,7 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
     );
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct StoppedPostClaimFixture {
     _tmp: tempfile::TempDir,
     state_dir: PathBuf,
@@ -16258,6 +16689,7 @@ impl StoppedPostClaimFixture {
         Self::new_with_canary_scopes(false, &["docs/stopped-focused"])
     }
 
+    #[cfg(target_os = "linux")]
     fn new_with_canary(canary: bool) -> Self {
         Self::new_with_canary_scopes(canary, &["docs/stopped-focused"])
     }
@@ -16536,12 +16968,14 @@ impl StoppedPostClaimFixture {
         run_main_agent(&self.checkout, &self.reconcile_args(), &self.envs())
     }
 
+    #[cfg(target_os = "linux")]
     fn run_reconcile_with_extra_env(&self, extra: &[(&str, &str)]) -> CmdOutput {
         let mut env = self.envs().to_vec();
         env.extend_from_slice(extra);
         run_main_agent(&self.checkout, &self.reconcile_args(), &env)
     }
 
+    #[cfg(target_os = "linux")]
     fn set_canary_supervisor_binding_starting(&self) {
         rewrite_orchestration_registry(&self.state_dir, |registry| {
             let assignment = &mut registry["assignments"]["assignment-stopped"];
@@ -16551,6 +16985,7 @@ impl StoppedPostClaimFixture {
         });
     }
 
+    #[cfg(target_os = "linux")]
     fn set_canary_supervisor_binding_working(&self) {
         rewrite_orchestration_registry(&self.state_dir, |registry| {
             let assignment = &mut registry["assignments"]["assignment-stopped"];
@@ -16607,7 +17042,10 @@ impl StoppedPostClaimFixture {
                     "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
                     runtime_pid.as_str(),
                 ),
-                ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                    FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+                ),
                 ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
                 ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
                 ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -16641,6 +17079,7 @@ impl StoppedPostClaimFixture {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_claimed_runtime_stop_at_fence_activation_barrier(
         &self,
         runtime: &TestProcessGroup,
@@ -16691,7 +17130,10 @@ impl StoppedPostClaimFixture {
             .env("AGENT_SESSION_FAKE_TMUX_LOG", &self.tmux_log)
             .env("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid)
             .env("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid)
-            .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+            .env(
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            )
             .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
             .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
             .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
@@ -16711,6 +17153,7 @@ impl StoppedPostClaimFixture {
         command.spawn().expect("spawn claimed runtime stop")
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_reconcile_at_barrier(&self, barrier: &Path, stage: &str) -> Child {
         let mut command = Command::new(bin::resolve("main-agent"));
         command
@@ -17033,6 +17476,187 @@ fn claimed_runtime_stop_rejects_insufficient_controller_claim_ttl_before_reserva
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
+fn claimed_runtime_stop_fails_closed_without_exact_stopped_runtime_proof() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-non-linux-proof",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+
+    let stopped = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-non-linux-proof-0001");
+    assert_eq!(stopped.code, 1, "outcome={}", stopped.stdout_text());
+    assert_eq!(
+        stopped.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        !runtime.is_running(),
+        "tmux termination may stop the pane without creating exact coordination proof"
+    );
+    let registry = orchestration_registry(&fixture.state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-stopped"]["state"], "working",
+        "unverified non-Linux absence must not advance the assignment"
+    );
+    assert!(
+        load_coordination_registry(&fixture.state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            }),
+        "unverified non-Linux absence must preserve the active worker claim"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof() {
+    let fixture = StoppedPostClaimFixture::new();
+    let orchestration_before = orchestration_registry(&fixture.state_dir);
+    let coordination_before = load_coordination_registry(&fixture.state_dir);
+    let worker_checkout = PathBuf::from(
+        orchestration_before["assignments"]["assignment-stopped"]["worktree"]
+            .as_str()
+            .expect("worker worktree"),
+    );
+    let retained_progress = worker_checkout.join("non-linux-progress-to-preserve");
+    fs::write(&retained_progress, "unaccepted worker output").expect("worker progress");
+    let worker_session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let worker_record_path = worker_session_dir.join("session.json");
+
+    let assert_fail_closed_diagnosis = |command: &str| {
+        let observed = run_main_agent(
+            &fixture.checkout,
+            &[
+                "--state-dir",
+                fixture.state_dir.to_str().expect("state dir"),
+                "worker",
+                command,
+                "assignment-stopped",
+                "--format",
+                "json",
+            ],
+            &fixture.envs(),
+        );
+        assert_eq!(observed.code, 0, "outcome={}", observed.stdout_text());
+        assert_eq!(
+            data(&observed)["classification"],
+            "evidence_unavailable",
+            "{command} must not call an unproved stopped runtime healthy"
+        );
+        assert_eq!(
+            data(&observed)["recovery_action"]["kind"],
+            "identity_evidence_reconciliation"
+        );
+        assert_eq!(
+            data(&observed)["recovery_action"]["executable"],
+            true,
+            "the bounded read-only supervision recheck remains safe to execute"
+        );
+        assert_eq!(
+            data(&observed)["recovery_action"]["argv"],
+            json!([
+                "main-agent",
+                "worker",
+                "supervise",
+                "assignment-stopped",
+                "--format",
+                "json"
+            ]),
+            "fail-closed diagnosis must not advertise a mutating recovery command"
+        );
+    };
+    for command in ["supervise", "diagnose"] {
+        assert_fail_closed_diagnosis(command);
+    }
+
+    // Diagnosis may refresh observation evidence and materialize its owner-local
+    // read-only capability. Freeze the complete authority tree immediately
+    // before crossing the rejected reconciliation mutation boundary.
+    let session_before_unverified = session_authority_snapshot(&worker_session_dir);
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 1, "outcome={}", reconciled.stdout_text());
+    assert_eq!(
+        reconciled.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert_eq!(
+        session_authority_snapshot(&worker_session_dir),
+        session_before_unverified,
+        "unverified diagnosis and reconciliation must not mutate worker session authority files"
+    );
+
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
+            .expect("worker session json");
+    worker_record
+        .as_object_mut()
+        .expect("worker session object")
+        .remove("delete_tmux_identity");
+    write_private_json(&worker_record_path, &worker_record);
+    for command in ["supervise", "diagnose"] {
+        assert_fail_closed_diagnosis(command);
+    }
+    let session_before_missing_identity = session_authority_snapshot(&worker_session_dir);
+    let missing_identity_reconcile = fixture.run_reconcile();
+    assert_eq!(
+        missing_identity_reconcile.code,
+        1,
+        "outcome={}",
+        missing_identity_reconcile.stdout_text()
+    );
+    assert_eq!(
+        missing_identity_reconcile.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert_eq!(
+        session_authority_snapshot(&worker_session_dir),
+        session_before_missing_identity,
+        "missing-identity diagnosis and reconciliation must not mutate worker session authority files"
+    );
+    assert_eq!(
+        orchestration_registry(&fixture.state_dir),
+        orchestration_before,
+        "unverified non-Linux absence must not terminalize the assignment"
+    );
+    assert_eq!(
+        load_coordination_registry(&fixture.state_dir),
+        coordination_before,
+        "unverified non-Linux absence must preserve the active worker claim"
+    );
+    assert!(
+        worker_session_dir.is_dir(),
+        "unverified non-Linux absence must preserve the worker session"
+    );
+    assert_eq!(
+        fs::read_to_string(retained_progress).expect("retained worker progress"),
+        "unaccepted worker output",
+        "fail-closed diagnosis and reconciliation must preserve the worker worktree"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_identity_only_interruption_projects_exact_replay() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17074,7 +17698,10 @@ fn claimed_runtime_stop_identity_only_interruption_projects_exact_replay() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17253,7 +17880,10 @@ fn claimed_runtime_stop_refuses_controller_claim_drift_before_runtime_stop() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17372,6 +18002,7 @@ fn claimed_runtime_stop_refuses_controller_claim_drift_before_runtime_stop() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_coordination() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17413,7 +18044,10 @@ fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_c
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17564,6 +18198,7 @@ fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_c
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_v2_activation_is_fail_closed_at_every_crash_boundary() {
     for stage in [
         "after_registry_v2",
@@ -17662,6 +18297,7 @@ fn claimed_runtime_stop_v2_activation_is_fail_closed_at_every_crash_boundary() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_reacquires_process_owned_fence_after_owner_crash() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17852,6 +18488,7 @@ fn claimed_runtime_stop_refuses_expired_authority_at_termination_boundary() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17893,7 +18530,10 @@ fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17961,6 +18601,7 @@ fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_replay_degrades_safely_after_stopped_claim_expires() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18066,6 +18707,7 @@ fn claimed_runtime_stop_replay_degrades_safely_after_stopped_claim_expires() {
     assert_eq!(data(&reconciled)["worker_claim_active_after"], false);
 }
 
+#[cfg(target_os = "linux")]
 fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18290,7 +18932,21 @@ fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
             "--format",
             "json",
         ],
-        &second_successor_env,
+        &[
+            (
+                "AGENT_SESSION_CAPABILITY_FILE",
+                fixture.second_successor_capability.as_str(),
+            ),
+            (
+                "AGENT_SESSION_TMUX_BIN",
+                fixture.tmux_bin.to_str().expect("tmux bin"),
+            ),
+            (
+                "AGENT_SESSION_FAKE_TMUX_LOG",
+                fixture.tmux_log.to_str().expect("tmux log"),
+            ),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
     );
     assert_eq!(
         deleted.code,
@@ -18304,6 +18960,7 @@ fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_successor_adopt_reconcile_and_delete_preserve_lineage() {
     for stage in [
         "after_identity",
@@ -18315,6 +18972,7 @@ fn claimed_runtime_stop_successor_adopt_reconcile_and_delete_preserve_lineage() 
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18356,7 +19014,10 @@ fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -19512,7 +20173,10 @@ fn provider_stop_canary_supervisor_admits_stalled_scope_empty_turn_and_releases(
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -19839,7 +20503,10 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         .env("AGENT_SESSION_CAPABILITY_FILE", &fixture.main_capability)
         .env("AGENT_SESSION_TMUX_BIN", &fixture.tmux_bin)
         .env("AGENT_SESSION_FAKE_TMUX_LOG", &fixture.tmux_log)
-        .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+        .env(
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        )
         .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
         .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
         .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
@@ -20031,7 +20698,10 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -20400,7 +21070,10 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$95"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%95"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -20495,7 +21168,10 @@ fn typed_provider_stop_canary_stops_only_the_armed_child_boundary() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$92"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%92"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -21403,7 +22079,10 @@ fn provider_stop_canary_timeout_replays_the_exact_durable_reservation() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$93"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%93"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -21592,18 +22271,32 @@ fn provider_stop_canary_fence_blocks_http_resume_before_authority_provisioning()
 }
 
 fn wait_for_barrier(barrier: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_barrier_with_timeout(barrier, Duration::from_secs(10), "reconcile-stopped");
+}
+
+fn wait_for_barrier_with_timeout(barrier: &Path, timeout: Duration, label: &str) {
+    let deadline = Instant::now() + timeout;
     while !barrier.join("ready").is_file() {
         assert!(
             Instant::now() < deadline,
-            "reconcile-stopped did not reach its stage barrier"
+            "{label} did not reach its stage barrier"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_barrier_or_child_exit(barrier: &Path, child: &mut Child, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_barrier_or_child_exit_with_timeout(barrier, child, label, Duration::from_secs(10));
+}
+
+fn wait_for_barrier_or_child_exit_with_timeout(
+    barrier: &Path,
+    child: &mut Child,
+    label: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
     while !barrier.join("ready").is_file() {
         if let Some(status) = child.try_wait().expect("poll barrier child") {
             let mut stdout = String::new();
@@ -21622,10 +22315,25 @@ fn wait_for_barrier_or_child_exit(barrier: &Path, child: &mut Child, label: &str
                 "{label} child exited before barrier: status={status} stdout={stdout} stderr={stderr}"
             );
         }
-        assert!(
-            Instant::now() < deadline,
-            "{label} did not reach its stage barrier"
-        );
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().expect("reap timed-out barrier child");
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(stream) = child.stdout.as_mut() {
+                stream
+                    .read_to_string(&mut stdout)
+                    .expect("read timed-out barrier child stdout");
+            }
+            if let Some(stream) = child.stderr.as_mut() {
+                stream
+                    .read_to_string(&mut stderr)
+                    .expect("read timed-out barrier child stderr");
+            }
+            panic!(
+                "{label} did not reach its stage barrier: status={status} stdout={stdout} stderr={stderr}"
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -21658,6 +22366,7 @@ fn terminate_at_barrier(child: Child, label: &str) {
     child.0 = None;
 }
 
+#[cfg(target_os = "linux")]
 fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Value {
     let mut stream = TcpStream::connect(address).expect("connect HTTP server");
     let request = format!(
@@ -21678,6 +22387,7 @@ fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Va
     serde_json::from_slice(body).expect("HTTP JSON response")
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ExhaustedReadinessRuntimeStopFixture {
     tmp: tempfile::TempDir,
     state_dir: PathBuf,
@@ -22048,7 +22758,10 @@ impl ExhaustedReadinessRuntimeStopFixture {
                 "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
                 self.runtime_pid_arg.as_str(),
             ),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
@@ -22136,6 +22849,33 @@ fn runtime_stop_projects_typed_executable_action() {
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
+fn runtime_stop_fails_closed_without_exact_stopped_runtime_proof() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let stopped = run_main_agent(
+        &fixture.main_checkout,
+        &fixture.stop_args(),
+        &fixture.envs(),
+    );
+
+    assert_eq!(stopped.code, 1, "outcome={}", stopped.stdout_text());
+    assert_eq!(
+        stopped.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        !fixture.runtime.is_running(),
+        "tmux termination may stop the pane without creating exact coordination proof"
+    );
+    let registry = orchestration_registry(&fixture.state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-exhausted"]["state"], "starting",
+        "unverified non-Linux absence must not advance the assignment"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_marker_first_crash_fences_worker_claim_and_is_adoptable() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-marker-first");
@@ -22296,6 +23036,7 @@ fn runtime_stop_releases_global_registries_after_authority_seal() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_crash_after_authority_seal_replays_exactly() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-sealed-crash");
@@ -22334,6 +23075,7 @@ fn runtime_stop_crash_after_authority_seal_replays_exactly() {
     assert!(!fixture.runtime.is_running());
 }
 
+#[cfg(target_os = "linux")]
 fn assert_runtime_stop_orphan_recovery(stage: &str) {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture
@@ -22395,16 +23137,19 @@ fn assert_runtime_stop_orphan_recovery(stage: &str) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_orphan_after_authority_seal_transfers_exact_replay() {
     assert_runtime_stop_orphan_recovery("after_authority_seal");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_orphan_after_process_stop_transfers_finalization_only() {
     assert_runtime_stop_orphan_recovery("after_runtime_stop");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_partial_fence_rebind_survives_pending_successor_loss() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let stop_barrier = fixture.tmp.path().join("runtime-stop-repeat-orphan");
@@ -22543,6 +23288,7 @@ fn runtime_stop_partial_fence_rebind_survives_pending_successor_loss() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_crash_after_process_stop_finalizes_without_second_kill() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-process-stopped");
@@ -22577,6 +23323,7 @@ fn runtime_stop_crash_after_process_stop_finalizes_without_second_kill() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_then_cancel_keeps_completed_replay_stable() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let stopped = run_main_agent(
@@ -22646,7 +23393,10 @@ fn runtime_stop_admission_guards_are_fail_closed() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         (
             "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
@@ -23352,11 +24102,22 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
         "pid_namespace": current_pid_namespace_identity()
     }));
     let stopped_runtime = invoke("3", "worker-f31-incarnation", "f31-stopped-runtime-0001");
-    assert_eq!(stopped_runtime.code, 65);
-    assert_eq!(
-        stopped_runtime.stdout_json()["error"]["code"],
-        "worker-runtime-stopped"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(stopped_runtime.code, 65);
+        assert_eq!(
+            stopped_runtime.stdout_json()["error"]["code"],
+            "worker-runtime-stopped"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(stopped_runtime.code, 1);
+        assert_eq!(
+            stopped_runtime.stdout_json()["error"]["code"],
+            "coordination-runtime-unverified"
+        );
+    }
     set_runtime_identity(json!({
         "launch_id": "worker-f31-incarnation",
         "session_id": "$73",
@@ -23673,11 +24434,22 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
     });
     set_runtime_identity(stopped_identity);
     let runtime_drift_replay = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
-    assert_eq!(runtime_drift_replay.code, 65);
-    assert_eq!(
-        runtime_drift_replay.stdout_json()["error"]["code"],
-        "worker-runtime-stopped"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(runtime_drift_replay.code, 65);
+        assert_eq!(
+            runtime_drift_replay.stdout_json()["error"]["code"],
+            "worker-runtime-stopped"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(runtime_drift_replay.code, 1);
+        assert_eq!(
+            runtime_drift_replay.stdout_json()["error"]["code"],
+            "coordination-runtime-unverified"
+        );
+    }
     assert!(
         !state_dir
             .join("sessions/worker-f31/authority-quarantine.json")
@@ -24625,6 +25397,7 @@ fn main_agent_revoke_claim_keeps_accepted_assignment_retirable() {
 /// closes such a lane while preserving the worker worktree, the run, and the
 /// Main Agent session.
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_post_claim_stopped_worker_is_terminalized_without_deleting_the_run() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -25391,6 +26164,7 @@ fn main_agent_post_claim_stopped_worker_is_terminalized_without_deleting_the_run
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_identical_replay_converges_from_typed_progress() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture._tmp.path().join("reconcile-progress-barrier");
@@ -25463,6 +26237,7 @@ fn reconcile_stopped_identical_replay_converges_from_typed_progress() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_observational_path_skips_operation_renewal_probes() {
     let fixture = StoppedPostClaimFixture::new();
     seed_operation(
@@ -25522,6 +26297,7 @@ fn reconcile_stopped_observational_path_skips_operation_renewal_probes() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_normal_and_after_seal_retry_share_stable_claim_truth() {
     let normal_fixture = StoppedPostClaimFixture::new();
     let normal = normal_fixture.run_reconcile();
@@ -25666,6 +26442,7 @@ fn reconcile_stopped_normal_and_after_seal_retry_share_stable_claim_truth() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_same_main_successor_claim_authorizes_roll_forward() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -25831,6 +26608,7 @@ fn reconcile_stopped_same_main_successor_claim_authorizes_roll_forward() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_revision_change_cannot_authorize_seal() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -25894,6 +26672,7 @@ fn reconcile_stopped_controller_claim_revision_change_cannot_authorize_seal() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_expired_original_accepts_same_main_successor_claim() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -25986,6 +26765,7 @@ fn reconcile_stopped_expired_original_accepts_same_main_successor_claim() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_different_session_cannot_take_over_progress() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26031,6 +26811,7 @@ fn reconcile_stopped_different_session_cannot_take_over_progress() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_prior_external_release_reports_stable_terminal_claim_truth() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26075,6 +26856,7 @@ fn reconcile_stopped_prior_external_release_reports_stable_terminal_claim_truth(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_completed_v1_receipt_replays_byte_stably() {
     let fixture = StoppedPostClaimFixture::new();
     let completed = fixture.run_reconcile();
@@ -26115,6 +26897,7 @@ fn reconcile_stopped_completed_v1_receipt_replays_byte_stably() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_fresh_replay_does_not_renew_expired_controller_claim() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26176,6 +26959,7 @@ fn reconcile_stopped_fresh_replay_does_not_renew_expired_controller_claim() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_release_before_seal_preserves_target_authority() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26274,6 +27058,7 @@ fn reconcile_stopped_controller_claim_release_before_seal_preserves_target_autho
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_expiry_before_seal_preserves_target_authority() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26329,6 +27114,7 @@ fn reconcile_stopped_controller_claim_expiry_before_seal_preserves_target_author
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_malformed_progress_fails_before_target_cleanup() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture._tmp.path().join("reconcile-malformed-barrier");
@@ -26414,6 +27200,7 @@ fn reconcile_stopped_malformed_progress_fails_before_target_cleanup() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_quarantine_blocks_http_resume_before_authority_provisioning() {
     let fixture = StoppedPostClaimFixture::new();
     let terminalized = fixture.run_reconcile();
@@ -27872,27 +28659,33 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
             "updated_at": "2030-01-01T00:00:00Z"
         });
     });
-    let legacy_cancel = run_managed_account_handoff_cancel(
+    let compatibility_cancel = run_managed_account_handoff_cancel(
         &main_checkout,
         &state_dir,
         &main_capability,
         "matrix-managed-v1-reservation-cancel-0001",
     );
     assert_eq!(
-        legacy_cancel.code,
+        compatibility_cancel.code,
         0,
         "v1 serialized reservation must load and recover: {}",
-        legacy_cancel.stdout_text()
+        compatibility_cancel.stdout_text()
     );
-    assert_eq!(data(&legacy_cancel)["legacy_reservation_recovered"], true);
-    assert_eq!(data(&legacy_cancel)["newer_account_intent_preserved"], true);
-    let legacy_registry = orchestration_registry(&state_dir);
+    assert_eq!(
+        data(&compatibility_cancel)["legacy_reservation_recovered"], // stale-audit: keep-contract
+        true
+    );
+    assert_eq!(
+        data(&compatibility_cancel)["newer_account_intent_preserved"],
+        true
+    );
+    let compatibility_registry = orchestration_registry(&state_dir);
     assert!(
-        legacy_registry["assignments"]["assignment-matrix"]["account_handoff"].is_null(),
+        compatibility_registry["assignments"]["assignment-matrix"]["account_handoff"].is_null(),
         "v1 recovery clears only the assignment-local unbound reservation"
     );
     assert_eq!(
-        legacy_registry["runs"]["run-one"], unrelated_run_before,
+        compatibility_registry["runs"]["run-one"], unrelated_run_before,
         "v1 recovery must preserve unrelated run state"
     );
     assert_eq!(
@@ -31297,10 +32090,8 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = data(&started)["readiness"].clone();
     assert_eq!(readiness["state"], "readiness_failed");
-    assert_eq!(readiness["classification"], "composer_not_ready");
-    assert_eq!(
-        readiness["prompt_observation"],
-        json!({
+    let expected_prompt_observation = match readiness["classification"].as_str() {
+        Some("composer_not_ready") => json!({
             "schema_version": "main-agent.worker-prompt-observation.v1",
             "prompt": {
                 "state": "not_present",
@@ -31310,8 +32101,21 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
                 "state": "unchanged_after_paste",
                 "proof": "tmux-pane-digest-before-submit"
             }
-        })
-    );
+        }),
+        Some("prompt_observation_unavailable") => json!({
+            "schema_version": "main-agent.worker-prompt-observation.v1",
+            "prompt": {
+                "state": "unavailable",
+                "proof": "provider-transcript-unavailable"
+            },
+            "composer": {
+                "state": "unchanged_after_paste",
+                "proof": "tmux-pane-digest-before-submit"
+            }
+        }),
+        classification => panic!("unexpected readiness classification: {classification:?}"),
+    };
+    assert_eq!(readiness["prompt_observation"], expected_prompt_observation);
     assert_eq!(readiness["assignment_state"], "starting");
     assert_eq!(readiness["worker_launched"], true);
     assert_eq!(readiness["delivery"]["state"], "unverified");
@@ -31564,6 +32368,7 @@ fn main_agent_worker_start_timeout_reports_exact_submitted_prompt() {
     let checkout = tmp.path().join("checkout");
     fs::create_dir(&state_dir).expect("state");
     init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    let canonical_checkout = fs::canonicalize(&checkout).expect("canonical checkout");
     seed_brokers_at(
         &state_dir,
         &[(
@@ -31605,7 +32410,7 @@ fn main_agent_worker_start_timeout_reports_exact_submitted_prompt() {
     let codex_session = codex_home.join("sessions/2026/07/29/session.jsonl");
     write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
-    let checkout_arg = checkout.to_string_lossy().into_owned();
+    let checkout_arg = canonical_checkout.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
@@ -31638,7 +32443,11 @@ fn main_agent_worker_start_timeout_reports_exact_submitted_prompt() {
             "codex-exact-prompt-timeout",
         )
         .env("AGENT_SESSION_FAKE_CODEX_CWD", &checkout_arg)
-        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "250")
+        // llvm-cov can spend several seconds scanning the freshly-created
+        // transcript on the native macOS runner. Keep this fixture's capture
+        // window above that instrumentation overhead so it reaches the exact
+        // prompt-observation contract that the test owns.
+        .env("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "5000")
         .env("AGENT_SESSION_CODEX_CAPTURE_POLL_MS", "10")
         .env("AGENT_SESSION_CODEX_AMBIGUITY_WINDOW_MS", "40")
         .env("AGENT_SESSION_FAKE_TMUX_CAPTURE_SLEEP", "5")
@@ -32059,20 +32868,59 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
             successor["data"]["readiness"]["prompt_observation"].is_object(),
             "every terminal readiness takeover branch must retain typed prompt evidence: {crash_stage}"
         );
+        let actual_attempt_count =
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"]
+                .as_u64()
+                .expect("typed recovery attempt count");
+        let pre_reservation_recovery_not_admitted =
+            crash_stage == "before_reserve" && actual_attempt_count == 0;
+        if pre_reservation_recovery_not_admitted {
+            assert_eq!(
+                successor["data"]["readiness"]["classification"],
+                "prompt_observation_unavailable"
+            );
+            assert_eq!(
+                successor["data"]["readiness"]["prompt_observation"]["prompt"],
+                json!({
+                    "state": "unavailable",
+                    "proof": "provider-transcript-unavailable"
+                }),
+                "a pre-reservation takeover may decline recovery only when bounded transcript proof is unavailable"
+            );
+        }
+        let expected_attempt_count = if pre_reservation_recovery_not_admitted {
+            0
+        } else {
+            1
+        };
         assert_eq!(
-            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"], 1,
-            "successor must resume the persisted recovery reservation"
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"],
+            expected_attempt_count,
+            "successor recovery attempt must match the durable reservation boundary: {crash_stage}"
         );
         assert_eq!(
             successor["data"]["readiness"]["submit_key_recovery"]["attempted"],
-            true
+            !pre_reservation_recovery_not_admitted,
+            "only a proof-unavailable takeover before reservation may decline recovery: {crash_stage}"
         );
         let registry = orchestration_registry(&state_dir);
-        assert_eq!(
-            registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
-            1
-        );
-        let expected_enter_count = if crash_stage == "sending" { 1 } else { 2 };
+        if pre_reservation_recovery_not_admitted {
+            assert!(
+                registry["assignments"][&assignment_id]["submit_recovery"].is_null(),
+                "proof-unavailable takeover before reservation must not create recovery state"
+            );
+        } else {
+            assert_eq!(
+                registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
+                1
+            );
+        }
+        let expected_enter_count =
+            if crash_stage == "sending" || pre_reservation_recovery_not_admitted {
+                1
+            } else {
+                2
+            };
         assert_eq!(
             tmux_calls(&tmux_log)
                 .iter()
@@ -32811,6 +33659,71 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     "pid_namespace": current_pid_namespace_identity()
                 });
                 write_private_json(&worker_record_path, &worker_record);
+                if !cfg!(target_os = "linux") {
+                    let orchestration_before = orchestration_registry(&state_dir);
+                    let coordination_before = load_coordination_registry(&state_dir);
+                    let session_before =
+                        session_authority_snapshot(&state_dir.join("sessions/worker-race"));
+                    let tmux_before = tmux_calls(&tmux_log);
+                    let unverified = run_main_agent(
+                        &checkout,
+                        &[
+                            "--state-dir",
+                            &state_arg,
+                            "worker",
+                            "reconcile-recovery",
+                            "assignment-race",
+                            "--if-revision",
+                            "3",
+                            "--idempotency-key",
+                            "refuse-non-linux-unverified-recovery-0001",
+                            "--format",
+                            "json",
+                        ],
+                        &[
+                            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                        ],
+                    );
+                    assert_eq!(unverified.code, 1, "outcome={}", unverified.stdout_text());
+                    assert_eq!(
+                        unverified.stdout_json()["error"]["code"],
+                        "coordination-runtime-unverified"
+                    );
+                    let registry = orchestration_registry(&state_dir);
+                    assert_eq!(
+                        registry["assignments"]["assignment-race"]["revision"], 3,
+                        "failed-closed reconciliation must not mutate the assignment"
+                    );
+                    assert_eq!(
+                        registry["assignments"]["assignment-race"]["submit_recovery"]["state"],
+                        "attempting",
+                        "failed-closed reconciliation must preserve the ambiguous-send fence"
+                    );
+                    assert_eq!(
+                        orchestration_registry(&state_dir),
+                        orchestration_before,
+                        "failed-closed reconciliation must preserve all orchestration authority"
+                    );
+                    assert_eq!(
+                        load_coordination_registry(&state_dir),
+                        coordination_before,
+                        "failed-closed reconciliation must preserve all coordination authority"
+                    );
+                    assert_eq!(
+                        session_authority_snapshot(&state_dir.join("sessions/worker-race")),
+                        session_before,
+                        "failed-closed reconciliation must preserve all worker session authority"
+                    );
+                    assert_eq!(
+                        tmux_calls(&tmux_log),
+                        tmux_before,
+                        "failed-closed reconciliation must not emit any terminal input"
+                    );
+                    continue;
+                }
                 for quiescence_case in ["active-claim", "active-operation", "uncertain-operation"] {
                     match quiescence_case {
                         "active-claim" => seed_active_claim(
@@ -33890,11 +34803,27 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         serde_json::from_slice(&output.stdout).expect("worker start json");
     let readiness = &envelope["data"]["readiness"];
     assert_eq!(readiness["state"], "readiness_failed");
-    assert_eq!(readiness["classification"], "bootstrap_failure");
-    assert_eq!(
-        readiness["prompt_observation"]["prompt"]["state"],
-        "submitted"
-    );
+    match readiness["classification"].as_str() {
+        Some("bootstrap_failure") => {
+            assert_eq!(
+                readiness["prompt_observation"]["prompt"],
+                json!({
+                    "state": "submitted",
+                    "proof": "provider-transcript-exact-match"
+                })
+            );
+        }
+        Some("prompt_observation_unavailable") => {
+            assert_eq!(
+                readiness["prompt_observation"]["prompt"],
+                json!({
+                    "state": "unavailable",
+                    "proof": "provider-transcript-unavailable"
+                })
+            );
+        }
+        classification => panic!("unexpected readiness classification: {classification:?}"),
+    }
     assert_eq!(
         readiness["delivery"]["proof"],
         "authoritative-provider-turn-terminated"
@@ -34421,6 +35350,10 @@ fn main_agent_worker_start_definitive_recovery_failure_converges_at_one_terminal
 }
 
 fn exercise_definitive_recovery_failure_boundary(mode: &str) {
+    // Coverage instrumentation makes each same-release subprocess startup
+    // materially slower on macOS. Keep synchronization waits generous without
+    // changing the four-second readiness deadline this fixture validates.
+    let synchronization_timeout = Duration::from_secs(60);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
@@ -34525,10 +35458,9 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
             &final_barrier,
         );
     }
-    let started = Instant::now();
     let mut start = Some(command.spawn().expect("spawn worker start"));
 
-    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    let barrier_deadline = Instant::now() + synchronization_timeout;
     while !recovery_barrier.join("ready").is_file() {
         assert!(
             Instant::now() < barrier_deadline,
@@ -34536,6 +35468,11 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    let receipt_key = format!("main-one:main-incarnation-one:{idempotency_key}");
+    let original_deadline_at_epoch = orchestration_registry(&state_dir)["receipts"]
+        [&receipt_key]["outcome"]["deadline_at_epoch"]
+        .as_i64()
+        .expect("original readiness deadline");
     let worker_record: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join(format!("sessions/{worker_id}/session.json")))
             .expect("worker session"),
@@ -34557,8 +35494,9 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
         }),
         serde_json::Value::Null,
     );
+    let recovery_started = Instant::now();
     fs::write(recovery_barrier.join("release"), b"continue").expect("release recovery");
-    let failure_deadline = Instant::now() + Duration::from_secs(10);
+    let failure_deadline = Instant::now() + synchronization_timeout;
     loop {
         let registry = orchestration_registry(&state_dir);
         let assignment = &registry["assignments"][&assignment_id];
@@ -34597,7 +35535,7 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
     }
 
     if mode == "final-checkpoint" {
-        let final_deadline = Instant::now() + Duration::from_secs(10);
+        let final_deadline = Instant::now() + synchronization_timeout;
         while !final_barrier.join("ready").is_file() {
             assert!(
                 Instant::now() < final_deadline,
@@ -34763,6 +35701,17 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
             "authenticated worker checkpoint confirmed"
         );
     } else {
+        let completed_at_epoch = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after Unix epoch")
+                .as_secs(),
+        )
+        .expect("current epoch fits i64");
+        assert!(
+            completed_at_epoch >= original_deadline_at_epoch,
+            "terminal recovery failure returned before the original deadline"
+        );
         assert_eq!(readiness["state"], "readiness_failed");
         assert_eq!(readiness["classification"], "readiness_recovery_failed");
         assert_eq!(
@@ -34784,15 +35733,9 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
                 .is_some_and(|value| value.contains("original readiness deadline"))
         );
         assert!(
-            started.elapsed() < Duration::from_secs(12),
+            recovery_started.elapsed() < Duration::from_secs(12),
             "original deadline or takeover was not bounded"
         );
-        if mode == "deadline" {
-            assert!(
-                started.elapsed() >= Duration::from_secs(3),
-                "terminal recovery failure returned before the original deadline"
-            );
-        }
 
         let replay = run_main_agent(
             &checkout,

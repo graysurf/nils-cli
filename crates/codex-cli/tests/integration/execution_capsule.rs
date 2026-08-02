@@ -242,17 +242,23 @@ fi
 
 # Report what the child actually received as its CODEX_HOME.
 if [ -n "${CODEX_CAPSULE_HOME_REPORT_DIR:-}" ]; then
+  stat_mode() {
+    if stat -c '%a' "$1" 2>/dev/null; then
+      return
+    fi
+    stat -f '%Lp' "$1"
+  }
   mkdir -p "$CODEX_CAPSULE_HOME_REPORT_DIR"
   printf '%s\n' "${CODEX_HOME:-}" > "$CODEX_CAPSULE_HOME_REPORT_DIR/codex-home"
   printf '%s\n' "$*" > "$CODEX_CAPSULE_HOME_REPORT_DIR/child-argv"
   { env | sort; } > "$CODEX_CAPSULE_HOME_REPORT_DIR/child-env" || true
   if [ -n "${CODEX_HOME:-}" ] && [ -d "${CODEX_HOME:-}" ]; then
-    stat -c '%a' "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-mode"
+    stat_mode "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-mode"
     ls -A "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-entries"
     for name in config.toml AGENTS.md hooks.json; do
       if [ -f "$CODEX_HOME/$name" ]; then
         cp "$CODEX_HOME/$name" "$CODEX_CAPSULE_HOME_REPORT_DIR/$name"
-        stat -c '%a' "$CODEX_HOME/$name" > "$CODEX_CAPSULE_HOME_REPORT_DIR/$name.mode"
+        stat_mode "$CODEX_HOME/$name" > "$CODEX_CAPSULE_HOME_REPORT_DIR/$name.mode"
       fi
     done
     if [ -L "$CODEX_HOME/auth.json" ]; then
@@ -447,6 +453,7 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
+    let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
     let capsule = write_capsule(temp.path(), &workspace, "workspace");
     let (bin_dir, argv_log, codex_home) = write_codex_stub(temp.path());
 
@@ -561,7 +568,7 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
             "exec",
             "--skip-git-repo-check",
             "-C",
-            workspace.to_str().unwrap()
+            canonical_workspace.to_str().unwrap()
         ]
     );
     assert_eq!(&argv[6..9], &["--sandbox", "workspace-write", "--json"]);
@@ -950,6 +957,7 @@ fn snapshot_preserves_argv0_and_exposes_explicit_capsule_paths() {
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("workspace");
     let capsule = write_capsule(temp.path(), &workspace, "workspace");
+    let canonical_capsule = fs::canonicalize(&capsule).expect("canonical capsule");
     replace_script(
         &capsule,
         b"#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s|%s|%s|%s|%s\\n' \"$0\" \"$#\" \"${BASH_SOURCE[0]}\" \"$EXECUTION_CAPSULE_DIR\" \"$EXECUTION_CAPSULE_ENTRYPOINT\" > snapshot-context\n",
@@ -992,9 +1000,9 @@ fn snapshot_preserves_argv0_and_exposes_explicit_capsule_paths() {
         context,
         format!(
             "{}|0|/dev/stdin|{}|{}\n",
-            capsule.join("run.sh").display(),
-            capsule.display(),
-            capsule.join("run.sh").display()
+            canonical_capsule.join("run.sh").display(),
+            canonical_capsule.display(),
+            canonical_capsule.join("run.sh").display()
         )
     );
 }

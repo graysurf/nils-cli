@@ -7509,7 +7509,12 @@ mod tests {
 
                         let fifo = CString::new(path.as_os_str().as_bytes())
                             .expect("fifo private target path");
-                        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), SECRET_FILE_MODE) }, 0);
+                        assert_eq!(
+                            unsafe {
+                                libc::mkfifo(fifo.as_ptr(), SECRET_FILE_MODE as libc::mode_t)
+                            },
+                            0
+                        );
                         let fifo_path = path.to_path_buf();
                         thread::spawn(move || {
                             let deadline = Instant::now() + Duration::from_millis(500);
@@ -7591,7 +7596,12 @@ mod tests {
 
                             let fifo = CString::new(path.as_os_str().as_bytes())
                                 .expect("fifo marker path");
-                            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), SECRET_FILE_MODE) }, 0);
+                            assert_eq!(
+                                unsafe {
+                                    libc::mkfifo(fifo.as_ptr(), SECRET_FILE_MODE as libc::mode_t)
+                                },
+                                0
+                            );
                             let fifo_path = path.to_path_buf();
                             thread::spawn(move || {
                                 let deadline = Instant::now() + Duration::from_millis(500);
@@ -8045,7 +8055,7 @@ mod tests {
         fs::remove_file(&registry).expect("remove registry symlink");
         let registry_c = CString::new(registry.as_os_str().as_bytes()).expect("registry path");
         assert_eq!(
-            unsafe { libc::mkfifo(registry_c.as_ptr(), SECRET_FILE_MODE) },
+            unsafe { libc::mkfifo(registry_c.as_ptr(), SECRET_FILE_MODE as libc::mode_t) },
             0,
             "create registry fifo fixture"
         );
@@ -8104,7 +8114,9 @@ mod tests {
                     let rollback_c =
                         CString::new(rollback.as_os_str().as_bytes()).expect("rollback path");
                     assert_eq!(
-                        unsafe { libc::mkfifo(rollback_c.as_ptr(), SECRET_FILE_MODE) },
+                        unsafe {
+                            libc::mkfifo(rollback_c.as_ptr(), SECRET_FILE_MODE as libc::mode_t)
+                        },
                         0,
                         "create rollback fifo fixture"
                     );
@@ -8160,7 +8172,9 @@ mod tests {
                     let rollback_c =
                         CString::new(rollback.as_os_str().as_bytes()).expect("rollback path");
                     assert_eq!(
-                        unsafe { libc::mkfifo(rollback_c.as_ptr(), SECRET_FILE_MODE) },
+                        unsafe {
+                            libc::mkfifo(rollback_c.as_ptr(), SECRET_FILE_MODE as libc::mode_t)
+                        },
                         0,
                         "replacement rollback fifo"
                     );

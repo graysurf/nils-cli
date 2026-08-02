@@ -20,6 +20,7 @@ nils-screen-record
 nils-secrets
 nils-api-testing-core
 nils-cli-template
+nils-scrub
 nils-claude-cli
 nils-codex-cli
 nils-opencode-cli
@@ -30,7 +31,6 @@ nils-git-lock
 nils-git-scope
 nils-image-processing
 nils-zsh-kit
-nils-scrub
 nils-evidence
 nils-plan-archive
 nils-plan-tooling

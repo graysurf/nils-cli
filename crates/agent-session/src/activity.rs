@@ -1384,6 +1384,93 @@ pub(crate) fn activate_runtime(
     activate_runtime_in_dir(&session_dir(context, &record.id), record)
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn activate_new_runtime_with(
+    record: &SessionRecord,
+    mut write: impl FnMut(&str, &[u8]) -> Result<(), CliError>,
+) -> Result<TurnState, CliError> {
+    let runtime = record.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    if runtime.launch_id.is_empty() {
+        return Err(CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+
+    let state = starting_state(runtime.started_at.clone(), 1, None);
+    let document = activity_document_for_runtime(
+        record,
+        &runtime.launch_id,
+        runtime.generation,
+        state.clone(),
+        Map::new(),
+    )?;
+
+    let expected_len = REPLAY_HEADER_BYTES + REPLAY_SLOT_COUNT * REPLAY_SLOT_BYTES;
+    let mut replay = vec![0_u8; expected_len];
+    replay[..REPLAY_HEADER_BYTES]
+        .copy_from_slice(&replay_header(&runtime.launch_id, runtime.generation));
+    write(ACTIVITY_REPLAY_FILE, &replay)?;
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|err| {
+        CliError::runtime(
+            "activity-render-failed",
+            format!("failed to render activity snapshot: {err}"),
+            None,
+        )
+    })?;
+    write(ACTIVITY_FILE, &bytes)?;
+    Ok(state)
+}
+
+fn activity_document_for_runtime(
+    record: &SessionRecord,
+    runtime_id: &str,
+    runtime_generation: u64,
+    state: TurnState,
+    extra: Map<String, Value>,
+) -> Result<ActivityDocument, CliError> {
+    Ok(ActivityDocument {
+        schema_version: ACTIVITY_DOCUMENT_VERSION.to_string(),
+        runtime_id: runtime_id.to_string(),
+        runtime_generation,
+        state,
+        pending_attention: Vec::new(),
+        overflow_attention: None,
+        seen_event_count: 0,
+        last_semantic_event: None,
+        last_semantic_event_at: None,
+        last_provider_event_kind: None,
+        last_provider_event_provider: None,
+        last_provider_event_at: None,
+        last_provider_event_turn_id: None,
+        provider_session_id: record
+            .provider_resume
+            .as_ref()
+            .filter(|resume| resume.provider == record.agent)
+            .map(|resume| {
+                projected_provider_identifier(
+                    runtime_id,
+                    AgentKind::from_name(&record.agent).expect("validated session agent"),
+                    "session",
+                    &resume.session_id,
+                )
+            })
+            .transpose()?,
+        last_event_at: None,
+        pending_journal: None,
+        runtime_unhealthy_reason: None,
+        operator_provider_turn_receipts: Vec::new(),
+        extra,
+    })
+}
+
 pub(crate) fn activate_runtime_in_dir(
     dir: &Path,
     record: &SessionRecord,
@@ -1476,41 +1563,11 @@ pub(crate) fn activate_runtime_in_dir(
         state.extra = document.state.extra.clone();
         state.source.extra = document.state.source.extra.clone();
     }
-    let mut document = ActivityDocument {
-        schema_version: ACTIVITY_DOCUMENT_VERSION.to_string(),
-        runtime_id: runtime_id.to_string(),
-        runtime_generation,
-        state,
-        pending_attention: Vec::new(),
-        overflow_attention: None,
-        seen_event_count: 0,
-        last_semantic_event: None,
-        last_semantic_event_at: None,
-        last_provider_event_kind: None,
-        last_provider_event_provider: None,
-        last_provider_event_at: None,
-        last_provider_event_turn_id: None,
-        provider_session_id: record
-            .provider_resume
-            .as_ref()
-            .filter(|resume| resume.provider == record.agent)
-            .map(|resume| {
-                projected_provider_identifier(
-                    runtime_id,
-                    AgentKind::from_name(&record.agent).expect("validated session agent"),
-                    "session",
-                    &resume.session_id,
-                )
-            })
-            .transpose()?,
-        last_event_at: None,
-        pending_journal: None,
-        runtime_unhealthy_reason: None,
-        operator_provider_turn_receipts: Vec::new(),
-        extra: existing
-            .take()
-            .map_or_else(Map::new, |document| document.extra),
-    };
+    let extra = existing
+        .take()
+        .map_or_else(Map::new, |document| document.extra);
+    let mut document =
+        activity_document_for_runtime(record, runtime_id, runtime_generation, state, extra)?;
     write_document(&path, &mut document)?;
     remove_runtime_unhealthy_marker(dir)?;
     Ok(document.state)

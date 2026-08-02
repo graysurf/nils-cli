@@ -630,7 +630,7 @@ fn removed_flags_are_unknown_and_never_mutate() {
             "docs(policy): reject removed flag",
             &head,
             None,
-            &[removed, "obsolete", "--dry-run"],
+            &[removed, "unsupported", "--dry-run"],
         );
 
         assert_eq!(

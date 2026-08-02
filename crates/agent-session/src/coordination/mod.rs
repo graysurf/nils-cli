@@ -1799,6 +1799,7 @@ pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<()
     broker::prepare(context, record)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare_in_dir(session_dir: &Path, _record: &SessionRecord) -> Result<(), CliError> {
     broker::prepare_in_dir(session_dir)
 }

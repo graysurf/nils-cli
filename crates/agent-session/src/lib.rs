@@ -18,8 +18,10 @@ use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
@@ -85,6 +87,7 @@ const PROVIDER_STOP_CANARY_STOPPED_FILE: &str = ".provider-stop-canary-stopped.j
 const PROVIDER_STOP_CANARY_RELEASE_FILE: &str = ".provider-stop-canary-release.json";
 const PROVIDER_STOP_CANARY_STARTUP_FAILURE_FILE: &str = ".provider-stop-canary-startup-failed.json";
 const PROVIDER_STOP_CANARY_RUNTIME_FAILURE_FILE: &str = ".provider-stop-canary-runtime-failed.json";
+#[cfg(target_os = "linux")]
 const PROVIDER_STOP_CANARY_CONTROL_SOCKET_PREFIX: &str = "nils-provider-stop-canary-control-";
 const PROVIDER_STOP_CANARY_SUPERVISOR_LOCK_FILE: &str = ".provider-stop-canary-supervisor.lock";
 const PROVIDER_STOP_CANARY_HOLD: Duration = Duration::from_secs(120);
@@ -1816,6 +1819,7 @@ struct StartLifecycleGuards<'a> {
     pre_runtime_release: PreRuntimeReleaseGuard<'a>,
     post_runtime_release: SessionStartGuard<'a>,
     post_prompt_delivery: SessionStartGuard<'a>,
+    ambiguous_prompt_delivery: SessionStartGuard<'a>,
     definitive_failure: SessionStartGuard<'a>,
 }
 
@@ -2149,20 +2153,37 @@ fn start_session_with_create_guard(
             }
         }
     }
-    if created.record.provider_resume.is_none()
-        && let Some(provider_resume) =
-            capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
-    {
-        let persisted_before_capture = created.record.clone();
-        created.record.provider_resume = Some(provider_resume);
-        if write_session_record(context, &created.record).is_err() {
-            created.record = load_session_record(context, &created.record.id)
-                .unwrap_or(persisted_before_capture);
-        }
+    let provider_resume_persistence = if prompt_delivery_error.is_some() {
+        ProviderResumePersistence::ReceiptOnly
+    } else {
+        ProviderResumePersistence::BestEffort
+    };
+    capture_and_persist_provider_resume_after_launch(
+        context,
+        args.agent,
+        &mut created.record,
+        launch_started_at,
+        provider_resume_persistence,
+    )?;
+    if prompt_delivery_error.is_some() && created.record.provider_resume.is_none() {
+        capture_and_persist_provider_resume_after_launch(
+            context,
+            args.agent,
+            &mut created.record,
+            launch_started_at,
+            provider_resume_persistence,
+        )?;
     }
-
     let status = session_status(&tmux_bin, &created.record);
-    reconcile_owned_startup_projection(context, &mut created.record, &status);
+    if prompt_delivery_error.is_none() {
+        reconcile_owned_startup_projection(context, &mut created.record, &status);
+    }
+    if prompt_delivery_error.is_some()
+        && let Some(guard) = lifecycle_guards.ambiguous_prompt_delivery.as_mut()
+        && let Err(error) = guard(&created.record)
+    {
+        return Err(error);
+    }
     let result = session_view(context, &created.record, Some(status), Some(&tmux_bin));
     record_workdir_usage(context, &cwd);
     // Keep the app-server bootstrap marker valid for the entire create-lock
@@ -2599,19 +2620,7 @@ impl PrivateSessionDirGuard {
         {
             use std::os::unix::ffi::OsStrExt;
 
-            let descriptor_path = self.session_descriptor_path();
-            if let Ok(entries) = fs::read_dir(&descriptor_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let result = match entry.file_type() {
-                        Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {
-                            fs::remove_dir_all(path)
-                        }
-                        _ => fs::remove_file(path),
-                    };
-                    let _ = result;
-                }
-            }
+            clear_private_directory_at(&self.session_directory);
             let name = self
                 .session_path
                 .file_name()
@@ -2626,18 +2635,34 @@ impl PrivateSessionDirGuard {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn session_descriptor_path(&self) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        let descriptor_root = Path::new("/proc/self/fd");
-        #[cfg(not(target_os = "linux"))]
-        let descriptor_root = Path::new("/dev/fd");
-        descriptor_root.join(self.session_directory.as_raw_fd().to_string())
+        Path::new("/proc/self/fd").join(self.session_directory.as_raw_fd().to_string())
     }
 
     #[cfg(not(unix))]
     fn session_descriptor_path(&self) -> PathBuf {
         self.session_path.clone()
+    }
+
+    #[cfg(unix)]
+    fn write_private_file(&self, name: &str, bytes: &[u8]) -> Result<(), CliError> {
+        write_private_file_at(
+            &self.session_directory,
+            &self.session_path.join(name),
+            name,
+            bytes,
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn write_private_file(&self, name: &str, bytes: &[u8]) -> Result<(), CliError> {
+        write_private_file(&self.session_path.join(name), bytes)
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn create_private_dir(&self, name: &str) -> Result<(), CliError> {
+        create_private_dir_at(&self.session_directory, &self.session_path.join(name), name)
     }
 }
 
@@ -2715,10 +2740,7 @@ fn create_record_with_guard(
     let prompt_file = match request.prompt {
         Some(prompt) => {
             let path = session_dir.join("prompt.md");
-            if let Err(error) = write_private_file(
-                &session_storage.session_descriptor_path().join("prompt.md"),
-                prompt.as_bytes(),
-            ) {
+            if let Err(error) = session_storage.write_private_file("prompt.md", prompt.as_bytes()) {
                 session_storage.cleanup_if_current();
                 return Err(error);
             }
@@ -2779,9 +2801,17 @@ fn create_record_with_guard(
         session_storage.cleanup_if_current();
         return Err(error);
     }
-    if let Err(err) =
-        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record)
-    {
+    #[cfg(target_os = "linux")]
+    let activity_result =
+        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let activity_result = activity::activate_new_runtime_with(&record, |name, bytes| {
+        session_storage.write_private_file(name, bytes)
+    });
+    #[cfg(not(unix))]
+    let activity_result =
+        activity::activate_runtime_in_dir(&session_storage.session_descriptor_path(), &record);
+    if let Err(err) = activity_result {
         session_storage.cleanup_if_current();
         return Err(err);
     }
@@ -2789,9 +2819,15 @@ fn create_record_with_guard(
         session_storage.cleanup_if_current();
         return Err(error);
     }
-    if let Err(err) =
-        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record)
-    {
+    #[cfg(target_os = "linux")]
+    let coordination_result =
+        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let coordination_result = session_storage.create_private_dir("coordination");
+    #[cfg(not(unix))]
+    let coordination_result =
+        coordination::prepare_in_dir(&session_storage.session_descriptor_path(), &record);
+    if let Err(err) = coordination_result {
         session_storage.cleanup_if_current();
         return Err(err);
     }
@@ -2851,7 +2887,6 @@ fn write_initial_session_record(
             None,
         )
     })?;
-    let directory = storage.session_descriptor_path();
     if let Some(sidecar) = durable_resume_record(record) {
         let sidecar_bytes = serde_json::to_vec_pretty(&sidecar).map_err(|err| {
             CliError::runtime(
@@ -2860,9 +2895,9 @@ fn write_initial_session_record(
                 None,
             )
         })?;
-        write_private_file(&directory.join(SESSION_RESUME_FILE), &sidecar_bytes)?;
+        storage.write_private_file(SESSION_RESUME_FILE, &sidecar_bytes)?;
     }
-    write_private_file(&directory.join("session.json"), &bytes)
+    storage.write_private_file("session.json", &bytes)
 }
 
 #[derive(Debug, Default)]
@@ -3270,6 +3305,7 @@ fn current_runtime_helper() -> Result<PathBuf, CliError> {
     Ok(executable)
 }
 
+#[cfg(target_os = "linux")]
 fn configure_provider_stop_canary(
     context: &CliContext,
     record: &mut SessionRecord,
@@ -3279,12 +3315,6 @@ fn configure_provider_stop_canary(
     if !armed {
         return Ok(());
     }
-    #[cfg(not(target_os = "linux"))]
-    return Err(CliError::usage(
-        "provider-stop-canary-platform-unsupported",
-        "the provider stop canary requires Linux exact-process identity evidence",
-        None,
-    ));
     if AgentKind::from_name(&record.agent) != Some(AgentKind::Codex) {
         return Err(CliError::usage(
             "provider-stop-canary-agent-unsupported",
@@ -3324,6 +3354,35 @@ fn configure_provider_stop_canary(
         }),
     );
     write_session_record(context, record)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_provider_stop_canary(
+    _context: &CliContext,
+    _record: &mut SessionRecord,
+    armed: bool,
+    _assignment_id: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_provider_stop_canary_platform_supported(armed)
+}
+
+pub(crate) fn ensure_provider_stop_canary_platform_supported(armed: bool) -> Result<(), CliError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = armed;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if armed {
+            return Err(CliError::usage(
+                "provider-stop-canary-platform-unsupported",
+                "the provider stop canary requires Linux exact-process identity evidence",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn provider_stop_canary_armed(record: &SessionRecord) -> bool {
@@ -3574,12 +3633,12 @@ pub(crate) fn provider_stop_canary_startup_error(stage: &str, failure_code: &str
     )
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn await_provider_stop_canary_startup(
     context: &CliContext,
     record: &SessionRecord,
     timeout: Duration,
 ) -> Result<(u32, u64), CliError> {
-    #[cfg(target_os = "linux")]
     let ((controller_session_id, controller_session_incarnation), address) = {
         let controller = provider_stop_canary_controller_reference(context, record)
             .map_err(|error| provider_stop_canary_startup_error("controller", error.code()))?;
@@ -3601,7 +3660,6 @@ pub(crate) fn await_provider_stop_canary_startup(
                 "provider-stop-canary-startup-timeout",
             ));
         }
-        #[cfg(target_os = "linux")]
         match query_provider_stop_canary_startup(
             context,
             record,
@@ -3616,17 +3674,24 @@ pub(crate) fn await_provider_stop_canary_startup(
                 return Err(provider_stop_canary_startup_error("guardian", error.code()));
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        return Err(provider_stop_canary_startup_error(
-            "controller",
-            "provider-stop-canary-platform-unsupported",
-        ));
         thread::sleep(
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(25)),
         );
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn await_provider_stop_canary_startup(
+    _context: &CliContext,
+    _record: &SessionRecord,
+    _timeout: Duration,
+) -> Result<(u32, u64), CliError> {
+    Err(provider_stop_canary_startup_error(
+        "controller",
+        "provider-stop-canary-platform-unsupported",
+    ))
 }
 
 pub(crate) fn provider_stop_canary_startup_wait() -> Duration {
@@ -3821,6 +3886,7 @@ fn acquire_provider_stop_canary_supervisor_lock(
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_provider_stop_canary_wrapper_identity(
     context: &CliContext,
     initial: &SessionRecord,
@@ -3878,6 +3944,19 @@ fn wait_for_provider_stop_canary_wrapper_identity(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn wait_for_provider_stop_canary_wrapper_identity(
+    _context: &CliContext,
+    _initial: &SessionRecord,
+) -> Result<SessionRecord, CliError> {
+    Err(CliError::data(
+        "provider-stop-canary-platform-unsupported",
+        "the provider stop canary wrapper is supported only on Linux",
+        None,
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn provider_stop_canary_wrapper_identity_wait() -> Duration {
     #[cfg(debug_assertions)]
     if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_PROVIDER_STOP_CANARY_WRAPPER_IDENTITY_MS")
@@ -6698,6 +6777,23 @@ pub(crate) fn authorize_provider_stop_canary_transition(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn authorize_provider_stop_canary_transition(
+    _context: &CliContext,
+    _record: &SessionRecord,
+    _controller_session_id: &str,
+    _controller_session_incarnation: &str,
+    _action: &str,
+    _request_digest: &str,
+    _idempotency_key: &str,
+) -> Result<(), CliError> {
+    Err(CliError::data(
+        "provider-stop-canary-platform-unsupported",
+        "provider stop canary transitions are supported only on Linux",
+        None,
+    ))
+}
+
 fn run_provider_stop_canary_supervisor(
     context: &CliContext,
     args: cli::ProviderStopCanarySupervisorArgs,
@@ -7243,6 +7339,7 @@ fn run_provider_stop_canary_guardian(
                         &provider_process_pins,
                         Some(child_pid as libc::pid_t),
                     )?;
+                    #[cfg(target_os = "linux")]
                     remove_empty_provider_stop_canary_cgroup(&provider_cgroup)?;
                     let mut stopped = provider_stop_canary_marker(&record, "stopped", child_pid);
                     stopped["child_exit_success"] = Value::Bool(status.success());
@@ -8022,9 +8119,12 @@ fn run_tmux_new_session(
             Some(json!({ "id": record.id })),
         )
     })?;
+    #[cfg(target_os = "linux")]
     let cgroup_mount = control_group
         .as_ref()
         .and_then(|_| capture_linux_cgroup_mount_identity());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_mount = None;
     let pid_namespace = linux_process_identity_namespace(pane_pid).map_err(|_| {
         CliError::runtime(
             "tmux-runtime-identity-invalid",
@@ -8151,6 +8251,40 @@ fn capture_provider_resume_after_launch(
         AgentKind::Codex => capture_codex_resume(record, launch_started_at),
         AgentKind::Claude | AgentKind::Hermes => None,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderResumePersistence {
+    BestEffort,
+    ReceiptOnly,
+}
+
+fn capture_and_persist_provider_resume_after_launch(
+    context: &CliContext,
+    agent: AgentKind,
+    record: &mut SessionRecord,
+    launch_started_at: SystemTime,
+    persistence: ProviderResumePersistence,
+) -> Result<(), CliError> {
+    if record.provider_resume.is_some() {
+        return Ok(());
+    }
+    let Some(provider_resume) =
+        capture_provider_resume_after_launch(agent, record, launch_started_at)
+    else {
+        return Ok(());
+    };
+    let persisted_before_capture = record.clone();
+    record.provider_resume = Some(provider_resume);
+    if persistence == ProviderResumePersistence::ReceiptOnly {
+        pause_session_ancestor_for_test("ambiguous-prompt-after-resume-capture")?;
+        return Ok(());
+    }
+    if write_session_record(context, record).is_ok() {
+        return Ok(());
+    }
+    *record = load_session_record(context, &record.id).unwrap_or(persisted_before_capture);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -11260,6 +11394,9 @@ fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), C
     if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
         return Ok(());
     }
+    if !resume_sidecar_matches_session_identity(&sidecar, record) {
+        return Ok(());
+    }
     if let Some(provider_resume) = sidecar.provider_resume.clone() {
         if let Some(existing) = record.provider_resume.as_mut() {
             merge_extra_fields(&mut existing.extra, provider_resume.extra);
@@ -11282,6 +11419,37 @@ fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), C
     }
     record.resume_sidecar_extra = sidecar.extra;
     Ok(())
+}
+
+fn resume_sidecar_matches_session_identity(
+    sidecar: &DurableResumeRecord,
+    record: &SessionRecord,
+) -> bool {
+    let provider_identity_matches = sidecar
+        .provider_resume
+        .as_ref()
+        .zip(record.provider_resume.as_ref())
+        .is_some_and(|(sidecar, current)| {
+            sidecar.provider == current.provider && sidecar.session_id == current.session_id
+        });
+    let runtime_identity_matches = sidecar
+        .runtime
+        .as_ref()
+        .zip(record.runtime.as_ref())
+        .is_some_and(|(sidecar, current)| same_runtime_identity(Some(sidecar), Some(current)));
+    let never_launched_identity_matches = sidecar
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())
+        .is_some_and(|launch_id| {
+            record
+                .extra
+                .get(TMUX_RUNTIME_NEVER_LAUNCHED_KEY)
+                .and_then(Value::as_str)
+                == Some(launch_id)
+        });
+    provider_identity_matches || runtime_identity_matches || never_launched_identity_matches
 }
 
 fn merge_extra_fields(target: &mut BTreeMap<String, Value>, source: BTreeMap<String, Value>) {
@@ -12892,9 +13060,12 @@ fn capture_tmux_runtime_identity(
     let process_session_id = process_session_id(pane_pid)?;
     let process_session_members = process_session_members(process_session_id, pane_pid)?;
     let control_group = linux_process_control_group(pane_pid)?;
+    #[cfg(target_os = "linux")]
     let cgroup_mount = control_group
         .as_ref()
         .and_then(|_| capture_linux_cgroup_mount_identity());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_mount = None;
     let pid_namespace = linux_process_identity_namespace(pane_pid)?;
 
     if !tmux_pane_identity_matches(tmux_bin, record, session_id, pane_id, pane_pid, timeout) {
@@ -13045,24 +13216,17 @@ fn linux_process_control_group(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_process_pid_namespace(
     pane_pid: libc::pid_t,
 ) -> Result<Option<TmuxPidNamespaceIdentity>, SessionTerminationFailure> {
-    #[cfg(target_os = "linux")]
-    {
-        let metadata = fs::metadata(format!("/proc/{pane_pid}/ns/pid"))
-            .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
-        Ok(Some(TmuxPidNamespaceIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            boot_id: linux_boot_id()?,
-        }))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pane_pid;
-        Ok(None)
-    }
+    let metadata = fs::metadata(format!("/proc/{pane_pid}/ns/pid"))
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    Ok(Some(TmuxPidNamespaceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        boot_id: linux_boot_id()?,
+    }))
 }
 
 fn linux_process_identity_namespace(
@@ -16576,6 +16740,174 @@ fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn write_private_file_at(
+    directory: &fs::File,
+    display_target: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    use std::ffi::CString;
+
+    let target = CString::new(name).map_err(|_| {
+        CliError::runtime(
+            "file-write-failed",
+            format!(
+                "failed to write {}: invalid file name",
+                display_target.display()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        )
+    })?;
+    let temporary_name = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
+    let temporary = CString::new(temporary_name.as_str()).expect("UUID temp name has no null byte");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            SECRET_FILE_MODE as libc::c_uint,
+        )
+    };
+    if descriptor < 0 {
+        return Err(private_file_io_error(
+            display_target,
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            if unsafe { libc::fchmod(file.as_raw_fd(), SECRET_FILE_MODE as libc::mode_t) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    if let Err(error) = write_result {
+        drop(file);
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        return Err(private_file_io_error(display_target, error));
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        return Err(private_file_io_error(display_target, error));
+    }
+    let _ = directory.sync_all();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn create_private_dir_at(
+    directory: &fs::File,
+    display_target: &Path,
+    name: &str,
+) -> Result<(), CliError> {
+    use std::ffi::CString;
+
+    let name = CString::new(name).map_err(|_| {
+        CliError::runtime(
+            "directory-create-failed",
+            format!(
+                "failed to create {}: invalid directory name",
+                display_target.display()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        )
+    })?;
+    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(CliError::runtime(
+            "directory-create-failed",
+            format!(
+                "failed to create {}: {}",
+                display_target.display(),
+                io::Error::last_os_error()
+            ),
+            Some(json!({ "path": display_path(display_target) })),
+        ));
+    }
+    let child = open_session_ancestor_at(directory, &name, "session")?;
+    child
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|error| {
+            CliError::runtime(
+                "directory-permissions-failed",
+                format!(
+                    "failed to set permissions on {}: {error}",
+                    display_target.display()
+                ),
+                Some(json!({ "path": display_path(display_target) })),
+            )
+        })
+}
+
+#[cfg(unix)]
+fn clear_private_directory_at(directory: &fs::File) {
+    use std::ffi::{CStr, CString};
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return;
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let _ = unsafe { libc::close(duplicate) };
+        return;
+    }
+    let mut names = Vec::<CString>::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    let _ = unsafe { libc::closedir(stream) };
+
+    for name in names {
+        let child_descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child_descriptor >= 0 {
+            let child = unsafe { fs::File::from_raw_fd(child_descriptor) };
+            clear_private_directory_at(&child);
+            drop(child);
+            let _ =
+                unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        } else {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn private_file_io_error(path: &Path, error: io::Error) -> CliError {
+    CliError::runtime(
+        "file-write-failed",
+        format!("failed to write {}: {error}", path.display()),
+        Some(json!({ "path": display_path(path) })),
+    )
+}
+
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     write_atomic(path, bytes, SECRET_FILE_MODE).map_err(|err| {
         CliError::runtime(
@@ -17381,6 +17713,35 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn persist_current_process_as_canary_wrapper(
+        context: &CliContext,
+        id: &str,
+    ) -> super::SessionRecord {
+        let mut record = load_session_record(context, id).expect("canary session record");
+        let current = super::read_linux_process_identity(std::process::id() as libc::pid_t)
+            .expect("current process identity")
+            .expect("live current process");
+        let identity = super::TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().expect("runtime").launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: current.pid,
+            pane_start_time: Some(current.start_time),
+            process_group_id: Some(current.process_group_id),
+            process_session_id: Some(current.session_id),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: None,
+            cgroup_mount: None,
+            pid_namespace: super::linux_process_pid_namespace(current.pid)
+                .expect("current process PID namespace"),
+        };
+        super::persist_launched_tmux_identity(context, &mut record, &identity)
+            .expect("persist canary wrapper identity");
+        load_session_record(context, id).expect("persisted canary session record")
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn provider_stop_canary_defers_cgroup_removal_until_children_are_reaped() {
         let tmp = tempfile::TempDir::new().expect("temporary state");
@@ -17391,7 +17752,7 @@ mod tests {
             None,
             Some("provider-stop-canary-deferred-removal"),
         );
-        let record = load_session_record(&context, &id).expect("canary session record");
+        let record = persist_current_process_as_canary_wrapper(&context, &id);
         let cgroup = match super::prepare_provider_stop_canary_cgroup(&context, &record) {
             Ok(cgroup) => cgroup,
             Err(error) if env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() != Ok("1") => {
@@ -17442,7 +17803,7 @@ mod tests {
             None,
             Some("provider-stop-canary-member-injection"),
         );
-        let record = load_session_record(&context, &id).expect("canary session record");
+        let record = persist_current_process_as_canary_wrapper(&context, &id);
         let cgroup = match super::prepare_provider_stop_canary_cgroup(&context, &record) {
             Ok(cgroup) => cgroup,
             Err(error) if env::var("AGENT_SESSION_TEST_REQUIRE_CGROUP").as_deref() != Ok("1") => {

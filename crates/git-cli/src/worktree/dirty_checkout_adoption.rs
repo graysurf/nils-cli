@@ -11079,11 +11079,11 @@ mod tests {
 
         let late_task = proc_root.path().join("10/task/20");
         fs::create_dir_all(&late_task).expect("create late synthetic task");
-        fs::write(
+        fs::write(late_task.join("children"), b"11\n").expect("write initial late-task metadata");
+        let task_children = [
+            proc_root.path().join("10/task/10/children"),
             late_task.join("children"),
-            vec![b' '; MAX_PROC_CHILDREN_BYTES + 1],
-        )
-        .expect("write oversized late-task metadata");
+        ];
         let mut streamed_prefix = Vec::new();
         descendant_processes_at(
             proc_root.path(),
@@ -11093,7 +11093,13 @@ mod tests {
                 metadata_bytes: MAX_PROC_CHILDREN_BYTES * 2,
                 ..limits
             },
-            |identity| streamed_prefix.push(identity),
+            |identity| {
+                streamed_prefix.push(identity);
+                for path in &task_children {
+                    fs::write(path, vec![b' '; MAX_PROC_CHILDREN_BYTES + 1])
+                        .expect("inject oversized remaining-task metadata");
+                }
+            },
         )
         .expect_err("a later task metadata overflow must fail closed");
         assert_eq!(

@@ -2682,7 +2682,7 @@ fn codex_activity_doctor_accepts_the_converged_agent_hook_control_plane() {
         &hook,
         r#"#!/usr/bin/env sh
 test "$*" = "doctor --product codex --format json" || exit 64
-printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}'
+printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}' # stale-audit: keep-contract
 "#,
     );
     let codex_bin = tmp.path().join("codex");
@@ -2743,7 +2743,7 @@ exit "${AGENT_HOOK_EXIT_CODE:-0}"
             "supported":true,
             "owned_count":7,
             "expected_owned_count":7,
-            "legacy_residue_count":0,
+            "legacy_residue_count":0, // stale-audit: keep-contract
             "unrelated_count":0,
             "config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -2819,7 +2819,7 @@ exit "${AGENT_HOOK_EXIT_CODE:-0}"
         None,
     ));
     let mut residue_case = valid;
-    residue_case["data"][0]["legacy_residue_count"] = json!(1);
+    residue_case["data"][0]["legacy_residue_count"] = json!(1); // stale-audit: keep-contract
     cases.push(("retired-residue", residue_case.to_string(), "0", None));
 
     for (name, response, exit_code, expected_error) in cases {
@@ -2866,7 +2866,7 @@ fn codex_activity_doctor_rejects_agent_hook_output_beyond_the_strict_cap() {
     write_executable(
         &hook,
         r#"#!/usr/bin/env sh
-printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}'
+printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":true,"data":[{"schema_version":"agent-hook.doctor.v1","product":"codex","status":"converged","supported":true,"owned_count":7,"expected_owned_count":7,"legacy_residue_count":0,"unrelated_count":0,"config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","recovery":"challenge-authorize-consume"}]}' # stale-audit: keep-contract
 dd if=/dev/zero bs=1048577 count=1 2>/dev/null | tr '\000' ' '
 printf '%s\n' '{"schema_version":"cli.agent-hook.doctor.v1","ok":false}'
 "#,
