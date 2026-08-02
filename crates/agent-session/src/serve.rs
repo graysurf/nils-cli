@@ -14522,7 +14522,7 @@ case "$1" in
     ;;
   if-shell)
     pid="$(cat {pane_pid})"
-    kill -KILL "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
     rm -f {running}
     ;;
   kill-session)
