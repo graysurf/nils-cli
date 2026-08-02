@@ -22309,34 +22309,65 @@ exit 0
                 serde_json::to_vec(&request).expect("operator request"),
             ))
             .expect("operator request");
+        #[cfg(not(target_os = "linux"))]
+        let before_operator =
+            fs::read(&registry_path).expect("registry before operator reconciliation");
         let (status, reconciled) = call(router(state.clone()), operator_request).await;
-        assert_eq!(status, StatusCode::OK, "{reconciled}");
-        assert_eq!(
-            reconciled["data"]["coordination"]["operation_reconciliation"]["state"],
-            "abandoned"
-        );
-        assert_eq!(
-            reconciled["data"]["coordination"]["operation_reconciliation"]["revision"],
-            8
-        );
         assert!(
             !reconciled
                 .to_string()
                 .contains("PRIVATE-EXECUTION-TOKEN-DIGEST")
         );
-
-        let replay = Request::builder()
-            .method("POST")
-            .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&request).expect("operator replay"),
-            ))
-            .expect("operator replay");
-        let (status, replayed) = call(router(state), replay).await;
-        assert_eq!(status, StatusCode::OK, "{replayed}");
-        assert_eq!(replayed, reconciled);
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reconciled}");
+            assert_eq!(reconciled["error"]["code"], "operation-still-running");
+            assert_eq!(
+                fs::read(&registry_path).expect("registry after unverified reconciliation"),
+                before_operator,
+                "unknown non-Linux runtime evidence must not mutate the operation"
+            );
+            let replay = Request::builder()
+                .method("POST")
+                .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("operator replay"),
+                ))
+                .expect("operator replay");
+            let (replay_status, replayed) = call(router(state), replay).await;
+            assert_eq!(
+                replay_status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{replayed}"
+            );
+            assert_eq!(replayed, reconciled);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(status, StatusCode::OK, "{reconciled}");
+            assert_eq!(
+                reconciled["data"]["coordination"]["operation_reconciliation"]["state"],
+                "abandoned"
+            );
+            assert_eq!(
+                reconciled["data"]["coordination"]["operation_reconciliation"]["revision"],
+                8
+            );
+            let replay = Request::builder()
+                .method("POST")
+                .uri("/sessions/alpha/operations/orphaned-lease/operator-reconcile/v1")
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("operator replay"),
+                ))
+                .expect("operator replay");
+            let (replay_status, replayed) = call(router(state), replay).await;
+            assert_eq!(replay_status, StatusCode::OK, "{replayed}");
+            assert_eq!(replayed, reconciled);
+        }
     }
 
     #[tokio::test]
