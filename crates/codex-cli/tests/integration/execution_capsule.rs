@@ -242,17 +242,23 @@ fi
 
 # Report what the child actually received as its CODEX_HOME.
 if [ -n "${CODEX_CAPSULE_HOME_REPORT_DIR:-}" ]; then
+  stat_mode() {
+    if stat -c '%a' "$1" 2>/dev/null; then
+      return
+    fi
+    stat -f '%Lp' "$1"
+  }
   mkdir -p "$CODEX_CAPSULE_HOME_REPORT_DIR"
   printf '%s\n' "${CODEX_HOME:-}" > "$CODEX_CAPSULE_HOME_REPORT_DIR/codex-home"
   printf '%s\n' "$*" > "$CODEX_CAPSULE_HOME_REPORT_DIR/child-argv"
   { env | sort; } > "$CODEX_CAPSULE_HOME_REPORT_DIR/child-env" || true
   if [ -n "${CODEX_HOME:-}" ] && [ -d "${CODEX_HOME:-}" ]; then
-    stat -c '%a' "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-mode"
+    stat_mode "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-mode"
     ls -A "$CODEX_HOME" > "$CODEX_CAPSULE_HOME_REPORT_DIR/home-entries"
     for name in config.toml AGENTS.md hooks.json; do
       if [ -f "$CODEX_HOME/$name" ]; then
         cp "$CODEX_HOME/$name" "$CODEX_CAPSULE_HOME_REPORT_DIR/$name"
-        stat -c '%a' "$CODEX_HOME/$name" > "$CODEX_CAPSULE_HOME_REPORT_DIR/$name.mode"
+        stat_mode "$CODEX_HOME/$name" > "$CODEX_CAPSULE_HOME_REPORT_DIR/$name.mode"
       fi
     done
     if [ -L "$CODEX_HOME/auth.json" ]; then

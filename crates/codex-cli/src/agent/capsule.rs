@@ -343,6 +343,18 @@ impl FileIdentity {
             changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn matches_after_rename(self, published: Self) -> bool {
+        self.device == published.device
+            && self.inode == published.inode
+            && self.uid == published.uid
+            && self.mode == published.mode
+            && self.links == published.links
+            && self.size == published.size
+            && self.modified_seconds == published.modified_seconds
+            && self.modified_nanoseconds == published.modified_nanoseconds
+    }
 }
 
 struct CapsuleDirectory {
@@ -1252,18 +1264,18 @@ impl CapsuleDirectory {
         );
         let temporary = c_name(OsStr::new(&temporary_name), "artifact-path-unsafe")?;
         let mut file = self.create_new_private(&temporary)?;
-        let expected = FileIdentity::from_metadata(&file.metadata().map_err(|error| {
-            CapsuleError::runtime(
-                "artifact-write-failed",
-                format!("cannot inspect temporary artifact: {error}"),
-            )
-        })?);
         if let Err(error) = write_and_sync_artifact(&mut file, name, bytes) {
             unsafe {
                 libc::unlinkat(self.file.as_raw_fd(), temporary.as_ptr(), 0);
             }
             return Err(error);
         }
+        let expected = FileIdentity::from_metadata(&file.metadata().map_err(|error| {
+            CapsuleError::runtime(
+                "artifact-write-failed",
+                format!("cannot inspect temporary artifact: {error}"),
+            )
+        })?);
         if unsafe {
             libc::renameat(
                 self.file.as_raw_fd(),
@@ -1282,22 +1294,47 @@ impl CapsuleDirectory {
                 format!("cannot publish {name}: {error}"),
             ));
         }
-        let published = self.open_private_regular(
+        let mut published = self.open_private_regular(
             OsStr::from_bytes(target.as_bytes()),
             "artifact-write-failed",
             "published artifact is not a regular file",
             "artifact-write-failed",
         )?;
-        let actual = FileIdentity::from_metadata(&published.metadata().map_err(|error| {
-            CapsuleError::runtime(
-                "artifact-write-failed",
-                format!("cannot inspect published {name}: {error}"),
-            )
-        })?);
-        if expected != actual {
+        let published_before_read =
+            FileIdentity::from_metadata(&published.metadata().map_err(|error| {
+                CapsuleError::runtime(
+                    "artifact-write-failed",
+                    format!("cannot inspect published {name}: {error}"),
+                )
+            })?);
+        // rename(2) may update ctime, so compare every stable field from the
+        // pre-publication inode and verify the published bytes independently.
+        if !expected.matches_after_rename(published_before_read) {
             return Err(CapsuleError::runtime(
                 "artifact-write-failed",
                 format!("published {name} does not match the private temporary file"),
+            ));
+        }
+        let mut published_bytes = Vec::with_capacity(bytes.len());
+        published
+            .read_to_end(&mut published_bytes)
+            .map_err(|error| {
+                CapsuleError::runtime(
+                    "artifact-write-failed",
+                    format!("cannot verify published {name}: {error}"),
+                )
+            })?;
+        let published_after_read =
+            FileIdentity::from_metadata(&published.metadata().map_err(|error| {
+                CapsuleError::runtime(
+                    "artifact-write-failed",
+                    format!("cannot recheck published {name}: {error}"),
+                )
+            })?);
+        if published_before_read != published_after_read || published_bytes != bytes {
+            return Err(CapsuleError::runtime(
+                "artifact-write-failed",
+                format!("published {name} changed while it was being verified"),
             ));
         }
         self.file.sync_all().map_err(|error| {
