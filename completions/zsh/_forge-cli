@@ -706,7 +706,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (observe)
 _arguments "${_arguments_options[@]}" : \
 '--expected-head=[Exact provider head SHA whose review observation is being appended]:SHA:_default' \
-'--findings-file=[Delivery-mode review-specialists merge envelope or observation array]:PATH:_default' \
+'--findings-file=[Delivery-mode review-specialists merge envelope or observation array. Both shapes require a \`lifecycle_fingerprint\`; only the array accepts \`disposition\`. See this command'\''s help footer for the full schemas]:PATH:_default' \
 '--expected-state=[Exact current provider-visible state-chain tip; omit only for genesis]:DIGEST:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \

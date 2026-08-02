@@ -908,12 +908,38 @@ pub struct PrReviewLoopInspectArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[command(after_help = "APPEND ORDER\n  \
+      An observation can only be appended at the CURRENT provider head, so \
+      history cannot be backfilled, and a `fixed` disposition requires a \
+      repaired head. Observe the reviewed head BEFORE pushing the repair:\n    \
+      observe --expected-head <reviewed head>   (disposition: open)\n    \
+      repair, push\n    \
+      observe --expected-head <repaired head>   (disposition: fixed)\n    \
+      merge --expected-head <repaired head>\n\n\
+      --findings-file SHAPES\n  \
+      1. A `review-specialists merge --mode delivery` envelope. Each row needs \
+      `evidence`, `recommendation`, and a `lifecycle_fingerprint` of the form \
+      `<category>:<component>:<invariant>` whose category segment equals the \
+      row's `category`. The envelope schema REJECTS `disposition` as an unknown \
+      field.\n  \
+      2. A bare observation array. Each row needs `lifecycle_fingerprint` and \
+      accepts `disposition` (open | fixed | accepted | reopened), which is how \
+      dispositions are carried across rounds.\n\n\
+      With --dry-run this runs a faithful non-mutating preflight: it reads and \
+      validates the findings payload, resolves the pull request, performs the \
+      head and state-tip CAS comparisons, and evaluates the transition, then \
+      reports every verdict in data.preflight[] without appending. The sweep \
+      does not short-circuit, so the payload verdict is still reported when the \
+      provider is unreachable — use it to check a findings file without writing \
+      durable provider-visible state.")]
 pub struct PrReviewLoopObserveArgs {
     pub id: u64,
     /// Exact provider head SHA whose review observation is being appended.
     #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub expected_head: String,
     /// Delivery-mode review-specialists merge envelope or observation array.
+    /// Both shapes require a `lifecycle_fingerprint`; only the array accepts
+    /// `disposition`. See this command's help footer for the full schemas.
     #[arg(long = "findings-file", value_name = "PATH")]
     pub findings_file: String,
     /// Exact current provider-visible state-chain tip; omit only for genesis.

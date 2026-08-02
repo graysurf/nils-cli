@@ -16,6 +16,7 @@ use crate::ops::pr_comments::github_repo_slug_from_url;
 use crate::ops::{pr_review, pr_view, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
+use crate::validations::RuleVerdict;
 
 const SCHEMA_INSPECT: &str = "pr.review-loop.inspect";
 const SCHEMA_OBSERVE: &str = "pr.review-loop.observe";
@@ -47,6 +48,24 @@ pub struct ReviewLoopMergeGate {
 struct ReviewLoopDryRunPayload {
     provider: &'static str,
     plan: Vec<String>,
+}
+
+/// `observe --dry-run`'s envelope: the same `plan` as before, plus the verdict
+/// of every read-only rule the real call enforces. `preflight` mirrors
+/// `pr deliver --dry-run`'s `local_preflight[]` element shape; the name differs
+/// because these rules include provider reads, never provider writes.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ReviewLoopObserveDryRunPayload {
+    provider: &'static str,
+    plan: Vec<String>,
+    preflight_ok: bool,
+    /// Whether the real run would append a new generation. True for an accepted
+    /// transition that changes state, and also for an extendable budget error,
+    /// which appends a durable hard-stop receipt before failing. False when the
+    /// chain is already current. `None` when the transition was not evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_append: Option<bool>,
+    preflight: Vec<RuleVerdict>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,12 +135,7 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 ) -> Result<i32, ForgeError> {
     let ctx = resolve_context(global, &remote_url_lookup)?;
     if global.dry_run {
-        return emit_dry_run(
-            &ctx,
-            "read the chain, evaluate one observation, and append with tip/head CAS",
-            SCHEMA_OBSERVE,
-            format,
-        );
+        return emit_observe_dry_run(runner, &ctx, &args, format);
     }
     let observations = read_observations(&args.findings_file)?;
     let (view, repository) = resolve_pr(runner, &ctx, args.id)?;
@@ -844,6 +858,153 @@ fn emit_state(
                 generation = payload.generation.unwrap_or(0),
                 appended = payload.appended,
             );
+        },
+    ))
+}
+
+/// Run every read-only check the real `observe` would run, in order, without
+/// short-circuiting and without appending anything.
+///
+/// Non-short-circuiting matters twice over. It reports every reason a real run
+/// would be rejected in one pass instead of one per attempt, and it keeps the
+/// local payload verdict available when the provider cannot be reached — which
+/// is what makes `--dry-run` usable as a schema check. Discovering the
+/// observation schema previously required a live `observe`, and a live
+/// `observe` appends durable, provider-visible state on success.
+fn emit_observe_dry_run<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    args: &PrReviewLoopObserveArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let mut verdicts: Vec<RuleVerdict> = Vec::with_capacity(5);
+
+    // Local first, so it survives an unreachable provider.
+    let observations = match read_observations(&args.findings_file) {
+        Ok(observations) => {
+            verdicts.push(RuleVerdict::from_result("findings_file", Ok(())));
+            Some(observations)
+        }
+        Err(error) => {
+            verdicts.push(RuleVerdict::from_result("findings_file", Err(error)));
+            None
+        }
+    };
+
+    let mut would_append = None;
+    match resolve_pr(runner, ctx, args.id) {
+        Ok((view, repository)) => {
+            verdicts.push(RuleVerdict::from_result("provider_pull_request", Ok(())));
+            verdicts.push(RuleVerdict::from_result(
+                "expected_head",
+                ensure_expected_head(view.head_sha.as_deref(), &args.expected_head),
+            ));
+            match pr_review::read_review_loop_state_view(runner, ctx, &repository, view.number) {
+                Ok(state_view) => {
+                    verdicts.push(RuleVerdict::from_result("review_state_chain", Ok(())));
+                    verdicts.push(RuleVerdict::from_result(
+                        "expected_state_tip",
+                        ensure_expected_tip(
+                            state_view.chain.tip_digest.as_deref(),
+                            args.expected_state.as_deref(),
+                        ),
+                    ));
+                    match &observations {
+                        Some(observations) => {
+                            let previous =
+                                review_state::latest_review_loop_state(&state_view.chain);
+                            let transition = review_state::observe_review_loop(
+                                previous,
+                                &args.expected_head,
+                                observations,
+                            );
+                            match transition {
+                                Ok(transition) => {
+                                    would_append = Some(transition.changed);
+                                    verdicts.push(RuleVerdict::from_result(
+                                        "observation_transition",
+                                        Ok(()),
+                                    ));
+                                }
+                                Err(error) => {
+                                    // An extendable budget error is the one
+                                    // failure the real run still writes for: it
+                                    // appends a durable hard-stop receipt so a
+                                    // restart returns the same stop. Predicting
+                                    // "this fails" without that would understate
+                                    // what the real call does.
+                                    if review_state::stop_budget_field(error.kind()).is_some() {
+                                        would_append = Some(true);
+                                    }
+                                    verdicts.push(RuleVerdict::from_result(
+                                        "observation_transition",
+                                        Err(error),
+                                    ));
+                                }
+                            }
+                        }
+                        None => verdicts.push(RuleVerdict::not_evaluated(
+                            "observation_transition",
+                            "the findings file could not be read",
+                        )),
+                    }
+                }
+                Err(error) => {
+                    verdicts.push(RuleVerdict::from_result("review_state_chain", Err(error)));
+                    verdicts.push(RuleVerdict::not_evaluated(
+                        "expected_state_tip",
+                        "the review-state chain could not be read",
+                    ));
+                    verdicts.push(RuleVerdict::not_evaluated(
+                        "observation_transition",
+                        "the review-state chain could not be read",
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            verdicts.push(RuleVerdict::from_result(
+                "provider_pull_request",
+                Err(error),
+            ));
+            for rule in ["expected_head", "review_state_chain", "expected_state_tip"] {
+                verdicts.push(RuleVerdict::not_evaluated(
+                    rule,
+                    "the provider pull request could not be read",
+                ));
+            }
+            verdicts.push(RuleVerdict::not_evaluated(
+                "observation_transition",
+                "the provider pull request could not be read",
+            ));
+        }
+    }
+
+    let preflight_ok = verdicts.iter().all(|verdict| verdict.ok);
+    Ok(emit_success(
+        schema_version_for(BINARY, SCHEMA_OBSERVE, SCHEMA_VERSION),
+        ReviewLoopObserveDryRunPayload {
+            provider: ctx.provider.as_str(),
+            plan: vec![
+                "read the chain, evaluate one observation, and append with tip/head CAS"
+                    .to_string(),
+            ],
+            preflight_ok,
+            would_append,
+            preflight: verdicts,
+        },
+        format,
+        |payload| {
+            println!(
+                "would {plan} (preflight_ok={ok})",
+                plan = payload.plan.join(", then "),
+                ok = payload.preflight_ok,
+            );
+            for verdict in &payload.preflight {
+                let status = if verdict.ok { "ok" } else { "FAIL" };
+                let detail = verdict.message.as_deref().unwrap_or("");
+                println!("  {status} {rule} {detail}", rule = verdict.rule);
+            }
         },
     ))
 }
