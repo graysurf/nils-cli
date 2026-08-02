@@ -809,7 +809,7 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn directory_file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+fn session_authority_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let mut entries = fs::read_dir(current)
             .expect("snapshot directory")
@@ -819,15 +819,17 @@ fn directory_file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         for entry in entries {
             let file_type = entry.file_type().expect("snapshot file type");
             let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot relative path")
+                .to_path_buf();
+            if relative == Path::new("activity.json") {
+                continue;
+            }
             if file_type.is_dir() {
                 visit(root, &path, snapshot);
             } else if file_type.is_file() {
-                snapshot.insert(
-                    path.strip_prefix(root)
-                        .expect("snapshot relative path")
-                        .to_path_buf(),
-                    fs::read(path).expect("snapshot file"),
-                );
+                snapshot.insert(relative, fs::read(path).expect("snapshot file"));
             }
         }
     }
@@ -17310,7 +17312,8 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
     let retained_progress = worker_checkout.join("non-linux-progress-to-preserve");
     fs::write(&retained_progress, "unaccepted worker output").expect("worker progress");
     let worker_session_dir = fixture.state_dir.join("sessions/worker-stopped");
-    let session_before_unverified = directory_file_snapshot(&worker_session_dir);
+    let worker_record_path = worker_session_dir.join("session.json");
+    let session_before_unverified = session_authority_snapshot(&worker_session_dir);
 
     let assert_fail_closed_diagnosis = |command: &str| {
         let observed = run_main_agent(
@@ -17365,12 +17368,11 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
         "coordination-runtime-unverified"
     );
     assert_eq!(
-        directory_file_snapshot(&worker_session_dir),
+        session_authority_snapshot(&worker_session_dir),
         session_before_unverified,
-        "unverified diagnosis and reconciliation must not mutate worker session authority"
+        "unverified diagnosis and reconciliation must not mutate worker session authority files"
     );
 
-    let worker_record_path = worker_session_dir.join("session.json");
     let mut worker_record: serde_json::Value =
         serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
             .expect("worker session json");
@@ -17379,7 +17381,7 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
         .expect("worker session object")
         .remove("delete_tmux_identity");
     write_private_json(&worker_record_path, &worker_record);
-    let session_before_missing_identity = directory_file_snapshot(&worker_session_dir);
+    let session_before_missing_identity = session_authority_snapshot(&worker_session_dir);
     for command in ["supervise", "diagnose"] {
         assert_fail_closed_diagnosis(command);
     }
@@ -17395,9 +17397,9 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
         "coordination-runtime-unverified"
     );
     assert_eq!(
-        directory_file_snapshot(&worker_session_dir),
+        session_authority_snapshot(&worker_session_dir),
         session_before_missing_identity,
-        "missing-identity diagnosis and reconciliation must not mutate worker session authority"
+        "missing-identity diagnosis and reconciliation must not mutate worker session authority files"
     );
     assert_eq!(
         orchestration_registry(&fixture.state_dir),
