@@ -3311,6 +3311,7 @@ fn run_worker_start_single_input(
         &request_digest,
         &legacy_request_digest,
     )?;
+    let pending_prompt_outcome_unknown = parse_ambiguous_worker_start_evidence(replay.as_ref())?;
     let pending_start = match replay {
         Some(value) if worker_start_readiness_is_pending(&value) => {
             drop(locked);
@@ -3743,12 +3744,71 @@ fn run_worker_start_single_input(
         renew_worker_start_batch_lane(context, batch_lane)?;
     }
     let existing = match load_session_record(context, &worker_session_id) {
-        Ok(worker) if runtime_is_proven_never_launched(&worker) => {
+        Ok(worker)
+            if pending_prompt_outcome_unknown.is_none()
+                && runtime_is_proven_never_launched(&worker) =>
+        {
             ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
             delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
             None
         }
-        Ok(worker) => Some(worker),
+        Ok(mut worker) => {
+            if let Some(evidence) = pending_prompt_outcome_unknown.as_ref() {
+                let expected_worker = &evidence.worker;
+                let worker_incarnation = worker
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+                if session_ref(context, &worker, worker_incarnation) != *expected_worker {
+                    return Err(CliError::data(
+                        "assignment-start-conflict",
+                        "persisted ambiguous worker start changed its exact session evidence",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    ));
+                }
+                if worker.provider_resume.is_none()
+                    && let Some(provider_resume) = evidence.provider_resume.as_ref()
+                {
+                    let expected_worker = expected_worker.clone();
+                    let provider_resume = provider_resume.clone();
+                    worker = crate::mutate_session_record(context, &worker.id, |current| {
+                        let current_incarnation = current
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| runtime.launch_id.as_str())
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                invalid_input("worker session incarnation is unavailable")
+                            })?;
+                        if session_ref(context, current, current_incarnation) != expected_worker {
+                            return Err(CliError::data(
+                                "assignment-start-conflict",
+                                "persisted ambiguous worker start changed its exact session evidence",
+                                Some(json!({ "assignment_id": assignment_id })),
+                            ));
+                        }
+                        current.provider_resume = Some(provider_resume);
+                        Ok(current.clone())
+                    })?;
+                    pause_batch_lane_for_test("after_ambiguous_resume_backfill")?;
+                }
+            }
+            Some(worker)
+        }
+        Err(error)
+            if error.code() == "session-not-found" && pending_prompt_outcome_unknown.is_some() =>
+        {
+            return Err(CliError::runtime(
+                "managed-worker-prompt-delivery-outcome-unknown",
+                "the exact ambiguous worker session is unavailable; preserve the transaction and do not redeliver",
+                Some(json!({
+                    "assignment_id": assignment_id,
+                    "worker": pending_prompt_outcome_unknown.map(|evidence| evidence.worker)
+                })),
+            ));
+        }
         Err(error) if error.code() == "session-not-found" => None,
         Err(error) => return Err(error),
     };
@@ -4021,6 +4081,43 @@ fn run_worker_start_single_input(
             )?;
             locked.save()
         };
+        let mut ambiguous_prompt_delivery_guard = |worker: &SessionRecord| {
+            let worker_incarnation = worker
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+            let expected_worker = session_ref(context, worker, worker_incarnation);
+            ensure_active_claim(context, &record)?;
+            let mut locked = orchestration::lock_registry(context)?;
+            validate_worker_start_authority_locked(
+                &locked.registry,
+                &record,
+                &incarnation,
+                &assignment_id,
+                &worker_session_id,
+                &expected_packet_digest,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &launch_input.launch.cwd,
+                launch_provider_config_dir.as_deref(),
+                Some(&expected_worker),
+                launch_input.provider_stop_canary.is_some(),
+            )?;
+            store_worker_start_ambiguous_launch_phase_locked(
+                &mut locked.registry,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                &legacy_request_digest,
+                &expected_worker,
+                worker.provider_resume.as_ref(),
+            )?;
+            locked.save()
+        };
         let mut definitive_failure_guard = |worker: &SessionRecord| {
             let worker_incarnation = worker
                 .runtime
@@ -4100,62 +4197,13 @@ fn run_worker_start_single_input(
                 pre_runtime_release: pre_runtime_release_guard,
                 post_runtime_release: post_runtime_release_guard,
                 post_prompt_delivery: post_prompt_delivery_guard,
+                ambiguous_prompt_delivery: Some(&mut ambiguous_prompt_delivery_guard),
                 definitive_failure: definitive_failure_guard,
             },
         );
         let started = match started {
             Ok(started) => started,
             Err(error) => {
-                if launch_input.provider_stop_canary.is_some()
-                    && error.code() == "managed-worker-prompt-delivery-outcome-unknown"
-                {
-                    let phase_update = (|| {
-                        let worker = load_session_record(context, &worker_session_id)?;
-                        let worker_incarnation = worker
-                            .runtime
-                            .as_ref()
-                            .map(|runtime| runtime.launch_id.as_str())
-                            .filter(|value| !value.is_empty())
-                            .ok_or_else(|| {
-                                invalid_input("worker session incarnation is unavailable")
-                            })?;
-                        let expected_worker = session_ref(context, &worker, worker_incarnation);
-                        ensure_active_claim(context, &record)?;
-                        let mut locked = orchestration::lock_registry(context)?;
-                        validate_worker_start_authority_locked(
-                            &locked.registry,
-                            &record,
-                            &incarnation,
-                            &assignment_id,
-                            &worker_session_id,
-                            &expected_packet_digest,
-                            &args.idempotency_key,
-                            &request_digest,
-                            &legacy_request_digest,
-                            &launch_input.launch.cwd,
-                            launch_provider_config_dir.as_deref(),
-                            Some(&expected_worker),
-                            true,
-                        )?;
-                        store_worker_start_launch_phase_locked(
-                            &mut locked.registry,
-                            &record,
-                            &incarnation,
-                            &args.idempotency_key,
-                            &request_digest,
-                            &legacy_request_digest,
-                            WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN,
-                            Some(&expected_worker),
-                        )?;
-                        locked.save()
-                    })();
-                    if let Err(phase_error) = phase_update {
-                        if let Some(fence) = worker_start_fence.take() {
-                            fence.finish(context, false)?;
-                        }
-                        return Err(phase_error);
-                    }
-                }
                 if let Some(fence) = worker_start_fence.take() {
                     fence.finish(context, false)?;
                 }
@@ -4665,15 +4713,15 @@ fn run_worker_start_single_input(
                         Some(&expected_worker),
                         true,
                     )?;
-                    store_worker_start_launch_phase_locked(
+                    store_worker_start_ambiguous_launch_phase_locked(
                         &mut locked.registry,
                         &record,
                         &incarnation,
                         &args.idempotency_key,
                         &request_digest,
                         &legacy_request_digest,
-                        WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN,
-                        Some(&expected_worker),
+                        &expected_worker,
+                        worker_record.provider_resume.as_ref(),
                     )?;
                     locked.save()?;
                     Err(error)
@@ -5969,6 +6017,48 @@ fn worker_start_is_pending(value: &Value) -> bool {
         && value["acceptance"] == "pending"
 }
 
+#[derive(Debug)]
+struct AmbiguousWorkerStartEvidence {
+    worker: SessionRef,
+    provider_resume: Option<crate::ProviderResume>,
+}
+
+fn parse_ambiguous_worker_start_evidence(
+    value: Option<&Value>,
+) -> Result<Option<AmbiguousWorkerStartEvidence>, CliError> {
+    let Some(value) = value.filter(|value| {
+        worker_start_is_pending(value)
+            && value["launch_phase"] == WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN
+    }) else {
+        return Ok(None);
+    };
+    let worker = serde_json::from_value::<SessionRef>(value["worker"].clone()).map_err(|_| {
+        CliError::data(
+            "assignment-start-conflict",
+            "persisted ambiguous worker start has no exact session evidence",
+            None,
+        )
+    })?;
+    let provider_resume = match value.get("provider_resume") {
+        None | Some(Value::Null) => None,
+        Some(provider_resume) => Some(
+            serde_json::from_value::<crate::ProviderResume>(provider_resume.clone()).map_err(
+                |_| {
+                    CliError::data(
+                        "assignment-start-conflict",
+                        "persisted ambiguous worker start has invalid resume evidence",
+                        None,
+                    )
+                },
+            )?,
+        ),
+    };
+    Ok(Some(AmbiguousWorkerStartEvidence {
+        worker,
+        provider_resume,
+    }))
+}
+
 const WORKER_START_PHASE_ASSIGNMENT_CREATED: &str = "assignment-created";
 const WORKER_START_PHASE_RUNTIME_HELD: &str = "worker-bound-runtime-held";
 const WORKER_START_PHASE_CANARY_STARTUP_PENDING: &str = "worker-bound-canary-startup-pending";
@@ -6061,6 +6151,36 @@ fn store_worker_start_launch_phase_locked(
     phase: &str,
     worker: Option<&SessionRef>,
 ) -> Result<(), CliError> {
+    if phase == WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN {
+        return Err(invalid_input(
+            "ambiguous worker start evidence requires the dedicated receipt writer",
+        ));
+    }
+    store_worker_start_launch_phase_evidence_locked(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+        phase,
+        worker,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_worker_start_launch_phase_evidence_locked(
+    registry: &mut orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    phase: &str,
+    worker: Option<&SessionRef>,
+    provider_resume: Option<&crate::ProviderResume>,
+) -> Result<(), CliError> {
     let mut pending = worker_start_idempotency_replay(
         registry,
         record,
@@ -6079,6 +6199,11 @@ fn store_worker_start_launch_phase_locked(
     })?;
     pending["launch_phase"] = json!(phase);
     pending["worker"] = worker.map_or(Value::Null, |worker| json!(worker));
+    if phase == WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN {
+        pending["provider_resume"] = provider_resume.map_or(Value::Null, |resume| json!(resume));
+    } else if let Some(pending) = pending.as_object_mut() {
+        pending.remove("provider_resume");
+    }
     store_receipt(
         registry,
         record,
@@ -6087,6 +6212,30 @@ fn store_worker_start_launch_phase_locked(
         "worker-start",
         request_digest,
         pending,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_worker_start_ambiguous_launch_phase_locked(
+    registry: &mut orchestration::Registry,
+    record: &SessionRecord,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    legacy_request_digest: &str,
+    worker: &SessionRef,
+    provider_resume: Option<&crate::ProviderResume>,
+) -> Result<(), CliError> {
+    store_worker_start_launch_phase_evidence_locked(
+        registry,
+        record,
+        incarnation,
+        idempotency_key,
+        request_digest,
+        legacy_request_digest,
+        WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN,
+        Some(worker),
+        provider_resume,
     )
 }
 
