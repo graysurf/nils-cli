@@ -78,8 +78,8 @@ struct GoArgs {
 }
 
 #[derive(Debug, Clone)]
-struct CliError {
-    code: &'static str,
+pub(crate) struct CliError {
+    pub(crate) code: &'static str,
     message: Box<str>,
     hint: Option<Box<str>>,
     exit_code: i32,
@@ -140,7 +140,7 @@ struct GoOutput {
 }
 
 impl CliError {
-    fn usage(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn usage(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into().into_boxed_str(),
@@ -150,7 +150,7 @@ impl CliError {
         }
     }
 
-    fn runtime(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn runtime(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into().into_boxed_str(),
@@ -160,7 +160,7 @@ impl CliError {
         }
     }
 
-    fn data(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn data(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into().into_boxed_str(),
@@ -170,12 +170,12 @@ impl CliError {
         }
     }
 
-    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into().into_boxed_str());
         self
     }
 
-    fn with_details(mut self, details: serde_json::Value) -> Self {
+    pub(crate) fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(Box::new(details));
         self
     }
@@ -835,7 +835,7 @@ fn parse_go_args(args: &[String]) -> Result<GoArgs, CliError> {
     })
 }
 
-fn take_format(args: &mut Vec<String>) -> Result<OutputFormat, CliError> {
+pub(crate) fn take_format(args: &mut Vec<String>) -> Result<OutputFormat, CliError> {
     let mut format = OutputFormat::Text;
     let mut i = 0usize;
     while i < args.len() {
@@ -872,7 +872,7 @@ fn parse_format_value(value: &str) -> Result<OutputFormat, CliError> {
     }
 }
 
-fn detect_format(args: &[String]) -> OutputFormat {
+pub(crate) fn detect_format(args: &[String]) -> OutputFormat {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -887,7 +887,7 @@ fn detect_format(args: &[String]) -> OutputFormat {
     OutputFormat::Text
 }
 
-fn take_help(args: &[String]) -> bool {
+pub(crate) fn take_help(args: &[String]) -> bool {
     args.iter()
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
 }
@@ -953,7 +953,7 @@ fn resolve_layout() -> Result<WorktreeLayout, CliError> {
     })
 }
 
-fn ensure_inside_git_repo() -> Result<(), CliError> {
+pub(crate) fn ensure_inside_git_repo() -> Result<(), CliError> {
     if git_status_success(&["rev-parse", "--is-inside-work-tree"]) {
         Ok(())
     } else {
@@ -1159,7 +1159,7 @@ fn run_git_worktree_prune() -> Result<(), CliError> {
     Ok(())
 }
 
-fn emit_success<T: Serialize, F: FnOnce() -> String>(
+pub(crate) fn emit_success<T: Serialize, F: FnOnce() -> String>(
     command: &str,
     format: OutputFormat,
     payload: &T,
@@ -1197,7 +1197,7 @@ fn error_envelope(command: &str, err: &CliError) -> Envelope<()> {
     Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error)
 }
 
-fn emit_error(command: &str, format: OutputFormat, err: CliError) -> i32 {
+pub(crate) fn emit_error(command: &str, format: OutputFormat, err: CliError) -> i32 {
     if err.code == "help" {
         return exit::SUCCESS;
     }
@@ -1234,7 +1234,7 @@ fn render_list_text(output: &ListOutput) -> String {
     lines.join("\n")
 }
 
-fn summarize_git_error(message: &str) -> String {
+pub(crate) fn summarize_git_error(message: &str) -> String {
     let trimmed = message.trim();
     let summary = trimmed
         .rsplit_once(" failed: ")

@@ -19,6 +19,8 @@ mod dirty_checkout_adoption;
 mod dispatcher;
 #[path = "integration/open.rs"]
 mod open;
+#[path = "integration/publish.rs"]
+mod publish;
 #[path = "integration/reset.rs"]
 mod reset;
 #[path = "integration/trusted_binary_cache.rs"]

@@ -1,0 +1,118 @@
+# git-cli Remote Surfaces
+
+## Ownership
+
+This is a crate-local specification for `git-cli push` and
+`git-cli sync-default`.
+
+## Why These Exist
+
+Agent policy assigns an owner to every Git mutation an agent performs: commits
+go through `semantic-commit`, worktrees through `git-cli worktree`, PR/MR
+records and merges through `forge-cli pr`, and default-branch delivery through
+`semantic-commit default-branch` / `forge-cli repo push-default`.
+
+Two mutations had no owner:
+
+- publishing a feature branch, and
+- advancing the local default branch to a commit already on its remote.
+
+Both had to fall back to raw `git`, which the delivery guard is built to
+distrust because a raw invocation cannot prove what it will touch. These two
+commands close that gap by making the safe cases provable rather than inferred.
+
+## `git-cli push`
+
+```text
+git-cli push [--remote <name>] [--expect-default <branch>]
+             [--force-with-lease] [--dry-run] [--format text|json]
+```
+
+Publishes the checked-out branch to the same-named branch on `<remote>`
+(default `origin`).
+
+The push always uses the fully qualified refspec
+`refs/heads/<branch>:refs/heads/<branch>`. That is the point of the command: it
+removes every input that makes a bare `git push` unclassifiable — `push.default`,
+`remote.pushDefault`, configured push refspecs, and upstream inference all stop
+affecting the destination. The only way the command could reach the default
+branch is by being *on* it, which it refuses.
+
+It adds `--set-upstream` whenever the configured upstream is not already this
+branch's own ref on this remote. That covers first publish for a branch created
+by `git-cli worktree add --no-track`, and it repairs a branch created before
+that flag existed, which carries the *default* branch as its upstream. Checking
+only for the presence of an upstream would leave exactly the broken case
+unrepaired.
+
+Refusals:
+
+| `error.code` | Condition |
+| --- | --- |
+| `detached-head` | HEAD is not attached to a branch |
+| `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached and no `--expect-default` was given |
+| `refuse-default-branch` | the checked-out branch is the remote's default branch |
+| `unknown-remote` | `<remote>` is not configured |
+
+`--expect-default` names what the default branch *is* when the remote HEAD is
+not cached locally, which is the offline path. It can only ever add a refusal:
+asserting `--expect-default main` while on `main` still refuses.
+
+Pushing the default branch is a delivery decision, not a publish step, so
+`refuse-default-branch` points at `forge-cli repo push-default` rather than
+offering a flag.
+
+## `git-cli sync-default`
+
+```text
+git-cli sync-default [--remote <name>] [--no-fetch] [--dry-run]
+                     [--format text|json]
+```
+
+Fast-forwards the local default branch to its remote-tracking ref. Fetches that
+one ref first unless `--no-fetch` is passed.
+
+The safety argument is that the local ref only ever moves forward onto a commit
+that is already published: nothing is authored, no content changes, nothing is
+published, and `git reset --hard @{1}` reverses it. Anything else is refused.
+
+Three strategies, selected by where the default branch is checked out:
+
+| `strategy` | Condition | Mechanism |
+| --- | --- | --- |
+| `noop` | local and remote refs already match | none |
+| `merge-ff-only` | the default branch is checked out here | `git merge --ff-only` after a clean-checkout check |
+| `update-ref` | no worktree holds the default branch | `git update-ref <ref> <new> <old>`, a compare-and-swap |
+
+`update-ref` is the everyday agent case — working on a topic branch while local
+`main` lags — and it moves the ref without touching any working tree.
+
+Refusals:
+
+| `error.code` | Condition |
+| --- | --- |
+| `not-fast-forward` | the local default branch carries commits the remote does not have |
+| `dirty-checkout` | the default branch is checked out here with staged or unstaged changes |
+| `default-branch-checked-out-elsewhere` | another worktree holds the default branch |
+| `local-default-branch-missing` | the repository has no local default branch |
+| `remote-default-branch-missing` | the remote-tracking ref does not resolve |
+| `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached |
+| `git-fetch-failed` | the fetch failed; `--no-fetch` syncs against the already-fetched ref |
+
+## JSON Contract
+
+Both commands accept `--format text|json` and use the shared workspace envelope:
+
+- `cli.git-cli.push.v1`
+- `cli.git-cli.sync-default.v1`
+
+`push` returns `branch`, `remote`, `remote_branch`, `refspec`, `head`,
+`default_branch`, `pushed`, `dry_run`, `created_remote_branch`, `upstream`, and
+`forced`.
+
+`sync-default` returns `default_branch`, `remote`, `remote_ref`,
+`previous_head`, `new_head`, `strategy`, `already_current`, `fast_forward`,
+`dry_run`, and `fetched`.
+
+`--dry-run` performs every read-only check and reports the strategy and target
+head it would use, without mutating anything.

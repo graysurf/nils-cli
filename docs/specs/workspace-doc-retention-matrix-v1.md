@@ -78,6 +78,7 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
 - `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - `crates/git-cli/docs/specs/dirty-checkout-adoption-json-contract-v1.md`
+- `crates/git-cli/docs/specs/git-cli-remote-surfaces.md`
 - `crates/git-cli/docs/specs/git-cli-worktree-convention.md`
 - `crates/macos-agent/docs/specs/macos-agent-journal-v2.md`
 - `crates/memo/docs/runbooks/memo-agent-workflow.md`
