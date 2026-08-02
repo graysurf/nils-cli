@@ -8762,19 +8762,35 @@ mod tests {
             self.child.as_ref().expect("live test child").id()
         }
 
-        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
-            let started_at = Instant::now();
-            loop {
-                match self.child.as_mut().expect("test child").try_wait() {
-                    Ok(Some(_)) => {
-                        self.child.take();
-                        return true;
+        fn into_background_reaper(mut self) -> TestProcessReaper {
+            let mut child = self.child.take().expect("live test child");
+            let process_group_id = self.process_group_id;
+            let (cleanup, cleanup_requested) = std::sync::mpsc::channel();
+            TestProcessReaper {
+                cleanup,
+                reaper: Some(std::thread::spawn(move || {
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status),
+                            Err(error) => return Err(error),
+                            Ok(None) => {}
+                        }
+                        match cleanup_requested.recv_timeout(Duration::from_millis(10)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                if let Some(status) = child.try_wait()? {
+                                    return Ok(status);
+                                }
+                                // SAFETY: this thread still owns the live leader of
+                                // the dedicated test-only process group.
+                                unsafe {
+                                    libc::kill(-process_group_id, libc::SIGKILL);
+                                }
+                                return child.wait();
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
                     }
-                    Ok(None) if started_at.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) | Err(_) => return false,
-                }
+                })),
             }
         }
     }
@@ -8789,6 +8805,38 @@ mod tests {
                 libc::kill(-self.process_group_id, libc::SIGKILL);
             }
             let _ = child.wait();
+        }
+    }
+
+    struct TestProcessReaper {
+        cleanup: std::sync::mpsc::Sender<()>,
+        reaper: Option<std::thread::JoinHandle<io::Result<std::process::ExitStatus>>>,
+    }
+
+    impl TestProcessReaper {
+        fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+            let started_at = Instant::now();
+            while self
+                .reaper
+                .as_ref()
+                .is_some_and(|reaper| !reaper.is_finished())
+                && started_at.elapsed() < timeout
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let Some(reaper) = self.reaper.take_if(|reaper| reaper.is_finished()) else {
+                return false;
+            };
+            matches!(reaper.join(), Ok(Ok(_)))
+        }
+    }
+
+    impl Drop for TestProcessReaper {
+        fn drop(&mut self) {
+            if let Some(reaper) = self.reaper.take() {
+                let _ = self.cleanup.send(());
+                let _ = reaper.join();
+            }
         }
     }
 
@@ -14587,8 +14635,12 @@ esac
         assert_eq!(stopped["cwd"], cwd.to_string_lossy().as_ref());
         assert_eq!(stopped["agent_profile"], "codex-profile");
 
-        let mut resumed_pane = TestProcessGroup::spawn();
+        let resumed_pane = TestProcessGroup::spawn();
         fs::write(&pane_pid, resumed_pane.pid().to_string()).unwrap();
+        // Real tmux reaps its pane child after kill-session. Keep a concurrent
+        // waiter so macOS does not report the terminated child as a live zombie
+        // process group while the resume path verifies the boundary is empty.
+        let mut resumed_pane = resumed_pane.into_background_reaper();
         let (resume_status, resume_body) = call(
             router(st),
             post_json("/sessions/fresh-profile/resume", Some(TOKEN), json!({})),
