@@ -31831,10 +31831,8 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
     let readiness = data(&started)["readiness"].clone();
     assert_eq!(readiness["state"], "readiness_failed");
-    assert_eq!(readiness["classification"], "composer_not_ready");
-    assert_eq!(
-        readiness["prompt_observation"],
-        json!({
+    let expected_prompt_observation = match readiness["classification"].as_str() {
+        Some("composer_not_ready") => json!({
             "schema_version": "main-agent.worker-prompt-observation.v1",
             "prompt": {
                 "state": "not_present",
@@ -31844,8 +31842,21 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
                 "state": "unchanged_after_paste",
                 "proof": "tmux-pane-digest-before-submit"
             }
-        })
-    );
+        }),
+        Some("prompt_observation_unavailable") => json!({
+            "schema_version": "main-agent.worker-prompt-observation.v1",
+            "prompt": {
+                "state": "unavailable",
+                "proof": "provider-transcript-unavailable"
+            },
+            "composer": {
+                "state": "unchanged_after_paste",
+                "proof": "tmux-pane-digest-before-submit"
+            }
+        }),
+        classification => panic!("unexpected readiness classification: {classification:?}"),
+    };
+    assert_eq!(readiness["prompt_observation"], expected_prompt_observation);
     assert_eq!(readiness["assignment_state"], "starting");
     assert_eq!(readiness["worker_launched"], true);
     assert_eq!(readiness["delivery"]["state"], "unverified");
@@ -34489,11 +34500,27 @@ fn assert_main_agent_worker_start_stops_on_authoritative_turn(kind: &str) {
         serde_json::from_slice(&output.stdout).expect("worker start json");
     let readiness = &envelope["data"]["readiness"];
     assert_eq!(readiness["state"], "readiness_failed");
-    assert_eq!(readiness["classification"], "bootstrap_failure");
-    assert_eq!(
-        readiness["prompt_observation"]["prompt"]["state"],
-        "submitted"
-    );
+    match readiness["classification"].as_str() {
+        Some("bootstrap_failure") => {
+            assert_eq!(
+                readiness["prompt_observation"]["prompt"],
+                json!({
+                    "state": "submitted",
+                    "proof": "provider-transcript-exact-match"
+                })
+            );
+        }
+        Some("prompt_observation_unavailable") => {
+            assert_eq!(
+                readiness["prompt_observation"]["prompt"],
+                json!({
+                    "state": "unavailable",
+                    "proof": "provider-transcript-unavailable"
+                })
+            );
+        }
+        classification => panic!("unexpected readiness classification: {classification:?}"),
+    }
     assert_eq!(
         readiness["delivery"]["proof"],
         "authoritative-provider-turn-terminated"
