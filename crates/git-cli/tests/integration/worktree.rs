@@ -1,6 +1,7 @@
 use crate::common;
-use common::{GitCliHarness, git, init_repo};
+use common::{GitCliHarness, git, init_bare_remote, init_repo};
 use nils_test_support::cmd::{CmdOutput, run_with};
+use nils_test_support::git::git_output;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
@@ -19,6 +20,15 @@ fn run_with_agent_home(
 
 fn parse_json(output: &CmdOutput) -> Value {
     serde_json::from_str(output.stdout_text().trim()).expect("valid json output")
+}
+
+/// Read one config key, distinguishing "unset" from "set to the empty string".
+fn git_config_optional(repo: &Path, key: &str) -> Option<String> {
+    let output = git_output(repo, &["config", "--get", key]);
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[test]
@@ -524,4 +534,64 @@ fn worktree_remove_refuses_primary_and_removes_managed_slug() {
     assert_eq!(remove_json["ok"], true);
     assert_eq!(remove_json["data"]["removed_path"], path);
     assert!(!Path::new(path).exists(), "worktree path should be removed");
+}
+
+#[test]
+fn worktree_add_does_not_adopt_the_base_ref_as_upstream() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let remote = init_bare_remote();
+    let agent_home = tempfile::TempDir::new().expect("agent home");
+
+    let remote_path = remote.path().to_string_lossy().to_string();
+    git(repo.path(), &["remote", "add", "origin", &remote_path]);
+    git(repo.path(), &["push", "-u", "origin", "main"]);
+    git(repo.path(), &["remote", "set-head", "origin", "main"]);
+
+    let add = run_with_agent_home(
+        &harness,
+        repo.path(),
+        agent_home.path(),
+        &["worktree", "add", "topic-upstream", "--format", "json"],
+    );
+    assert_eq!(add.code, 0, "stderr: {}", add.stderr_text());
+
+    let add_json = parse_json(&add);
+    assert_eq!(
+        add_json["data"]["base_ref"], "origin/main",
+        "the default base ref stays the cached remote default branch"
+    );
+    assert_eq!(add_json["data"]["branch"], "feat/topic-upstream");
+
+    // Branching from `origin/main` must not make the default branch this
+    // branch's upstream. A managed worktree branch is unpublished, so any
+    // consumer that reads `@{upstream}` to find the branch head — `forge-cli pr
+    // deliver` among them — would resolve the default branch instead and report
+    // the head as unpushed.
+    assert_eq!(
+        git_config_optional(repo.path(), "branch.feat/topic-upstream.merge"),
+        None,
+        "a new managed branch must not inherit an upstream ref"
+    );
+    assert_eq!(
+        git_config_optional(repo.path(), "branch.feat/topic-upstream.remote"),
+        None,
+        "a new managed branch must not inherit an upstream remote"
+    );
+
+    let worktree_path = add_json["data"]["path"].as_str().expect("path");
+    let upstream = git_output(
+        Path::new(worktree_path),
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+    assert!(
+        !upstream.status.success(),
+        "an unpublished managed branch has no upstream, got {}",
+        String::from_utf8_lossy(&upstream.stdout).trim()
+    );
 }

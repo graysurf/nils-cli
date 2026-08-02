@@ -10,13 +10,37 @@ fn assert_contains(text: &str, needle: &str) {
     );
 }
 
+/// Assert one `Commands:` row, ignoring clap's column padding. The padding
+/// reflows whenever a longer command name is added, which says nothing about
+/// whether the row is present.
+fn assert_command_row(stdout: &str, name: &str, description: &str) {
+    let expected = format!("{name} {description}");
+    let found = stdout
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>().join(" ") == expected);
+    assert!(
+        found,
+        "expected a command row for {name:?} described as {description:?}\n\n{stdout}"
+    );
+}
+
 fn assert_top_level_help(stdout: &str) {
     assert_contains(stdout, "Git helper CLI");
     assert_contains(stdout, "Usage: git-cli <group> <command> [args]");
     assert_contains(stdout, "Commands:");
-    assert_contains(stdout, "utils       Utility helpers");
-    assert_contains(stdout, "summary     Summarize repository history");
-    assert_contains(stdout, "completion  Export shell completion script");
+    assert_command_row(stdout, "utils", "Utility helpers");
+    assert_command_row(stdout, "summary", "Summarize repository history");
+    assert_command_row(stdout, "completion", "Export shell completion script");
+    assert_command_row(
+        stdout,
+        "push",
+        "Publish the checked-out branch to its own remote branch",
+    );
+    assert_command_row(
+        stdout,
+        "sync-default",
+        "Fast-forward the local default branch to its remote-tracking ref",
+    );
     assert_contains(stdout, "-V, --version  Print version");
 }
 

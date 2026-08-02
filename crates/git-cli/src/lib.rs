@@ -8,6 +8,7 @@ pub mod commit_shared;
 pub mod completion;
 pub mod open;
 pub mod prompt;
+pub mod publish;
 pub mod reset;
 pub mod utils;
 pub mod worktree;

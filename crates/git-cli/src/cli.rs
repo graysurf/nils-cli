@@ -3,7 +3,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use nils_common::cli_contract::exit;
 use std::ffi::OsString;
 
-use crate::{branch, ci, commit, completion, open, reset, utils, worktree};
+use crate::{branch, ci, commit, completion, open, publish, reset, utils, worktree};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,6 +35,13 @@ enum Group {
     Ci(CiGroup),
     #[command(about = "Open remote pages")]
     Open(OpenGroup),
+    #[command(about = "Publish the checked-out branch to its own remote branch")]
+    Push(RawArgs),
+    #[command(
+        name = "sync-default",
+        about = "Fast-forward the local default branch to its remote-tracking ref"
+    )]
+    SyncDefault(RawArgs),
     #[command(about = "Summarize repository history")]
     Summary(RawArgs),
     #[command(about = "Export shell completion script")]
@@ -286,6 +293,10 @@ where
         Some(Group::Worktree(group)) => run_worktree(group),
         Some(Group::Ci(group)) => run_ci(group),
         Some(Group::Open(group)) => run_open(group),
+        Some(Group::Push(raw)) => publish::dispatch("push", &raw.args).unwrap_or(exit::USAGE),
+        Some(Group::SyncDefault(raw)) => {
+            publish::dispatch("sync-default", &raw.args).unwrap_or(exit::USAGE)
+        }
         Some(Group::Summary(raw)) => git_summary::cli::run_embedded(&raw.args),
         Some(Group::Completion(raw)) => run_completion(raw),
         Some(Group::Help) | None => print_root_help(),

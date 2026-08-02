@@ -116,6 +116,26 @@ The managed layout (`repo-key`, the managed/external classification, and slug-ba
 anchored to the repository's primary worktree, so `worktree` commands behave identically whether run
 from the primary checkout or from inside any linked worktree.
 
+### push
+
+- `push`: Publish the checked-out branch to its own branch on the remote, using the fully
+  qualified refspec `refs/heads/<branch>:refs/heads/<branch>` so the destination cannot depend on
+  `push.default`, `remote.pushDefault`, or configured push refspecs. Sets the upstream on first
+  publish. Refuses the remote's default branch (`refuse-default-branch`), a detached HEAD, and an
+  unresolvable remote default (`default-branch-unresolved`).
+  Options: `--remote <name>`, `--expect-default <branch>`, `--force-with-lease`, `--dry-run`,
+  `--format text|json`.
+
+### sync-default
+
+- `sync-default`: Fast-forward the local default branch to its remote-tracking ref, and nothing
+  else. Uses `git merge --ff-only` when the default branch is checked out here, and a
+  compare-and-swap `git update-ref` when no worktree holds it. Refuses divergence
+  (`not-fast-forward`), a dirty checkout, and a default branch held by another worktree.
+  Options: `--remote <name>`, `--no-fetch`, `--dry-run`, `--format text|json`.
+
+See the [remote surfaces spec](docs/specs/git-cli-remote-surfaces.md) for the full contract.
+
 ### ci
 
 - `pick`: Create and push a `ci/<target>/<name>` branch with cherry-picked commits.
@@ -186,3 +206,4 @@ Rust implementation rather than spawning another binary.
 
 - [Docs index](docs/README.md)
 - [Worktree convention spec](docs/specs/git-cli-worktree-convention.md)
+- [Remote surfaces spec](docs/specs/git-cli-remote-surfaces.md)

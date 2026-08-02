@@ -44,6 +44,19 @@ path so the caller can `cd` into it. `--shell` prints an evaluable
 `cd -- <path>` command instead of the bare path, mirroring `utils root --shell`;
 the committed `gxwcd` shell helper wraps it and adds worktree-name completion.
 
+## Upstream Tracking
+
+`add` creates the branch with `--no-track`. The default base ref is the cached
+remote default branch (`origin/main`), and Git's `branch.autoSetupMerge` default
+would otherwise record *that* as the new branch's upstream — leaving
+`branch.<new>.merge = refs/heads/main`. Every consumer that reads `@{upstream}`
+to find the branch head would then resolve the default branch instead, which is
+how `forge-cli pr deliver` came to report an already-pushed head as unpushed.
+
+A managed worktree branch is unpublished, so it has no upstream. The upstream is
+established at publish time by `git-cli push`, which sets it to the branch's own
+ref. See [git-cli remote surfaces](git-cli-remote-surfaces.md).
+
 ## Primary Worktree Resolution
 
 The managed layout — `<repo-key>`, the managed/external classification, and
