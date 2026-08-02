@@ -129,7 +129,7 @@ async function findTrustedPullRequestCi({
       pull.merged_at &&
       pull.merge_commit_sha === sha &&
       pull.head?.ref === branch &&
-      pull.head?.sha === sha &&
+      /^[0-9a-f]{40}$/i.test(pull.head?.sha || "") &&
       pull.head?.repo?.full_name === fullName &&
       pull.base?.ref === "main" &&
       pull.base?.repo?.full_name === fullName,
@@ -138,6 +138,32 @@ async function findTrustedPullRequestCi({
     return null;
   }
   const trustedPull = trustedPulls[0];
+  const pullHeadSha = trustedPull.head.sha;
+
+  if (pullHeadSha !== sha) {
+    const [taggedCommit, pullHeadCommit] = await Promise.all([
+      github.rest.repos.getCommit({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        ref: sha,
+      }),
+      github.rest.repos.getCommit({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        ref: pullHeadSha,
+      }),
+    ]);
+    const taggedTree = taggedCommit.data?.commit?.tree?.sha;
+    const pullHeadTree = pullHeadCommit.data?.commit?.tree?.sha;
+    if (
+      taggedCommit.data?.sha !== sha ||
+      pullHeadCommit.data?.sha !== pullHeadSha ||
+      !/^[0-9a-f]{40}$/i.test(taggedTree || "") ||
+      taggedTree !== pullHeadTree
+    ) {
+      return null;
+    }
+  }
 
   const runs = await listAll(
     github,
@@ -147,7 +173,7 @@ async function findTrustedPullRequestCi({
       repo: context.repo.repo,
       workflow_id: "ci.yml",
       event: "pull_request",
-      head_sha: sha,
+      head_sha: pullHeadSha,
       per_page: 100,
     },
     "workflow_runs",
@@ -158,13 +184,13 @@ async function findTrustedPullRequestCi({
       run.status === "completed" &&
       run.conclusion === "success" &&
       run.head_branch === branch &&
-      run.head_sha === sha &&
+      run.head_sha === pullHeadSha &&
       run.repository?.full_name === fullName &&
       run.head_repository?.full_name === fullName &&
       ((run.pull_requests || []).length === 0 ||
         ((run.pull_requests || []).length === 1 &&
           run.pull_requests[0].number === trustedPull.number &&
-          run.pull_requests[0].head?.sha === sha &&
+          run.pull_requests[0].head?.sha === pullHeadSha &&
           run.pull_requests[0].base?.ref === "main")),
   );
   if (trustedRuns.length !== 1) {

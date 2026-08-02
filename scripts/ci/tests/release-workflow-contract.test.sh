@@ -35,6 +35,36 @@ assert_not_contains() {
 assert_contains .github/workflows/release.yml \
   'require("./.github/scripts/release-ci-gate.cjs")' \
   "release workflow uses checked-in provenance gate"
+assert_contains .github/workflows/release.yml "workflow_dispatch:" \
+  "release workflow supports exact-tag recovery dispatch"
+assert_contains .github/workflows/release.yml "RELEASE_TRIGGERING_ACTOR" \
+  "release reruns bind the triggering identity"
+assert_contains .github/workflows/release.yml \
+  'bash .github/scripts/validate-release-invocation.sh' \
+  "release recovery uses the tested invocation validator"
+
+validator=.github/scripts/validate-release-invocation.sh
+bash "$validator" push graysurf graysurf 1 refs/tags/v1.22.10
+bash "$validator" workflow_dispatch xsin4880 xsin4880 1 refs/tags/v1.22.10
+bash "$validator" workflow_dispatch 'dobi-bot[bot]' 'dobi-bot[bot]' 1 refs/tags/v1.22.10
+bash "$validator" push graysurf xsin4880 2 refs/tags/v1.22.10
+assert_invocation_rejected() {
+  if bash "$validator" "$@" >/dev/null 2>&1; then
+    echo "FAIL: release invocation validator accepted: $*" >&2
+    exit 1
+  fi
+}
+assert_invocation_rejected workflow_dispatch xsin4880 untrusted-writer 2 refs/tags/v1.22.10
+assert_invocation_rejected workflow_dispatch untrusted-writer untrusted-writer 1 refs/tags/v1.22.10
+assert_invocation_rejected workflow_dispatch xsin4880 "" 1 refs/tags/v1.22.10
+assert_invocation_rejected push graysurf untrusted-writer 2 refs/tags/v1.22.10
+assert_invocation_rejected schedule xsin4880 xsin4880 1 refs/tags/v1.22.10
+for invalid_ref in refs/heads/main refs/tags/v1.22.10-rc.1 refs/tags/1.22.10; do
+  if bash "$validator" push graysurf graysurf 1 "$invalid_ref" >/dev/null 2>&1; then
+    echo "FAIL: release ref validator accepted $invalid_ref" >&2
+    exit 1
+  fi
+done
 assert_contains .github/workflows/release.yml "pull-requests: read" \
   "release gate can verify the canonical merged PR"
 assert_contains .github/workflows/release.yml "- runs_on: ubuntu-24.04-arm" \
