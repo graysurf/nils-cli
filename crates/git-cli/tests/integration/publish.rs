@@ -213,6 +213,51 @@ fn push_refuses_when_the_remote_default_branch_is_unknown() {
 }
 
 #[test]
+fn push_expect_default_cannot_widen_admission() {
+    // `--expect-default` exists so an offline caller can name the default branch
+    // when the remote head is not cached. It must never be able to *admit* a
+    // push that would otherwise be refused, or it is a bypass rather than an
+    // escape hatch: asserting some other branch while standing on the real
+    // default would publish the default branch.
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let remote = init_bare_remote();
+    let remote_path = remote.path().to_string_lossy().to_string();
+    git(repo.path(), &["remote", "add", "origin", &remote_path]);
+    git(repo.path(), &["push", "origin", "main"]);
+    let published = rev_parse(repo.path(), "HEAD");
+    commit_file(repo.path(), "local.txt", "local\n", "local only");
+
+    // No cached `origin/HEAD`, standing on `main`, asserting a different branch.
+    let output = harness.run(
+        repo.path(),
+        &["push", "--expect-default", "develop", "--format", "json"],
+    );
+    assert_ne!(
+        output.code, 0,
+        "a wrong --expect-default must not admit a push of a default-looking branch"
+    );
+    assert_eq!(
+        rev_parse(remote.path(), "refs/heads/main"),
+        published,
+        "the remote default branch is untouched"
+    );
+
+    // With the real default cached, a disagreeing assertion is a mismatch, not a
+    // second opinion that wins.
+    git(repo.path(), &["remote", "set-head", "origin", "main"]);
+    let mismatch = harness.run(
+        repo.path(),
+        &["push", "--expect-default", "develop", "--format", "json"],
+    );
+    assert_ne!(mismatch.code, 0);
+    assert_eq!(
+        parse_json(&mismatch)["error"]["code"],
+        "expect-default-mismatch"
+    );
+}
+
+#[test]
 fn push_expect_default_still_refuses_the_default_branch() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
@@ -222,13 +267,29 @@ fn push_expect_default_still_refuses_the_default_branch() {
     git(repo.path(), &["push", "origin", "main"]);
     commit_file(repo.path(), "local.txt", "local\n", "local only");
 
-    let output = harness.run(
+    // Uncached remote head: refused before the assertion is even consulted,
+    // because a conventional default-branch name cannot be cleared by an
+    // unverifiable claim.
+    let unverifiable = harness.run(
         repo.path(),
         &["push", "--expect-default", "main", "--format", "json"],
     );
-    assert_ne!(output.code, 0);
+    assert_ne!(unverifiable.code, 0);
     assert_eq!(
-        parse_json(&output)["error"]["code"],
+        parse_json(&unverifiable)["error"]["code"],
+        "default-branch-unverifiable"
+    );
+
+    // Cached remote head: the assertion agrees, and the push is refused for the
+    // plain reason that this *is* the default branch.
+    git(repo.path(), &["remote", "set-head", "origin", "main"]);
+    let refused = harness.run(
+        repo.path(),
+        &["push", "--expect-default", "main", "--format", "json"],
+    );
+    assert_ne!(refused.code, 0);
+    assert_eq!(
+        parse_json(&refused)["error"]["code"],
         "refuse-default-branch"
     );
 }

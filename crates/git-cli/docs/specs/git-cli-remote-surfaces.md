@@ -51,12 +51,24 @@ Refusals:
 | --- | --- |
 | `detached-head` | HEAD is not attached to a branch |
 | `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached and no `--expect-default` was given |
+| `default-branch-unverifiable` | the remote head is not cached and the checked-out branch is a conventional default-branch name |
+| `expect-default-mismatch` | `--expect-default` disagrees with the cached remote head |
 | `refuse-default-branch` | the checked-out branch is the remote's default branch |
 | `unknown-remote` | `<remote>` is not configured |
 
 `--expect-default` names what the default branch *is* when the remote HEAD is
-not cached locally, which is the offline path. It can only ever add a refusal:
-asserting `--expect-default main` while on `main` still refuses.
+not cached locally, which is the offline path. It is an escape hatch, never a
+second opinion, so it can only ever *add* a refusal:
+
+- when the remote head **is** cached, cached truth wins and a disagreeing
+  assertion is `expect-default-mismatch`;
+- when it is **not** cached, the assertion cannot clear a branch whose name is
+  conventionally a default (`main`, `master`, `trunk`, `develop`,
+  `development`, `default`) — that is `default-branch-unverifiable`.
+
+Without those two rules `--expect-default develop` while standing on `main`
+would publish the default branch, which is the thing this command exists to
+refuse.
 
 Pushing the default branch is a delivery decision, not a publish step, so
 `refuse-default-branch` points at `forge-cli repo push-default` rather than

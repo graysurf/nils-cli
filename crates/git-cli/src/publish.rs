@@ -35,6 +35,16 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
 }
 
 const DEFAULT_REMOTE: &str = "origin";
+/// Branch names conventionally used as a repository default. Used only to refuse
+/// an *unverifiable* push, never to admit one.
+const WELL_KNOWN_DEFAULT_BRANCHES: &[&str] = &[
+    "main",
+    "master",
+    "trunk",
+    "develop",
+    "development",
+    "default",
+];
 const PUSH_DEFAULT_HINT: &str = "pushing the default branch is a delivery decision, not a publish step; use \
      `forge-cli repo push-default` with the expected base and reason file when \
      direct-main delivery was explicitly authorized";
@@ -137,10 +147,50 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
     // it, because the refspec below is pinned to the checked-out branch. So the
     // default branch is the single fact that has to be established before any
     // mutation, and failing to establish it is a refusal, not a warning.
-    let default_branch = match args.expect_default.clone() {
-        Some(expected) => expected,
-        None => cached_default_branch(&args.remote).ok_or_else(|| {
-            CliError::data(
+    //
+    // `--expect-default` is an escape hatch for an uncached remote head, never a
+    // second opinion that can widen admission. Cached truth always wins, and a
+    // disagreeing assertion is a mismatch: otherwise `--expect-default develop`
+    // while standing on `main` would publish the default branch.
+    let default_branch = match (cached_default_branch(&args.remote), &args.expect_default) {
+        (Some(cached), Some(expected)) if cached != *expected => {
+            return Err(CliError::data(
+                "expect-default-mismatch",
+                format!(
+                    "--expect-default '{expected}' disagrees with the cached default \
+                     branch '{cached}' of remote '{}'",
+                    args.remote
+                ),
+            )
+            .with_hint(
+                "drop `--expect-default`; it names the default branch only when the \
+                 remote head is not cached locally",
+            ));
+        }
+        (Some(cached), _) => cached,
+        (None, Some(expected)) => {
+            // The assertion is unverifiable here, so it cannot be trusted to
+            // clear a branch that plausibly *is* a default branch.
+            if WELL_KNOWN_DEFAULT_BRANCHES.contains(&branch.as_str()) {
+                return Err(CliError::data(
+                    "default-branch-unverifiable",
+                    format!(
+                        "'{branch}' is a conventional default-branch name and the \
+                         default branch of remote '{}' is not cached, so this push \
+                         cannot be proven safe",
+                        args.remote
+                    ),
+                )
+                .with_hint(format!(
+                    "run `git remote set-head {} --auto` to establish the real \
+                     default branch; `--expect-default` cannot admit this push",
+                    args.remote
+                )));
+            }
+            expected.clone()
+        }
+        (None, None) => {
+            return Err(CliError::data(
                 "default-branch-unresolved",
                 format!(
                     "cannot resolve the default branch of remote '{}'",
@@ -151,8 +201,8 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
                 "run `git remote set-head {} --auto` to cache it, or pass \
                  `--expect-default <branch>` to name it offline",
                 args.remote
-            ))
-        })?,
+            )));
+        }
     };
 
     if branch == default_branch {
