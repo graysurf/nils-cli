@@ -23844,11 +23844,22 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
         "pid_namespace": current_pid_namespace_identity()
     }));
     let stopped_runtime = invoke("3", "worker-f31-incarnation", "f31-stopped-runtime-0001");
-    assert_eq!(stopped_runtime.code, 65);
-    assert_eq!(
-        stopped_runtime.stdout_json()["error"]["code"],
-        "worker-runtime-stopped"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(stopped_runtime.code, 65);
+        assert_eq!(
+            stopped_runtime.stdout_json()["error"]["code"],
+            "worker-runtime-stopped"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(stopped_runtime.code, 1);
+        assert_eq!(
+            stopped_runtime.stdout_json()["error"]["code"],
+            "coordination-runtime-unverified"
+        );
+    }
     set_runtime_identity(json!({
         "launch_id": "worker-f31-incarnation",
         "session_id": "$73",
@@ -24165,11 +24176,22 @@ fn main_agent_revoke_claim_fences_exact_idle_live_worker_without_input() {
     });
     set_runtime_identity(stopped_identity);
     let runtime_drift_replay = invoke("3", "worker-f31-incarnation", "f31-revoke-0001");
-    assert_eq!(runtime_drift_replay.code, 65);
-    assert_eq!(
-        runtime_drift_replay.stdout_json()["error"]["code"],
-        "worker-runtime-stopped"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(runtime_drift_replay.code, 65);
+        assert_eq!(
+            runtime_drift_replay.stdout_json()["error"]["code"],
+            "worker-runtime-stopped"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(runtime_drift_replay.code, 1);
+        assert_eq!(
+            runtime_drift_replay.stdout_json()["error"]["code"],
+            "coordination-runtime-unverified"
+        );
+    }
     assert!(
         !state_dir
             .join("sessions/worker-f31/authority-quarantine.json")
