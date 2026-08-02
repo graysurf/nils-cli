@@ -8764,31 +8764,31 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let codex_home = tmp.path().join("codex-home");
     let codex_session = codex_home.join("sessions/2026/07/26/session.jsonl");
     let assignment_path = tmp.path().join("assignment-ambiguous-enter.json");
-    write_private_json(
-        &assignment_path,
-        &json!({
-            "schema_version": "main-agent.assignment-input.v1",
-            "assignment_id": "assignment-ambiguous-enter",
-            "task_summary": "Preserve an ambiguous initial Enter",
-            "task": {},
-            "launch": {
-                "agent": "codex",
-                "cwd": checkout,
-                "title": null,
-                "session_id": "worker-ambiguous-enter",
-                "coordination_mode": "enforce",
-                "agent_args": []
-            },
-            "repository": "example/repository",
-            "worktree": null,
-            "base_ref": "main",
-            "scopes": ["crates/agent-session"],
-            "durable_refs": [],
-            "provider_stop_canary": {
-                "schema_version": "main-agent.provider-process-stop-canary.v1"
-            }
-        }),
-    );
+    let mut assignment = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-ambiguous-enter",
+        "task_summary": "Preserve an ambiguous initial Enter",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-ambiguous-enter",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    if cfg!(target_os = "linux") {
+        assignment["provider_stop_canary"] = json!({
+            "schema_version": "main-agent.provider-process-stop-canary.v1"
+        });
+    }
+    write_private_json(&assignment_path, &assignment);
     write_trusted_codex_config(&codex_home, &[&checkout]);
     let state_arg = state_dir.to_string_lossy().into_owned();
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
@@ -8855,7 +8855,7 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
     let ambiguous_registry = orchestration_registry(&state_dir);
     assert_eq!(
         ambiguous_registry["assignments"]["assignment-ambiguous-enter"]["revision"],
-        2
+        if cfg!(target_os = "linux") { 2 } else { 1 }
     );
     assert_eq!(
         ambiguous_registry["receipts"]["main-one:main-incarnation-one:worker-start-ambiguous-enter-0001"]
@@ -32604,20 +32604,59 @@ fn main_agent_worker_start_finalizer_takeover_resumes_the_same_recovery_attempt(
             successor["data"]["readiness"]["prompt_observation"].is_object(),
             "every terminal readiness takeover branch must retain typed prompt evidence: {crash_stage}"
         );
+        let actual_attempt_count =
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"]
+                .as_u64()
+                .expect("typed recovery attempt count");
+        let pre_reservation_recovery_not_admitted =
+            crash_stage == "before_reserve" && actual_attempt_count == 0;
+        if pre_reservation_recovery_not_admitted {
+            assert_eq!(
+                successor["data"]["readiness"]["classification"],
+                "prompt_observation_unavailable"
+            );
+            assert_eq!(
+                successor["data"]["readiness"]["prompt_observation"]["prompt"],
+                json!({
+                    "state": "unavailable",
+                    "proof": "provider-transcript-unavailable"
+                }),
+                "a pre-reservation takeover may decline recovery only when bounded transcript proof is unavailable"
+            );
+        }
+        let expected_attempt_count = if pre_reservation_recovery_not_admitted {
+            0
+        } else {
+            1
+        };
         assert_eq!(
-            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"], 1,
-            "successor must resume the persisted recovery reservation"
+            successor["data"]["readiness"]["submit_key_recovery"]["attempt_count"],
+            expected_attempt_count,
+            "successor recovery attempt must match the durable reservation boundary: {crash_stage}"
         );
         assert_eq!(
             successor["data"]["readiness"]["submit_key_recovery"]["attempted"],
-            true
+            !pre_reservation_recovery_not_admitted,
+            "only a proof-unavailable takeover before reservation may decline recovery: {crash_stage}"
         );
         let registry = orchestration_registry(&state_dir);
-        assert_eq!(
-            registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
-            1
-        );
-        let expected_enter_count = if crash_stage == "sending" { 1 } else { 2 };
+        if pre_reservation_recovery_not_admitted {
+            assert!(
+                registry["assignments"][&assignment_id]["submit_recovery"].is_null(),
+                "proof-unavailable takeover before reservation must not create recovery state"
+            );
+        } else {
+            assert_eq!(
+                registry["assignments"][&assignment_id]["submit_recovery"]["attempt_count"],
+                1
+            );
+        }
+        let expected_enter_count =
+            if crash_stage == "sending" || pre_reservation_recovery_not_admitted {
+                1
+            } else {
+                2
+            };
         assert_eq!(
             tmux_calls(&tmux_log)
                 .iter()
