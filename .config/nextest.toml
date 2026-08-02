@@ -27,12 +27,12 @@ threads-required = "num-test-threads"
 filter = 'package(nils-git-cli) & test(concurrent_adoption_consumes_a_challenge_exactly_once)'
 threads-required = "num-test-threads"
 
-# These tests assert bounded observer latency and exercise repeated streamed
-# subprocess output. Coverage instrumentation plus full-workspace process
-# pressure can otherwise exhaust their deliberately narrow timing and spawn
-# margins before the behavior under test runs.
+# This test asserts a 75 ms caller-visible admission bound while spawning and
+# observing worker subprocesses. Coverage instrumentation plus full-workspace
+# process pressure can exhaust that deliberately narrow margin before the
+# behavior under test runs.
 [[profile.ci.overrides]]
-filter = 'package(nils-agent-session) & test(/(worker_prompt_observation_has_a_fixed_time_and_admission_bound|worktree_fingerprint_streaming_boundaries_and_untracked_aggregate_are_explicit)/)'
+filter = 'package(nils-agent-session) & test(worker_prompt_observation_has_a_fixed_time_and_admission_bound)'
 threads-required = "num-test-threads"
 
 [profile.ci.junit]

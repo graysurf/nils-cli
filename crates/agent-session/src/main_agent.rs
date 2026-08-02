@@ -29241,7 +29241,9 @@ mod tests {
                      2) size=\"$2\" ;;\n\
                      *) size=\"$1\" ;;\n\
                    esac\n\
-                   head -c \"$size\" /dev/zero\n\
+                   if [ \"$size\" -gt 0 ]; then\n\
+                     head -c \"$size\" /dev/zero\n\
+                   fi\n\
                  fi\n",
                 output_size_file.display()
             ),
