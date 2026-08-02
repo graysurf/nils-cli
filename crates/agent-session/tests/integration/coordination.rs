@@ -35369,17 +35369,27 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
 }
 
 #[test]
-fn main_agent_worker_start_definitive_recovery_failure_converges_at_one_terminal_boundary() {
-    for mode in ["deadline", "final-checkpoint", "takeover"] {
-        exercise_definitive_recovery_failure_boundary(mode);
-    }
+fn main_agent_worker_start_definitive_recovery_failure_converges_at_deadline_boundary() {
+    exercise_definitive_recovery_failure_boundary("deadline");
+}
+
+#[test]
+fn main_agent_worker_start_definitive_recovery_failure_converges_at_final_checkpoint_boundary() {
+    exercise_definitive_recovery_failure_boundary("final-checkpoint");
+}
+
+#[test]
+fn main_agent_worker_start_definitive_recovery_failure_converges_at_takeover_boundary() {
+    exercise_definitive_recovery_failure_boundary("takeover");
 }
 
 fn exercise_definitive_recovery_failure_boundary(mode: &str) {
     // Coverage instrumentation makes each same-release subprocess startup
-    // materially slower on macOS. Keep synchronization waits generous without
-    // changing the four-second readiness deadline this fixture validates.
-    let synchronization_timeout = Duration::from_secs(60);
+    // materially slower on macOS: a neighboring serialized fixture took more
+    // than 72 seconds in CI before this barrier. Keep synchronization waits
+    // generous without changing the four-second readiness deadline this
+    // fixture validates.
+    let synchronization_timeout = Duration::from_secs(120);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
