@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -805,6 +808,35 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
 }
 
+#[cfg(not(target_os = "linux"))]
+fn directory_file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries = fs::read_dir(current)
+            .expect("snapshot directory")
+            .map(|entry| entry.expect("snapshot entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let file_type = entry.file_type().expect("snapshot file type");
+            let path = entry.path();
+            if file_type.is_dir() {
+                visit(root, &path, snapshot);
+            } else if file_type.is_file() {
+                snapshot.insert(
+                    path.strip_prefix(root)
+                        .expect("snapshot relative path")
+                        .to_path_buf(),
+                    fs::read(path).expect("snapshot file"),
+                );
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
 #[cfg(target_os = "linux")]
 fn assert_authority_quarantine_released(path: &Path) {
     assert!(
@@ -1250,6 +1282,7 @@ fn released_v1_claim_renew_fixture(state_dir: &Path, session_id: &str) -> Result
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn coordination_authority_snapshot(
     registry: &serde_json::Value,
     session_id: &str,
@@ -16703,6 +16736,7 @@ impl StoppedPostClaimFixture {
         run_main_agent(&self.checkout, &self.reconcile_args(), &self.envs())
     }
 
+    #[cfg(target_os = "linux")]
     fn run_reconcile_with_extra_env(&self, extra: &[(&str, &str)]) -> CmdOutput {
         let mut env = self.envs().to_vec();
         env.extend_from_slice(extra);
@@ -16887,6 +16921,7 @@ impl StoppedPostClaimFixture {
         command.spawn().expect("spawn claimed runtime stop")
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_reconcile_at_barrier(&self, barrier: &Path, stage: &str) -> Child {
         let mut command = Command::new(bin::resolve("main-agent"));
         command
@@ -17258,6 +17293,114 @@ fn claimed_runtime_stop_fails_closed_without_exact_stopped_runtime_proof() {
                     && claim["state"] == "active"
             }),
         "unverified non-Linux absence must preserve the active worker claim"
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof() {
+    let fixture = StoppedPostClaimFixture::new();
+    let orchestration_before = orchestration_registry(&fixture.state_dir);
+    let coordination_before = load_coordination_registry(&fixture.state_dir);
+    let worker_checkout = PathBuf::from(
+        orchestration_before["assignments"]["assignment-stopped"]["worktree"]
+            .as_str()
+            .expect("worker worktree"),
+    );
+    let retained_progress = worker_checkout.join("non-linux-progress-to-preserve");
+    fs::write(&retained_progress, "unaccepted worker output").expect("worker progress");
+    let worker_session_dir = fixture.state_dir.join("sessions/worker-stopped");
+    let session_before_unverified = directory_file_snapshot(&worker_session_dir);
+
+    let assert_fail_closed_diagnosis = |command: &str| {
+        let observed = run_main_agent(
+            &fixture.checkout,
+            &[
+                "--state-dir",
+                fixture.state_dir.to_str().expect("state dir"),
+                "worker",
+                command,
+                "assignment-stopped",
+                "--format",
+                "json",
+            ],
+            &fixture.envs(),
+        );
+        assert_eq!(observed.code, 0, "outcome={}", observed.stdout_text());
+        assert_eq!(
+            data(&observed)["classification"],
+            "evidence_unavailable",
+            "{command} must not call an unproved stopped runtime healthy"
+        );
+        assert_eq!(
+            data(&observed)["recovery_action"]["kind"],
+            "identity_evidence_reconciliation"
+        );
+        assert_eq!(data(&observed)["recovery_action"]["executable"], false);
+    };
+    for command in ["supervise", "diagnose"] {
+        assert_fail_closed_diagnosis(command);
+    }
+
+    let reconciled = fixture.run_reconcile();
+    assert_eq!(reconciled.code, 1, "outcome={}", reconciled.stdout_text());
+    assert_eq!(
+        reconciled.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert_eq!(
+        directory_file_snapshot(&worker_session_dir),
+        session_before_unverified,
+        "unverified diagnosis and reconciliation must not mutate worker session authority"
+    );
+
+    let worker_record_path = worker_session_dir.join("session.json");
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker session record"))
+            .expect("worker session json");
+    worker_record
+        .as_object_mut()
+        .expect("worker session object")
+        .remove("delete_tmux_identity");
+    write_private_json(&worker_record_path, &worker_record);
+    let session_before_missing_identity = directory_file_snapshot(&worker_session_dir);
+    for command in ["supervise", "diagnose"] {
+        assert_fail_closed_diagnosis(command);
+    }
+    let missing_identity_reconcile = fixture.run_reconcile();
+    assert_eq!(
+        missing_identity_reconcile.code,
+        1,
+        "outcome={}",
+        missing_identity_reconcile.stdout_text()
+    );
+    assert_eq!(
+        missing_identity_reconcile.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert_eq!(
+        directory_file_snapshot(&worker_session_dir),
+        session_before_missing_identity,
+        "missing-identity diagnosis and reconciliation must not mutate worker session authority"
+    );
+    assert_eq!(
+        orchestration_registry(&fixture.state_dir),
+        orchestration_before,
+        "unverified non-Linux absence must not terminalize the assignment"
+    );
+    assert_eq!(
+        load_coordination_registry(&fixture.state_dir),
+        coordination_before,
+        "unverified non-Linux absence must preserve the active worker claim"
+    );
+    assert!(
+        worker_session_dir.is_dir(),
+        "unverified non-Linux absence must preserve the worker session"
+    );
+    assert_eq!(
+        fs::read_to_string(retained_progress).expect("retained worker progress"),
+        "unaccepted worker output",
+        "fail-closed diagnosis and reconciliation must preserve the worker worktree"
     );
 }
 
@@ -21944,6 +22087,7 @@ fn terminate_at_barrier(child: Child, label: &str) {
     child.0 = None;
 }
 
+#[cfg(target_os = "linux")]
 fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Value {
     let mut stream = TcpStream::connect(address).expect("connect HTTP server");
     let request = format!(
@@ -24952,6 +25096,7 @@ fn main_agent_revoke_claim_keeps_accepted_assignment_retirable() {
 /// closes such a lane while preserving the worker worktree, the run, and the
 /// Main Agent session.
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_post_claim_stopped_worker_is_terminalized_without_deleting_the_run() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -25718,6 +25863,7 @@ fn main_agent_post_claim_stopped_worker_is_terminalized_without_deleting_the_run
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_identical_replay_converges_from_typed_progress() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture._tmp.path().join("reconcile-progress-barrier");
@@ -25790,6 +25936,7 @@ fn reconcile_stopped_identical_replay_converges_from_typed_progress() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_observational_path_skips_operation_renewal_probes() {
     let fixture = StoppedPostClaimFixture::new();
     seed_operation(
@@ -25849,6 +25996,7 @@ fn reconcile_stopped_observational_path_skips_operation_renewal_probes() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_normal_and_after_seal_retry_share_stable_claim_truth() {
     let normal_fixture = StoppedPostClaimFixture::new();
     let normal = normal_fixture.run_reconcile();
@@ -25993,6 +26141,7 @@ fn reconcile_stopped_normal_and_after_seal_retry_share_stable_claim_truth() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_same_main_successor_claim_authorizes_roll_forward() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26158,6 +26307,7 @@ fn reconcile_stopped_same_main_successor_claim_authorizes_roll_forward() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_revision_change_cannot_authorize_seal() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26221,6 +26371,7 @@ fn reconcile_stopped_controller_claim_revision_change_cannot_authorize_seal() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_expired_original_accepts_same_main_successor_claim() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26313,6 +26464,7 @@ fn reconcile_stopped_expired_original_accepts_same_main_successor_claim() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_different_session_cannot_take_over_progress() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26358,6 +26510,7 @@ fn reconcile_stopped_different_session_cannot_take_over_progress() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_prior_external_release_reports_stable_terminal_claim_truth() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26402,6 +26555,7 @@ fn reconcile_stopped_prior_external_release_reports_stable_terminal_claim_truth(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_completed_v1_receipt_replays_byte_stably() {
     let fixture = StoppedPostClaimFixture::new();
     let completed = fixture.run_reconcile();
@@ -26442,6 +26596,7 @@ fn reconcile_stopped_completed_v1_receipt_replays_byte_stably() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_fresh_replay_does_not_renew_expired_controller_claim() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26503,6 +26658,7 @@ fn reconcile_stopped_fresh_replay_does_not_renew_expired_controller_claim() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_release_before_seal_preserves_target_authority() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26601,6 +26757,7 @@ fn reconcile_stopped_controller_claim_release_before_seal_preserves_target_autho
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_controller_claim_expiry_before_seal_preserves_target_authority() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture
@@ -26656,6 +26813,7 @@ fn reconcile_stopped_controller_claim_expiry_before_seal_preserves_target_author
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_malformed_progress_fails_before_target_cleanup() {
     let fixture = StoppedPostClaimFixture::new();
     let barrier = fixture._tmp.path().join("reconcile-malformed-barrier");
@@ -26741,6 +26899,7 @@ fn reconcile_stopped_malformed_progress_fails_before_target_cleanup() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn reconcile_stopped_quarantine_blocks_http_resume_before_authority_provisioning() {
     let fixture = StoppedPostClaimFixture::new();
     let terminalized = fixture.run_reconcile();

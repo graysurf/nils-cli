@@ -65,7 +65,7 @@ const WORKER_PROMPT_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKER_PROMPT_OBSERVATION_MAX_READERS: usize = 4;
 static ACTIVE_WORKER_PROMPT_OBSERVATION_READERS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
-static WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+static WORKER_PROMPT_OBSERVATION_BLOCK_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
 const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start --await-ready -> worker bootstrap\n  worker supervise -> accept -> closeout (retires terminal workers and closes)\n\nMACRO-FIRST RECOVERY:\n  Use worker supervise for repeatable diagnosis. Use self recover only for this\n  exact Main Agent controller's stale broker. Guidance continuity and managed\n  account handoff use their typed worker actions. Use worker reassign only when\n  supervision proves safe reassignment. If a macro stops, continue from its\n  last_proven_safe_state with worker diagnose, submit-recovery, cancel,\n  account-handoff-cancel, retire, or exact closeout replay. Account handoff\n  cancellation requires the current assignment revision and\n  --authorize-account-change. Never resend a prompt or inject an\n  unbounded/manual Enter.\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request. A partial closeout reuses its original run revision, checkpoint,\n  and key because its progress receipt owns later stage revisions.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent self recover --idempotency-key controller-recover-001 --format json\n  main-agent worker start --assignment-file assignment.json --await-ready 5m --idempotency-key start-001 --format json\n  main-agent worker supervise ASSIGNMENT_ID --format json\n  main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason \"pre-claim bootstrap failure\" --idempotency-key reassign-001 --format json\n  main-agent closeout --if-run-revision 7 --checkpoint-file final.json --idempotency-key closeout-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
@@ -6881,12 +6881,8 @@ fn worker_prompt_observed_with_timeout(
         .spawn(move || {
             let _permit = permit;
             #[cfg(test)]
-            {
-                let stall =
-                    WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST.swap(0, Ordering::AcqRel);
-                if stall > 0 {
-                    thread::sleep(Duration::from_millis(stall as u64));
-                }
+            while WORKER_PROMPT_OBSERVATION_BLOCK_FOR_TEST.load(Ordering::Acquire) != 0 {
+                thread::sleep(Duration::from_millis(1));
             }
             let result = worker_prompt_observed_inner(&context, &worker);
             let _ = sender.send(result);
@@ -8915,12 +8911,27 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     );
     let worker_unreachable =
         assignment.worker.is_some() && matches!(&session_evidence, DiagnosticEvidence::Absent(_));
+    let durable_runtime_status = session_evidence
+        .value()
+        .and_then(|record| crate::coordination_runtime_evidence(record).ok())
+        .map(|evidence| evidence.status);
+    let stopped_runtime_unverified = !cfg!(target_os = "linux")
+        && assignment.worker.is_some()
+        && worker_status == "stopped"
+        && !matches!(
+            durable_runtime_status,
+            Some(
+                crate::CoordinationRuntimeStatus::Stopped
+                    | crate::CoordinationRuntimeStatus::Running
+            )
+        );
     let evidence_unavailable = packet_evidence.is_unavailable_or_mismatched()
         || session_evidence.is_unavailable_or_mismatched()
         || activity_evidence.is_unavailable_or_mismatched()
         || coordination_evidence.is_unavailable_or_mismatched()
         || worktree_unavailable
         || guidance_unavailable
+        || stopped_runtime_unverified
         || raw_rate_limit_diagnostic.is_unavailable();
     let preclaim_blocker = assignment_has_preclaim_blocker(&assignment);
     let terminal_recovery_reconciled =
@@ -8941,10 +8952,6 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     // tmux query: a live or unknown runtime fails closed, and this is the same
     // combined cgroup/process-session/process-group proof the terminalization
     // re-establishes under the session-record lock.
-    let durable_runtime_status = session_evidence
-        .value()
-        .and_then(|record| crate::coordination_runtime_evidence(record).ok())
-        .map(|evidence| evidence.status);
     let durable_runtime_stopped =
         durable_runtime_status == Some(crate::CoordinationRuntimeStatus::Stopped);
     let durable_runtime_running =
@@ -28662,6 +28669,14 @@ mod tests {
     fn worker_prompt_observation_has_a_fixed_time_and_admission_bound() {
         use std::os::unix::fs::PermissionsExt;
 
+        struct ObservationBlocker;
+
+        impl Drop for ObservationBlocker {
+            fn drop(&mut self) {
+                WORKER_PROMPT_OBSERVATION_BLOCK_FOR_TEST.store(0, Ordering::Release);
+            }
+        }
+
         let temporary = tempfile::TempDir::new().expect("temporary state");
         let context = CliContext {
             state_dir: temporary.path().join("state"),
@@ -28677,16 +28692,13 @@ mod tests {
         fs::set_permissions(&prompt_path, fs::Permissions::from_mode(0o600))
             .expect("private prompt");
         worker.prompt_file = Some(prompt_path.to_string_lossy().into_owned());
-        WORKER_PROMPT_OBSERVATION_STALL_MILLIS_FOR_TEST.store(100, Ordering::Release);
-        let started = Instant::now();
+        WORKER_PROMPT_OBSERVATION_BLOCK_FOR_TEST.store(1, Ordering::Release);
+        let blocker = ObservationBlocker;
         assert_eq!(
             worker_prompt_observed_with_timeout(context, worker, Duration::from_millis(10),),
             None
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(75),
-            "the caller must not wait for the blocked transcript reader"
-        );
+        drop(blocker);
         let deadline = Instant::now() + Duration::from_secs(1);
         while ACTIVE_WORKER_PROMPT_OBSERVATION_READERS.load(Ordering::Acquire) != 0
             && Instant::now() < deadline

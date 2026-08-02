@@ -296,7 +296,8 @@ fn enforce_valid_read_only_bypasses_only_the_declared_fallback_handler() {
         assert_eq!(
             output.code,
             0,
-            "product={product}; stderr={}",
+            "product={product}; stdout={}; stderr={}",
+            output.stdout_text(),
             output.stderr_text()
         );
         assert_eq!(output.stdout_json()["data"]["action"], "allow");

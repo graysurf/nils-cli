@@ -27,12 +27,11 @@ threads-required = "num-test-threads"
 filter = 'package(nils-git-cli) & test(concurrent_adoption_consumes_a_challenge_exactly_once)'
 threads-required = "num-test-threads"
 
-# This test asserts a 75 ms caller-visible admission bound while spawning and
-# observing worker subprocesses. Coverage instrumentation plus full-workspace
-# process pressure can exhaust that deliberately narrow margin before the
-# behavior under test runs.
+# This fixture verifies two products by invoking same-release descriptor
+# producers and runtime handlers. Reserve process capacity so full-workspace
+# pressure cannot turn OS child-spawn availability into a semantic failure.
 [[profile.ci.overrides]]
-filter = 'package(nils-agent-session) & test(worker_prompt_observation_has_a_fixed_time_and_admission_bound)'
+filter = 'package(nils-agent-hook) & test(enforce_valid_read_only_bypasses_only_the_declared_fallback_handler)'
 threads-required = "num-test-threads"
 
 [profile.ci.junit]
