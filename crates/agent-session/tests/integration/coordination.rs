@@ -1225,6 +1225,7 @@ fn load_coordination_registry(state_dir: &Path) -> serde_json::Value {
     .expect("coordination registry json")
 }
 
+#[cfg(target_os = "linux")]
 fn released_v1_claim_renew_fixture(state_dir: &Path, session_id: &str) -> Result<(), &'static str> {
     let path = state_dir.join("coordination/registry.json");
     let bytes = fs::read(&path).map_err(|_| "unavailable")?;
@@ -16265,6 +16266,7 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
     );
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct StoppedPostClaimFixture {
     _tmp: tempfile::TempDir,
     state_dir: PathBuf,
@@ -16672,6 +16674,7 @@ impl StoppedPostClaimFixture {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_claimed_runtime_stop_at_fence_activation_barrier(
         &self,
         runtime: &TestProcessGroup,
@@ -17067,6 +17070,60 @@ fn claimed_runtime_stop_rejects_insufficient_controller_claim_ttl_before_reserva
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
+fn claimed_runtime_stop_fails_closed_without_exact_stopped_runtime_proof() {
+    let fixture = StoppedPostClaimFixture::new();
+    seed_activity_state(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "claimed-stop-non-linux-proof",
+            "started_at": "2030-01-01T00:00:00Z",
+            "completed_at": "2030-01-01T00:00:01Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &fixture.state_dir,
+        "worker-stopped",
+        "worker-stopped-incarnation",
+        91,
+    );
+
+    let stopped = fixture.run_claimed_runtime_stop(&runtime, "claimed-stop-non-linux-proof-0001");
+    assert_eq!(stopped.code, 1, "outcome={}", stopped.stdout_text());
+    assert_eq!(
+        stopped.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        !runtime.is_running(),
+        "tmux termination may stop the pane without creating exact coordination proof"
+    );
+    let registry = orchestration_registry(&fixture.state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-stopped"]["state"], "working",
+        "unverified non-Linux absence must not advance the assignment"
+    );
+    assert!(
+        load_coordination_registry(&fixture.state_dir)["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .any(|claim| {
+                claim["session_id"] == "worker-stopped"
+                    && claim["session_incarnation"] == "worker-stopped-incarnation"
+                    && claim["state"] == "active"
+            }),
+        "unverified non-Linux absence must preserve the active worker claim"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_identity_only_interruption_projects_exact_replay() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17412,6 +17469,7 @@ fn claimed_runtime_stop_refuses_controller_claim_drift_before_runtime_stop() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_coordination() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17607,6 +17665,7 @@ fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_c
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_v2_activation_is_fail_closed_at_every_crash_boundary() {
     for stage in [
         "after_registry_v2",
@@ -17705,6 +17764,7 @@ fn claimed_runtime_stop_v2_activation_is_fail_closed_at_every_crash_boundary() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_reacquires_process_owned_fence_after_owner_crash() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -17895,6 +17955,7 @@ fn claimed_runtime_stop_refuses_expired_authority_at_termination_boundary() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18007,6 +18068,7 @@ fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_replay_degrades_safely_after_stopped_claim_expires() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18112,6 +18174,7 @@ fn claimed_runtime_stop_replay_degrades_safely_after_stopped_claim_expires() {
     assert_eq!(data(&reconciled)["worker_claim_active_after"], false);
 }
 
+#[cfg(target_os = "linux")]
 fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -18364,6 +18427,7 @@ fn assert_claimed_runtime_stop_pending_successor_loss(stage: &str) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_successor_adopt_reconcile_and_delete_preserve_lineage() {
     for stage in [
         "after_identity",
@@ -18375,6 +18439,7 @@ fn claimed_runtime_stop_successor_adopt_reconcile_and_delete_preserve_lineage() 
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
     let fixture = StoppedPostClaimFixture::new();
     seed_activity_state(
@@ -21760,6 +21825,7 @@ fn post_json_over_http(address: &str, path: &str, token: &str) -> serde_json::Va
     serde_json::from_slice(body).expect("HTTP JSON response")
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ExhaustedReadinessRuntimeStopFixture {
     tmp: tempfile::TempDir,
     state_dir: PathBuf,
@@ -22221,6 +22287,33 @@ fn runtime_stop_projects_typed_executable_action() {
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
+fn runtime_stop_fails_closed_without_exact_stopped_runtime_proof() {
+    let fixture = ExhaustedReadinessRuntimeStopFixture::new();
+    let stopped = run_main_agent(
+        &fixture.main_checkout,
+        &fixture.stop_args(),
+        &fixture.envs(),
+    );
+
+    assert_eq!(stopped.code, 1, "outcome={}", stopped.stdout_text());
+    assert_eq!(
+        stopped.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        !fixture.runtime.is_running(),
+        "tmux termination may stop the pane without creating exact coordination proof"
+    );
+    let registry = orchestration_registry(&fixture.state_dir);
+    assert_eq!(
+        registry["assignments"]["assignment-exhausted"]["state"], "starting",
+        "unverified non-Linux absence must not advance the assignment"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_marker_first_crash_fences_worker_claim_and_is_adoptable() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-marker-first");
@@ -22381,6 +22474,7 @@ fn runtime_stop_releases_global_registries_after_authority_seal() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_crash_after_authority_seal_replays_exactly() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-sealed-crash");
@@ -22419,6 +22513,7 @@ fn runtime_stop_crash_after_authority_seal_replays_exactly() {
     assert!(!fixture.runtime.is_running());
 }
 
+#[cfg(target_os = "linux")]
 fn assert_runtime_stop_orphan_recovery(stage: &str) {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture
@@ -22480,16 +22575,19 @@ fn assert_runtime_stop_orphan_recovery(stage: &str) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_orphan_after_authority_seal_transfers_exact_replay() {
     assert_runtime_stop_orphan_recovery("after_authority_seal");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_orphan_after_process_stop_transfers_finalization_only() {
     assert_runtime_stop_orphan_recovery("after_runtime_stop");
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_partial_fence_rebind_survives_pending_successor_loss() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let stop_barrier = fixture.tmp.path().join("runtime-stop-repeat-orphan");
@@ -22628,6 +22726,7 @@ fn runtime_stop_partial_fence_rebind_survives_pending_successor_loss() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_crash_after_process_stop_finalizes_without_second_kill() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let barrier = fixture.tmp.path().join("runtime-stop-process-stopped");
@@ -22662,6 +22761,7 @@ fn runtime_stop_crash_after_process_stop_finalizes_without_second_kill() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn runtime_stop_then_cancel_keeps_completed_replay_stable() {
     let fixture = ExhaustedReadinessRuntimeStopFixture::new();
     let stopped = run_main_agent(
