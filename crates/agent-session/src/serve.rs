@@ -14504,6 +14504,9 @@ case "$1" in
   display-message)
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
+  kill-session)
+    rm -f {running}
+    ;;
   *) exit 0 ;;
 esac
 "#,
