@@ -805,6 +805,7 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
 }
 
+#[cfg(target_os = "linux")]
 fn assert_authority_quarantine_released(path: &Path) {
     assert!(
         !path.exists(),
@@ -8885,6 +8886,7 @@ fn main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_cleans_prelock_quarantine_failure_before_retry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9033,6 +9035,7 @@ fn main_agent_canary_worker_start_cleans_prelock_quarantine_failure_before_retry
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_rolls_back_post_save_hook_failure_before_retry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9178,6 +9181,7 @@ fn main_agent_canary_worker_start_rolls_back_post_save_hook_failure_before_retry
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_preserves_committed_attachment_when_rollback_fails() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9348,6 +9352,7 @@ fn main_agent_canary_worker_start_preserves_committed_attachment_when_rollback_f
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_bootstrap_waits_for_matching_startup_quarantine_clear() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -9942,6 +9947,7 @@ fn main_agent_canary_bootstrap_waits_for_matching_startup_quarantine_clear() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_worker_start_never_completes_an_interrupted_prompt_attempt() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -11516,6 +11522,139 @@ fn main_agent_canary_startup_admits_only_authenticated_guardian_status() {
     }
     assert!(!Path::new(&format!("/proc/{child_pid}")).exists());
     assert!(!Path::new(&format!("/proc/{descendant_pid}")).exists());
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn main_agent_worker_start_rejects_provider_stop_canary_before_durable_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let assignment_path = tmp
+        .path()
+        .join("assignment-canary-platform-unsupported.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-canary-platform-unsupported",
+            "task_summary": "Reject an unsupported canary before worker launch",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-canary-platform-unsupported",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": checkout,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "provider_stop_canary": {
+                "schema_version": "main-agent.provider-process-stop-canary.v1"
+            }
+        }),
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-canary-platform-unsupported");
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let codex_home = tmp.path().join("codex-home");
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--if-run-revision",
+        "1",
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-canary-platform-unsupported-0001",
+        "--format",
+        "json",
+    ];
+    let env = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+    let orchestration_before_rejection = fs::read(state_dir.join("orchestration/registry.json"))
+        .expect("orchestration registry before rejection");
+    let coordination_before_rejection = fs::read(state_dir.join("coordination/registry.json"))
+        .expect("coordination registry before rejection");
+    let refused =
+        run_main_agent_with_codex_trust(&checkout, &args, &env, &codex_home, &[&checkout]);
+    assert_eq!(refused.code, 64, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "provider-stop-canary-platform-unsupported"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-canary-platform-unsupported")
+            .is_none(),
+        "platform admission must precede assignment persistence"
+    );
+    assert!(
+        !state_dir
+            .join("sessions/worker-canary-platform-unsupported")
+            .exists(),
+        "platform admission must not create worker state or capability material"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "platform admission must precede tmux and prompt transport"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json"))
+            .expect("orchestration registry after rejection"),
+        orchestration_before_rejection,
+        "platform rejection must not mutate orchestration state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json"))
+            .expect("coordination registry after rejection"),
+        coordination_before_rejection,
+        "platform rejection must not create an operation fence"
+    );
+
+    let replay = run_main_agent_with_codex_trust(&checkout, &args, &env, &codex_home, &[&checkout]);
+    assert_eq!(replay.code, 64, "outcome={}", replay.stdout_text());
+    assert_eq!(replay.stdout_text(), refused.stdout_text());
+    assert_eq!(
+        fs::read(state_dir.join("orchestration/registry.json"))
+            .expect("orchestration registry after replay"),
+        orchestration_before_rejection,
+        "replay must not advance orchestration state"
+    );
+    assert_eq!(
+        fs::read(state_dir.join("coordination/registry.json"))
+            .expect("coordination registry after replay"),
+        coordination_before_rejection,
+        "replay must not create an operation fence"
+    );
+    assert!(tmux_calls(&tmux_log).is_empty());
 }
 
 #[test]

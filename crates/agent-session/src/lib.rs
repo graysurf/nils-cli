@@ -3345,14 +3345,26 @@ fn configure_provider_stop_canary(
     armed: bool,
     _assignment_id: Option<&str>,
 ) -> Result<(), CliError> {
-    if armed {
-        return Err(CliError::usage(
-            "provider-stop-canary-platform-unsupported",
-            "the provider stop canary requires Linux exact-process identity evidence",
-            None,
-        ));
+    ensure_provider_stop_canary_platform_supported(armed)
+}
+
+pub(crate) fn ensure_provider_stop_canary_platform_supported(armed: bool) -> Result<(), CliError> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = armed;
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        if armed {
+            return Err(CliError::usage(
+                "provider-stop-canary-platform-unsupported",
+                "the provider stop canary requires Linux exact-process identity evidence",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn provider_stop_canary_armed(record: &SessionRecord) -> bool {

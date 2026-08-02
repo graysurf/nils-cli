@@ -3292,6 +3292,7 @@ fn run_worker_start_single_input(
     validate_idempotency_key(&args.idempotency_key)?;
     let await_ready = parse_await_ready(&args.await_ready)?;
     validate_assignment_input(&input)?;
+    crate::ensure_provider_stop_canary_platform_supported(input.provider_stop_canary.is_some())?;
     let (record, incarnation) = authenticated_self(context)?;
     ensure_active_claim(context, &record)?;
     let (packet_value, request_digest, legacy_request_digest) =
