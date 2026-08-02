@@ -21551,7 +21551,7 @@ exit 0
         let runtime = replacement.runtime.as_mut().unwrap();
         runtime.launch_id = "launch-replacement-fence-next".to_string();
         runtime.generation = 2;
-        let second = registry
+        let mut second = registry
             .subscribe(&context, &tmux, &replacement)
             .await
             .unwrap();
@@ -21562,6 +21562,13 @@ exit 0
             1,
             "cleanup for the deleted runtime must retain the same-id replacement broker"
         );
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"replacement-live").unwrap();
+        source_writer.flush().unwrap();
+        assert_eq!(recv_attach_bytes(&mut second).await, b"replacement-live");
         first.release().await;
         second.release().await;
         wait_for_subscriber_count(&registry, "replacement-fence", 0).await;
@@ -22077,6 +22084,53 @@ exit 0
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn fanout_fixture_close_is_fenced_to_the_captured_target_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("source.fifo");
+        create_private_fifo(&source).unwrap();
+        let guard = FixtureWriterGuard::new_with_pidfd_fault(
+            tmp.path(),
+            &source,
+            FixturePidfdFault::ErrnoTimes {
+                errno: libc::EIO,
+                remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(20)),
+            },
+        );
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, guard.identity_dir());
+        let old_destination = tmp.path().join("old.out");
+        let replacement_destination = tmp.path().join("replacement.out");
+        arm_fixture_writer(&tmux, "same-target", &old_destination);
+        let old = wait_for_fixture_target_record(
+            guard.identity_dir(),
+            "same-target",
+            FixtureIdentityState::Ready,
+        );
+
+        close_fixture_writer(&tmux, "same-target");
+        arm_fixture_writer(&tmux, "same-target", &replacement_destination);
+        let replacement =
+            wait_for_fixture_target_replacement(guard.identity_dir(), "same-target", &old);
+        wait_for_fixture_pid_start_exit(&old.identity);
+        assert!(!fixture_pid_start_matches(&old.identity));
+        assert!(fixture_process_matches(&replacement.identity));
+
+        let mut source_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap();
+        source_writer.write_all(b"replacement-live").unwrap();
+        source_writer.flush().unwrap();
+        wait_for_fixture_output(&replacement_destination, b"replacement-live");
+
+        close_fixture_writer(&tmux, "same-target");
+        wait_for_fixture_pid_start_exit(&replacement.identity);
+        assert!(!fixture_pid_start_matches(&replacement.identity));
+        guard.cleanup().expect("cleanup generation-fenced writers");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fanout_fixture_pidfd_denial_falls_back_without_leaking() {
         for errno in [libc::ENOSYS, libc::EPERM] {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -22089,24 +22143,110 @@ exit 0
                 FixturePidfdFault::Errno(errno),
             );
             let tmux = fanout_tmux(tmp.path(), &calls, &source, guard.identity_dir());
-            let destination = tmp.path().join("target.out");
-            assert!(
-                std::process::Command::new(&tmux)
-                    .args([
-                        "pipe-pane",
-                        "-t",
-                        "target",
-                        &format!("cat > {}", destination.display()),
-                    ])
-                    .status()
-                    .unwrap()
-                    .success(),
-            );
-            let identity = wait_for_fixture_target_identity(guard.identity_dir(), "target");
+            let destination_a = tmp.path().join("target-a.out");
+            let destination_b = tmp.path().join("target-b.out");
+            arm_fixture_writer(&tmux, "target-a", &destination_a);
+            arm_fixture_writer(&tmux, "target-b", &destination_b);
+            let target_a = wait_for_fixture_target_identity(guard.identity_dir(), "target-a");
+            let target_b = wait_for_fixture_target_identity(guard.identity_dir(), "target-b");
+            let mut source_writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .unwrap();
 
+            close_fixture_writer(&tmux, "target-a");
+            wait_for_fixture_pid_start_exit(&target_a);
+            assert!(!fixture_pid_start_matches(&target_a));
+            assert!(fixture_process_matches(&target_b));
+            source_writer.write_all(b"fallback-b").unwrap();
+            source_writer.flush().unwrap();
+            wait_for_fixture_output(&destination_b, b"fallback-b");
+
+            close_fixture_writer(&tmux, "target-b");
+            wait_for_fixture_pid_start_exit(&target_b);
+            assert!(!fixture_pid_start_matches(&target_b));
             guard.cleanup().expect("pidfd denial fallback cleanup");
-            assert!(!fixture_pid_start_matches(&identity));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arm_fixture_writer(tmux: &Path, target: &str, destination: &Path) {
+        assert!(
+            std::process::Command::new(tmux)
+                .args([
+                    "pipe-pane",
+                    "-t",
+                    target,
+                    &format!("cat > {}", destination.display()),
+                ])
+                .status()
+                .unwrap()
+                .success(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_fixture_writer(tmux: &Path, target: &str) {
+        assert!(
+            std::process::Command::new(tmux)
+                .args(["pipe-pane", "-t", target])
+                .status()
+                .unwrap()
+                .success(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_fixture_output(path: &Path, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::fs::read(path).unwrap_or_default() == expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "fixture output did not arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fanout_fixture_cleanup_disarms_late_writer_launches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("source.fifo");
+        create_private_fifo(&source).unwrap();
+        let guard = FixtureWriterGuard::new(tmp.path(), &source);
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, guard.identity_dir());
+
+        guard.cleanup().expect("disarm fixture writer launches");
+        let destination = tmp.path().join("target.out");
+        assert!(
+            std::process::Command::new(&tmux)
+                .args([
+                    "pipe-pane",
+                    "-t",
+                    "late-target",
+                    &format!("cat > {}", destination.display()),
+                ])
+                .status()
+                .unwrap()
+                .success(),
+        );
+
+        assert!(
+            fixture_identity_records(guard.identity_dir())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fixture_identity_records(&guard.identity_dir().join("started"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !fixture_fifo_has_reader(&source),
+            "cleanup must prevent a delayed tmux fixture arm from opening the source FIFO",
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -22128,8 +22268,9 @@ exit 0
             Some(&pre_exec_release),
         );
         let destination = tmp.path().join("target.out");
+        let launch_tmux = tmux.clone();
         let launch = std::thread::spawn(move || {
-            std::process::Command::new(&tmux)
+            std::process::Command::new(&launch_tmux)
                 .args([
                     "pipe-pane",
                     "-t",
@@ -22152,12 +22293,20 @@ exit 0
         assert!(fixture_pid_start_matches(&initializing.identity));
         assert!(!fixture_process_matches(&initializing.identity));
 
-        guard.cleanup().expect("cleanup paused pre-exec writer");
+        assert!(
+            std::process::Command::new(&tmux)
+                .args(["pipe-pane", "-t", "target"])
+                .status()
+                .unwrap()
+                .success()
+        );
         assert!(launch.join().unwrap().success());
+        wait_for_fixture_pid_start_exit(&initializing.identity);
         assert!(!fixture_pid_start_matches(&initializing.identity));
         guard
             .wait_for_started_and_reaped(1)
             .expect("paused pre-exec writer must be recorded and reaped");
+        guard.cleanup().expect("cleanup paused pre-exec writer");
     }
 
     #[cfg(target_os = "linux")]
@@ -22185,6 +22334,30 @@ exit 0
             assert!(
                 Instant::now() < deadline,
                 "fixture writer for {expected_target} did not become ready",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_fixture_target_replacement(
+        identity_dir: &Path,
+        expected_target: &str,
+        previous: &FixtureIdentityRecord,
+    ) -> FixtureIdentityRecord {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            for record in fixture_identity_records(identity_dir).unwrap() {
+                if record.target == expected_target
+                    && record.state == FixtureIdentityState::Ready
+                    && record.generation != previous.generation
+                {
+                    return record;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement fixture writer for {expected_target} did not become ready",
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -22238,6 +22411,18 @@ exit 0
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn fixture_child_guard_bounds_a_non_exiting_child() {
+        let started = Instant::now();
+        let identity = {
+            let child = FixtureChildGuard::spawn_non_exiting();
+            child.identity().clone()
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!fixture_pid_start_matches(&identity));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn fixture_cleanup_reports_an_unhandled_signal_failure_without_leaking() {
         let tmp = tempfile::TempDir::new().unwrap();
         let source = tmp.path().join("identity-source.fifo");
@@ -22255,14 +22440,16 @@ exit 0
             "{}.{}.identity",
             identity.pid, identity.start_token
         ));
+        let stop_path = guard.identity_dir().join("synthetic.stop");
         std::fs::write(
             identity_path,
             format!(
-                "{}\n{}\n{}\n{}\ntarget\nready\n\n",
+                "{}\n{}\n{}\n{}\ntarget\nready\n\ngeneration\n{}\n",
                 identity.pid,
                 identity.start_token,
                 identity.command_token,
                 identity.source_token.display(),
+                stop_path.display(),
             ),
         )
         .unwrap();
@@ -22270,6 +22457,38 @@ exit 0
         let error = guard.cleanup().unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
         assert!(fixture_process_matches(identity));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fanout_fixture_cleanup_surfaces_a_terminal_monitor_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("source.fifo");
+        create_private_fifo(&source).unwrap();
+        let guard = FixtureWriterGuard::new_with_pidfd_fault(
+            tmp.path(),
+            &source,
+            FixturePidfdFault::Errno(libc::EIO),
+        );
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, guard.identity_dir());
+        let destination = tmp.path().join("target.out");
+        arm_fixture_writer(&tmux, "target", &destination);
+        let identity = wait_for_fixture_target_identity(guard.identity_dir(), "target");
+        close_fixture_writer(&tmux, "target");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while guard.monitor_error.lock().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture close monitor failure did not become observable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = guard.cleanup().unwrap_err();
+        assert!(error.to_string().contains("fixture close request failed"));
+        wait_for_fixture_pid_start_exit(&identity);
+        assert!(!fixture_pid_start_matches(&identity));
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22284,7 +22503,7 @@ exit 0
     struct FixtureChildGuard {
         child: Option<std::process::Child>,
         identity: FixtureProcessIdentity,
-        source: PathBuf,
+        release_source: Option<PathBuf>,
     }
 
     #[cfg(target_os = "linux")]
@@ -22316,7 +22535,26 @@ exit 0
             Self {
                 child: Some(child),
                 identity,
-                source: source.to_path_buf(),
+                release_source: Some(source.to_path_buf()),
+            }
+        }
+
+        fn spawn_non_exiting() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn non-exiting fixture");
+            let pid = child.id() as libc::pid_t;
+            let identity = FixtureProcessIdentity {
+                pid,
+                start_token: fixture_process_start_token(pid).expect("fixture start token"),
+                command_token: "sleep".to_string(),
+                source_token: PathBuf::from("30"),
+            };
+            Self {
+                child: Some(child),
+                identity,
+                release_source: None,
             }
         }
 
@@ -22343,21 +22581,34 @@ exit 0
             let Some(mut child) = self.child.take() else {
                 return;
             };
+            let deadline = Instant::now() + Duration::from_millis(250);
             loop {
                 if child.try_wait().ok().flatten().is_some() {
                     return;
                 }
-                release_fixture_fifo_readers(&self.source);
+                if let Some(source) = &self.release_source {
+                    release_fixture_fifo_readers(source);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug)]
     enum FixturePidfdFault {
         None,
         #[cfg(target_os = "linux")]
         Errno(i32),
+        #[cfg(target_os = "linux")]
+        ErrnoTimes {
+            errno: i32,
+            remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        },
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22372,14 +22623,16 @@ exit 0
         target: String,
         state: FixtureIdentityState,
         init_release: Option<PathBuf>,
+        generation: String,
+        stop_path: PathBuf,
         path: PathBuf,
     }
 
     struct FixtureWriterGuard {
         identity_dir: PathBuf,
-        source: PathBuf,
         monitor_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         monitor: Option<std::thread::JoinHandle<()>>,
+        monitor_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
         pidfd_fault: FixturePidfdFault,
     }
 
@@ -22388,23 +22641,33 @@ exit 0
             Self::new_with_pidfd_fault(dir, source, FixturePidfdFault::None)
         }
 
-        fn new_with_pidfd_fault(dir: &Path, source: &Path, pidfd_fault: FixturePidfdFault) -> Self {
+        fn new_with_pidfd_fault(
+            dir: &Path,
+            _source: &Path,
+            pidfd_fault: FixturePidfdFault,
+        ) -> Self {
             let identity_dir = dir.join("fixture-writer-identities");
             std::fs::create_dir(&identity_dir).expect("create fixture identity directory");
             std::fs::create_dir(identity_dir.join("started"))
                 .expect("create fixture identity history directory");
+            std::fs::create_dir(identity_dir.join("targets"))
+                .expect("create fixture target identity directory");
             let monitor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let monitor_error = std::sync::Arc::new(std::sync::Mutex::new(None));
             let monitor = std::thread::spawn({
                 let identity_dir = identity_dir.clone();
-                let source = source.to_path_buf();
                 let monitor_stop = monitor_stop.clone();
-                move || fixture_close_monitor(&identity_dir, &source, &monitor_stop, pidfd_fault)
+                let monitor_error = monitor_error.clone();
+                let pidfd_fault = pidfd_fault.clone();
+                move || {
+                    fixture_close_monitor(&identity_dir, &monitor_stop, &monitor_error, pidfd_fault)
+                }
             });
             Self {
                 identity_dir,
-                source: source.to_path_buf(),
                 monitor_stop,
                 monitor: Some(monitor),
+                monitor_error,
                 pidfd_fault,
             }
         }
@@ -22418,9 +22681,10 @@ exit 0
             loop {
                 let started = fixture_identity_records(&self.identity_dir.join("started"))?;
                 if started.len() == expected
-                    && started
-                        .iter()
-                        .all(|record| !fixture_pid_start_matches(&record.identity))
+                    && started.iter().all(|record| {
+                        !fixture_pid_start_matches(&record.identity)
+                            && fixture_supervisor_done(&self.identity_dir, record)
+                    })
                 {
                     return Ok(());
                 }
@@ -22445,42 +22709,164 @@ exit 0
             let records = fixture_identity_records(&self.identity_dir)
                 .expect("read fixture writer identities");
             let Some(record) = records.last() else { return };
-            stop_fixture_record(record, &self.source, self.pidfd_fault)
+            stop_fixture_record(record, self.pidfd_fault.clone())
                 .expect("terminate fixture writer");
         }
 
         fn cleanup(&self) -> io::Result<()> {
-            cleanup_fixture_records(&self.identity_dir, &self.source, None, self.pidfd_fault)
+            std::fs::write(self.identity_dir.join("cleanup.requested"), b"")?;
+            wait_for_fixture_monitor_idle(&self.identity_dir)?;
+            let monitor_error = self.monitor_error.lock().unwrap().clone();
+            let cleanup_result =
+                cleanup_fixture_records(&self.identity_dir, None, self.pidfd_fault.clone());
+            let supervisor_result = wait_for_fixture_supervisors(&self.identity_dir);
+            if let Some(error) = monitor_error {
+                return Err(io::Error::other(error));
+            }
+            cleanup_result?;
+            supervisor_result
         }
     }
 
     impl Drop for FixtureWriterGuard {
         fn drop(&mut self) {
+            let _ = self.cleanup();
             self.monitor_stop
                 .store(true, std::sync::atomic::Ordering::Release);
             if let Some(monitor) = self.monitor.take() {
                 let _ = monitor.join();
             }
-            let _ = self.cleanup();
         }
     }
 
     fn fixture_close_monitor(
         identity_dir: &Path,
-        source: &Path,
         stop: &std::sync::atomic::AtomicBool,
+        monitor_error: &std::sync::Mutex<Option<String>>,
         pidfd_fault: FixturePidfdFault,
     ) {
-        let requests = identity_dir.join("close.requests");
-        let mut handled = 0;
+        let mut pending_since = HashMap::<PathBuf, Instant>::new();
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            let contents = std::fs::read_to_string(&requests).unwrap_or_default();
-            let targets: Vec<_> = contents.lines().collect();
-            for target in targets.iter().skip(handled) {
-                let _ = cleanup_fixture_records(identity_dir, source, Some(target), pidfd_fault);
+            let requests = fixture_close_request_paths(identity_dir).unwrap_or_default();
+            pending_since.retain(|path, _| requests.contains(path));
+            for request in requests {
+                let since = *pending_since
+                    .entry(request.clone())
+                    .or_insert_with(Instant::now);
+                let outcome =
+                    process_fixture_close_request(identity_dir, &request, pidfd_fault.clone());
+                let timed_out = since.elapsed() >= Duration::from_secs(2);
+                match outcome {
+                    Ok(true) => {
+                        let _ = std::fs::remove_file(&request);
+                        pending_since.remove(&request);
+                    }
+                    Ok(false) if !timed_out => {}
+                    Err(_) if !timed_out => {}
+                    Ok(false) => {
+                        monitor_error.lock().unwrap().get_or_insert_with(|| {
+                            format!(
+                                "fixture close request did not resolve an exact published writer: {}",
+                                request.display()
+                            )
+                        });
+                        let _ = std::fs::remove_file(&request);
+                        pending_since.remove(&request);
+                    }
+                    Err(error) => {
+                        monitor_error.lock().unwrap().get_or_insert_with(|| {
+                            format!("fixture close request failed: {error}")
+                        });
+                        let _ = std::fs::remove_file(&request);
+                        pending_since.remove(&request);
+                    }
+                }
             }
-            handled = targets.len();
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn fixture_close_request_paths(identity_dir: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut requests = Vec::new();
+        for entry in std::fs::read_dir(identity_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("request") {
+                requests.push(path);
+            }
+        }
+        requests.sort();
+        Ok(requests)
+    }
+
+    fn process_fixture_close_request(
+        identity_dir: &Path,
+        request: &Path,
+        pidfd_fault: FixturePidfdFault,
+    ) -> io::Result<bool> {
+        let contents = std::fs::read_to_string(request)?;
+        let mut fields = contents.lines();
+        let target = fields
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing close target"))?;
+        let generation = fields.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing close generation")
+        })?;
+        let exact = Some((target, generation));
+        let records: Vec<_> = fixture_identity_records(identity_dir)?
+            .into_iter()
+            .filter(|record| record.target == target && record.generation == generation)
+            .collect();
+        if records.is_empty() {
+            let historical: Vec<_> = fixture_identity_records(&identity_dir.join("started"))?
+                .into_iter()
+                .filter(|record| record.target == target && record.generation == generation)
+                .collect();
+            return Ok(!historical.is_empty()
+                && historical
+                    .iter()
+                    .all(|record| !fixture_pid_start_matches(&record.identity)));
+        }
+        cleanup_fixture_records(identity_dir, exact, pidfd_fault)?;
+        Ok(true)
+    }
+
+    fn wait_for_fixture_monitor_idle(identity_dir: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fixture_close_request_paths(identity_dir)?.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture close monitor did not finish pending requests",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn fixture_supervisor_done(identity_dir: &Path, record: &FixtureIdentityRecord) -> bool {
+        identity_dir
+            .join(format!("{}.done", record.generation))
+            .exists()
+    }
+
+    fn wait_for_fixture_supervisors(identity_dir: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let started = fixture_identity_records(&identity_dir.join("started"))?;
+            if started
+                .iter()
+                .all(|record| fixture_supervisor_done(identity_dir, record))
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture writer supervisors did not exit",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -22494,7 +22880,7 @@ exit 0
             }
             let contents = std::fs::read_to_string(&path)?;
             let fields: Vec<_> = contents.lines().collect();
-            if fields.len() < 6 {
+            if fields.len() < 9 {
                 continue;
             }
             let Ok(pid) = fields[0].parse() else {
@@ -22518,6 +22904,8 @@ exit 0
                     .get(6)
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from),
+                generation: fields[7].to_string(),
+                stop_path: PathBuf::from(fields[8]),
                 path,
             });
         }
@@ -22527,15 +22915,18 @@ exit 0
 
     fn cleanup_fixture_records(
         identity_dir: &Path,
-        source: &Path,
-        target: Option<&str>,
+        exact: Option<(&str, &str)>,
         pidfd_fault: FixturePidfdFault,
     ) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let records: Vec<_> = fixture_identity_records(identity_dir)?
                 .into_iter()
-                .filter(|record| target.is_none_or(|target| record.target == target))
+                .filter(|record| {
+                    exact.is_none_or(|(target, generation)| {
+                        record.target == target && record.generation == generation
+                    })
+                })
                 .collect();
             if records.is_empty() {
                 return Ok(());
@@ -22552,14 +22943,18 @@ exit 0
                         }
                     }
                     FixtureIdentityState::Ready => {
-                        stop_fixture_record(record, source, pidfd_fault)?;
+                        stop_fixture_record(record, pidfd_fault.clone())?;
                     }
                 }
             }
             if Instant::now() >= deadline {
                 let live = fixture_identity_records(identity_dir)?
                     .into_iter()
-                    .filter(|record| target.is_none_or(|target| record.target == target))
+                    .filter(|record| {
+                        exact.is_none_or(|(target, generation)| {
+                            record.target == target && record.generation == generation
+                        })
+                    })
                     .filter(|record| fixture_pid_start_matches(&record.identity))
                     .count();
                 if live == 0 {
@@ -22576,7 +22971,6 @@ exit 0
 
     fn stop_fixture_record(
         record: &FixtureIdentityRecord,
-        source: &Path,
         pidfd_fault: FixturePidfdFault,
     ) -> io::Result<()> {
         #[cfg(not(target_os = "linux"))]
@@ -22588,7 +22982,7 @@ exit 0
         let signal_result = signal_fixture_process_if_matches_with_fault(
             &record.identity,
             libc::SIGTERM,
-            pidfd_fault,
+            pidfd_fault.clone(),
         );
         #[cfg(not(target_os = "linux"))]
         let signal_result: io::Result<bool> = Err(io::Error::from_raw_os_error(libc::ENOSYS));
@@ -22600,7 +22994,7 @@ exit 0
                     Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)
                 ) =>
             {
-                release_fixture_fifo_readers(source);
+                std::fs::write(&record.stop_path, b"")?;
             }
             Err(error) => return Err(error),
         }
@@ -22613,7 +23007,7 @@ exit 0
                 pidfd_fault,
             )?;
             #[cfg(not(target_os = "linux"))]
-            release_fixture_fifo_readers(source);
+            std::fs::write(&record.stop_path, b"")?;
             wait_for_fixture_pid_start_exit(&record.identity);
         }
         if fixture_pid_start_matches(&record.identity) {
@@ -22626,11 +23020,25 @@ exit 0
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn release_fixture_fifo_readers(source: &Path) {
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(source);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_fifo_has_reader(source: &Path) -> bool {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(source)
+        {
+            Ok(_) => true,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => false,
+            Err(error) => panic!("probe fixture FIFO reader: {error}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -22730,8 +23138,23 @@ exit 0
         if !fixture_process_matches(identity) {
             return Ok(false);
         }
-        if let FixturePidfdFault::Errno(errno) = fault {
-            return Err(io::Error::from_raw_os_error(errno));
+        match fault {
+            FixturePidfdFault::None => {}
+            FixturePidfdFault::Errno(errno) => {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            FixturePidfdFault::ErrnoTimes { errno, remaining } => {
+                if remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |value| value.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+            }
         }
         // SAFETY: pidfd_open binds the handle to the process occupying this PID.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
@@ -22804,19 +23227,31 @@ exit 0
     ) -> PathBuf {
         let pre_exec_started = pre_exec_started.unwrap_or_else(|| Path::new(""));
         let pre_exec_release = pre_exec_release.unwrap_or_else(|| Path::new(""));
+        let calls_q = shell_words::quote(&calls.to_string_lossy()).into_owned();
+        let source_q = shell_words::quote(&source.to_string_lossy()).into_owned();
+        let identity_dir_q = shell_words::quote(&identity_dir.to_string_lossy()).into_owned();
+        let pre_exec_started_q =
+            shell_words::quote(&pre_exec_started.to_string_lossy()).into_owned();
+        let pre_exec_release_q =
+            shell_words::quote(&pre_exec_release.to_string_lossy()).into_owned();
         executable(
             &dir.join("tmux"),
             &format!(
                 r#"#!/usr/bin/env sh
-printf '%s\n' "$*" >> {}
+printf '%s\n' "$*" >> {calls_q}
 target=''
 previous=''
 for arg in "$@"; do
   if [ "$previous" = '-t' ]; then target=$arg; fi
   previous=$arg
 done
-pre_exec_started={}
-pre_exec_release={}
+pre_exec_started={pre_exec_started_q}
+pre_exec_release={pre_exec_release_q}
+fixture_identity_dir={identity_dir_q}
+fixture_source={source_q}
+fixture_cleanup_requested() {{
+  [ ! -d "$fixture_identity_dir" ] || [ -e "$fixture_identity_dir/cleanup.requested" ]
+}}
 fixture_start_token() {{
   fixture_pid=$1
   if [ -r "/proc/$fixture_pid/stat" ]; then
@@ -22830,17 +23265,18 @@ fixture_writer_ready() {{
   [ "$(fixture_start_token "$writer_pid")" = "$writer_start" ] || return 1
   if [ -r "/proc/$writer_pid/comm" ]; then
     [ "$(cat "/proc/$writer_pid/comm" 2>/dev/null)" = cat ] &&
-    tr '\000' '\n' < "/proc/$writer_pid/cmdline" 2>/dev/null | grep -Fqx -- {}
+    tr '\000' '\n' < "/proc/$writer_pid/cmdline" 2>/dev/null | grep -Fqx -- "$fixture_source"
   else
     [ "$(ps -p "$writer_pid" -o comm= 2>/dev/null | awk -F/ '{{print $NF}}' | awk '{{$1=$1; print}}')" = cat ] &&
-    ps -ww -p "$writer_pid" -o command= 2>/dev/null | grep -Fq -- {}
+    ps -ww -p "$writer_pid" -o command= 2>/dev/null | grep -Fq -- "$fixture_source"
   fi
 }}
 write_identity() {{
   identity_state=$1
   identity_tmp=$identity_file.tmp.$$
-  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    "$writer_pid" "$writer_start" cat {} "$target" "$identity_state" "$pre_exec_release" \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$writer_pid" "$writer_start" cat "$fixture_source" "$target" "$identity_state" \
+    "$pre_exec_release" "$generation" "$stop_path" \
     > "$identity_tmp"
   mv "$identity_tmp" "$identity_file"
 }}
@@ -22851,16 +23287,28 @@ fi
 if [ "$1" = "pipe-pane" ]; then
   last=""
   for arg in "$@"; do last="$arg"; done
+  launcher_start=$(fixture_start_token $$ || true)
+  generation=$$.$launcher_start
+  current_file=$fixture_identity_dir/targets/$target.current
   case "$last" in
     "cat > "*)
+      if fixture_cleanup_requested; then exit 0; fi
       dest=${{last#cat > }}
+      current_tmp=$current_file.tmp.$$
+      printf '%s\n%s\n' "$generation" "$target" > "$current_tmp"
+      mv "$current_tmp" "$current_file"
+      stop_path=$fixture_identity_dir/$generation.stop
+      arm_ready=$fixture_identity_dir/$generation.ready
+      arm_failed=$fixture_identity_dir/$generation.failed
+      supervisor_done=$fixture_identity_dir/$generation.done
+      (
       (
         if [ -n "$pre_exec_started" ]; then
           : > "$pre_exec_started"
           while [ ! -e "$pre_exec_release" ]; do sleep 0.01; done
         fi
         exec 3>"$dest"
-        exec cat {} >&3
+        exec cat "$fixture_source" >&3
       ) &
       writer_pid=$!
       writer_start=''
@@ -22869,44 +23317,75 @@ if [ "$1" = "pipe-pane" ]; then
         writer_start=$(fixture_start_token "$writer_pid" || true)
         attempts=$((attempts + 1))
       done
-      if [ -z "$writer_start" ]; then
-        : > {}
-        wait "$writer_pid" 2>/dev/null || true
-        exit 1
+        if [ -z "$writer_start" ]; then
+          [ -n "$pre_exec_release" ] && : > "$pre_exec_release"
+          : > "$arm_failed"
+          wait "$writer_pid" 2>/dev/null || true
+          : > "$supervisor_done"
+          exit 1
       fi
-      identity_file={}/$writer_pid.$writer_start.identity
+      identity_file=$fixture_identity_dir/$writer_pid.$writer_start.identity
       write_identity initializing
       attempts=0
       while ! fixture_writer_ready && [ "$attempts" -lt 200 ]; do
+        if fixture_cleanup_requested || [ -e "$stop_path" ]; then
+          [ -n "$pre_exec_release" ] && : > "$pre_exec_release"
+        fi
         sleep 0.01
         attempts=$((attempts + 1))
       done
       if ! fixture_writer_ready; then
-        : > {}
-        wait "$writer_pid" 2>/dev/null || true
-        rm -f "$identity_file"
-        exit 1
+        [ -n "$pre_exec_release" ] && : > "$pre_exec_release"
+          : > "$arm_failed"
+          wait "$writer_pid" 2>/dev/null || true
+          rm -f "$identity_file"
+          : > "$supervisor_done"
+          exit 1
       fi
       write_identity ready
-      cp "$identity_file" {}/started/$writer_pid.$writer_start.identity
+      cp "$identity_file" "$fixture_identity_dir/started/$writer_pid.$writer_start.identity"
+      : > "$arm_ready"
+      while fixture_writer_ready; do
+        if fixture_cleanup_requested || [ -e "$stop_path" ]; then
+          if fixture_writer_ready; then
+            kill -TERM "$writer_pid" 2>/dev/null || true
+          fi
+        fi
+        sleep 0.01
+      done
+      wait "$writer_pid" 2>/dev/null || true
+      rm -f "$identity_file" "$stop_path"
+      : > "$supervisor_done"
+      ) </dev/null >/dev/null 2>&1 &
+      attempts=0
+      while [ ! -e "$arm_ready" ] && [ ! -e "$arm_failed" ] && [ "$attempts" -lt 250 ]; do
+        sleep 0.01
+        attempts=$((attempts + 1))
+      done
+      if [ -e "$arm_ready" ]; then
+        rm -f "$arm_ready"
+      else
+        : > "$stop_path"
+        rm -f "$arm_failed"
+        exit 1
+      fi
       ;;
-    *) printf '%s\n' "$target" >> {}/close.requests ;;
+    *)
+      if [ -r "$current_file" ]; then
+        close_generation=$(sed -n '1p' "$current_file")
+        close_target=$(sed -n '2p' "$current_file")
+        if [ "$close_target" = "$target" ] && [ -n "$close_generation" ]; then
+          request_tmp=$fixture_identity_dir/close.$generation.request.tmp
+          request_file=$fixture_identity_dir/close.$generation.request
+          printf '%s\n%s\n' "$target" "$close_generation" > "$request_tmp"
+          mv "$request_tmp" "$request_file"
+        fi
+      fi
+      ;;
   esac
 fi
 exit 0
 "#,
-                shell_words::quote(&calls.to_string_lossy()),
-                shell_words::quote(&pre_exec_started.to_string_lossy()),
-                shell_words::quote(&pre_exec_release.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&identity_dir.to_string_lossy()),
-                shell_words::quote(&source.to_string_lossy()),
-                shell_words::quote(&identity_dir.to_string_lossy()),
-                shell_words::quote(&identity_dir.to_string_lossy()),
             ),
         )
     }
