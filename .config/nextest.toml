@@ -34,5 +34,12 @@ threads-required = "num-test-threads"
 filter = 'package(nils-agent-hook) & test(enforce_valid_read_only_bypasses_only_the_declared_fallback_handler)'
 threads-required = "num-test-threads"
 
+# These fixtures coordinate same-release subprocesses across bounded barrier
+# and transcript-observation windows. Give each the complete CI thread pool so
+# unrelated coverage work cannot consume the process admission they validate.
+[[profile.ci.overrides]]
+filter = 'package(nils-agent-session) & test(/(main_agent_worker_start_preserves_ambiguous_initial_enter_without_redelivery|main_agent_worker_start_timeout_reports_exact_submitted_prompt)/)'
+threads-required = "num-test-threads"
+
 [profile.ci.junit]
 path = "junit.xml"
