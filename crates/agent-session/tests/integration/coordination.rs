@@ -17336,7 +17336,23 @@ fn main_agent_post_claim_stopped_worker_fails_closed_without_exact_runtime_proof
             data(&observed)["recovery_action"]["kind"],
             "identity_evidence_reconciliation"
         );
-        assert_eq!(data(&observed)["recovery_action"]["executable"], false);
+        assert_eq!(
+            data(&observed)["recovery_action"]["executable"],
+            true,
+            "the bounded read-only supervision recheck remains safe to execute"
+        );
+        assert_eq!(
+            data(&observed)["recovery_action"]["argv"],
+            json!([
+                "main-agent",
+                "worker",
+                "supervise",
+                "assignment-stopped",
+                "--format",
+                "json"
+            ]),
+            "fail-closed diagnosis must not advertise a mutating recovery command"
+        );
     };
     for command in ["supervise", "diagnose"] {
         assert_fail_closed_diagnosis(command);
