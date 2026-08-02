@@ -1162,7 +1162,11 @@ with the matching primitive when intentionally changing the request.
 fails, retry the identical retire key with the original revision; its progress
 receipt replays release and resumes delete. Child stage keys are digest-backed
 and remain within the public idempotency-key bound even when the parent key is
-128 bytes.
+128 bytes. If the exact accepted-to-released progress retained only the
+assignment-derived worker claim, that same replay revokes the quiescent claim
+under the retire proof before deletion. Reconcile any active or uncertain
+operation first; a standalone released-state `worker revoke-claim` remains
+forbidden.
 
 ### 5. Review, accept, and release
 

@@ -36559,6 +36559,249 @@ fn main_agent_quick_idempotency_binds_the_canonical_readiness_wait() {
 }
 
 #[test]
+fn main_agent_retire_replays_released_worker_with_retained_claim() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    for checkout in [&main_checkout, &worker_checkout] {
+        init_checkout(checkout, "https://example.invalid/example/repository.git");
+    }
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-retire-replay-0001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-retire-claim",
+                "worker-retire-claim-incarnation",
+                "worker-private-capability-retire-replay-0001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-retire-claim",
+        "task_summary": "Retire a released worker with a retained claim",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-retire-claim",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": worker_checkout,
+        "base_ref": "main",
+        "scopes": ["docs/retire-claim"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-retire-claim",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-retire-claim",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Retire a released worker with a retained claim",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-retire-claim",
+                "session_incarnation": "worker-retire-claim-incarnation",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": worker_checkout,
+            "base_ref": "main",
+            "scopes": ["docs/retire-claim"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-retire-claim");
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "bootstrap",
+            "--idempotency-key",
+            "retire-claim-bootstrap-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        bootstrapped.code,
+        0,
+        "outcome={}",
+        bootstrapped.stdout_text()
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        let assignment = &mut registry["assignments"]["assignment-retire-claim"];
+        assignment["state"] = json!("accepted");
+        assignment["revision"] = json!(4);
+    });
+    seed_activity_state(
+        &state_dir,
+        "worker-retire-claim",
+        "worker-retire-claim-incarnation",
+        "waiting",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "retire-claim-complete",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:03Z",
+            "outcome": "completed"
+        }),
+    );
+    let runtime = seed_live_runtime_identity(
+        &state_dir,
+        "worker-retire-claim",
+        "worker-retire-claim-incarnation",
+        97,
+    );
+    seed_operation(
+        &state_dir,
+        "worker-retire-claim",
+        "worker-retire-claim-incarnation",
+        "retire-claim-active-operation",
+        "active",
+    );
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let runtime_pid = runtime.pid().to_string();
+    let state_runtime = state_dir.to_string_lossy().into_owned();
+    let envs = [
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", runtime_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            runtime_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$97"),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%97"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
+            "worker-retire-claim",
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_runtime.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_RUNTIME_ID",
+            "worker-retire-claim-incarnation",
+        ),
+    ];
+    let retire_args = [
+        "--state-dir",
+        state_arg.as_str(),
+        "worker",
+        "retire",
+        "assignment-retire-claim",
+        "--if-revision",
+        "4",
+        "--idempotency-key",
+        "retire-retained-claim-0001",
+        "--format",
+        "json",
+    ];
+    let fenced = run_main_agent(&main_checkout, &retire_args, &envs);
+    assert_eq!(fenced.code, 65, "outcome={}", fenced.stdout_text());
+    assert_eq!(
+        fenced.stdout_json()["error"]["code"],
+        "worker-not-quiescent"
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-retire-claim"]["state"],
+        "released"
+    );
+
+    let arbitrary_revoke = run_main_agent(
+        &main_checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "revoke-claim",
+            "assignment-retire-claim",
+            "--worker-incarnation",
+            "worker-retire-claim-incarnation",
+            "--if-revision",
+            "5",
+            "--reason",
+            "arbitrary released claim revocation must remain forbidden",
+            "--idempotency-key",
+            "arbitrary-released-revoke-0001",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(arbitrary_revoke.code, 65);
+    assert_eq!(
+        arbitrary_revoke.stdout_json()["error"]["code"],
+        "assignment-state-conflict"
+    );
+
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .retain(|operation| operation["lease_id"] != "retire-claim-active-operation");
+    });
+    let replayed = run_main_agent(&main_checkout, &retire_args, &envs);
+    assert_eq!(
+        replayed.code,
+        0,
+        "stdout={} stderr={}",
+        replayed.stdout_text(),
+        replayed.stderr_text()
+    );
+    assert_eq!(data(&replayed)["retired"], true);
+    assert_eq!(data(&replayed)["released"], true);
+    assert!(!state_dir.join("sessions/worker-retire-claim").exists());
+    let terminal_replay = run_main_agent(&main_checkout, &retire_args, &envs);
+    assert_eq!(terminal_replay.code, 0);
+    assert_eq!(data(&terminal_replay), data(&replayed));
+}
+
+#[test]
 fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

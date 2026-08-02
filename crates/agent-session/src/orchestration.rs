@@ -1823,7 +1823,10 @@ impl Registry {
                     || reservation.run_id != assignment.run_id
                     || reservation.controller != assignment.primary_manager
                     || assignment.worker.as_ref() != Some(&reservation.worker)
-                    || !matches!(assignment.state.as_str(), "working" | "accepted")
+                    || !matches!(
+                        assignment.state.as_str(),
+                        "working" | "accepted" | "released"
+                    )
                     || !worker_claim_revocation_revision_is_valid(
                         reservation.reserved_revision,
                         reservation.adopted_revision,
