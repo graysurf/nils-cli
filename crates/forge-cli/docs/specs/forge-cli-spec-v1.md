@@ -633,8 +633,27 @@ backend mapping, validation rules, and output schema versions.
   the exact approval marker. The stop code must map to its canonical budget
   field and the proposal must match the active receipt. Each proposal is
   consumable once; retry and delivery paths cannot silently increase a budget.
+- An observation can only be appended at the current provider head, so history
+  cannot be backfilled, and a `fixed` disposition requires a repaired head.
+  Together those force the observation to precede the repair push: observe the
+  reviewed head as `open`, push the repair, observe the repaired head as
+  `fixed`, then merge at that head. Doing every repair first and then trying to
+  record the history is unrecoverable, because the pre-repair head is gone and
+  the round count cannot be reconstructed.
 - All three commands emit their own `cli.forge-cli.pr.review-loop.*.v1` schema.
-  Dry-run is offline and reports the command-specific read/transition plan.
+  `inspect` and `extend` dry-runs are offline and report the command-specific
+  read/transition plan.
+- `observe --dry-run` is a faithful non-mutating preflight. It reads and
+  validates the findings payload, resolves the pull request, performs the head
+  and state-tip compare-and-swap comparisons, and evaluates the transition,
+  reporting each verdict in `data.preflight[]` — the same element shape as
+  `pr deliver --dry-run`'s `local_preflight[]`, under a different name because
+  these rules include provider reads. `data.preflight_ok` is the conjunction and
+  `data.would_append` reports whether an accepted real run would append a new
+  generation. The sweep does not short-circuit, so the local payload verdict is
+  reported even when the provider is unreachable; that is the supported way to
+  check a findings file without writing durable provider-visible state, which a
+  live `observe` does on success.
 
 ### `pr pending-review delete` compatibility surface
 

@@ -484,7 +484,7 @@ impl RuleVerdict {
         }
     }
 
-    fn not_evaluated(rule: &'static str, why: &str) -> Self {
+    pub(crate) fn not_evaluated(rule: &'static str, why: &str) -> Self {
         Self {
             rule,
             ok: false,
