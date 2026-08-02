@@ -8,7 +8,7 @@ the three rules that enforce that contract and the single escape hatch
 the engine is allowed to take.
 
 Source: [`agent-runtime-kit/docs/source/inventory-target-architecture.md`
-→ Resolved Decision #9](https://github.com/graysurf/agent-runtime-kit/blob/main/docs/source/inventory-target-architecture.md#resolved-decisions).
+→ Resolved Decision #9](https://github.com/sympoies/agent-runtime-kit/blob/main/docs/source/inventory-target-architecture.md#resolved-decisions).
 
 ## Rule 1 — no hash-randomized iteration on the render path
 

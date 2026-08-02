@@ -437,4 +437,4 @@ consumes it via `nils_scrub` and labels its scrub-log header
 - Plan 3 (skill bodies): `agent-plan-archive:plans/github.com/graysurf/agent-runtime-kit/2026-05-27-plan-archive-runtime-kit/plan-archive-runtime-kit-plan.md`
 - Tracker: <https://github.com/sympoies/nils-cli/issues/571>
 
-[master-design]: https://github.com/graysurf/agent-runtime-kit/blob/main/docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md
+[master-design]: https://github.com/sympoies/agent-runtime-kit/blob/main/docs/plans/2026-05-26-plan-archive-system/plan-archive-system-discussion-source.md

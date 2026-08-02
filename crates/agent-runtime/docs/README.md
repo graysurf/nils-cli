@@ -6,7 +6,7 @@
 Crate-local docs here cover nils-cli-owned runtime-kit binary behavior.
 Higher-level architecture and migration plans for the rendered runtime surface
 live in the consuming repo
-[`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit).
+[`sympoies/agent-runtime-kit`](https://github.com/sympoies/agent-runtime-kit).
 
 ## Specs
 
@@ -28,5 +28,5 @@ live in the consuming repo
 ## Links
 
 - Back to crate README: [`../README.md`](../README.md)
-- Consuming repo: [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit)
+- Consuming repo: [`sympoies/agent-runtime-kit`](https://github.com/sympoies/agent-runtime-kit)
 - Tracking issue: [`graysurf/agent-runtime-kit#1`](https://github.com/graysurf/agent-runtime-kit/issues/1)

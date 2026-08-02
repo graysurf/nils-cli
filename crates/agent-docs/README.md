@@ -23,7 +23,7 @@ and typed automatic-integration decisions (`integration resolve`).
 The agent does not run a per-task `agent-docs` preflight: always-on policy is
 delivered by the harness (auto-loaded prompt files), intent docs are
 hook-injected, and enforcement happens at the finish line. See the cross-repo
-design in `graysurf/agent-runtime-kit`
+design in `sympoies/agent-runtime-kit`
 (`docs/plans/2026-05-30-agent-docs-redesign/`).
 
 ## Command surface

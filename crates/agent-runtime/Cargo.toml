@@ -4,7 +4,7 @@ version = "1.25.12"
 edition.workspace = true
 license.workspace = true
 
-description = "Render / install / doctor / audit-drift CLI for graysurf/agent-runtime-kit."
+description = "Render / install / doctor / audit-drift CLI for sympoies/agent-runtime-kit."
 repository = "https://github.com/sympoies/nils-cli"
 
 [lib]

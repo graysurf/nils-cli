@@ -352,7 +352,7 @@ rules, limits, error codes, and HTTP coverage live in
 
 The canonical agent-facing policy, including how an agent responds to overlap
 advice, lives in agent-runtime-kit's
-[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
+[`session-coordination.md`](https://github.com/sympoies/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
 This README defines CLI and operator semantics only.
 
 ## Turn-state integration

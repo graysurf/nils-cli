@@ -4,7 +4,7 @@
 
 `nils-agent-runtime` is the Rust crate (in `crates/agent-runtime/`) that
 ships the `agent-runtime` binary
-for [`graysurf/agent-runtime-kit`](https://github.com/graysurf/agent-runtime-kit).
+for [`sympoies/agent-runtime-kit`](https://github.com/sympoies/agent-runtime-kit).
 The binary owns deterministic runtime-kit tooling: render / install /
 audit / doctor flows, runtime state maintenance, and workflow-oriented helpers
 that should not live in provider wrappers such as `forge-cli`.

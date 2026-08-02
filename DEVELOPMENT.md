@@ -77,7 +77,7 @@ Before changing coordination behavior, read the crate-local
 [`agent-session` documentation index](crates/agent-session/docs/README.md) and
 the [Session Coordination V1 contract](crates/agent-session/docs/specs/session-coordination-v1.md).
 This repository owns the CLI, automatic presence, work-context, and protocol
-contracts. `graysurf/agent-runtime-kit` owns the global agent policy and hook
+contracts. `sympoies/agent-runtime-kit` owns the global agent policy and hook
 consumer behavior.
 
 Keep work authorization distinct from collision awareness: default `advisory`

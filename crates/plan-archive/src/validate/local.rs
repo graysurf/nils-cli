@@ -5,7 +5,7 @@
 //!
 //! ```yaml
 //! version: 1
-//! archive_clone_path: ~/Project/graysurf/agent-plan-archive
+//! archive_clone_path: ~/Project/serenvia/agent-plan-archive
 //! working_repo_roots:
 //!   - ~/Project
 //!   - /workspace/src
@@ -29,7 +29,7 @@ use super::ValidationWarning;
 
 const SUPPORTED_VERSION: u32 = 1;
 const DEFAULT_REFRESH_BATCH_SIZE: u32 = 50;
-const DEFAULT_ARCHIVE_CLONE_PATH: &str = "~/Project/graysurf/agent-plan-archive";
+const DEFAULT_ARCHIVE_CLONE_PATH: &str = "~/Project/serenvia/agent-plan-archive";
 
 /// Parsed and normalized machine-local config.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -259,8 +259,13 @@ mod tests {
 
     #[test]
     fn empty_input_returns_defaults() {
+        unsafe { std::env::set_var("HOME", "/Users/test-defaults") };
         let v = validate_local_yaml("").expect("defaults");
         assert!(matches!(v.data.source, LocalSource::Defaults));
+        assert_eq!(
+            v.data.config.archive_clone_path,
+            PathBuf::from("/Users/test-defaults/Project/serenvia/agent-plan-archive")
+        );
         assert!(v.data.config.working_repo_roots.is_empty());
         assert_eq!(v.data.config.performance.refresh_batch_size, 50);
         assert!(!v.warnings.is_empty());

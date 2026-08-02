@@ -5,7 +5,7 @@ awareness, declared work context, and mutation admission. The normative
 schemas, state machines, and failure codes remain in
 [Session coordination v1](../specs/session-coordination-v1.md). The canonical
 agent-facing decision and overlap-response policy lives in agent-runtime-kit's
-[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
+[`session-coordination.md`](https://github.com/sympoies/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
 
 ## Choose a coordination mode
 

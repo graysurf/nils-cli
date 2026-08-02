@@ -1,5 +1,5 @@
 //! `agent-runtime` CLI library. Render / install / doctor /
-//! audit-drift for graysurf/agent-runtime-kit.
+//! audit-drift for sympoies/agent-runtime-kit.
 //!
 //! ## Determinism contract (Resolved Decision #9)
 //!
@@ -39,7 +39,7 @@ pub mod uninstall;
     name = "agent-runtime",
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
-    about = "Render / install / doctor / audit-drift for graysurf/agent-runtime-kit."
+    about = "Render / install / doctor / audit-drift for sympoies/agent-runtime-kit."
 )]
 pub struct Cli {
     #[command(subcommand)]
