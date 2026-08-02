@@ -3311,6 +3311,22 @@ fn run_worker_start_single_input(
         &request_digest,
         &legacy_request_digest,
     )?;
+    let pending_prompt_outcome_unknown_worker = replay
+        .as_ref()
+        .filter(|value| {
+            worker_start_is_pending(value)
+                && value["launch_phase"] == WORKER_START_PHASE_PROMPT_OUTCOME_UNKNOWN
+        })
+        .map(|value| {
+            serde_json::from_value::<SessionRef>(value["worker"].clone()).map_err(|_| {
+                CliError::data(
+                    "assignment-start-conflict",
+                    "persisted ambiguous worker start has no exact session evidence",
+                    None,
+                )
+            })
+        })
+        .transpose()?;
     let pending_start = match replay {
         Some(value) if worker_start_readiness_is_pending(&value) => {
             drop(locked);
@@ -3743,12 +3759,45 @@ fn run_worker_start_single_input(
         renew_worker_start_batch_lane(context, batch_lane)?;
     }
     let existing = match load_session_record(context, &worker_session_id) {
-        Ok(worker) if runtime_is_proven_never_launched(&worker) => {
+        Ok(worker)
+            if pending_prompt_outcome_unknown_worker.is_none()
+                && runtime_is_proven_never_launched(&worker) =>
+        {
             ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
             delete_session(context, &worker_session_id, resolve_tmux_bin(None))?;
             None
         }
-        Ok(worker) => Some(worker),
+        Ok(worker) => {
+            if let Some(expected_worker) = pending_prompt_outcome_unknown_worker.as_ref() {
+                let worker_incarnation = worker
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid_input("worker session incarnation is unavailable"))?;
+                if session_ref(context, &worker, worker_incarnation) != *expected_worker {
+                    return Err(CliError::data(
+                        "assignment-start-conflict",
+                        "persisted ambiguous worker start changed its exact session evidence",
+                        Some(json!({ "assignment_id": assignment_id })),
+                    ));
+                }
+            }
+            Some(worker)
+        }
+        Err(error)
+            if error.code() == "session-not-found"
+                && pending_prompt_outcome_unknown_worker.is_some() =>
+        {
+            return Err(CliError::runtime(
+                "managed-worker-prompt-delivery-outcome-unknown",
+                "the exact ambiguous worker session is unavailable; preserve the transaction and do not redeliver",
+                Some(json!({
+                    "assignment_id": assignment_id,
+                    "worker": pending_prompt_outcome_unknown_worker
+                })),
+            ));
+        }
         Err(error) if error.code() == "session-not-found" => None,
         Err(error) => return Err(error),
     };
@@ -4106,9 +4155,7 @@ fn run_worker_start_single_input(
         let started = match started {
             Ok(started) => started,
             Err(error) => {
-                if launch_input.provider_stop_canary.is_some()
-                    && error.code() == "managed-worker-prompt-delivery-outcome-unknown"
-                {
+                if error.code() == "managed-worker-prompt-delivery-outcome-unknown" {
                     let phase_update = (|| {
                         let worker = load_session_record(context, &worker_session_id)?;
                         let worker_incarnation = worker
@@ -4135,7 +4182,7 @@ fn run_worker_start_single_input(
                             &launch_input.launch.cwd,
                             launch_provider_config_dir.as_deref(),
                             Some(&expected_worker),
-                            true,
+                            launch_input.provider_stop_canary.is_some(),
                         )?;
                         store_worker_start_launch_phase_locked(
                             &mut locked.registry,
