@@ -14511,7 +14511,7 @@ esac
     }
 
     #[tokio::test]
-    async fn fresh_profile_session_stops_and_resumes_with_its_durable_context() {
+    async fn fresh_profile_session_resume_preserves_context_or_fails_closed_without_proof() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("worktrees/issue-362");
         let config_dir = tmp.path().join("codex-profile");
@@ -14646,16 +14646,6 @@ esac
             post_json("/sessions/fresh-profile/resume", Some(TOKEN), json!({})),
         )
         .await;
-        assert_eq!(resume_status, StatusCode::OK, "body={resume_body}");
-        assert_eq!(
-            resume_body["data"]["session"]["cwd"],
-            cwd.to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            resume_body["data"]["session"]["agent_profile"],
-            "codex-profile"
-        );
-
         let calls = fs::read_to_string(log).unwrap();
         assert_eq!(
             calls
@@ -14681,28 +14671,70 @@ esac
             calls.contains("resume fresh-provider-id"),
             "managed resume must use the captured provider id: {calls:?}"
         );
-        let terminate = ProcessCommand::new(&tmux)
-            .args([
-                "if-shell",
-                "-F",
-                "-t",
-                "%77",
-                "true",
-                "kill-session -t $77",
-                "false",
-            ])
-            .status()
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                resume_status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "body={resume_body}"
+            );
+            assert_eq!(
+                resume_body["error"]["code"],
+                "coordination-runtime-unverified"
+            );
+            assert!(
+                resumed_pane.wait_for_exit(Duration::from_secs(1)),
+                "failed-launch cleanup must reap the replacement pane"
+            );
+            assert!(
+                !running.exists(),
+                "failed-launch cleanup must clear tmux liveness"
+            );
+            let retained: Value = serde_json::from_str(
+                &fs::read_to_string(tmp.path().join("sessions/fresh-profile/session.json"))
+                    .unwrap(),
+            )
             .unwrap();
-        assert!(terminate.success());
-        assert!(
-            resumed_pane.wait_for_exit(Duration::from_secs(1)),
-            "identity-bound fixture termination must stop the pane process group"
-        );
-        assert!(
-            !running.exists(),
-            "identity-bound fixture termination must clear tmux liveness"
-        );
-        drop(resumed_pane);
+            assert_eq!(retained["cwd"], cwd.to_string_lossy().as_ref());
+            assert_eq!(retained["runtime"]["agent_profile"], "codex-profile");
+            assert_eq!(
+                retained["provider_resume"]["session_id"],
+                "fresh-provider-id"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(resume_status, StatusCode::OK, "body={resume_body}");
+            assert_eq!(
+                resume_body["data"]["session"]["cwd"],
+                cwd.to_string_lossy().as_ref()
+            );
+            assert_eq!(
+                resume_body["data"]["session"]["agent_profile"],
+                "codex-profile"
+            );
+            let terminate = ProcessCommand::new(&tmux)
+                .args([
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    "%77",
+                    "true",
+                    "kill-session -t $77",
+                    "false",
+                ])
+                .status()
+                .unwrap();
+            assert!(terminate.success());
+            assert!(
+                resumed_pane.wait_for_exit(Duration::from_secs(1)),
+                "identity-bound fixture termination must stop the pane process group"
+            );
+            assert!(
+                !running.exists(),
+                "identity-bound fixture termination must clear tmux liveness"
+            );
+        }
     }
 
     #[tokio::test]
