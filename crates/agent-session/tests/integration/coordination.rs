@@ -22,10 +22,17 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+use super::cli::spawn_test_process_group;
 use super::cli::{
-    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group,
-    spawn_test_process_group, tmux_calls,
+    TestProcessGroup, fake_agent, fake_tmux, spawn_scoped_test_process_group, tmux_calls,
 };
+
+// Linux production termination deliberately proves it can stop a captured process
+// boundary even when tmux does not. Other Unix targets cannot pin that boundary,
+// so their success fixtures must model real tmux by terminating the pane group.
+const FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP: &str =
+    if cfg!(target_os = "linux") { "1" } else { "0" };
 
 #[cfg(target_os = "linux")]
 fn provider_stop_canary_test_capability() -> Result<(), String> {
@@ -11511,6 +11518,7 @@ fn main_agent_canary_startup_admits_only_authenticated_guardian_status() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn main_agent_canary_startup_failure_precedes_prompt_transport() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -11588,7 +11596,10 @@ fn main_agent_canary_startup_failure_precedes_prompt_transport() {
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
             ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
                 "worker-canary-startup-failure",
@@ -11655,7 +11666,10 @@ fn main_agent_canary_startup_failure_precedes_prompt_transport() {
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid_arg),
             ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid_arg),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
                 "worker-canary-startup-failure",
@@ -16014,7 +16028,10 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             pane_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
         (
@@ -16103,7 +16120,10 @@ fn main_agent_failed_preclaim_worker_is_cancelled_retired_and_reassigned_in_isol
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             pane_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-failed"),
         (
@@ -16615,7 +16635,10 @@ impl StoppedPostClaimFixture {
                     "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
                     runtime_pid.as_str(),
                 ),
-                ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                    FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+                ),
                 ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
                 ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
                 ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -16699,7 +16722,10 @@ impl StoppedPostClaimFixture {
             .env("AGENT_SESSION_FAKE_TMUX_LOG", &self.tmux_log)
             .env("AGENT_SESSION_FAKE_TMUX_PANE_PID", &runtime_pid)
             .env("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &runtime_pid)
-            .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+            .env(
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            )
             .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
             .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
             .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
@@ -17082,7 +17108,10 @@ fn claimed_runtime_stop_identity_only_interruption_projects_exact_replay() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17261,7 +17290,10 @@ fn claimed_runtime_stop_refuses_controller_claim_drift_before_runtime_stop() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17421,7 +17453,10 @@ fn claimed_runtime_stop_fences_exact_claim_mutation_without_blocking_unrelated_c
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -17901,7 +17936,10 @@ fn claimed_runtime_stop_waiter_replays_terminal_result_after_assignment_advances
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -18378,7 +18416,10 @@ fn claimed_runtime_stop_preserves_the_active_claim_for_reconcile_stopped() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -19534,7 +19575,10 @@ fn provider_stop_canary_supervisor_admits_stalled_scope_empty_turn_and_releases(
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -19861,7 +19905,10 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
         .env("AGENT_SESSION_CAPABILITY_FILE", &fixture.main_capability)
         .env("AGENT_SESSION_TMUX_BIN", &fixture.tmux_bin)
         .env("AGENT_SESSION_FAKE_TMUX_LOG", &fixture.tmux_log)
-        .env("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1")
+        .env(
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        )
         .env("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91")
         .env("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91")
         .env("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped")
@@ -20053,7 +20100,10 @@ fn provider_stop_canary_rejects_same_uid_request_from_inside_provider_cgroup() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$91"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%91"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -20422,7 +20472,10 @@ fn compiled_provider_stop_canary_hold_expiry_converges_through_reconcile() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             supervisor_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$95"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%95"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -20517,7 +20570,10 @@ fn typed_provider_stop_canary_stops_only_the_armed_child_boundary() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$92"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%92"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -21425,7 +21481,10 @@ fn provider_stop_canary_timeout_replays_the_exact_durable_reservation() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$93"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%93"),
         ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "worker-stopped"),
@@ -22071,7 +22130,10 @@ impl ExhaustedReadinessRuntimeStopFixture {
                 "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
                 self.runtime_pid_arg.as_str(),
             ),
-            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            (
+                "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+                FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+            ),
             ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
             (
                 "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
@@ -22669,7 +22731,10 @@ fn runtime_stop_admission_guards_are_fail_closed() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid_arg.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        (
+            "AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP",
+            FAKE_TMUX_KEEP_GROUP_FOR_VERIFIED_STOP,
+        ),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
         (
             "AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID",
