@@ -1594,4 +1594,762 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------
+    // The chain is the only durable proof that a bounded review ran. Every
+    // guard below is what stops a forged, replayed, or forked comment history
+    // from being accepted as that proof.
+    // ---------------------------------------------------------------------
+
+    const REPO: &str = "acme/widgets";
+    const PR: u64 = 7;
+    const FP: &str = "correctness:review-loop:one";
+
+    fn record(
+        head: &str,
+        generation: u64,
+        previous: Option<String>,
+        state: ReviewLoopState,
+    ) -> ReviewStateRecord {
+        ReviewStateRecord::new(
+            REPO,
+            PR,
+            head,
+            generation,
+            previous,
+            ReviewStatePayload::ReviewLoop { state },
+        )
+        .expect("record")
+    }
+
+    fn observed(fingerprint: &str, status: ReviewFindingStatus) -> ReviewFindingObservation {
+        ReviewFindingObservation {
+            fingerprint: fingerprint.to_string(),
+            root_cause_fingerprint: None,
+            blocking: true,
+            status,
+            threads: Vec::new(),
+        }
+    }
+
+    fn genesis_with(observations: &[ReviewFindingObservation]) -> ReviewLoopState {
+        observe_review_loop(None, "head", observations)
+            .expect("genesis")
+            .state
+    }
+
+    #[test]
+    fn an_empty_comment_history_is_a_valid_genesis_chain() {
+        let chain = parse_chain(Vec::<&str>::new(), REPO, PR).expect("empty chain");
+
+        assert!(chain.records.is_empty());
+        assert_eq!(chain.tip_digest, None);
+        assert_eq!(latest_review_loop_state(&chain), None);
+    }
+
+    #[test]
+    fn a_record_for_another_pull_request_is_refused() {
+        let marker = record("head", 0, None, fixture_loop_state(0))
+            .marker()
+            .expect("marker");
+
+        let wrong_repo =
+            parse_chain([marker.as_str()], "acme/other", PR).expect_err("repository mismatch");
+        assert_eq!(wrong_repo.kind(), "review_state_conflict");
+
+        let wrong_pr = parse_chain([marker.as_str()], REPO, 8).expect_err("pr mismatch");
+        assert!(
+            wrong_pr
+                .detail()
+                .unwrap_or_default()
+                .contains("expected=acme/widgets#8"),
+            "detail should name both identities: {:?}",
+            wrong_pr.detail()
+        );
+    }
+
+    #[test]
+    fn a_tampered_record_digest_is_refused() {
+        let mut forged = record("head", 0, None, fixture_loop_state(0));
+        forged.record_digest = "sha256:forged".to_string();
+        let marker = forged.marker().expect("marker");
+
+        let error = parse_chain([marker.as_str()], REPO, PR).expect_err("forged digest");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("record_digest=sha256:forged"),
+            "{:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn an_identical_record_seen_twice_is_deduplicated() {
+        // A provider can echo the same comment on two pages; that must not be
+        // read as a competing generation.
+        let marker = record("head", 0, None, fixture_loop_state(0))
+            .marker()
+            .expect("marker");
+
+        let chain =
+            parse_chain([marker.as_str(), marker.as_str()], REPO, PR).expect("deduplicated");
+
+        assert_eq!(chain.records.len(), 1);
+    }
+
+    #[test]
+    fn a_chain_without_exactly_one_genesis_is_refused() {
+        let orphan = record(
+            "head",
+            1,
+            Some("sha256:absent".to_string()),
+            fixture_loop_state(1),
+        )
+        .marker()
+        .expect("marker");
+        let error = parse_chain([orphan.as_str()], REPO, PR).expect_err("no genesis");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("genesis_count=0"),
+            "{:?}",
+            error.detail()
+        );
+
+        let genesis_a = record("head", 0, None, fixture_loop_state(0));
+        let mut forked = fixture_loop_state(0);
+        forked.no_progress_rounds = 1;
+        let genesis_b = record("head", 0, None, forked);
+        let error = parse_chain(
+            [
+                genesis_a.marker().unwrap().as_str(),
+                genesis_b.marker().unwrap().as_str(),
+            ],
+            REPO,
+            PR,
+        )
+        .expect_err("two genesis records");
+        // Two roots are a fork, which the competing-generation guard catches
+        // before the genesis count is ever consulted.
+        assert_eq!(
+            error.message(),
+            "review-state chain contains competing generations"
+        );
+        assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn a_non_contiguous_generation_is_refused() {
+        let genesis = record("head", 0, None, fixture_loop_state(0));
+        let skipped = record(
+            "head",
+            5,
+            Some(genesis.record_digest.clone()),
+            fixture_loop_state(1),
+        );
+
+        let error = parse_chain(
+            [
+                genesis.marker().unwrap().as_str(),
+                skipped.marker().unwrap().as_str(),
+            ],
+            REPO,
+            PR,
+        )
+        .expect_err("generation gap");
+
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("expected_generation=1; observed_generation=5"),
+            "{:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn a_review_loop_state_bound_to_another_head_is_refused() {
+        let mut state = fixture_loop_state(0);
+        state.head_sha = "other-head".to_string();
+        let marker = record("head", 0, None, state).marker().expect("marker");
+
+        let error = parse_chain([marker.as_str()], REPO, PR).expect_err("head mismatch");
+
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("record_head=head; state_head=other-head"),
+            "{:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn a_receipt_record_does_not_shadow_the_latest_loop_state() {
+        let loop_state = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+        let genesis = record("head", 0, None, loop_state.clone());
+        let receipt = ReviewStateRecord::new(
+            REPO,
+            PR,
+            "head",
+            1,
+            Some(genesis.record_digest.clone()),
+            ReviewStatePayload::ReviewRunReceipt {
+                receipt: fixture_receipt(),
+            },
+        )
+        .expect("receipt record");
+
+        let chain = parse_chain(
+            [
+                genesis.marker().unwrap().as_str(),
+                receipt.marker().unwrap().as_str(),
+            ],
+            REPO,
+            PR,
+        )
+        .expect("chain");
+
+        assert_eq!(chain.records.len(), 2);
+        assert_eq!(chain.tip_digest.as_deref(), Some(&*receipt.record_digest));
+        assert_eq!(
+            latest_review_loop_state(&chain),
+            Some(&loop_state),
+            "the newest loop state must be found behind the receipt"
+        );
+    }
+
+    #[test]
+    fn state_markers_are_only_recognized_when_they_are_well_formed() {
+        assert_eq!(parse_state_marker("no marker here").expect("none"), None);
+
+        let unterminated = format!("{STATE_MARKER_OPEN}deadbeef");
+        assert_eq!(
+            parse_state_marker(&unterminated)
+                .expect_err("unterminated")
+                .kind(),
+            "review_state_conflict"
+        );
+
+        for payload in ["", "xyz", "abc"] {
+            let body = format!("{STATE_MARKER_OPEN}{payload}{STATE_MARKER_CLOSE}");
+            assert!(
+                parse_state_marker(&body).is_err(),
+                "payload {payload:?} is not canonical hex"
+            );
+        }
+
+        // Canonical hex that decodes to non-JSON is still refused.
+        let not_json = format!("{STATE_MARKER_OPEN}7b7b{STATE_MARKER_CLOSE}");
+        assert!(parse_state_marker(&not_json).is_err());
+
+        // Canonical hex that decodes to invalid UTF-8 is refused too.
+        let not_utf8 = format!("{STATE_MARKER_OPEN}ff{STATE_MARKER_CLOSE}");
+        assert!(parse_state_marker(&not_utf8).is_err());
+    }
+
+    #[test]
+    fn a_lifecycle_fingerprint_must_be_three_stable_parts() {
+        for bad in [
+            "correctness",
+            "correctness:review-loop",
+            "correctness:review-loop:one:extra",
+            "Correctness:review-loop:one",
+            "correctness::one",
+            "-lead:review-loop:one",
+            "trail-:review-loop:one",
+        ] {
+            let error =
+                observe_review_loop(None, "head", &[observed(bad, ReviewFindingStatus::Open)])
+                    .expect_err("bad fingerprint");
+            assert_eq!(error.kind(), "review_fingerprint_collision", "{bad}");
+        }
+
+        observe_review_loop(
+            None,
+            "head",
+            &[observed(
+                "perf-2:review-loop:n-1",
+                ReviewFindingStatus::Open,
+            )],
+        )
+        .expect("digits and inner dashes are stable");
+    }
+
+    #[test]
+    fn one_lifecycle_identity_cannot_describe_two_different_observations() {
+        let mut second = observed(FP, ReviewFindingStatus::Open);
+        second.threads = vec!["PRRT_1".to_string()];
+
+        let error = observe_review_loop(
+            None,
+            "head",
+            &[observed(FP, ReviewFindingStatus::Open), second.clone()],
+        )
+        .expect_err("collision");
+        assert_eq!(error.kind(), "review_fingerprint_collision");
+
+        // The same observation repeated is collapsed, not rejected.
+        observe_review_loop(None, "head", &[second.clone(), second]).expect("idempotent repeat");
+    }
+
+    #[test]
+    fn an_empty_head_is_refused_before_any_observation_work() {
+        let error = observe_review_loop(None, "  ", &[observed(FP, ReviewFindingStatus::Open)]);
+        assert_eq!(
+            error.expect_err("empty head").kind(),
+            "review_state_conflict"
+        );
+    }
+
+    #[test]
+    fn a_same_head_observation_cannot_drop_or_silently_clear_an_open_finding() {
+        let previous = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+
+        let omitted =
+            observe_review_loop(Some(&previous), "head", &[]).expect_err("omitted open finding");
+        assert!(
+            omitted
+                .detail()
+                .unwrap_or_default()
+                .contains(&format!("fingerprint={FP}")),
+            "{:?}",
+            omitted.detail()
+        );
+
+        // Declaring it fixed at the same head means nothing was repaired.
+        let cleared = observe_review_loop(
+            Some(&previous),
+            "head",
+            &[observed(FP, ReviewFindingStatus::Fixed)],
+        )
+        .expect_err("fixed without a new head");
+        assert_eq!(cleared.kind(), "review_state_conflict");
+
+        // Downgrading it to non-blocking at the same head is the same trick.
+        let mut downgraded = observed(FP, ReviewFindingStatus::Open);
+        downgraded.blocking = false;
+        let error = observe_review_loop(Some(&previous), "head", &[downgraded])
+            .expect_err("silent downgrade");
+        assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn advancing_the_head_marks_unobserved_open_findings_fixed() {
+        let previous = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+
+        let transition =
+            observe_review_loop(Some(&previous), "head-2", &[]).expect("repaired head");
+
+        assert!(transition.changed);
+        assert_eq!(transition.state.round, 1);
+        assert_eq!(
+            transition.state.findings[FP].status,
+            ReviewFindingStatus::Fixed
+        );
+        // The sweep only flips the status; the finding's last observed head and
+        // seen count stay pinned to the round that actually saw it.
+        assert_eq!(transition.state.findings[FP].last_seen_head, "head");
+        assert_eq!(transition.state.findings[FP].seen_count, 1);
+    }
+
+    #[test]
+    fn a_reopened_finding_stops_the_loop_when_no_reopen_budget_remains() {
+        let first = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+        let fixed = observe_review_loop(Some(&first), "head-2", &[])
+            .expect("repair")
+            .state;
+
+        // The default budget allows zero automatic reopens.
+        let error = observe_review_loop(
+            Some(&fixed),
+            "head-3",
+            &[observed(FP, ReviewFindingStatus::Open)],
+        )
+        .expect_err("reopened");
+        assert_eq!(error.kind(), "review_finding_reopened");
+        assert_eq!(
+            stop_budget_field(error.kind()),
+            Some("max_auto_reopens_per_fingerprint")
+        );
+
+        // With budget, the reopen is absorbed and counted.
+        let mut generous = fixed;
+        generous.budget.max_auto_reopens_per_fingerprint = 1;
+        let transition = observe_review_loop(
+            Some(&generous),
+            "head-3",
+            &[observed(FP, ReviewFindingStatus::Open)],
+        )
+        .expect("reopen within budget");
+        assert_eq!(transition.state.findings[FP].reopen_count, 1);
+        assert_eq!(
+            transition.state.findings[FP].status,
+            ReviewFindingStatus::Open
+        );
+    }
+
+    #[test]
+    fn a_repeated_identical_observation_reports_no_change() {
+        let previous = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+
+        let transition = observe_review_loop(
+            Some(&previous),
+            "head",
+            &[observed(FP, ReviewFindingStatus::Open)],
+        )
+        .expect("unchanged");
+
+        assert!(!transition.changed);
+        assert_eq!(transition.state, previous);
+    }
+
+    #[test]
+    fn an_extension_proposal_digest_is_bound_to_every_input() {
+        let base = extension_proposal_digest(
+            "sha256:tip",
+            "review_round_limit_exceeded",
+            "max_repair_rounds",
+            1,
+        )
+        .expect("digest");
+        assert!(base.starts_with("sha256:"));
+
+        for (tip, code, field, increment) in [
+            (
+                "sha256:other",
+                "review_round_limit_exceeded",
+                "max_repair_rounds",
+                1,
+            ),
+            ("sha256:tip", "review_no_progress", "max_repair_rounds", 1),
+            (
+                "sha256:tip",
+                "review_round_limit_exceeded",
+                "max_no_progress_rounds",
+                1,
+            ),
+            (
+                "sha256:tip",
+                "review_round_limit_exceeded",
+                "max_repair_rounds",
+                2,
+            ),
+        ] {
+            assert_ne!(
+                extension_proposal_digest(tip, code, field, increment).expect("digest"),
+                base,
+                "digest must change for ({tip}, {code}, {field}, {increment})"
+            );
+        }
+
+        for increment in [0, 101] {
+            assert_eq!(
+                extension_proposal_digest(
+                    "sha256:tip",
+                    "review_round_limit_exceeded",
+                    "max_repair_rounds",
+                    increment
+                )
+                .expect_err("out of range")
+                .kind(),
+                "review_extension_invalid"
+            );
+        }
+        assert_eq!(
+            extension_proposal_digest(
+                "sha256:tip",
+                "review_round_limit_exceeded",
+                "max_everything",
+                1
+            )
+            .expect_err("unknown field")
+            .kind(),
+            "review_extension_invalid"
+        );
+    }
+
+    #[test]
+    fn only_a_budget_stop_can_be_recorded_for_extension() {
+        let previous = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+        let not_a_budget_stop = ForgeError::validation(
+            error_schema(),
+            "review_state_conflict",
+            "something else",
+            None,
+        );
+
+        let error = record_review_loop_hard_stop(
+            &previous,
+            "head-2",
+            &[observed(FP, ReviewFindingStatus::Open)],
+            "sha256:tip",
+            &not_a_budget_stop,
+        )
+        .expect_err("not a budget stop");
+        assert_eq!(error.kind(), "review_state_conflict");
+
+        let budget_stop = ForgeError::validation(
+            error_schema(),
+            "review_round_limit_exceeded",
+            "budget exhausted",
+            None,
+        );
+        let stopped = record_review_loop_hard_stop(
+            &previous,
+            "head-2",
+            &[observed(FP, ReviewFindingStatus::Open)],
+            "sha256:tip",
+            &budget_stop,
+        )
+        .expect("hard stop");
+        let stop = stopped.hard_stop.as_ref().expect("stop recorded");
+        assert_eq!(stop.code, "review_round_limit_exceeded");
+        assert_eq!(stop.budget_field, "max_repair_rounds");
+        assert_eq!(stop.increment, 1);
+        assert_eq!(stop.attempted_head_sha, "head-2");
+        assert!(!stop.extension_applied);
+        assert!(!stop.observation_digest.is_empty());
+    }
+
+    #[test]
+    fn an_extension_proposal_cannot_be_consumed_twice() {
+        let previous = genesis_with(&[observed(FP, ReviewFindingStatus::Open)]);
+        let budget_stop = ForgeError::validation(
+            error_schema(),
+            "review_round_limit_exceeded",
+            "budget exhausted",
+            None,
+        );
+        let stopped = record_review_loop_hard_stop(
+            &previous,
+            "head-2",
+            &[observed(FP, ReviewFindingStatus::Open)],
+            "sha256:tip",
+            &budget_stop,
+        )
+        .expect("hard stop");
+        let proposal = stopped
+            .hard_stop
+            .as_ref()
+            .expect("stop")
+            .proposal_digest
+            .clone();
+
+        let extended = apply_review_loop_extension(
+            &stopped,
+            proposal.clone(),
+            "https://github.com/acme/widgets/pull/7#issuecomment-1".to_string(),
+            "review_round_limit_exceeded",
+            "max_repair_rounds",
+            1,
+        )
+        .expect("extension applied");
+        assert_eq!(
+            extended.budget.max_repair_rounds,
+            previous.budget.max_repair_rounds + 1
+        );
+        assert!(extended.hard_stop.as_ref().expect("stop").extension_applied);
+
+        // Applying it again is refused because the stop is already consumed.
+        assert_eq!(
+            apply_review_loop_extension(
+                &extended,
+                proposal.clone(),
+                "https://example.invalid/2".to_string(),
+                "review_round_limit_exceeded",
+                "max_repair_rounds",
+                1,
+            )
+            .expect_err("already applied")
+            .kind(),
+            "review_extension_invalid"
+        );
+
+        // A state with no hard stop has nothing to extend.
+        assert_eq!(
+            apply_review_loop_extension(
+                &previous,
+                proposal,
+                "https://example.invalid/3".to_string(),
+                "review_round_limit_exceeded",
+                "max_repair_rounds",
+                1,
+            )
+            .expect_err("no stop")
+            .kind(),
+            "review_extension_invalid"
+        );
+    }
+
+    #[test]
+    fn budget_field_mapping_is_closed() {
+        assert_eq!(
+            stop_budget_field("review_round_limit_exceeded"),
+            Some("max_repair_rounds")
+        );
+        assert_eq!(
+            stop_budget_field("review_no_progress"),
+            Some("max_no_progress_rounds")
+        );
+        assert_eq!(
+            stop_budget_field("review_finding_reopened"),
+            Some("max_auto_reopens_per_fingerprint")
+        );
+        assert_eq!(stop_budget_field("review_state_conflict"), None);
+        assert_eq!(stop_budget_field(""), None);
+    }
+
+    #[test]
+    fn owned_markers_are_recognized_and_stripped_without_touching_prose() {
+        let run = "sha256:run";
+        let body = format!(
+            "Review body\n{}\n{}\n{}\nTrailing prose\n",
+            review_run_marker(run),
+            finding_marker(run, "sha256:digest"),
+            thread_disposition_marker("PRRT_1"),
+        );
+
+        assert_eq!(parse_review_run_id(&body).as_deref(), Some(run));
+        assert_eq!(
+            parse_finding_marker(&body),
+            Some((run.to_string(), "sha256:digest".to_string()))
+        );
+        assert!(has_thread_disposition_marker(&body));
+        assert_eq!(strip_owned_markers(&body), "Review body\nTrailing prose");
+
+        // A body with no markers is left byte-identical apart from trailing space.
+        assert_eq!(strip_owned_markers("just prose\n"), "just prose");
+        assert_eq!(parse_review_run_id("just prose"), None);
+        assert_eq!(parse_finding_marker("just prose"), None);
+        assert!(!has_thread_disposition_marker("just prose"));
+    }
+
+    #[test]
+    fn malformed_markers_are_not_recognized() {
+        // An empty id, or one carrying whitespace, is not a usable run id.
+        assert_eq!(parse_review_run_id(&review_run_marker("")), None);
+        assert_eq!(parse_review_run_id(&review_run_marker("two words")), None);
+        assert!(!has_thread_disposition_marker(&thread_disposition_marker(
+            ""
+        )));
+
+        // A finding marker needs both halves.
+        assert_eq!(parse_finding_marker(&finding_marker("", "sha256:d")), None);
+        assert_eq!(parse_finding_marker(&finding_marker("run", "")), None);
+    }
+
+    #[test]
+    fn a_review_run_id_is_bound_to_every_preimage_field() {
+        let base = compute_review_run_id(
+            REPO,
+            PR,
+            "head",
+            0,
+            &["testing".to_string()],
+            "comments-only",
+            "sha256:summary",
+            &[],
+        )
+        .expect("run id");
+        assert!(base.starts_with("sha256:"));
+
+        let variants = [
+            compute_review_run_id(
+                "acme/other",
+                PR,
+                "head",
+                0,
+                &["testing".to_string()],
+                "comments-only",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                8,
+                "head",
+                0,
+                &["testing".to_string()],
+                "comments-only",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                PR,
+                "head-2",
+                0,
+                &["testing".to_string()],
+                "comments-only",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                PR,
+                "head",
+                1,
+                &["testing".to_string()],
+                "comments-only",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                PR,
+                "head",
+                0,
+                &["security".to_string()],
+                "comments-only",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                PR,
+                "head",
+                0,
+                &["testing".to_string()],
+                "approve",
+                "sha256:summary",
+                &[],
+            ),
+            compute_review_run_id(
+                REPO,
+                PR,
+                "head",
+                0,
+                &["testing".to_string()],
+                "comments-only",
+                "sha256:other",
+                &[],
+            ),
+        ];
+        for variant in variants {
+            assert_ne!(variant.expect("run id"), base);
+        }
+    }
+
+    #[test]
+    fn the_digest_helper_is_prefixed_and_lowercase_hex() {
+        let digest = sha256_digest(b"payload");
+
+        assert!(digest.starts_with("sha256:"));
+        let hex = digest.trim_start_matches("sha256:");
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(sha256_digest(b"payload"), digest, "digest is deterministic");
+        assert_ne!(sha256_digest(b"payload2"), digest);
+    }
 }

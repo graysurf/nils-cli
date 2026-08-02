@@ -194,3 +194,178 @@ fn emit(format: OutputFormat, descriptor: OperationEffectDescriptor) -> i32 {
     }
     exit::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::Parser;
+    use pretty_assertions::assert_eq;
+
+    fn classify_argv(argv: &[&str]) -> (&'static str, Effect, ProviderEffect, Vec<&'static str>) {
+        let mut full = vec!["forge-cli"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full)
+            .unwrap_or_else(|error| panic!("argv {argv:?} must parse: {error}"));
+        classify(&cli)
+    }
+
+    /// Every read must declare a read-only effect; a network read must never
+    /// be classified as a write.
+    fn assert_network_read(argv: &[&str], operation: &str, reads: &[&str]) {
+        let (name, effect, provider, declared) = classify_argv(argv);
+        assert_eq!(name, operation, "{argv:?}");
+        assert_eq!(effect, Effect::ReadOnly, "{argv:?}");
+        assert_eq!(provider, ProviderEffect::NetworkRead, "{argv:?}");
+        assert_eq!(declared, reads.to_vec(), "{argv:?}");
+    }
+
+    #[test]
+    fn provider_reads_are_classified_as_read_only_network_calls() {
+        assert_network_read(&["auth", "status"], "auth.status", &["provider_auth"]);
+        assert_network_read(&["repo", "view"], "repo.view", &["git_remote", "provider"]);
+        assert_network_read(&["pr", "view", "7"], "pr.view", &["provider"]);
+        assert_network_read(&["pr", "list"], "pr.list", &["provider"]);
+        assert_network_read(&["pr", "comments", "7"], "pr.comments", &["provider"]);
+        assert_network_read(&["pr", "reviews", "7"], "pr.reviews", &["provider"]);
+        assert_network_read(&["pr", "tasks", "7"], "pr.tasks", &["provider"]);
+        assert_network_read(&["pr", "checks", "7"], "pr.checks", &["provider"]);
+        assert_network_read(&["pr", "wait-checks", "7"], "pr.wait-checks", &["provider"]);
+        assert_network_read(&["issue", "view", "7"], "issue.view", &["provider"]);
+        assert_network_read(&["issue", "list"], "issue.list", &["provider"]);
+        assert_network_read(&["label", "list"], "label.list", &["provider"]);
+        assert_network_read(
+            &["label", "audit", "--catalog", "/tmp/labels.yaml"],
+            "label.audit",
+            &["provider"],
+        );
+    }
+
+    #[test]
+    fn provider_writes_are_classified_as_network_mutations() {
+        for (argv, operation) in [
+            (
+                vec!["label", "ensure", "--catalog", "/tmp/labels.yaml"],
+                "label.ensure",
+            ),
+            (vec!["pr", "merge", "7"], "pr.mutation"),
+            (vec!["issue", "close", "7"], "issue.mutation"),
+        ] {
+            let (name, effect, provider, reads) = classify_argv(&argv);
+            assert_eq!(name, operation, "{argv:?}");
+            assert_eq!(effect, Effect::Mutation, "{argv:?}");
+            assert_eq!(provider, ProviderEffect::NetworkWrite, "{argv:?}");
+            assert!(reads.is_empty(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn repo_bootstrap_declares_the_receipt_it_writes() {
+        let (name, effect, provider, reads) = classify_argv(&[
+            "repo",
+            "bootstrap",
+            "--owner-kind",
+            "user",
+            "--default-branch",
+            "main",
+            "--file",
+            "README.md",
+            "--message",
+            "init",
+            "--reason-file",
+            "/tmp/reason.md",
+        ]);
+
+        assert_eq!(name, "repo.bootstrap");
+        assert_eq!(effect, Effect::Mutation);
+        assert_eq!(provider, ProviderEffect::NetworkWrite);
+        assert_eq!(reads, vec!["provider", "user_config", "bootstrap_receipt"]);
+    }
+
+    #[test]
+    fn review_validation_only_reaches_the_provider_when_it_checks_the_diff() {
+        let (name, effect, provider, reads) = classify_argv(&["pr", "review", "validate"]);
+        assert_eq!(name, "pr.review.validate");
+        assert_eq!(effect, Effect::ReadOnly);
+        assert_eq!(provider, ProviderEffect::LocalRead);
+        assert_eq!(reads, vec!["local_inputs"]);
+
+        let (name, effect, provider, reads) =
+            classify_argv(&["pr", "review", "validate", "--check-diff"]);
+        assert_eq!(name, "pr.review.validate");
+        assert_eq!(effect, Effect::ReadOnly);
+        assert_eq!(provider, ProviderEffect::NetworkRead);
+        assert_eq!(reads, vec!["local_inputs", "provider"]);
+    }
+
+    #[test]
+    fn posting_a_review_is_a_provider_write() {
+        let (name, effect, provider, reads) = classify_argv(&["pr", "review"]);
+
+        assert_eq!(name, "pr.review.post");
+        assert_eq!(effect, Effect::Mutation);
+        assert_eq!(provider, ProviderEffect::NetworkWrite);
+        assert!(reads.is_empty());
+    }
+
+    #[test]
+    fn inbox_is_a_mutation_whenever_it_may_write_its_cache() {
+        // `--no-cache` keeps the command read-only.
+        let (name, effect, _, reads) = classify_argv(&["inbox", "list", "--no-cache"]);
+        assert_eq!(name, "inbox.query");
+        assert_eq!(effect, Effect::ReadOnly);
+        assert_eq!(reads, vec!["provider", "user_config"]);
+
+        // Without it the cache may be rewritten, so it must not claim to be a read.
+        let (name, effect, provider, reads) = classify_argv(&["inbox", "list"]);
+        assert_eq!(name, "inbox.cache-write");
+        assert_eq!(effect, Effect::Mutation);
+        assert_eq!(provider, ProviderEffect::NetworkRead);
+        assert_eq!(reads, vec!["provider", "user_config", "cache"]);
+
+        for subcommand in ["status", "next"] {
+            let (name, _, _, _) = classify_argv(&["inbox", subcommand, "--no-cache"]);
+            assert_eq!(name, "inbox.query", "{subcommand}");
+            let (name, _, _, _) = classify_argv(&["inbox", subcommand]);
+            assert_eq!(name, "inbox.cache-write", "{subcommand}");
+        }
+    }
+
+    #[test]
+    fn local_only_and_self_describing_commands_declare_no_provider_effect() {
+        let (name, effect, provider, reads) = classify_argv(&["completion", "zsh"]);
+        assert_eq!(name, "completion");
+        assert_eq!(effect, Effect::ReadOnly);
+        assert_eq!(provider, ProviderEffect::None);
+        assert!(reads.is_empty());
+
+        // Describing the describer cannot claim to know its own effect.
+        let (name, effect, provider, _) = classify_argv(&["operation-effect", "--", "pr", "list"]);
+        assert_eq!(name, "operation-effect");
+        assert_eq!(effect, Effect::Unknown);
+        assert_eq!(provider, ProviderEffect::None);
+
+        // A bare invocation with no subcommand is equally unknown.
+        let (name, effect, _, _) = classify_argv(&[]);
+        assert_eq!(name, "operation-effect");
+        assert_eq!(effect, Effect::Unknown);
+    }
+
+    #[test]
+    fn a_descriptor_is_emitted_for_both_formats() {
+        assert_eq!(
+            run(
+                vec![OsString::from("pr"), OsString::from("list")],
+                OutputFormat::Json
+            ),
+            exit::SUCCESS
+        );
+        assert_eq!(
+            run(
+                vec![OsString::from("pr"), OsString::from("list")],
+                OutputFormat::Text
+            ),
+            exit::SUCCESS
+        );
+    }
+}

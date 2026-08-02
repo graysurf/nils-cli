@@ -31,7 +31,7 @@ Options:
 
 Environment:
   NILS_CLI_COVERAGE_FAIL_UNDER_LINES
-    Override coverage threshold used with --with-coverage (default: 84).
+    Override coverage threshold used with --with-coverage (default: 85).
 USAGE
 }
 
@@ -183,9 +183,8 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   exit 2
 fi
 
-# Keep the temporary native-run 30743840826 floor aligned with CI. After the
-# runtime-kit delivery, restore 85 once native full-workspace coverage reaches 85%.
-coverage_fail_under="${NILS_CLI_COVERAGE_FAIL_UNDER_LINES:-84}"
+# Keep this floor aligned with the `coverage` job in .github/workflows/ci.yml.
+coverage_fail_under="${NILS_CLI_COVERAGE_FAIL_UNDER_LINES:-85}"
 
 run mkdir -p target/coverage
 run cargo llvm-cov nextest --profile ci --workspace --no-fail-fast --lcov --output-path target/coverage/lcov.info --fail-under-lines "$coverage_fail_under"

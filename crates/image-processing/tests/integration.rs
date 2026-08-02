@@ -5,6 +5,8 @@
 
 #[path = "integration/common.rs"]
 pub mod common;
+#[path = "integration/completion_export.rs"]
+mod completion_export;
 #[path = "integration/core_flows.rs"]
 mod core_flows;
 #[path = "integration/dry_run_paths.rs"]

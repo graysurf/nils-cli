@@ -818,3 +818,318 @@ fn push_unique_intent(intents: &mut Vec<String>, name: &str) {
         intents.push(name.to_string());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _tmp: TempDir,
+        roots: ResolvedRoots,
+        project: PathBuf,
+    }
+
+    /// A docs-home and a separate project root, each with its own catalog.
+    fn fixture(home_catalog: &str, project_catalog: &str) -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("docs-home");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        if !home_catalog.is_empty() {
+            fs::write(home.join("AGENT_DOCS.toml"), home_catalog).unwrap();
+        }
+        if !project_catalog.is_empty() {
+            fs::write(project.join("AGENT_DOCS.toml"), project_catalog).unwrap();
+        }
+        Fixture {
+            roots: ResolvedRoots::for_paths(home, project.clone()),
+            project,
+            _tmp: tmp,
+        }
+    }
+
+    fn intent(name: &str) -> Context {
+        Context::parse(name).expect("intent")
+    }
+
+    const PROJECT_CATALOG: &str = r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = true
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "OPTIONAL.md"
+
+[[validation]]
+context = "project-dev"
+commands = ["cargo test"]
+"#;
+
+    #[test]
+    fn a_present_required_document_is_reported_as_satisfied() {
+        let fixture = fixture("", PROJECT_CATALOG);
+        fs::write(fixture.project.join("DEVELOPMENT.md"), "# dev\n").unwrap();
+        fs::write(fixture.project.join("OPTIONAL.md"), "# optional\n").unwrap();
+
+        let report = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+
+        assert_eq!(report.schema_version, PreflightReport::SCHEMA_VERSION);
+        assert_eq!(report.intent.as_str(), "project-dev");
+        assert_eq!(report.documents.len(), 2);
+        assert_eq!(report.summary.required_total, 1);
+        assert_eq!(report.summary.satisfied_required, 1);
+        assert_eq!(report.summary.missing_required, 0);
+        assert!(!report.has_unsatisfied_required());
+        assert_eq!(report.validation.commands, vec!["cargo test"]);
+        assert!(
+            report.documents.iter().all(|doc| doc.content.is_none()),
+            "content is emitted only on request"
+        );
+    }
+
+    #[test]
+    fn a_missing_required_document_leaves_the_intent_unsatisfied() {
+        let fixture = fixture("", PROJECT_CATALOG);
+
+        let report = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+
+        let required = report
+            .documents
+            .iter()
+            .find(|doc| doc.required)
+            .expect("required document");
+        assert_eq!(required.status, DocumentStatus::Missing);
+        assert_eq!(report.summary.missing_required, 1);
+        assert!(report.has_unsatisfied_required());
+    }
+
+    #[test]
+    fn content_emission_is_opt_in_and_reads_the_resolved_file() {
+        let fixture = fixture("", PROJECT_CATALOG);
+        fs::write(fixture.project.join("DEVELOPMENT.md"), "# dev\nbody\n").unwrap();
+
+        let report = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            true,
+        )
+        .expect("resolve");
+
+        let required = report
+            .documents
+            .iter()
+            .find(|doc| doc.required)
+            .expect("required document");
+        assert_eq!(required.content.as_deref(), Some("# dev\nbody\n"));
+        // A document that does not exist has no content to emit.
+        let optional = report
+            .documents
+            .iter()
+            .find(|doc| !doc.required)
+            .expect("optional document");
+        assert_eq!(optional.status, DocumentStatus::Missing);
+        assert_eq!(optional.content, None);
+    }
+
+    #[test]
+    fn an_unknown_intent_resolves_to_an_empty_document_set() {
+        let fixture = fixture("", PROJECT_CATALOG);
+
+        let report = resolve_intent(
+            &intent("no-such-intent"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+
+        assert!(report.documents.is_empty());
+        assert_eq!(report.summary.required_total, 0);
+        assert!(!report.has_unsatisfied_required());
+        assert!(report.validation.commands.is_empty());
+    }
+
+    #[test]
+    fn a_product_filter_selects_only_matching_documents() {
+        let catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "CLAUDE.md"
+product = "claude"
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "CODEX.md"
+product = "codex"
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "SHARED.md"
+"#;
+        let fixture = fixture("", catalog);
+
+        let claude = resolve_intent_for_product(
+            &intent("project-dev"),
+            &fixture.roots,
+            Some(Product::Claude),
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+        let paths = |report: &PreflightReport| {
+            report
+                .documents
+                .iter()
+                .map(|doc| doc.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        // A product-neutral document applies to every product.
+        assert_eq!(paths(&claude), vec!["CLAUDE.md", "SHARED.md"]);
+        assert_eq!(claude.product, Some(Product::Claude));
+
+        let codex = resolve_intent_for_product(
+            &intent("project-dev"),
+            &fixture.roots,
+            Some(Product::Codex),
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+        assert_eq!(paths(&codex), vec!["CODEX.md", "SHARED.md"]);
+
+        // With no product filter, every declared document is resolved.
+        let all = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+        assert_eq!(all.documents.len(), 3);
+        assert_eq!(all.product, None);
+    }
+
+    #[test]
+    fn a_pre_loaded_catalog_resolves_without_touching_the_filesystem_catalog() {
+        let fixture = fixture("", PROJECT_CATALOG);
+        fs::write(fixture.project.join("DEVELOPMENT.md"), "# dev\n").unwrap();
+        let catalog = load_catalog_from_roots(&fixture.roots).expect("catalog");
+
+        // Deleting the on-disk catalog proves the pre-loaded one is used.
+        fs::remove_file(fixture.project.join("AGENT_DOCS.toml")).unwrap();
+
+        let report = resolve_intent_with_catalog(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+            &catalog,
+        );
+
+        assert_eq!(report.documents.len(), 2);
+        assert_eq!(report.summary.satisfied_required, 1);
+    }
+
+    #[test]
+    fn a_broken_catalog_surfaces_the_config_error_instead_of_an_empty_report() {
+        let fixture = fixture("", "[[document]\n");
+
+        let err = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect_err("broken catalog");
+
+        assert!(err.file_path.ends_with("AGENT_DOCS.toml"), "{err:?}");
+    }
+
+    #[test]
+    fn a_home_catalog_contributes_its_own_scoped_documents() {
+        let home_catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "home"
+path = "HOME_POLICY.md"
+required = true
+"#;
+        let fixture = fixture(home_catalog, PROJECT_CATALOG);
+
+        let report = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            false,
+            FallbackMode::Auto,
+            false,
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            report.documents.len(),
+            3,
+            "home and project catalogs both contribute: {:?}",
+            report.documents.iter().map(|d| &d.path).collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .documents
+                .iter()
+                .any(|doc| doc.scope == Scope::Home && doc.required),
+            "the home-scoped requirement must survive resolution"
+        );
+    }
+
+    #[test]
+    fn strict_mode_still_returns_a_report_for_a_satisfied_intent() {
+        let fixture = fixture("", PROJECT_CATALOG);
+        fs::write(fixture.project.join("DEVELOPMENT.md"), "# dev\n").unwrap();
+
+        let report = resolve_intent(
+            &intent("project-dev"),
+            &fixture.roots,
+            true,
+            FallbackMode::LocalOnly,
+            false,
+        )
+        .expect("resolve");
+
+        assert!(report.strict);
+        assert_eq!(report.docs_home, fixture.roots.docs_home);
+        assert_eq!(report.project_path, fixture.roots.project_path);
+        assert!(!report.is_linked_worktree);
+    }
+}

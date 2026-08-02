@@ -163,6 +163,239 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Serve a fixed sequence of raw HTTP responses on loopback, recording the
+    /// request lines so pagination and endpoint shape can be asserted.
+    struct StubApi {
+        base: String,
+        handle: Option<thread::JoinHandle<Vec<String>>>,
+    }
+
+    impl StubApi {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let handle = thread::spawn(move || {
+                let mut requests = Vec::new();
+                for response in responses {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).ok();
+                    // Drain headers so the client is not left blocked on write.
+                    loop {
+                        let mut header = String::new();
+                        match reader.read_line(&mut header) {
+                            Ok(0) => break,
+                            Ok(_) if header.trim().is_empty() => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    requests.push(request_line.trim().to_string());
+                    stream.write_all(response.as_bytes()).ok();
+                    stream.flush().ok();
+                }
+                requests
+            });
+            Self {
+                base,
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&mut self) -> Vec<String> {
+            self.handle
+                .take()
+                .expect("server joined once")
+                .join()
+                .expect("server thread")
+        }
+    }
+
+    fn http_response(status: &str, body: &str, extra_headers: &[&str]) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n");
+        for header in extra_headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        response
+    }
+
+    #[test]
+    fn list_installations_follows_link_pagination_to_the_last_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        // The advertised `next` URL points back at this same stub, which is
+        // what the client must follow to reach the second page.
+        let next_link = format!("Link: <http://{addr}/app/installations?page=2>; rel=\"next\"");
+        let base = format!("http://{addr}");
+        let handle = thread::spawn(move || {
+            let responses = [
+                http_response(
+                    "200 OK",
+                    r#"[{"id":1,"account":{"login":"acme"},"repository_selection":"all"}]"#,
+                    &[&next_link],
+                ),
+                http_response(
+                    "200 OK",
+                    r#"[{"id":2,"account":{"login":"widgets"},"permissions":{"contents":"read"}}]"#,
+                    &[],
+                ),
+            ];
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).ok();
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                seen.push(request_line.trim().to_string());
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+            seen
+        });
+
+        let client = Client::new(&base).expect("client");
+        let installations = client.list_installations("jwt-token").expect("list");
+        let requests = handle.join().expect("server");
+
+        assert_eq!(installations.len(), 2, "both pages must be returned");
+        assert_eq!(installations[0].id, 1);
+        assert_eq!(
+            installations[0].account.as_ref().map(|a| a.login.as_str()),
+            Some("acme")
+        );
+        assert_eq!(installations[1].id, 2);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("/app/installations?per_page=100"),
+            "{:?}",
+            requests[0]
+        );
+        assert!(requests[1].contains("page=2"), "{:?}", requests[1]);
+    }
+
+    #[test]
+    fn mint_installation_token_posts_to_the_installation_endpoint() {
+        let mut stub = StubApi::start(vec![http_response(
+            "201 Created",
+            r#"{"token":"ghs_example","expires_at":"2026-08-03T01:00:00Z","repository_selection":"selected"}"#,
+            &[],
+        )]);
+
+        let client = Client::new(&format!("{}/", stub.base)).expect("client");
+        let token = client
+            .mint_installation_token("jwt-token", "12345")
+            .expect("token");
+        let requests = stub.requests();
+
+        assert_eq!(token.token, "ghs_example");
+        assert_eq!(token.expires_at, "2026-08-03T01:00:00Z");
+        assert_eq!(token.repository_selection.as_deref(), Some("selected"));
+        assert_eq!(
+            requests,
+            vec!["POST /app/installations/12345/access_tokens HTTP/1.1".to_string()],
+            "a trailing slash in api_base must not double up in the path"
+        );
+    }
+
+    #[test]
+    fn a_github_error_body_is_surfaced_without_the_credential() {
+        let mut stub = StubApi::start(vec![http_response(
+            "401 Unauthorized",
+            r#"{"message":"A JWT could not be decoded"}"#,
+            &[],
+        )]);
+
+        let client = Client::new(&stub.base).expect("client");
+        let err = client
+            .mint_installation_token("jwt-token", "1")
+            .expect_err("unauthorized");
+        stub.requests();
+
+        let rendered = format!("{err:?}");
+        assert!(rendered.contains("HTTP 401"), "{rendered}");
+        assert!(
+            rendered.contains("A JWT could not be decoded"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("jwt-token"),
+            "the App JWT must never appear in an error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_non_json_error_body_degrades_to_the_status_code() {
+        let mut stub = StubApi::start(vec![http_response("502 Bad Gateway", "upstream down", &[])]);
+
+        let client = Client::new(&stub.base).expect("client");
+        let err = client.list_installations("jwt").expect_err("bad gateway");
+        stub.requests();
+
+        assert!(format!("{err:?}").contains("GitHub API returned HTTP 502"));
+    }
+
+    #[test]
+    fn an_undecodable_success_body_is_reported_as_unavailable() {
+        let mut stub = StubApi::start(vec![http_response("200 OK", "{not json", &[])]);
+
+        let client = Client::new(&stub.base).expect("client");
+        let err = client.list_installations("jwt").expect_err("bad payload");
+        stub.requests();
+
+        assert!(format!("{err:?}").contains("decode installations response"));
+    }
+
+    #[test]
+    fn a_refused_connection_is_reported_as_a_network_failure() {
+        // Bind then drop so nothing is listening on the port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("probe port");
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        // Another process can win that ephemeral port between the drop and the
+        // request; if anything is listening the connect-refused branch is
+        // unreachable rather than wrong, so skip instead of failing.
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+
+        let client = Client::new(&format!("http://{addr}")).expect("client");
+        let err = client.list_installations("jwt").expect_err("no server");
+
+        assert!(format!("{err:?}").contains("request failed"));
+    }
+
+    #[test]
+    fn github_message_reads_only_a_string_message_field() {
+        assert_eq!(
+            github_message(r#"{"message":"Bad credentials"}"#).as_deref(),
+            Some("Bad credentials")
+        );
+        assert!(github_message("not json").is_none());
+        assert!(github_message(r#"{"other":"value"}"#).is_none());
+        assert!(github_message(r#"{"message":42}"#).is_none());
+    }
+
     #[test]
     fn parse_next_link_picks_the_next_rel() {
         let header = "<https://api.github.com/app/installations?per_page=100&page=2>; rel=\"next\", \

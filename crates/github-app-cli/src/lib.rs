@@ -27,3 +27,22 @@ pub fn now_unix() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_name_backs_the_schema_version_prefix() {
+        assert_eq!(BINARY, "github-app-cli");
+    }
+
+    #[test]
+    fn now_unix_is_a_monotonic_wall_clock_second_count() {
+        let first = now_unix();
+        // Well past the 2020 epoch floor: a zero here would mean the clock
+        // fallback fired and JWT `iat`/`exp` claims would be nonsense.
+        assert!(first > 1_600_000_000, "unexpected clock value: {first}");
+        assert!(now_unix() >= first);
+    }
+}

@@ -11,6 +11,8 @@ mod characterization_warnings;
 mod commit_mode;
 #[path = "integration/common.rs"]
 pub mod common;
+#[path = "integration/completion_export.rs"]
+mod completion_export;
 #[path = "integration/edge_cases.rs"]
 mod edge_cases;
 #[path = "integration/exit_codes.rs"]

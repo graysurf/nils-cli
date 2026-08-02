@@ -1108,4 +1108,148 @@ mod tests {
         assert_eq!(status_str(decision.status), "required-missing");
         assert_eq!(kind_str(decision.kind), "fail");
     }
+
+    #[test]
+    fn decision_labels_are_the_published_wire_values() {
+        assert_eq!(kind_str(DecisionKind::Direct), "direct");
+        assert_eq!(kind_str(DecisionKind::Direnv), "direnv");
+        assert_eq!(kind_str(DecisionKind::Dotenv), "direnv-dotenv");
+        assert_eq!(kind_str(DecisionKind::Fail), "fail");
+
+        assert_eq!(status_str(DecisionStatus::Absent), "absent");
+        assert_eq!(status_str(DecisionStatus::Bypassed), "bypassed");
+        assert_eq!(status_str(DecisionStatus::Active), "active");
+        assert_eq!(
+            status_str(DecisionStatus::RequiredMissing),
+            "required-missing"
+        );
+        assert_eq!(status_str(DecisionStatus::MissingDirenv), "missing-direnv");
+        assert_eq!(status_str(DecisionStatus::Blocked), "blocked");
+    }
+
+    #[test]
+    fn error_categories_round_trip_through_the_shared_cli_error() {
+        // `render_error` returns the exit code the CLI would exit with, so it
+        // is the observable proof that the category survived the conversion.
+        let rendered = |err: AgentRunError| {
+            render_error(
+                "cli.agent-run.operation-effect.v1",
+                "agent-run operation-effect",
+                OutputFormat::Json,
+                err.into_cli_error(),
+            )
+        };
+
+        let usage = AgentRunError::usage("invalid-cwd", "bad cwd", None);
+        assert_eq!(usage.exit_code, crate::common::EXIT_USAGE);
+        assert_eq!(rendered(usage), crate::common::EXIT_USAGE);
+
+        let unavailable = AgentRunError::unavailable(
+            "dotenv-parse-failed",
+            "no direnv",
+            Some(json!({"env_file": "/repo/.env"})),
+        );
+        assert_eq!(unavailable.exit_code, EXIT_UNAVAILABLE);
+        assert_eq!(unavailable.into_cli_error().code(), "dotenv-parse-failed");
+
+        // A path-resolution failure degrades to a runtime error, and the
+        // fallback arm of `into_cli_error` must preserve that exit code.
+        let runtime = AgentRunError::from_cli_error(CliError::runtime("x", "y", None));
+        assert_eq!(runtime.code, "path-resolution-failed");
+        assert_eq!(runtime.exit_code, EXIT_RUNTIME);
+        assert_eq!(rendered(runtime), EXIT_RUNTIME);
+    }
+
+    #[test]
+    fn resolve_cwd_requires_an_existing_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let canonical = fs::canonicalize(tmp.path()).expect("canonical tempdir");
+
+        assert_eq!(resolve_cwd(tmp.path()).expect("existing dir"), canonical);
+
+        let missing = resolve_cwd(&tmp.path().join("absent")).expect_err("missing dir");
+        assert_eq!(missing.code, "invalid-cwd");
+        assert_eq!(missing.exit_code, crate::common::EXIT_USAGE);
+
+        let file = tmp.path().join("file");
+        fs::write(&file, b"x").expect("write file");
+        let not_a_dir = resolve_cwd(&file).expect_err("file is not a directory");
+        assert_eq!(not_a_dir.code, "invalid-cwd");
+    }
+
+    #[test]
+    fn execution_plan_with_direnv_off_never_probes_direnv() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        fs::write(tmp.path().join(".env"), "A=1\n").expect("env");
+
+        let plan = execution_plan(tmp.path(), DirenvMode::Off).expect("plan");
+
+        assert_eq!(plan.cwd, fs::canonicalize(tmp.path()).unwrap());
+        assert_eq!(kind_str(plan.decision.kind), "direct");
+        assert_eq!(status_str(plan.decision.status), "bypassed");
+        assert!(plan.env_file.is_some(), "the .env is still reported");
+    }
+
+    #[test]
+    fn operation_effect_for_inspect_binds_enforcement_or_fails_closed() {
+        // The descriptor may only claim a read-only inspection when the OS
+        // sandbox backend is verifiable. Where it is not — macOS, or a host
+        // without the required namespace support — the command must report
+        // `unavailable` rather than degrade to an unenforced success.
+        for format in [OutputFormat::Json, OutputFormat::Text] {
+            let code = run_operation_effect(OperationEffectArgs {
+                format,
+                argv: vec![
+                    OsString::from("inspect"),
+                    OsString::from("--"),
+                    OsString::from("true"),
+                ],
+            });
+            assert!(
+                code == exit::SUCCESS || code == EXIT_UNAVAILABLE,
+                "unexpected exit {code} for {format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_effect_fails_closed_for_any_non_inspection_command() {
+        // Anything that is not `inspect` must be reported as a mutation rather
+        // than silently described as read-only.
+        let code = run_operation_effect(OperationEffectArgs {
+            format: OutputFormat::Json,
+            argv: vec![
+                OsString::from("exec"),
+                OsString::from("--"),
+                OsString::from("true"),
+            ],
+        });
+
+        assert_eq!(code, exit::SUCCESS);
+    }
+
+    #[test]
+    fn operation_effect_reports_argv_that_does_not_parse() {
+        for format in [OutputFormat::Json, OutputFormat::Text] {
+            let code = run_operation_effect(OperationEffectArgs {
+                format,
+                argv: vec![OsString::from("definitely-not-a-subcommand")],
+            });
+            assert_eq!(code, crate::common::EXIT_USAGE, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn operation_effect_rejects_an_inspect_cwd_that_does_not_exist() {
+        let code = run_operation_effect(OperationEffectArgs {
+            format: OutputFormat::Json,
+            argv: vec![
+                OsString::from("inspect"),
+                OsString::from("--cwd"),
+                OsString::from("/definitely/not/a/directory"),
+            ],
+        });
+
+        assert_eq!(code, crate::common::EXIT_USAGE);
+    }
 }

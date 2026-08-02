@@ -1034,6 +1034,8 @@ fn schema_err() -> String {
 mod tests {
     use super::*;
 
+    use crate::backend::BackendSuccess;
+
     #[test]
     fn delivery_merge_envelope_maps_to_lifecycle_observations() {
         let value = serde_json::json!({
@@ -1095,6 +1097,1166 @@ mod tests {
                 .expect_err("approval comment must belong to the target PR")
                 .kind(),
             "review_extension_approval_invalid"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Command-level coverage: inspect / observe / extend drive the durable
+    // provider chain through a stateful fake `gh`, so an appended state is
+    // visible to the very next read exactly as it would be on the provider.
+    // ---------------------------------------------------------------------
+
+    const REPO: &str = "acme/widgets";
+    const PR: u64 = 7;
+    const HEAD: &str = "head-7";
+    const NEXT_HEAD: &str = "head-8";
+    const VIEWER: &str = "forge-bot";
+    const TIP_CREATED_AT: &str = "2026-07-20T12:00:00Z";
+
+    fn view_json(head_sha: &str) -> String {
+        serde_json::json!({
+            "number": PR,
+            "url": "https://github.com/acme/widgets/pull/7",
+            "state": "OPEN",
+            "isDraft": false,
+            "title": "feat: sample",
+            "headRefName": "feat/sample",
+            "headRefOid": head_sha,
+            "baseRefName": "main",
+            "mergeable": "MERGEABLE",
+            "mergedAt": null,
+            "labels": []
+        })
+        .to_string()
+    }
+
+    fn comment_node(body: &str, created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "author": {"login": VIEWER},
+            "authorAssociation": "MEMBER",
+            "body": body,
+            "createdAt": created_at
+        })
+    }
+
+    /// Stateful `gh` double: a posted review-state comment becomes part of the
+    /// next comment page, so append + read-back verification runs for real.
+    struct FakeGitHub {
+        view: String,
+        comments: std::cell::RefCell<Vec<serde_json::Value>>,
+        approval: Option<String>,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakeGitHub {
+        fn new(head_sha: &str) -> Self {
+            Self {
+                view: view_json(head_sha),
+                comments: std::cell::RefCell::new(Vec::new()),
+                approval: None,
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_state(self, state: &review_state::ReviewLoopState, head: &str) -> Self {
+            let record = review_state::ReviewStateRecord::new(
+                REPO,
+                PR,
+                head,
+                0,
+                None,
+                review_state::ReviewStatePayload::ReviewLoop {
+                    state: state.clone(),
+                },
+            )
+            .expect("seed record");
+            let marker = record.marker().expect("seed marker");
+            self.comments
+                .borrow_mut()
+                .push(comment_node(&marker, TIP_CREATED_AT));
+            self
+        }
+
+        fn with_approval(mut self, approval: serde_json::Value) -> Self {
+            self.approval = Some(approval.to_string());
+            self
+        }
+
+        fn tip_digest(&self) -> Option<String> {
+            let bodies: Vec<String> = self
+                .comments
+                .borrow()
+                .iter()
+                .map(|node| node["body"].as_str().unwrap_or_default().to_string())
+                .collect();
+            review_state::parse_chain(bodies.iter().map(String::as_str), REPO, PR)
+                .expect("seeded chain")
+                .tip_digest
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+
+        fn appended_bodies(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "--method"))
+                .filter_map(|argv| {
+                    argv.iter()
+                        .find_map(|arg| arg.strip_prefix("body="))
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+    }
+
+    impl BackendRunner for FakeGitHub {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            let argv: Vec<String> = call
+                .argv
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            self.calls.borrow_mut().push(argv.clone());
+
+            if argv.first().map(String::as_str) == Some("pr") {
+                return Ok(BackendSuccess {
+                    stdout: self.view.clone(),
+                    stderr: String::new(),
+                });
+            }
+            if argv.get(1).map(String::as_str) == Some("graphql") {
+                let page = serde_json::json!({
+                    "data": {
+                        "viewer": {"login": VIEWER},
+                        "repository": {"pullRequest": {"comments": {
+                            "nodes": *self.comments.borrow(),
+                            "pageInfo": {"hasNextPage": false, "endCursor": "cursor-end"}
+                        }}}
+                    }
+                });
+                return Ok(BackendSuccess {
+                    stdout: page.to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if argv.iter().any(|arg| arg == "--method") {
+                let body = argv
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("body="))
+                    .unwrap_or_default()
+                    .to_string();
+                self.comments
+                    .borrow_mut()
+                    .push(comment_node(&body, "2026-07-20T12:00:09Z"));
+                return Ok(BackendSuccess {
+                    stdout: "https://github.com/acme/widgets/pull/7#issuecomment-2".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            match self.approval.as_ref() {
+                Some(body) => Ok(BackendSuccess {
+                    stdout: body.clone(),
+                    stderr: String::new(),
+                }),
+                None => Err(ForgeError::software(
+                    schema_err(),
+                    "unexpected backend call",
+                    Some(argv.join(" ")),
+                )),
+            }
+        }
+
+        fn run_raw(&self, call: &BackendCall) -> Result<crate::backend::BackendOutput, ForgeError> {
+            self.run(call).map(|success| crate::backend::BackendOutput {
+                stdout: success.stdout,
+                stderr: success.stderr,
+                status_success: true,
+                exit_code: 0,
+            })
+        }
+    }
+
+    fn flags(dry_run: bool) -> GlobalFlags {
+        GlobalFlags {
+            format: None,
+            remote: "origin".to_string(),
+            provider: None,
+            host: None,
+            repo: Some(REPO.to_string()),
+            store_root: None,
+            dry_run,
+        }
+    }
+
+    fn github_remote(_: &str) -> Option<String> {
+        Some("https://github.com/acme/widgets.git".to_string())
+    }
+
+    fn gitlab_remote(_: &str) -> Option<String> {
+        Some("https://gitlab.com/acme/widgets.git".to_string())
+    }
+
+    fn github_ctx() -> ProviderContext {
+        ProviderContext {
+            provider: Provider::GitHub,
+            host: "github.com".to_string(),
+            source: crate::provider::DetectionSource::Flag,
+            repo: Some(REPO.to_string()),
+        }
+    }
+
+    fn open_finding(fingerprint: &str) -> review_state::ReviewFindingObservation {
+        review_state::ReviewFindingObservation {
+            fingerprint: fingerprint.to_string(),
+            root_cause_fingerprint: None,
+            blocking: true,
+            status: review_state::ReviewFindingStatus::Open,
+            threads: Vec::new(),
+        }
+    }
+
+    fn genesis_state(
+        head: &str,
+        observations: &[review_state::ReviewFindingObservation],
+    ) -> review_state::ReviewLoopState {
+        review_state::observe_review_loop(None, head, observations)
+            .expect("genesis transition")
+            .state
+    }
+
+    fn findings_file(dir: &tempfile::TempDir, body: &str) -> String {
+        let path = dir.path().join("findings.json");
+        fs::write(&path, body).expect("write findings");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn observe_args(
+        findings: &str,
+        expected_head: &str,
+        expected_state: Option<&str>,
+    ) -> PrReviewLoopObserveArgs {
+        PrReviewLoopObserveArgs {
+            id: PR,
+            expected_head: expected_head.to_string(),
+            findings_file: findings.to_string(),
+            expected_state: expected_state.map(str::to_string),
+        }
+    }
+
+    fn extend_args(
+        expected_head: &str,
+        expected_state: &str,
+        proposal: &str,
+    ) -> PrReviewLoopExtendArgs {
+        PrReviewLoopExtendArgs {
+            id: PR,
+            expected_head: expected_head.to_string(),
+            expected_state: expected_state.to_string(),
+            stop_code: "review_round_limit_exceeded".to_string(),
+            budget_field: "max_repair_rounds".to_string(),
+            increment: 1,
+            proposal_digest: proposal.to_string(),
+            approval_comment: 99,
+        }
+    }
+
+    fn stopped_state(head: &str, proposal: &str) -> review_state::ReviewLoopState {
+        review_state::ReviewLoopState {
+            head_sha: head.to_string(),
+            round: 1,
+            no_progress_rounds: 0,
+            budget: review_state::ReviewLoopBudget::default(),
+            findings: std::collections::BTreeMap::new(),
+            extensions: Vec::new(),
+            hard_stop: Some(review_state::ReviewLoopHardStop {
+                code: "review_round_limit_exceeded".to_string(),
+                budget_field: "max_repair_rounds".to_string(),
+                increment: 1,
+                proposal_digest: proposal.to_string(),
+                attempted_head_sha: head.to_string(),
+                observation_digest: "sha256:observation".to_string(),
+                extension_applied: false,
+            }),
+        }
+    }
+
+    fn approval_payload(created_at: &str, association: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "html_url": "https://github.com/acme/widgets/pull/7#issuecomment-99",
+            "issue_url": "https://api.github.com/repos/acme/widgets/issues/7",
+            "user": {"login": "maintainer"},
+            "author_association": association,
+            "created_at": created_at,
+            "body": body
+        })
+    }
+
+    // --- inspect ---------------------------------------------------------
+
+    #[test]
+    fn inspect_dry_run_plans_without_touching_the_provider() {
+        let runner = FakeGitHub::new(HEAD);
+        let code = run_inspect_with(
+            &runner,
+            &flags(true),
+            PrReviewLoopInspectArgs { id: PR },
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("dry run");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn inspect_reports_the_existing_chain_without_appending() {
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+
+        let code = run_inspect_with(
+            &runner,
+            &flags(false),
+            PrReviewLoopInspectArgs { id: PR },
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("inspect");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn inspect_rejects_a_non_github_provider() {
+        let runner = FakeGitHub::new(HEAD);
+        let error = run_inspect_with(
+            &runner,
+            &flags(false),
+            PrReviewLoopInspectArgs { id: PR },
+            OutputFormat::Json,
+            gitlab_remote,
+        )
+        .expect_err("review-loop is GitHub-only in v1");
+
+        assert_eq!(error.kind(), "provider_unsupported");
+        assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+    }
+
+    // --- observe ---------------------------------------------------------
+
+    #[test]
+    fn observe_appends_the_genesis_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(
+            &dir,
+            r#"{"data":{"findings":[{"lifecycle_fingerprint":"correctness:review-loop:one","primary":{"severity":"high"}}]}}"#,
+        );
+        let runner = FakeGitHub::new(HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args(&findings, HEAD, None),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("genesis observation");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.appended_bodies().len(), 1);
+        let chain_state = review_state::parse_chain(
+            runner.appended_bodies().iter().map(String::as_str),
+            REPO,
+            PR,
+        )
+        .expect("appended chain");
+        let state = review_state::latest_review_loop_state(&chain_state).expect("state");
+        assert_eq!(state.head_sha, HEAD);
+        assert_eq!(state.round, 0);
+        assert!(state.findings.contains_key("correctness:review-loop:one"));
+    }
+
+    #[test]
+    fn observe_dry_run_reports_an_unreadable_findings_file_without_failing() {
+        let runner = FakeGitHub::new(HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(true),
+            observe_args("/definitely/missing.json", HEAD, None),
+            OutputFormat::Text,
+            github_remote,
+        )
+        .expect("a failing preflight rule is reported, not returned as an error");
+
+        // The dry run is a faithful read-only preflight: it reaches the
+        // provider to evaluate the remaining rules even when the local
+        // findings file is unusable, and it still appends nothing.
+        assert_eq!(code, 0);
+        assert!(
+            !runner.calls().is_empty(),
+            "the preflight must actually read provider state"
+        );
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn observe_dry_run_predicts_an_append_without_performing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let runner = FakeGitHub::new(HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(true),
+            observe_args(&findings, HEAD, None),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("clean preflight");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            runner.appended_bodies(),
+            Vec::<String>::new(),
+            "a dry run must never write the durable chain"
+        );
+    }
+
+    #[test]
+    fn observe_is_a_no_op_when_the_observation_matches_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let code = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args(&findings, HEAD, Some(&tip)),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("unchanged observation");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            runner.appended_bodies(),
+            Vec::<String>::new(),
+            "an unchanged observation must not grow the durable chain"
+        );
+    }
+
+    #[test]
+    fn observe_rejects_a_head_that_the_provider_does_not_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let runner = FakeGitHub::new(HEAD);
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args(&findings, "head-mismatch", None),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("head mismatch");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("provider_head="),
+            "detail should name both heads: {:?}",
+            error.detail()
+        );
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn observe_rejects_a_stale_expected_state_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args(&findings, HEAD, Some("sha256:stale")),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("tip mismatch");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("expected_state=sha256:stale"),
+            "detail should name the stale tip: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn observe_records_a_durable_hard_stop_before_failing_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let mut state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        // Exhaust the repair-round budget so advancing to a new head stops.
+        state.budget.max_repair_rounds = 0;
+        let runner = FakeGitHub::new(NEXT_HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args(&findings, NEXT_HEAD, Some(&tip)),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("budget exhausted");
+
+        assert_eq!(error.kind(), "review_round_limit_exceeded");
+        let detail = error.detail().unwrap_or_default();
+        assert!(
+            detail.contains("approval_marker=<!-- forge-cli:review-loop-extension:v1 "),
+            "the operator needs the exact approval marker: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("attempted_head={NEXT_HEAD}")),
+            "detail should name the attempted head: {detail}"
+        );
+        assert_eq!(
+            runner.appended_bodies().len(),
+            1,
+            "the hard stop must be durable before the command fails"
+        );
+    }
+
+    #[test]
+    fn observe_replays_a_recorded_hard_stop_without_appending_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let mut state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        state.budget.max_repair_rounds = 0;
+        let seeded = FakeGitHub::new(NEXT_HEAD).with_state(&state, HEAD);
+        let tip = seeded.tip_digest().expect("seeded tip");
+        run_observe_with(
+            &seeded,
+            &flags(false),
+            observe_args(&findings, NEXT_HEAD, Some(&tip)),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("first stop");
+        let stopped_tip = seeded.tip_digest().expect("stopped tip");
+        let appended_after_first = seeded.appended_bodies().len();
+
+        let error = run_observe_with(
+            &seeded,
+            &flags(false),
+            observe_args(&findings, NEXT_HEAD, Some(&stopped_tip)),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("stop is durable");
+
+        assert_eq!(error.kind(), "review_round_limit_exceeded");
+        assert_eq!(
+            seeded.appended_bodies().len(),
+            appended_after_first,
+            "a replayed hard stop must not append a second stop record"
+        );
+    }
+
+    #[test]
+    fn observe_rejects_an_unreadable_findings_file() {
+        let runner = FakeGitHub::new(HEAD);
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args("/definitely/missing/findings.json", HEAD, None),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("missing findings file");
+
+        assert_eq!(error.kind(), "review_findings_invalid");
+        assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+    }
+
+    // --- extend ----------------------------------------------------------
+
+    #[test]
+    fn extend_dry_run_plans_without_touching_the_provider() {
+        let runner = FakeGitHub::new(HEAD);
+        let code = run_extend_with(
+            &runner,
+            &flags(true),
+            extend_args(HEAD, "sha256:tip", "sha256:proposal"),
+            OutputFormat::Text,
+            github_remote,
+        )
+        .expect("dry run");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn extend_requires_an_existing_review_loop_state() {
+        let runner = FakeGitHub::new(HEAD);
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, "sha256:tip", "sha256:proposal"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("no chain to extend");
+
+        // A genesis chain has no tip, so the tip guard fires before the
+        // "state must exist" guard.
+        assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn extend_rejects_a_state_without_a_durable_hard_stop() {
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, "sha256:proposal"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("nothing to extend");
+
+        assert_eq!(error.kind(), "review_extension_invalid");
+    }
+
+    #[test]
+    fn extend_rejects_a_request_that_does_not_match_the_hard_stop() {
+        let state = stopped_state(HEAD, "sha256:proposal");
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, "sha256:other-proposal"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("proposal digest mismatch");
+
+        assert_eq!(error.kind(), "review_extension_invalid");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("expected_proposal=sha256:proposal"),
+            "detail should name the durable proposal: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn extend_rejects_a_state_bound_to_a_different_head() {
+        let state = stopped_state(HEAD, "sha256:proposal");
+        let runner = FakeGitHub::new(NEXT_HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(NEXT_HEAD, &tip, "sha256:proposal"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("head mismatch");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains(&format!("state_head={HEAD}")),
+            "detail should name the bound head: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn extend_rejects_an_approval_from_a_non_maintainer() {
+        let proposal = "sha256:proposal";
+        let state = stopped_state(HEAD, proposal);
+        let marker = extension_approval_marker(proposal, "max_repair_rounds", 1);
+        let runner = FakeGitHub::new(HEAD)
+            .with_state(&state, HEAD)
+            .with_approval(approval_payload("2026-07-20T12:00:01Z", "NONE", &marker));
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, proposal),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("outsider approval");
+
+        assert_eq!(error.kind(), "review_extension_approval_invalid");
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn extend_rejects_an_approval_missing_required_metadata() {
+        let proposal = "sha256:proposal";
+        let state = stopped_state(HEAD, proposal);
+        let runner = FakeGitHub::new(HEAD)
+            .with_state(&state, HEAD)
+            .with_approval(serde_json::json!({
+                "html_url": "https://github.com/acme/widgets/pull/7#issuecomment-99",
+                "issue_url": "https://api.github.com/repos/acme/widgets/issues/7",
+                "user": {"login": "maintainer"},
+                "author_association": "MEMBER",
+                "created_at": "2026-07-20T12:00:01Z"
+            }));
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, proposal),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("approval body missing");
+
+        assert_eq!(error.kind(), "review_extension_approval_invalid");
+        assert!(
+            error.detail().unwrap_or_default().contains("field=/body"),
+            "detail should name the missing field: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn extend_rejects_an_approval_on_another_pull_request() {
+        let proposal = "sha256:proposal";
+        let state = stopped_state(HEAD, proposal);
+        let marker = extension_approval_marker(proposal, "max_repair_rounds", 1);
+        let mut payload = approval_payload("2026-07-20T12:00:01Z", "MEMBER", &marker);
+        payload["issue_url"] =
+            serde_json::json!("https://api.github.com/repos/acme/widgets/issues/8");
+        let runner = FakeGitHub::new(HEAD)
+            .with_state(&state, HEAD)
+            .with_approval(payload);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, proposal),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("approval belongs to another PR");
+
+        assert_eq!(error.kind(), "review_extension_approval_invalid");
+    }
+
+    #[test]
+    fn extend_applies_exactly_one_budget_increment() {
+        let proposal = "sha256:proposal";
+        let state = stopped_state(HEAD, proposal);
+        let marker = extension_approval_marker(proposal, "max_repair_rounds", 1);
+        let body = format!("Approving the extension.\n\n{marker}\n");
+        let runner = FakeGitHub::new(HEAD)
+            .with_state(&state, HEAD)
+            .with_approval(approval_payload("2026-07-20T12:00:01Z", "MEMBER", &body));
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let code = run_extend_with(
+            &runner,
+            &flags(false),
+            extend_args(HEAD, &tip, proposal),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("extension applied");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.appended_bodies().len(), 1);
+        let bodies: Vec<String> = runner
+            .comments
+            .borrow()
+            .iter()
+            .map(|node| node["body"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let chain = review_state::parse_chain(bodies.iter().map(String::as_str), REPO, PR)
+            .expect("extended chain");
+        let extended = review_state::latest_review_loop_state(&chain).expect("state");
+        assert_eq!(
+            extended.budget.max_repair_rounds,
+            review_state::ReviewLoopBudget::default().max_repair_rounds + 1
+        );
+        assert_eq!(extended.extensions.len(), 1);
+        assert_eq!(extended.extensions[0].proposal_digest, proposal);
+        assert!(
+            extended
+                .hard_stop
+                .as_ref()
+                .expect("stop retained")
+                .extension_applied,
+            "the consumed hard stop must be marked applied so it cannot be replayed"
+        );
+    }
+
+    // --- merge gates -----------------------------------------------------
+
+    #[test]
+    fn merge_gate_is_optional_without_a_ledger() {
+        let runner = FakeGitHub::new(HEAD);
+        let gate = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            false,
+        )
+        .expect("no ledger is allowed when not required");
+
+        assert_eq!(gate, None);
+    }
+
+    #[test]
+    fn merge_gate_requires_a_genesis_ledger_when_bounded() {
+        let runner = FakeGitHub::new(HEAD);
+        let error = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            true,
+        )
+        .expect_err("bounded delivery needs a ledger");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn merge_gate_rejects_a_pull_request_url_without_a_repo_slug() {
+        let runner = FakeGitHub::new(HEAD);
+        let error = ensure_merge_ready(&runner, &github_ctx(), "not-a-url", PR, HEAD, false)
+            .expect_err("unusable URL");
+
+        assert_eq!(error.kind(), "software_error");
+    }
+
+    #[test]
+    fn merge_gate_blocks_on_a_durable_hard_stop() {
+        let state = stopped_state(HEAD, "sha256:proposal");
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+
+        let error = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            true,
+        )
+        .expect_err("hard stop blocks merge");
+
+        assert_eq!(error.kind(), "review_round_limit_exceeded");
+    }
+
+    #[test]
+    fn merge_gate_rejects_a_ledger_bound_to_another_head() {
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+
+        let error = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            NEXT_HEAD,
+            true,
+        )
+        .expect_err("ledger head mismatch");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("review_loop_head="),
+            "detail should name both heads: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn merge_gate_rejects_open_blocking_findings() {
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+
+        let error = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            true,
+        )
+        .expect_err("blocking findings stay open");
+
+        assert_eq!(error.kind(), "review_findings_open");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("findings=correctness:review-loop:one"),
+            "detail should name the open finding: {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn merge_gate_reports_the_tip_for_a_clean_ledger() {
+        let mut observation = open_finding("correctness:review-loop:one");
+        observation.status = review_state::ReviewFindingStatus::Fixed;
+        let state = genesis_state(HEAD, &[observation]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let gate = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            true,
+        )
+        .expect("clean ledger")
+        .expect("gate present");
+
+        assert_eq!(gate.state_tip_digest, tip);
+        assert_eq!(gate.head_sha, HEAD);
+        assert_eq!(gate.round, 0);
+        assert_eq!(gate.no_progress_rounds, 0);
+        assert_eq!(gate.open_blocking_findings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn merge_recheck_accepts_an_unchanged_tip() {
+        let mut observation = open_finding("correctness:review-loop:one");
+        observation.status = review_state::ReviewFindingStatus::Fixed;
+        let state = genesis_state(HEAD, &[observation]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let previous = ensure_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            true,
+        )
+        .expect("gate")
+        .expect("gate present");
+
+        let current = recheck_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            &previous,
+        )
+        .expect("tip unchanged");
+
+        assert_eq!(current, previous);
+    }
+
+    #[test]
+    fn merge_recheck_rejects_a_tip_that_moved_before_merge() {
+        let mut observation = open_finding("correctness:review-loop:one");
+        observation.status = review_state::ReviewFindingStatus::Fixed;
+        let state = genesis_state(HEAD, &[observation]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let previous = ReviewLoopMergeGate {
+            state_tip_digest: "sha256:previous".to_string(),
+            head_sha: HEAD.to_string(),
+            round: 0,
+            no_progress_rounds: 0,
+            open_blocking_findings: Vec::new(),
+        };
+
+        let error = recheck_merge_ready(
+            &runner,
+            &github_ctx(),
+            "https://github.com/acme/widgets/pull/7",
+            PR,
+            HEAD,
+            &previous,
+        )
+        .expect_err("tip moved");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains("expected_tip=sha256:previous"),
+            "detail should name both tips: {:?}",
+            error.detail()
+        );
+    }
+
+    // --- findings parsing ------------------------------------------------
+
+    #[test]
+    fn findings_input_accepts_envelope_wrapper_and_bare_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = findings_file(
+            &dir,
+            r#"{"data":{"findings":[{"fingerprint":"a"},{"fingerprint":"b"}]}}"#,
+        );
+        assert_eq!(read_observations(&envelope).expect("envelope").len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let bare = findings_file(&dir, r#"[{"fingerprint":"a"}]"#);
+        assert_eq!(read_observations(&bare).expect("bare array").len(), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let findings_key = findings_file(&dir, r#"{"findings":[{"fingerprint":"a"}]}"#);
+        assert_eq!(
+            read_observations(&findings_key)
+                .expect("findings key")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn findings_input_rejects_invalid_json_and_non_array_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = findings_file(&dir, "{ not json");
+        assert_eq!(
+            read_observations(&broken).expect_err("invalid JSON").kind(),
+            "review_findings_invalid"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let scalar = findings_file(&dir, r#"{"findings":42}"#);
+        assert_eq!(
+            read_observations(&scalar)
+                .expect_err("findings must be an array")
+                .kind(),
+            "review_findings_invalid"
+        );
+    }
+
+    #[test]
+    fn observation_requires_a_lifecycle_fingerprint() {
+        let error = observation_from_value(&serde_json::json!({"blocking": true}))
+            .expect_err("fingerprint is mandatory");
+        assert_eq!(error.kind(), "review_fingerprint_required");
+
+        let empty = observation_from_value(&serde_json::json!({"fingerprint": ""}))
+            .expect_err("empty fingerprint is not a fingerprint");
+        assert_eq!(empty.kind(), "review_fingerprint_required");
+    }
+
+    #[test]
+    fn observation_reads_disposition_severity_and_threads() {
+        let info_only = observation_from_value(&serde_json::json!({
+            "fingerprint": "style:review-loop:one",
+            "primary": {"severity": "info"}
+        }))
+        .expect("observation");
+        assert!(
+            !info_only.blocking,
+            "an info-severity finding must not block by default"
+        );
+
+        let explicit = observation_from_value(&serde_json::json!({
+            "fingerprint": "correctness:review-loop:two",
+            "blocking": false,
+            "disposition": "fixed",
+            "root_cause_fingerprint": "correctness:review-loop:root",
+            "threads": ["PRRT_1", 42]
+        }))
+        .expect("observation");
+        assert!(!explicit.blocking);
+        assert_eq!(explicit.status, review_state::ReviewFindingStatus::Fixed);
+        assert_eq!(
+            explicit.root_cause_fingerprint.as_deref(),
+            Some("correctness:review-loop:root")
+        );
+        assert_eq!(explicit.threads, vec!["PRRT_1".to_string()]);
+    }
+
+    #[test]
+    fn finding_status_parses_every_supported_disposition() {
+        assert_eq!(
+            parse_finding_status("open").expect("open"),
+            review_state::ReviewFindingStatus::Open
+        );
+        assert_eq!(
+            parse_finding_status("fixed").expect("fixed"),
+            review_state::ReviewFindingStatus::Fixed
+        );
+        assert_eq!(
+            parse_finding_status("accepted").expect("accepted"),
+            review_state::ReviewFindingStatus::Accepted
+        );
+        assert_eq!(
+            parse_finding_status("preference").expect("preference"),
+            review_state::ReviewFindingStatus::Preference
+        );
+        assert_eq!(
+            parse_finding_status("follow-up").expect("follow-up"),
+            review_state::ReviewFindingStatus::FollowUp
+        );
+        assert_eq!(
+            parse_finding_status("wontfix")
+                .expect_err("unsupported disposition")
+                .kind(),
+            "review_findings_invalid"
+        );
+    }
+
+    #[test]
+    fn expected_tip_guard_names_genesis_on_both_sides() {
+        ensure_expected_tip(None, None).expect("genesis matches genesis");
+        let error = ensure_expected_tip(Some("sha256:provider"), None)
+            .expect_err("provider is ahead of genesis");
+        assert_eq!(error.kind(), "review_state_conflict");
+        let detail = error.detail().unwrap_or_default();
+        assert!(
+            detail.contains("expected_state=<genesis>"),
+            "genesis must be spelled out: {detail}"
+        );
+        assert!(
+            detail.contains("provider_state=sha256:provider"),
+            "{detail}"
         );
     }
 }

@@ -953,3 +953,507 @@ fn byte_offset_to_line_column(raw: &str, offset: usize) -> ConfigErrorLocation {
     }
     ConfigErrorLocation { line, column }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::model::ConfigErrorKind;
+    use pretty_assertions::assert_eq;
+
+    const FILE: &str = "/repo/AGENT_DOCS.toml";
+
+    fn load(raw: &str) -> Result<ScopeCatalog, ConfigLoadError> {
+        load_scope_catalog_from_str(
+            Scope::Project,
+            CatalogOrigin::Repository,
+            Path::new("/repo"),
+            Path::new(FILE),
+            raw,
+        )
+    }
+
+    fn load_as(
+        source_scope: Scope,
+        origin: CatalogOrigin,
+        raw: &str,
+    ) -> Result<ScopeCatalog, ConfigLoadError> {
+        load_scope_catalog_from_str(
+            source_scope,
+            origin,
+            Path::new("/repo"),
+            Path::new(FILE),
+            raw,
+        )
+    }
+
+    /// Assert the failing field path without pinning the human wording.
+    fn field_error(raw: &str, expected_field: &str) -> ConfigLoadError {
+        let err = load(raw).expect_err("catalog must be rejected");
+        assert_eq!(err.kind, ConfigErrorKind::Validation);
+        assert_eq!(
+            err.field.as_deref(),
+            Some(expected_field),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.file_path, PathBuf::from(FILE));
+        err
+    }
+
+    #[test]
+    fn a_full_catalog_round_trips_every_supported_field() {
+        let catalog = load(
+            r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+product = ["claude", "codex", "claude"]
+phase = ["review", "plan"]
+required = true
+when = "always"
+marker = "dev-marker"
+last-reviewed-within-days = 30
+notes = "keep in sync"
+
+[[validation]]
+context = "project-dev"
+commands = ["  cargo test  "]
+product = "codex"
+marker = "validation-marker"
+description = "run the suite"
+
+[skills]
+enforce_name_prefix = true
+allowed_prefixes = ["project", "private"]
+dir = "  .agents/skills  "
+"#,
+        )
+        .expect("catalog");
+
+        assert_eq!(catalog.source_scope, Scope::Project);
+        assert_eq!(catalog.root, PathBuf::from("/repo"));
+        assert_eq!(catalog.documents.len(), 1);
+        let document = &catalog.documents[0];
+        assert_eq!(document.context.as_str(), "project-dev");
+        assert_eq!(document.scope, Scope::Project);
+        assert_eq!(document.path, PathBuf::from("DEVELOPMENT.md"));
+        // Products and phases are sorted and de-duplicated so two catalogs that
+        // list the same set in a different order compare equal.
+        assert_eq!(document.products.len(), 2);
+        assert_eq!(
+            document
+                .phases
+                .iter()
+                .map(Phase::as_str)
+                .collect::<Vec<_>>(),
+            vec!["plan", "review"]
+        );
+        assert!(document.required);
+        assert_eq!(document.when_raw, "always");
+        assert_eq!(document.marker.as_deref(), Some("dev-marker"));
+        assert_eq!(document.freshness_days, Some(30));
+        assert_eq!(document.notes.as_deref(), Some("keep in sync"));
+
+        assert_eq!(catalog.validations.len(), 1);
+        assert_eq!(catalog.validations[0].commands, vec!["cargo test"]);
+        assert_eq!(
+            catalog.validations[0].description.as_deref(),
+            Some("run the suite")
+        );
+
+        let policy = catalog.skill_policy.expect("skill policy");
+        assert!(policy.enforce_name_prefix);
+        assert_eq!(policy.dir, ".agents/skills");
+        assert_eq!(policy.allowed_prefixes, SkillPolicy::default_prefixes());
+    }
+
+    #[test]
+    fn an_empty_catalog_yields_empty_sections() {
+        let catalog = load("").expect("empty catalog");
+
+        assert!(catalog.documents.is_empty());
+        assert!(catalog.validations.is_empty());
+        assert!(catalog.skill_policy.is_none());
+        assert!(catalog.path_classes.is_none());
+    }
+
+    #[test]
+    fn invalid_toml_reports_a_line_and_column() {
+        let err = load("[[document]\ncontext = \"x\"\n").expect_err("broken toml");
+
+        assert_eq!(err.kind, ConfigErrorKind::Parse);
+        let location = err.location.expect("location");
+        assert_eq!(location.line, 1);
+        assert!(err.message.contains(CONFIG_FILE_NAME), "{}", err.message);
+    }
+
+    #[test]
+    fn a_private_catalog_hides_the_raw_toml_error() {
+        let err = load_as(Scope::Project, CatalogOrigin::User, "not = toml =")
+            .expect_err("broken private toml");
+
+        assert_eq!(err.kind, ConfigErrorKind::Parse);
+        // The private catalog lives outside the repo, so its contents must not
+        // leak into an error surfaced in repository output.
+        assert_eq!(err.message, "invalid private catalog TOML");
+    }
+
+    #[test]
+    fn byte_offsets_translate_to_one_based_line_and_column() {
+        let raw = "abc\nde\n";
+        assert_eq!(byte_offset_to_line_column(raw, 0).line, 1);
+        assert_eq!(byte_offset_to_line_column(raw, 0).column, 1);
+        let second_line = byte_offset_to_line_column(raw, 5);
+        assert_eq!(second_line.line, 2);
+        assert_eq!(second_line.column, 2);
+        // An out-of-range offset is clamped rather than panicking.
+        let clamped = byte_offset_to_line_column(raw, 9999);
+        assert_eq!(clamped.line, 3);
+        assert_eq!(clamped.column, 1);
+    }
+
+    #[test]
+    fn document_and_validation_sections_must_be_arrays_of_tables() {
+        let err = load("document = 5").expect_err("scalar document");
+        assert_eq!(err.kind, ConfigErrorKind::Validation);
+        assert_eq!(err.field.as_deref(), Some("document"));
+        assert_eq!(err.entry_index, None);
+
+        let err = load("validation = \"x\"").expect_err("scalar validation");
+        assert_eq!(err.field.as_deref(), Some("validation"));
+
+        let err = load("document = [1]").expect_err("non-table entry");
+        assert_eq!(err.field.as_deref(), Some("document"));
+        assert_eq!(err.entry_index, Some(0));
+
+        let err = load("validation = [1]").expect_err("non-table entry");
+        assert_eq!(err.field.as_deref(), Some("validation"));
+        assert_eq!(err.entry_index, Some(0));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_with_the_allowed_list() {
+        let err = field_error(
+            r#"
+[[document]]
+context = "x"
+scope = "project"
+path = "a.md"
+typo = true
+"#,
+            "typo",
+        );
+        assert!(err.message.contains("allowed fields:"), "{}", err.message);
+
+        field_error(
+            r#"
+[[validation]]
+context = "x"
+commands = ["a"]
+typo = true
+"#,
+            "typo",
+        );
+    }
+
+    #[test]
+    fn required_document_fields_are_enforced() {
+        field_error(
+            "[[document]]\nscope = \"project\"\npath = \"a.md\"\n",
+            "context",
+        );
+        field_error("[[document]]\ncontext = \"x\"\npath = \"a.md\"\n", "scope");
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\n",
+            "path",
+        );
+        field_error(
+            "[[document]]\ncontext = 5\nscope = \"project\"\npath = \"a.md\"\n",
+            "context",
+        );
+        field_error(
+            "[[document]]\ncontext = \"bad ctx\"\nscope = \"project\"\npath = \"a.md\"\n",
+            "context",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"nowhere\"\npath = \"a.md\"\n",
+            "scope",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"   \"\n",
+            "path",
+        );
+    }
+
+    #[test]
+    fn scope_visibility_depends_on_the_catalog_source() {
+        let global_doc = "[[document]]\ncontext = \"x\"\nscope = \"global\"\npath = \"a.md\"\n";
+        // A repository catalog may not declare a global requirement.
+        field_error(global_doc, "scope");
+        // The home catalog may.
+        load_as(Scope::Home, CatalogOrigin::Home, global_doc).expect("home global scope");
+
+        // A private/user catalog is project-scoped only.
+        let err = load_as(
+            Scope::Project,
+            CatalogOrigin::User,
+            "[[document]]\ncontext = \"x\"\nscope = \"home\"\npath = \"a.md\"\n",
+        )
+        .expect_err("user catalog scope");
+        assert_eq!(err.field.as_deref(), Some("scope"));
+    }
+
+    #[test]
+    fn private_catalog_paths_must_stay_inside_the_project() {
+        let allowed = load_as(
+            Scope::Project,
+            CatalogOrigin::User,
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"docs/a.md\"\n",
+        )
+        .expect("relative private path");
+        assert_eq!(allowed.documents[0].path, PathBuf::from("docs/a.md"));
+
+        for escape in ["/etc/passwd", "../outside.md"] {
+            let err = load_as(
+                Scope::Project,
+                CatalogOrigin::User,
+                &format!(
+                    "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"{escape}\"\n"
+                ),
+            )
+            .expect_err("private path escape");
+            assert_eq!(err.field.as_deref(), Some("path"), "{escape}");
+        }
+
+        // A repository catalog is trusted to name absolute paths.
+        load("[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"/abs/a.md\"\n")
+            .expect("repository absolute path");
+    }
+
+    #[test]
+    fn product_accepts_string_or_array_and_rejects_everything_else() {
+        let single = load(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nproduct = \"claude\"\n",
+        )
+        .expect("string product");
+        assert_eq!(single.documents[0].products.len(), 1);
+
+        for bad in [
+            "product = []",
+            "product = [1]",
+            "product = 5",
+            "product = \"nope\"",
+        ] {
+            field_error(
+                &format!(
+                    "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\n{bad}\n"
+                ),
+                "product",
+            );
+        }
+
+        // The same rules apply on the validation side.
+        field_error(
+            "[[validation]]\ncontext = \"x\"\ncommands = [\"a\"]\nproduct = 5\n",
+            "product",
+        );
+    }
+
+    #[test]
+    fn phase_accepts_string_or_array_and_rejects_everything_else() {
+        let single = load(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nphase = \"plan\"\n",
+        )
+        .expect("string phase");
+        assert_eq!(single.documents[0].phases[0].as_str(), "plan");
+
+        for bad in [
+            "phase = []",
+            "phase = [1]",
+            "phase = 5",
+            "phase = \"bad phase\"",
+        ] {
+            field_error(
+                &format!(
+                    "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\n{bad}\n"
+                ),
+                "phase",
+            );
+        }
+    }
+
+    #[test]
+    fn optional_scalar_fields_are_type_checked() {
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nrequired = \"yes\"\n",
+            "required",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nmarker = 5\n",
+            "marker",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nnotes = 5\n",
+            "notes",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nlast-reviewed-within-days = \"30\"\n",
+            "last-reviewed-within-days",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nlast-reviewed-within-days = 0\n",
+            "last-reviewed-within-days",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nwhen = 5\n",
+            "when",
+        );
+        field_error(
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\nwhen = \"?? invalid\"\n",
+            "when",
+        );
+    }
+
+    #[test]
+    fn validation_commands_must_be_a_non_empty_list_of_non_empty_strings() {
+        for bad in [
+            "",
+            "commands = \"cargo test\"",
+            "commands = []",
+            "commands = [1]",
+            "commands = [\"   \"]",
+        ] {
+            field_error(
+                &format!("[[validation]]\ncontext = \"x\"\n{bad}\n"),
+                "commands",
+            );
+        }
+    }
+
+    #[test]
+    fn skills_policy_defaults_and_validation() {
+        let defaults = load("[skills]\n").expect("empty skills table");
+        let policy = defaults.skill_policy.expect("policy");
+        assert!(!policy.enforce_name_prefix);
+        assert_eq!(policy.dir, SkillPolicy::DEFAULT_DIR);
+        assert_eq!(policy.allowed_prefixes, SkillPolicy::default_prefixes());
+
+        let root_errors = [
+            ("skills = 5", "skills"),
+            ("[skills]\ntypo = true", "skills.typo"),
+            (
+                "[skills]\nenforce_name_prefix = \"yes\"",
+                "skills.enforce_name_prefix",
+            ),
+            (
+                "[skills]\nallowed_prefixes = \"project\"",
+                "skills.allowed_prefixes",
+            ),
+            ("[skills]\nallowed_prefixes = []", "skills.allowed_prefixes"),
+            (
+                "[skills]\nallowed_prefixes = [1]",
+                "skills.allowed_prefixes",
+            ),
+            (
+                "[skills]\nallowed_prefixes = [\"  \"]",
+                "skills.allowed_prefixes",
+            ),
+            (
+                "[skills]\nallowed_prefixes = [\"Project\"]",
+                "skills.allowed_prefixes",
+            ),
+            ("[skills]\ndir = 5", "skills.dir"),
+            ("[skills]\ndir = \"   \"", "skills.dir"),
+        ];
+        for (raw, field) in root_errors {
+            let err = load(raw).expect_err("skills policy must be rejected");
+            assert_eq!(err.kind, ConfigErrorKind::Validation);
+            assert_eq!(err.field.as_deref(), Some(field), "raw={raw}");
+            assert_eq!(err.entry_index, None);
+        }
+
+        let custom = load("[skills]\nallowed_prefixes = [\" team-a \"]\ndir = \"skills\"\n")
+            .expect("custom policy");
+        let policy = custom.skill_policy.expect("policy");
+        assert_eq!(policy.allowed_prefixes, vec!["team-a".to_string()]);
+        assert_eq!(policy.dir, "skills");
+    }
+
+    #[test]
+    fn path_classes_must_be_a_table() {
+        let err = load("path_classes = 5").expect_err("scalar path_classes");
+        assert_eq!(err.kind, ConfigErrorKind::Validation);
+        assert_eq!(err.field.as_deref(), Some("path_classes"));
+    }
+
+    #[test]
+    fn value_type_names_every_toml_kind() {
+        assert_eq!(value_type(&Value::String(String::new())), "string");
+        assert_eq!(value_type(&Value::Integer(1)), "integer");
+        assert_eq!(value_type(&Value::Float(1.0)), "float");
+        assert_eq!(value_type(&Value::Boolean(true)), "boolean");
+        assert_eq!(value_type(&Value::Array(Vec::new())), "array");
+        assert_eq!(value_type(&Value::Table(toml::map::Map::new())), "table");
+    }
+
+    #[test]
+    fn scope_catalog_loading_is_optional_and_path_derived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        assert_eq!(config_path_for_root(root), root.join(CONFIG_FILE_NAME));
+        assert!(
+            load_scope_catalog(Scope::Project, root)
+                .expect("missing catalog is not an error")
+                .is_none()
+        );
+
+        fs::write(
+            config_path_for_root(root),
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"a.md\"\n",
+        )
+        .unwrap();
+        let catalog = load_scope_catalog(Scope::Project, root)
+            .expect("catalog")
+            .expect("present");
+        assert_eq!(catalog.documents.len(), 1);
+
+        let external = load_external_project_catalog(root, &config_path_for_root(root))
+            .expect("external catalog");
+        assert_eq!(external.source_scope, Scope::Project);
+
+        let missing = load_external_project_catalog(root, &root.join("absent.toml"))
+            .expect_err("missing external catalog");
+        assert_eq!(missing.kind, ConfigErrorKind::Io);
+    }
+
+    #[test]
+    fn a_repo_that_is_its_own_docs_home_is_loaded_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            config_path_for_root(root),
+            "[[document]]\ncontext = \"x\"\nscope = \"home\"\npath = \"a.md\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_catalog(root, root).expect("catalog");
+        assert!(loaded.home.is_some());
+        assert!(
+            loaded.project.is_none(),
+            "the shared catalog must not be counted twice"
+        );
+
+        let project_only = tempfile::tempdir().unwrap();
+        fs::write(
+            config_path_for_root(project_only.path()),
+            "[[document]]\ncontext = \"x\"\nscope = \"project\"\npath = \"b.md\"\n",
+        )
+        .unwrap();
+        let split = load_catalog(root, project_only.path()).expect("catalog");
+        assert!(split.home.is_some());
+        assert_eq!(split.project.expect("project").documents.len(), 1);
+    }
+}

@@ -2030,4 +2030,211 @@ skills:
         assert!(report.skipped.is_empty());
         assert!(report.output_root.exists());
     }
+
+    // -----------------------------------------------------------------
+    // Path sandboxing. Every render-time path passes one of these guards;
+    // each is what stops a hostile manifest value or a planted symlink from
+    // reading or writing outside the source and build roots.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_relative_join_stays_under_its_base() {
+        let base = Path::new("/src");
+
+        assert_eq!(
+            sandboxed_join(base, "skills/a/SKILL.md").unwrap(),
+            PathBuf::from("/src/skills/a/SKILL.md")
+        );
+        // A `./` segment is normal navigation, not an escape.
+        assert_eq!(
+            sandboxed_join(base, "./skills/a").unwrap(),
+            PathBuf::from("/src/skills/a")
+        );
+
+        for hostile in ["../etc/passwd", "skills/../../etc", "/etc/passwd"] {
+            let err = sandboxed_join(base, hostile).expect_err("escape must be refused");
+            assert!(
+                err.to_string().contains("render must stay under /src"),
+                "{hostile}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_path_that_resolves_outside_the_source_root_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let outside = base.join("outside");
+        let src = base.join("src");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        fs::write(src.join("SKILL.md.tera"), b"body").unwrap();
+
+        let inside = canonicalize_under(&src, &src.join("SKILL.md.tera")).expect("inside");
+        assert_eq!(inside, src.join("SKILL.md.tera"));
+
+        // A symlink under the source root pointing outside it is the escape
+        // this guard exists for.
+        let planted = src.join("planted.tera");
+        std::os::unix::fs::symlink(outside.join("secret"), &planted).unwrap();
+        let err = canonicalize_under(&src, &planted).expect_err("symlink escape");
+        assert!(err.to_string().contains("likely a symlink escape"), "{err}");
+
+        // A path that does not exist cannot be read at all.
+        let err = canonicalize_under(&src, &src.join("absent")).expect_err("missing");
+        assert!(err.to_string().contains("canonicalize"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_path_is_guarded_through_its_parent_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let build = base.join("build");
+        let outside = base.join("outside");
+        fs::create_dir_all(build.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // The file itself need not exist yet; only its parent must resolve
+        // inside the build root.
+        let target = build.join("nested").join("SKILL.md");
+        assert_eq!(guard_write_under(&build, &target).expect("inside"), target);
+
+        let escaped = base.join("escape");
+        std::os::unix::fs::symlink(&outside, &escaped).unwrap();
+        let err = guard_write_under(&build, &escaped.join("SKILL.md"))
+            .expect_err("parent symlink escape");
+        assert!(err.to_string().contains("likely a symlink escape"), "{err}");
+
+        // A parent that does not exist is refused rather than created.
+        let err = guard_write_under(&build, &build.join("absent").join("SKILL.md"))
+            .expect_err("missing parent");
+        assert!(err.to_string().contains("canonicalize parent"), "{err}");
+
+        let err = guard_write_under(&build, Path::new("/")).expect_err("root has no parent");
+        assert!(err.to_string().contains("has no parent"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leaf_symlink_is_never_written_through() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("real");
+        fs::write(&target, b"content").unwrap();
+
+        reject_leaf_symlink(&dir.join("absent")).expect("a missing output is fine");
+        reject_leaf_symlink(&target).expect("a regular file is fine");
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = reject_leaf_symlink(&link).expect_err("leaf symlink");
+        assert!(
+            err.to_string()
+                .contains("refusing to follow a leaf symlink"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_render_root_is_refused_before_any_write() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let real = dir.join("real");
+        fs::create_dir_all(&real).unwrap();
+
+        reject_existing_symlink(&dir.join("absent"), "output root").expect("missing is fine");
+        reject_existing_symlink(&real, "output root").expect("real directory is fine");
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = reject_existing_symlink(&link, "default render output root")
+            .expect_err("symlinked root");
+        assert!(
+            err.to_string()
+                .contains("refusing to use it as a render root"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_if_exists_distinguishes_absent_from_broken() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let real = dir.join("real");
+        fs::create_dir_all(&real).unwrap();
+
+        assert_eq!(
+            canonicalize_if_exists(&real).unwrap(),
+            Some(fs::canonicalize(&real).unwrap())
+        );
+        assert_eq!(canonicalize_if_exists(&dir.join("absent")).unwrap(), None);
+    }
+
+    #[test]
+    fn render_to_may_not_repeat_the_build_prefix() {
+        validate_render_to("s", "codex", "skills/a/SKILL.md").expect("relative render_to");
+        validate_render_to("s", "codex", "buildings/a.md")
+            .expect("a path that merely starts with the same letters is fine");
+
+        let err = validate_render_to("s", "codex", "build/codex/skills/a/SKILL.md")
+            .expect_err("doubled prefix");
+        assert!(err.to_string().contains("would double the prefix"), "{err}");
+    }
+
+    #[test]
+    fn the_tera_suffix_is_stripped_only_when_present() {
+        assert_eq!(
+            strip_tera_suffix(Path::new("skills/a/SKILL.md.tera")),
+            PathBuf::from("skills/a/SKILL.md")
+        );
+        assert_eq!(
+            strip_tera_suffix(Path::new("skills/a/SKILL.md")),
+            PathBuf::from("skills/a/SKILL.md")
+        );
+        assert_eq!(
+            strip_tera_suffix(Path::new("skills/a/plain")),
+            PathBuf::from("skills/a/plain")
+        );
+    }
+
+    #[test]
+    fn the_default_output_root_is_build_slash_product() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("manifests")).unwrap();
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).expect("source root");
+
+        assert_eq!(
+            default_product_output_root(&root, "claude"),
+            root.path().join("build").join("claude")
+        );
+        // With no build directory yet there is nothing unsafe to reject.
+        reject_unsafe_default_output_root(&root, &default_product_output_root(&root, "claude"))
+            .expect("clean tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_build_directory_is_refused_as_a_default_output_root() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(source.join("manifests")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, source.join("build")).unwrap();
+        let root = SourceRoot::from_arg_or_cwd(Some(&source)).expect("source root");
+
+        let err =
+            reject_unsafe_default_output_root(&root, &default_product_output_root(&root, "codex"))
+                .expect_err("symlinked build root");
+
+        assert!(
+            err.to_string()
+                .contains("refusing to use it as a render root"),
+            "{err}"
+        );
+    }
 }
