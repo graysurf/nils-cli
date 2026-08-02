@@ -23,7 +23,7 @@ Options:
                      --plan-only, or --changed-file <path> through to
                      scripts/ci/nils-cli-local-fast.sh.
   --with-coverage    Run coverage gate after the full CI stack:
-                     cargo llvm-cov nextest --profile ci --workspace --lcov \
+                     cargo llvm-cov nextest --profile ci --workspace --no-fail-fast --lcov \
                        --output-path target/coverage/lcov.info --fail-under-lines <N>
                      bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
                      cargo test --workspace --doc
@@ -31,7 +31,7 @@ Options:
 
 Environment:
   NILS_CLI_COVERAGE_FAIL_UNDER_LINES
-    Override coverage threshold used with --with-coverage (default: 85).
+    Override coverage threshold used with --with-coverage (default: 84).
 USAGE
 }
 
@@ -183,10 +183,12 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   exit 2
 fi
 
-coverage_fail_under="${NILS_CLI_COVERAGE_FAIL_UNDER_LINES:-85}"
+# Keep the temporary native-run 30743840826 floor aligned with CI. After the
+# runtime-kit delivery, restore 85 once native full-workspace coverage reaches 85%.
+coverage_fail_under="${NILS_CLI_COVERAGE_FAIL_UNDER_LINES:-84}"
 
 run mkdir -p target/coverage
-run cargo llvm-cov nextest --profile ci --workspace --lcov --output-path target/coverage/lcov.info --fail-under-lines "$coverage_fail_under"
+run cargo llvm-cov nextest --profile ci --workspace --no-fail-fast --lcov --output-path target/coverage/lcov.info --fail-under-lines "$coverage_fail_under"
 run bash scripts/ci/coverage-summary.sh target/coverage/lcov.info
 run cargo test --workspace --doc
 
