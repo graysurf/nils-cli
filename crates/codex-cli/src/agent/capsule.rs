@@ -1252,18 +1252,18 @@ impl CapsuleDirectory {
         );
         let temporary = c_name(OsStr::new(&temporary_name), "artifact-path-unsafe")?;
         let mut file = self.create_new_private(&temporary)?;
-        let expected = FileIdentity::from_metadata(&file.metadata().map_err(|error| {
-            CapsuleError::runtime(
-                "artifact-write-failed",
-                format!("cannot inspect temporary artifact: {error}"),
-            )
-        })?);
         if let Err(error) = write_and_sync_artifact(&mut file, name, bytes) {
             unsafe {
                 libc::unlinkat(self.file.as_raw_fd(), temporary.as_ptr(), 0);
             }
             return Err(error);
         }
+        let expected = FileIdentity::from_metadata(&file.metadata().map_err(|error| {
+            CapsuleError::runtime(
+                "artifact-write-failed",
+                format!("cannot inspect temporary artifact: {error}"),
+            )
+        })?);
         if unsafe {
             libc::renameat(
                 self.file.as_raw_fd(),

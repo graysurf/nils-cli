@@ -1819,6 +1819,7 @@ struct StartLifecycleGuards<'a> {
     pre_runtime_release: PreRuntimeReleaseGuard<'a>,
     post_runtime_release: SessionStartGuard<'a>,
     post_prompt_delivery: SessionStartGuard<'a>,
+    ambiguous_prompt_delivery: SessionStartGuard<'a>,
     definitive_failure: SessionStartGuard<'a>,
 }
 
@@ -2152,20 +2153,37 @@ fn start_session_with_create_guard(
             }
         }
     }
-    if created.record.provider_resume.is_none()
-        && let Some(provider_resume) =
-            capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
-    {
-        let persisted_before_capture = created.record.clone();
-        created.record.provider_resume = Some(provider_resume);
-        if write_session_record(context, &created.record).is_err() {
-            created.record = load_session_record(context, &created.record.id)
-                .unwrap_or(persisted_before_capture);
-        }
+    let provider_resume_persistence = if prompt_delivery_error.is_some() {
+        ProviderResumePersistence::ReceiptOnly
+    } else {
+        ProviderResumePersistence::BestEffort
+    };
+    capture_and_persist_provider_resume_after_launch(
+        context,
+        args.agent,
+        &mut created.record,
+        launch_started_at,
+        provider_resume_persistence,
+    )?;
+    if prompt_delivery_error.is_some() && created.record.provider_resume.is_none() {
+        capture_and_persist_provider_resume_after_launch(
+            context,
+            args.agent,
+            &mut created.record,
+            launch_started_at,
+            provider_resume_persistence,
+        )?;
     }
-
     let status = session_status(&tmux_bin, &created.record);
-    reconcile_owned_startup_projection(context, &mut created.record, &status);
+    if prompt_delivery_error.is_none() {
+        reconcile_owned_startup_projection(context, &mut created.record, &status);
+    }
+    if prompt_delivery_error.is_some()
+        && let Some(guard) = lifecycle_guards.ambiguous_prompt_delivery.as_mut()
+        && let Err(error) = guard(&created.record)
+    {
+        return Err(error);
+    }
     let result = session_view(context, &created.record, Some(status), Some(&tmux_bin));
     record_workdir_usage(context, &cwd);
     // Keep the app-server bootstrap marker valid for the entire create-lock
@@ -8235,6 +8253,40 @@ fn capture_provider_resume_after_launch(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderResumePersistence {
+    BestEffort,
+    ReceiptOnly,
+}
+
+fn capture_and_persist_provider_resume_after_launch(
+    context: &CliContext,
+    agent: AgentKind,
+    record: &mut SessionRecord,
+    launch_started_at: SystemTime,
+    persistence: ProviderResumePersistence,
+) -> Result<(), CliError> {
+    if record.provider_resume.is_some() {
+        return Ok(());
+    }
+    let Some(provider_resume) =
+        capture_provider_resume_after_launch(agent, record, launch_started_at)
+    else {
+        return Ok(());
+    };
+    let persisted_before_capture = record.clone();
+    record.provider_resume = Some(provider_resume);
+    if persistence == ProviderResumePersistence::ReceiptOnly {
+        pause_session_ancestor_for_test("ambiguous-prompt-after-resume-capture")?;
+        return Ok(());
+    }
+    if write_session_record(context, record).is_ok() {
+        return Ok(());
+    }
+    *record = load_session_record(context, &record.id).unwrap_or(persisted_before_capture);
+    Ok(())
+}
+
 #[derive(Debug)]
 struct CodexResumeCandidate {
     session_id: String,
@@ -11342,6 +11394,9 @@ fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), C
     if sidecar.schema_version != SESSION_RESUME_DOCUMENT_VERSION {
         return Ok(());
     }
+    if !resume_sidecar_matches_session_identity(&sidecar, record) {
+        return Ok(());
+    }
     if let Some(provider_resume) = sidecar.provider_resume.clone() {
         if let Some(existing) = record.provider_resume.as_mut() {
             merge_extra_fields(&mut existing.extra, provider_resume.extra);
@@ -11364,6 +11419,37 @@ fn merge_resume_sidecar(path: &Path, record: &mut SessionRecord) -> Result<(), C
     }
     record.resume_sidecar_extra = sidecar.extra;
     Ok(())
+}
+
+fn resume_sidecar_matches_session_identity(
+    sidecar: &DurableResumeRecord,
+    record: &SessionRecord,
+) -> bool {
+    let provider_identity_matches = sidecar
+        .provider_resume
+        .as_ref()
+        .zip(record.provider_resume.as_ref())
+        .is_some_and(|(sidecar, current)| {
+            sidecar.provider == current.provider && sidecar.session_id == current.session_id
+        });
+    let runtime_identity_matches = sidecar
+        .runtime
+        .as_ref()
+        .zip(record.runtime.as_ref())
+        .is_some_and(|(sidecar, current)| same_runtime_identity(Some(sidecar), Some(current)));
+    let never_launched_identity_matches = sidecar
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty())
+        .is_some_and(|launch_id| {
+            record
+                .extra
+                .get(TMUX_RUNTIME_NEVER_LAUNCHED_KEY)
+                .and_then(Value::as_str)
+                == Some(launch_id)
+        });
+    provider_identity_matches || runtime_identity_matches || never_launched_identity_matches
 }
 
 fn merge_extra_fields(target: &mut BTreeMap<String, Value>, source: BTreeMap<String, Value>) {
