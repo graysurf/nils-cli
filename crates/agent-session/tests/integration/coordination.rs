@@ -22324,23 +22324,7 @@ fn wait_for_barrier_or_child_exit_with_timeout(
 ) {
     let deadline = Instant::now() + timeout;
     while !barrier.join("ready").is_file() {
-        if let Some(status) = child.try_wait().expect("poll barrier child") {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let Some(stream) = child.stdout.as_mut() {
-                stream
-                    .read_to_string(&mut stdout)
-                    .expect("read barrier child stdout");
-            }
-            if let Some(stream) = child.stderr.as_mut() {
-                stream
-                    .read_to_string(&mut stderr)
-                    .expect("read barrier child stderr");
-            }
-            panic!(
-                "{label} child exited before barrier: status={status} stdout={stdout} stderr={stderr}"
-            );
-        }
+        panic_if_child_exited(child, label);
         if Instant::now() >= deadline {
             let _ = child.kill();
             let status = child.wait().expect("reap timed-out barrier child");
@@ -22361,6 +22345,24 @@ fn wait_for_barrier_or_child_exit_with_timeout(
             );
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn panic_if_child_exited(child: &mut Child, label: &str) {
+    if let Some(status) = child.try_wait().expect("poll fixture child") {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(stream) = child.stdout.as_mut() {
+            stream
+                .read_to_string(&mut stdout)
+                .expect("read fixture child stdout");
+        }
+        if let Some(stream) = child.stderr.as_mut() {
+            stream
+                .read_to_string(&mut stderr)
+                .expect("read fixture child stderr");
+        }
+        panic!("{label} child exited early: status={status} stdout={stdout} stderr={stderr}");
     }
 }
 
@@ -35171,6 +35173,10 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
 
 #[test]
 fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
+    // Coverage-instrumented same-release subprocess startup can take longer
+    // than ten seconds on macOS. Keep fixture synchronization generous while
+    // preserving the four-second readiness deadline exercised below.
+    let synchronization_timeout = Duration::from_secs(120);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let checkout = tmp.path().join("checkout");
@@ -35228,7 +35234,7 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
     let codex_arg = codex_bin.to_string_lossy().into_owned();
 
-    let start = Command::new(bin::resolve("main-agent"))
+    let mut start = Command::new(bin::resolve("main-agent"))
         .current_dir(&checkout)
         .args([
             "--state-dir",
@@ -35266,14 +35272,12 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
         .spawn()
         .expect("spawn worker start");
 
-    let barrier_deadline = Instant::now() + Duration::from_secs(10);
-    while !barrier.join("ready").is_file() {
-        assert!(
-            Instant::now() < barrier_deadline,
-            "readiness recovery never reached the serialized send boundary"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_barrier_or_child_exit_with_timeout(
+        &barrier,
+        &mut start,
+        "readiness recovery serialized send boundary",
+        synchronization_timeout,
+    );
     let worker_record: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join(format!("sessions/{worker_id}/session.json")))
             .expect("worker session"),
@@ -35296,8 +35300,9 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
         serde_json::Value::Null,
     );
     fs::write(barrier.join("release"), b"continue").expect("release recovery");
-    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    let recovery_deadline = Instant::now() + synchronization_timeout;
     loop {
+        panic_if_child_exited(&mut start, "readiness recovery durable failure record");
         let registry = orchestration_registry(&state_dir);
         let assignment = &registry["assignments"][assignment_id];
         if assignment["submit_recovery"]["state"] == "failed" {
