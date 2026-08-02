@@ -34,12 +34,11 @@ threads-required = "num-test-threads"
 filter = 'package(nils-agent-hook) & test(enforce_valid_read_only_bypasses_only_the_declared_fallback_handler)'
 threads-required = "num-test-threads"
 
-# These fixtures exercise prompt-observation and serialized recovery deadlines
-# through multiple subprocesses. Keep unrelated workspace load from exhausting
-# their deliberately bounded reader and hook windows before the contract under
-# test can run.
+# These fixtures exercise prompt-observation deadlines through multiple
+# subprocesses. Keep unrelated workspace load from exhausting their deliberately
+# bounded reader windows before the contract under test can run.
 [[profile.ci.overrides]]
-filter = 'package(nils-agent-session) & test(/main_agent_(worker_start_await_ready_(stops_on_authoritative_terminal_turns|folds_timeout_into_readiness_failed)|submit_recovery_rechecks_authority_inside_the_serialized_send_boundary)/)'
+filter = 'package(nils-agent-session) & test(/main_agent_worker_start_await_ready_(stops_on_authoritative_terminal_turns|folds_timeout_into_readiness_failed)/)'
 threads-required = "num-test-threads"
 
 [profile.ci.junit]

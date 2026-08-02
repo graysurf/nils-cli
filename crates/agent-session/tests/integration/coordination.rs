@@ -808,7 +808,6 @@ fn write_private_json(path: &Path, value: &serde_json::Value) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
 }
 
-#[cfg(not(target_os = "linux"))]
 fn session_authority_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let mut entries = fs::read_dir(current)
@@ -33346,6 +33345,71 @@ fn main_agent_submit_recovery_rechecks_authority_inside_the_serialized_send_boun
                     "pid_namespace": current_pid_namespace_identity()
                 });
                 write_private_json(&worker_record_path, &worker_record);
+                if !cfg!(target_os = "linux") {
+                    let orchestration_before = orchestration_registry(&state_dir);
+                    let coordination_before = load_coordination_registry(&state_dir);
+                    let session_before =
+                        session_authority_snapshot(&state_dir.join("sessions/worker-race"));
+                    let tmux_before = tmux_calls(&tmux_log);
+                    let unverified = run_main_agent(
+                        &checkout,
+                        &[
+                            "--state-dir",
+                            &state_arg,
+                            "worker",
+                            "reconcile-recovery",
+                            "assignment-race",
+                            "--if-revision",
+                            "3",
+                            "--idempotency-key",
+                            "refuse-non-linux-unverified-recovery-0001",
+                            "--format",
+                            "json",
+                        ],
+                        &[
+                            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+                            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                        ],
+                    );
+                    assert_eq!(unverified.code, 1, "outcome={}", unverified.stdout_text());
+                    assert_eq!(
+                        unverified.stdout_json()["error"]["code"],
+                        "coordination-runtime-unverified"
+                    );
+                    let registry = orchestration_registry(&state_dir);
+                    assert_eq!(
+                        registry["assignments"]["assignment-race"]["revision"], 3,
+                        "failed-closed reconciliation must not mutate the assignment"
+                    );
+                    assert_eq!(
+                        registry["assignments"]["assignment-race"]["submit_recovery"]["state"],
+                        "attempting",
+                        "failed-closed reconciliation must preserve the ambiguous-send fence"
+                    );
+                    assert_eq!(
+                        orchestration_registry(&state_dir),
+                        orchestration_before,
+                        "failed-closed reconciliation must preserve all orchestration authority"
+                    );
+                    assert_eq!(
+                        load_coordination_registry(&state_dir),
+                        coordination_before,
+                        "failed-closed reconciliation must preserve all coordination authority"
+                    );
+                    assert_eq!(
+                        session_authority_snapshot(&state_dir.join("sessions/worker-race")),
+                        session_before,
+                        "failed-closed reconciliation must preserve all worker session authority"
+                    );
+                    assert_eq!(
+                        tmux_calls(&tmux_log),
+                        tmux_before,
+                        "failed-closed reconciliation must not emit any terminal input"
+                    );
+                    continue;
+                }
                 for quiescence_case in ["active-claim", "active-operation", "uncertain-operation"] {
                     match quiescence_case {
                         "active-claim" => seed_active_claim(
