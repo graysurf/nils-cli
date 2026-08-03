@@ -1,4 +1,5 @@
 use crate::git;
+use nils_common::agent_attribution;
 use nils_common::git as common_git;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 use serde_json::json;
@@ -1620,12 +1621,15 @@ struct BlockedMessageRule {
     patterns: &'static [BlockedMessagePattern],
 }
 
+/// Blocked-line shapes. Both delegate to
+/// [`nils_common::agent_attribution`] so the commit path and forge-cli's
+/// provider path (Rule 17) reject the exact same attribution forms. Matching
+/// here is verbatim — unlike the markdown payload scan, a commit message gets no
+/// code-span exemption, so an attribution line cannot hide behind backticks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockedMessagePattern {
-    TrailerValueStartsWith {
-        token: &'static str,
-        value_prefix: &'static str,
-    },
+    AgentCoauthorTrailer,
+    AgentGeneratorMarker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1640,18 +1644,27 @@ struct BlockedMessageMatch {
 }
 
 const CLAUDE_COAUTHOR_PATTERNS: &[BlockedMessagePattern] =
-    &[BlockedMessagePattern::TrailerValueStartsWith {
-        token: "Co-Authored-By",
-        value_prefix: "Claude",
-    }];
+    &[BlockedMessagePattern::AgentCoauthorTrailer];
 
-const BLOCKED_MESSAGE_RULES: &[BlockedMessageRule] = &[BlockedMessageRule {
-    id: "claude-coauthor-trailer",
-    reason: "do not attribute commits to any Claude model",
-    matched_hint: "Co-Authored-By: Claude ...",
-    fix: "remove the `Co-Authored-By: Claude ...` trailer",
-    patterns: CLAUDE_COAUTHOR_PATTERNS,
-}];
+const CLAUDE_GENERATED_MARKER_PATTERNS: &[BlockedMessagePattern] =
+    &[BlockedMessagePattern::AgentGeneratorMarker];
+
+const BLOCKED_MESSAGE_RULES: &[BlockedMessageRule] = &[
+    BlockedMessageRule {
+        id: "claude-coauthor-trailer",
+        reason: "do not attribute commits to any Claude model",
+        matched_hint: "Co-Authored-By: Claude ...",
+        fix: "remove the `Co-Authored-By: Claude ...` trailer",
+        patterns: CLAUDE_COAUTHOR_PATTERNS,
+    },
+    BlockedMessageRule {
+        id: "claude-generated-marker",
+        reason: "do not advertise the generating agent in commit messages",
+        matched_hint: "agent generator marker line",
+        fix: "remove the generator marker line, including its claude-code link",
+        patterns: CLAUDE_GENERATED_MARKER_PATTERNS,
+    },
+];
 
 fn validate_blocked_message_rules(message: &str, trailers: &[String]) -> Result<(), i32> {
     for rule in BLOCKED_MESSAGE_RULES {
@@ -1703,37 +1716,10 @@ fn blocked_message_source_label(source: BlockedMessageSource) -> String {
 impl BlockedMessagePattern {
     fn matches(self, line: &str) -> bool {
         match self {
-            Self::TrailerValueStartsWith {
-                token,
-                value_prefix,
-            } => trailer_value_starts_with(line, token, value_prefix),
+            Self::AgentCoauthorTrailer => agent_attribution::line_is_blocked_coauthor_trailer(line),
+            Self::AgentGeneratorMarker => agent_attribution::line_has_generator_marker(line),
         }
     }
-}
-
-fn trailer_value_starts_with(line: &str, expected_token: &str, value_prefix: &str) -> bool {
-    let Some((token, value)) = split_trailer(line.trim()) else {
-        return false;
-    };
-    token.eq_ignore_ascii_case(expected_token)
-        && starts_with_ascii_word_ignore_case(value, value_prefix)
-}
-
-fn starts_with_ascii_word_ignore_case(value: &str, expected_word: &str) -> bool {
-    if expected_word.is_empty() {
-        return false;
-    }
-    let value = value.trim_start();
-    let Some(prefix) = value.get(..expected_word.len()) else {
-        return false;
-    };
-    if !prefix.eq_ignore_ascii_case(expected_word) {
-        return false;
-    }
-    value[expected_word.len()..]
-        .chars()
-        .next()
-        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
 }
 
 fn is_valid_header(header: &str) -> bool {
