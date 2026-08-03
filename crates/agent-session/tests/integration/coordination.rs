@@ -35389,11 +35389,10 @@ fn main_agent_worker_start_definitive_recovery_failure_converges_at_takeover_bou
 }
 
 fn exercise_definitive_recovery_failure_boundary(mode: &str) {
-    // Coverage instrumentation makes each same-release subprocess startup
-    // materially slower on macOS: a neighboring serialized fixture took more
-    // than 72 seconds in CI before this barrier. Keep synchronization waits
-    // generous without changing the four-second readiness deadline this
-    // fixture validates.
+    // These fixtures own the terminal boundary after a definitive recovery
+    // failure, not the production recovery delay. Start recovery immediately
+    // so macOS coverage overhead cannot consume half of the four-second
+    // readiness deadline before the fixture reaches its synchronization point.
     let synchronization_timeout = Duration::from_secs(120);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -35483,6 +35482,7 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
             "NILS_AGENT_SESSION_TEST_READINESS_FINALIZER_LEASE_SECS",
             "3",
         )
+        .env("NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_DELAY_MS", "0")
         .env(
             "NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_DIR",
             &recovery_barrier,
@@ -35501,14 +35501,12 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
     }
     let mut start = Some(command.spawn().expect("spawn worker start"));
 
-    let barrier_deadline = Instant::now() + synchronization_timeout;
-    while !recovery_barrier.join("ready").is_file() {
-        assert!(
-            Instant::now() < barrier_deadline,
-            "recovery barrier timed out for {mode}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_barrier_or_child_exit_with_timeout(
+        &recovery_barrier,
+        start.as_mut().expect("worker start"),
+        &format!("definitive recovery failure {mode}"),
+        synchronization_timeout,
+    );
     let receipt_key = format!("main-one:main-incarnation-one:{idempotency_key}");
     let original_deadline_at_epoch = orchestration_registry(&state_dir)["receipts"]
         [&receipt_key]["outcome"]["deadline_at_epoch"]
@@ -35539,6 +35537,10 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
     fs::write(recovery_barrier.join("release"), b"continue").expect("release recovery");
     let failure_deadline = Instant::now() + synchronization_timeout;
     loop {
+        panic_if_child_exited(
+            start.as_mut().expect("worker start"),
+            &format!("definitive recovery failure record {mode}"),
+        );
         let registry = orchestration_registry(&state_dir);
         let assignment = &registry["assignments"][&assignment_id];
         if assignment["submit_recovery"]["state"] == "failed" {
@@ -35578,6 +35580,10 @@ fn exercise_definitive_recovery_failure_boundary(mode: &str) {
     if mode == "final-checkpoint" {
         let final_deadline = Instant::now() + synchronization_timeout;
         while !final_barrier.join("ready").is_file() {
+            panic_if_child_exited(
+                start.as_mut().expect("worker start"),
+                "definitive recovery final receipt",
+            );
             assert!(
                 Instant::now() < final_deadline,
                 "final receipt barrier timed out"

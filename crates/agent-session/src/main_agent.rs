@@ -7145,6 +7145,19 @@ fn worker_start_finalizer_lease_secs(progress: &Value) -> i64 {
     }
 }
 
+fn worker_submit_key_recovery_delay(timeout: Duration) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = env::var("NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_DELAY_MS")
+        && let Ok(value) = value.parse::<u64>()
+    {
+        let delay = Duration::from_millis(value);
+        if delay <= WORKER_SUBMIT_KEY_RECOVERY_DELAY && delay <= timeout {
+            return delay;
+        }
+    }
+    std::cmp::min(WORKER_SUBMIT_KEY_RECOVERY_DELAY, timeout / 2)
+}
+
 fn pause_readiness_recovery_for_test(stage: &str) -> Result<(), CliError> {
     #[cfg(debug_assertions)]
     if env::var("NILS_AGENT_SESSION_TEST_READINESS_RECOVERY_BARRIER_STAGE").as_deref() == Ok(stage)
@@ -7251,7 +7264,7 @@ fn await_worker_readiness(
         recovery_continuation,
     } = request;
     let started = Instant::now();
-    let recovery_after = std::cmp::min(WORKER_SUBMIT_KEY_RECOVERY_DELAY, timeout / 2);
+    let recovery_after = worker_submit_key_recovery_delay(timeout);
     let recovery_eligible = submit_key_recovery_eligible;
     let (mut recovery, mut recovery_stage) = match recovery_continuation.as_ref() {
         Some(value) => {
