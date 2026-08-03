@@ -1,6 +1,8 @@
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::http::{HttpResponse, LoopbackServer, TestServer};
+#[cfg(unix)]
+use nils_test_support::tempdir::ScopedTempDir;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
@@ -72,9 +74,54 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// Restores a directory's mode when it drops.
+///
+/// `remove_dir_all` cannot unlink entries from a `0o555` directory, so a fixture
+/// left read-only survives `TempDir` teardown — silently, because `Drop` discards
+/// the error (class 2 in `docs/specs/test-temp-directory-policy.md`). Restoring
+/// from `Drop` instead of an inline statement means an unwinding assertion or a
+/// panic inside `run` cannot leave the fixture unremovable.
+#[cfg(unix)]
+struct RestoredMode {
+    dir: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestoredMode {
+    fn read_only(dir: &Path) -> Self {
+        let permissions = fs::metadata(dir).expect("cache metadata").permissions();
+        let guard = Self {
+            dir: dir.to_path_buf(),
+            mode: permissions.mode() & 0o7777,
+        };
+
+        let mut read_only = permissions;
+        read_only.set_mode(0o555);
+        fs::set_permissions(dir, read_only).expect("make cache read-only");
+
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoredMode {
+    fn drop(&mut self) {
+        let Ok(metadata) = fs::metadata(&self.dir) else {
+            return;
+        };
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(self.mode);
+        let _ = fs::set_permissions(&self.dir, permissions);
+    }
+}
+
 #[cfg(unix)]
 fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    // The fixture below is deliberately made read-only for the duration of the
+    // run, which is exactly the shape whose teardown can fail, so it uses the
+    // handle that reports a failed cleanup instead of leaking quietly.
+    let dir = ScopedTempDir::new();
     let secret_dir = dir.path().join("secrets");
     fs::create_dir_all(&secret_dir).expect("secret dir");
     fs::write(
@@ -99,11 +146,7 @@ fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
     // Keep the invalid entry readable while preventing the successful live
     // request from replacing it before collect_async_round performs reset
     // metadata backfill.
-    let mut read_only = fs::metadata(cache_dir)
-        .expect("cache metadata")
-        .permissions();
-    read_only.set_mode(0o555);
-    fs::set_permissions(cache_dir, read_only).expect("make cache read-only");
+    let restored_mode = RestoredMode::read_only(cache_dir);
 
     let server = LoopbackServer::new().expect("server");
     server.add_route(
@@ -132,11 +175,9 @@ fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
         ],
     );
 
-    let mut writable = fs::metadata(cache_dir)
-        .expect("cache metadata")
-        .permissions();
-    writable.set_mode(0o700);
-    fs::set_permissions(cache_dir, writable).expect("restore cache permissions");
+    // Restore before asserting so a failing assertion reports the behaviour
+    // under test rather than a fixture that cannot be cleaned up.
+    drop(restored_mode);
 
     assert_exit(&output, 0);
     let out = stdout(&output);

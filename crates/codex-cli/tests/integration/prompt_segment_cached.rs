@@ -91,6 +91,57 @@ fn write_prompt_segment_cache_kv(cache_root: &Path, key: &str, kv: &str) -> Path
     path
 }
 
+/// The refresh cooldown these tests hold open, in seconds.
+///
+/// Long enough that the marker written by [`RefreshCooldown::hold`] stays inside
+/// the window for the whole test, so the suppression cannot expire mid-run.
+const REFRESH_COOLDOWN_SECONDS: &str = "3600";
+
+/// Keeps a plain `prompt-segment` run from launching a detached refresh child.
+///
+/// A run whose cache is stale or expired calls `enqueue_background_refresh`,
+/// which spawns `prompt-segment --refresh` in its own process group and returns
+/// without waiting. That child outlives both the CLI and the test, and every
+/// path it takes — taking the refresh lock, writing the cache, stamping the
+/// marker — starts with `create_dir_all`, so it can recreate the fixture
+/// `TempDir` teardown has already removed and leave a `cache_root/` behind in
+/// `$TMPDIR` (class 3 in `docs/specs/test-temp-directory-policy.md`).
+///
+/// Tests whose subject is rendering rather than refreshing opt out through the
+/// production cooldown instead of racing the child: a recent `<key>.refresh.at`
+/// marker plus a long `CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS` makes
+/// `enqueue_background_refresh` return before it spawns anything.
+struct RefreshCooldown {
+    marker: PathBuf,
+    stamp: String,
+}
+
+impl RefreshCooldown {
+    fn hold(cache_root: &Path, key: &str) -> Self {
+        let dir = cache_root.join("codex").join("prompt-segment-rate-limits");
+        fs::create_dir_all(&dir).expect("cache dir");
+
+        let marker = dir.join(format!("{key}.refresh.at"));
+        let stamp = now_epoch().saturating_sub(5).max(1).to_string();
+        fs::write(&marker, &stamp).expect("write refresh marker");
+
+        Self { marker, stamp }
+    }
+
+    /// Fails when the run spawned a refresh child after all.
+    ///
+    /// `enqueue_background_refresh` rewrites the marker immediately before
+    /// spawning, so an unchanged marker is proof that it returned on the
+    /// cooldown and that no background writer can outlive this test.
+    fn assert_held(&self) {
+        assert_eq!(
+            fs::read_to_string(&self.marker).expect("read refresh marker"),
+            self.stamp,
+            "the run spawned a detached refresh child instead of honouring the cooldown"
+        );
+    }
+}
+
 #[test]
 fn prompt_segment_disabled_prints_nothing() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -439,6 +490,7 @@ fn prompt_segment_stale_cache_appends_suffix() {
             "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
         ),
     );
+    let cooldown = RefreshCooldown::hold(&cache_root, "alpha");
 
     let output = run(
         &[
@@ -456,6 +508,14 @@ fn prompt_segment_stale_cache_appends_suffix() {
         &[
             ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
             ("CODEX_PROMPT_SEGMENT_STALE_SUFFIX", " (STALE)"),
+            (
+                "CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS",
+                REFRESH_COOLDOWN_SECONDS,
+            ),
+            // Belt and braces: the cooldown already stops the spawn, and a dead
+            // loopback port keeps a regression from reaching the real backend
+            // instead of turning into a leak.
+            ("CODEX_CHATGPT_BASE_URL", "http://127.0.0.1:9"),
         ],
     );
     assert_exit(&output, 0);
@@ -463,6 +523,7 @@ fn prompt_segment_stale_cache_appends_suffix() {
         stdout(&output),
         "alpha 5h:1% W:2% 2023-11-21T20:53Z (STALE)\n"
     );
+    cooldown.assert_held();
 }
 
 #[test]
@@ -478,6 +539,7 @@ fn prompt_segment_does_not_render_cache_at_max_stale_age() {
             "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
         ),
     );
+    let cooldown = RefreshCooldown::hold(&cache_root, "alpha");
 
     let output = run(
         &["prompt-segment", "--ttl", "1h"],
@@ -491,6 +553,10 @@ fn prompt_segment_does_not_render_cache_at_max_stale_age() {
             ("CODEX_CHATGPT_BASE_URL", "http://127.0.0.1:9"),
             ("CODEX_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
             ("CODEX_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "1"),
+            (
+                "CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS",
+                REFRESH_COOLDOWN_SECONDS,
+            ),
         ],
     );
 
@@ -500,6 +566,7 @@ fn prompt_segment_does_not_render_cache_at_max_stale_age() {
         cache_file.is_file(),
         "max-stale handling must not delete cache"
     );
+    cooldown.assert_held();
 }
 
 #[test]
