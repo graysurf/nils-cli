@@ -47,6 +47,20 @@ The common shape: the fixture is removed while something still holds a path into
 it, and the writer calls `create_dir_all` before writing. One marker write is
 enough to resurrect the whole tree.
 
+### Class 2 usually means a permission the test set itself
+
+A fixture is rarely read-only by accident. The shape is a test that chmods a
+directory to `0o555` to prove the code under test cannot write to it, then
+restores the mode in a plain statement afterwards. `remove_dir_all` cannot unlink
+entries from a read-only directory, so any panic between those two statements —
+an unwinding assertion, a `Command::spawn` that fails under load — hands teardown
+a directory it cannot empty, and the survivors are whatever sits under it.
+Restore from `Drop` instead, so the unwinding path restores it too:
+`RestoredMode` in `crates/codex-cli/tests/integration/rate_limits_async.rs`.
+Note that `remove_dir_all` stops at the first error, so the leftovers name the
+read-only subtree and nothing else — sibling fixture directories removed before
+it are already gone.
+
 ### Class 4 is a placement bug, not a timing bug
 
 `RemoteSessionAllocationLock` names its lock after the directory it guards and
@@ -71,6 +85,14 @@ no race involved. Give any such API a parent the fixture owns.
    released rather than for the cache file, because the child writes its marker
    and releases its lock after the cache. Waiting on an intermediate artifact
    returns while writes are still pending.
+   **Better still, do not start it.** When the background work is incidental to
+   what the test asserts, hold the production cooldown open so nothing is
+   spawned: `RefreshCooldown` in
+   `crates/codex-cli/tests/integration/prompt_segment_cached.rs` writes a recent
+   `<key>.refresh.at` marker, sets `CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS`
+   past the test's lifetime, and then asserts the marker is untouched —
+   `enqueue_background_refresh` rewrites it immediately before spawning, so a
+   regression fails the test instead of leaking a directory.
 4. **`abort()` is not a barrier; `await` is.** Aborting a task only schedules
    cancellation. Where a shutdown path already exists, use it — the projection
    tests call `finish_fail_close`, the broker tests call
@@ -109,7 +131,10 @@ measuring by hand instead:
 
 The contents of a leaked directory identify the writer: `usage.refresh.at` is the
 `claude-cli` refresh child, an empty `sessions/` is the activity broker re-arming,
-and a stray `*.allocation.lock` is a sibling-placed lock.
+and a stray `*.allocation.lock` is a sibling-placed lock. A lone `cache_root/` is
+the `codex-cli` prompt-segment cache, and it has two possible writers — the
+detached refresh child recreating it (class 3) or a read-only cache directory
+teardown could not empty (class 2) — so check both before concluding.
 
 ## Do not redirect `TMPDIR` into the build tree
 
