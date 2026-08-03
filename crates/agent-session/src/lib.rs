@@ -10183,7 +10183,6 @@ fn add_runtime_tmux_environment(
     Ok(())
 }
 
-
 fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
     let Some(title) = title else {
         return Ok(None);

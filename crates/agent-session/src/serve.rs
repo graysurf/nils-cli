@@ -2846,8 +2846,149 @@ struct RepoRemoteUrlQuery {
 
 // --- handlers -----------------------------------------------------------------
 
+/// Whether the control-plane runtime can actually serve, independent of whether
+/// this HTTP handler answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeAvailability {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+impl RuntimeAvailability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Projected control-plane health for one machine.
+struct HealthProjection {
+    availability: RuntimeAvailability,
+    executable_state: &'static str,
+    coordination: &'static str,
+    reasons: Vec<&'static str>,
+    protected_sessions: usize,
+}
+
+impl HealthProjection {
+    /// `machine offline`, `runtime unavailable`, and `session protected` are
+    /// three different operator situations with three different responses, and
+    /// collapsing them into one "offline" state is what made Agent Console
+    /// unable to say anything useful during the `sympoies/nils-cli#1409`
+    /// incident. Machine reachability is already answered by receiving this
+    /// response at all, so this projection covers the other two.
+    fn collect(state: &ServeState) -> Self {
+        let mut reasons = Vec::new();
+        let mut availability = RuntimeAvailability::Available;
+
+        let executable_state = nils_common::runtime_compat::executable_state(std::process::id());
+        if executable_state == nils_common::runtime_compat::ExecutableState::Replaced {
+            // The daemon is answering from an executable that no longer exists,
+            // so a restart is required before it can be trusted to serve.
+            availability = RuntimeAvailability::Unavailable;
+            reasons.push("runtime-executable-replaced");
+        }
+
+        if !state.context.state_dir.is_dir() {
+            availability = RuntimeAvailability::Unavailable;
+            reasons.push("state-dir-unavailable");
+        }
+
+        let (coordination, protected_sessions) =
+            match nils_common::coordination_projection::load(&state.context.state_dir) {
+                Ok(Some(registry)) => {
+                    let now = jiff::Timestamp::now().as_second();
+                    // A session whose broker is ready with a fresh heartbeat is
+                    // protected: its runtime must not be restarted out from
+                    // under an active claim or an uncertain operation.
+                    let protected = registry
+                        .brokers
+                        .values()
+                        .filter(|broker| {
+                            broker.state == "ready"
+                                && nils_common::coordination_projection::heartbeat_fresh(
+                                    &state.context.state_dir,
+                                    &broker.session_id,
+                                    &broker.incarnation,
+                                    now,
+                                )
+                        })
+                        .count();
+                    ("available", protected)
+                }
+                Ok(None) => ("absent", 0),
+                Err(error) => {
+                    availability = availability.max_degraded();
+                    let code = match error {
+                        nils_common::coordination_projection::ReadError::Unavailable => {
+                            "coordination-unavailable"
+                        }
+                        nils_common::coordination_projection::ReadError::Untrusted => {
+                            "coordination-untrusted"
+                        }
+                        nils_common::coordination_projection::ReadError::Invalid => {
+                            "coordination-invalid"
+                        }
+                        nils_common::coordination_projection::ReadError::Incompatible => {
+                            "runtime-version-skew"
+                        }
+                    };
+                    reasons.push(code);
+                    (code, 0)
+                }
+            };
+
+        Self {
+            availability,
+            executable_state: executable_state.as_str(),
+            coordination,
+            reasons,
+            protected_sessions,
+        }
+    }
+
+    fn health(&self) -> &'static str {
+        match self.availability {
+            RuntimeAvailability::Available => "healthy",
+            RuntimeAvailability::Degraded => "degraded",
+            RuntimeAvailability::Unavailable => "critical",
+        }
+    }
+}
+
+impl RuntimeAvailability {
+    /// Degrade without ever upgrading an already-unavailable runtime.
+    fn max_degraded(self) -> Self {
+        match self {
+            Self::Unavailable => Self::Unavailable,
+            _ => Self::Degraded,
+        }
+    }
+}
+
 async fn healthz(State(state): State<Arc<ServeState>>) -> Response {
-    envelope_ok(json!({ "status": "ok", "machine": state.machine }))
+    let projection = HealthProjection::collect(&state);
+    // `status` keeps its historical meaning — this handler answered — so an
+    // existing consumer is unaffected. The distinguishable states are additive.
+    envelope_ok(json!({
+        "status": "ok",
+        "machine": state.machine,
+        "health": projection.health(),
+        "runtime": {
+            "state": projection.availability.as_str(),
+            "binary_version": nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
+            "executable_state": projection.executable_state,
+            "coordination": projection.coordination,
+            "reasons": projection.reasons,
+        },
+        "sessions": {
+            "protected": projection.protected_sessions,
+        },
+    }))
 }
 
 async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
@@ -11657,6 +11798,148 @@ esac
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["machine"], MACHINE);
+    }
+
+    /// `machine offline`, `runtime unavailable`, and `session protected` are
+    /// three distinct operator situations. Collapsing them into one generic
+    /// offline state is what left Agent Console unable to say anything useful
+    /// during the `sympoies/nils-cli#1409` incident.
+    #[tokio::test]
+    async fn healthz_separates_runtime_and_session_protection_from_machine_reach() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(router(st.clone()), get("/healthz")).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+
+        // Reaching this handler already answers machine reachability, so
+        // `status` keeps its historical meaning for existing consumers.
+        assert_eq!(data["status"], "ok");
+        assert_eq!(data["health"], "healthy");
+        assert_eq!(data["runtime"]["state"], "available");
+        assert_eq!(data["runtime"]["coordination"], "absent");
+        assert_eq!(data["runtime"]["reasons"], serde_json::json!([]));
+        assert_eq!(data["sessions"]["protected"], 0);
+        assert!(
+            data["runtime"]["binary_version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "version skew diagnosis needs the serving release: {data}"
+        );
+        assert!(
+            matches!(
+                data["runtime"]["executable_state"].as_str(),
+                Some("live") | Some("unknown")
+            ),
+            "a running daemon is not replaced: {data}"
+        );
+    }
+
+    /// An unreadable coordination store degrades the runtime without claiming
+    /// the machine is offline.
+    #[tokio::test]
+    async fn healthz_degrades_on_an_unreadable_coordination_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let coordination = tmp.path().join("coordination");
+        std::fs::create_dir_all(&coordination).unwrap();
+        let registry = coordination.join("registry.json");
+        std::fs::write(&registry, b"{").unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (status, body) = call(router(st.clone()), get("/healthz")).await;
+        assert_eq!(status, StatusCode::OK, "the machine is still reachable");
+        let data = &body["data"];
+        assert_eq!(data["status"], "ok");
+        assert_eq!(data["health"], "degraded");
+        assert_eq!(data["runtime"]["state"], "degraded");
+        assert_eq!(data["runtime"]["coordination"], "coordination-invalid");
+        assert_eq!(
+            data["runtime"]["reasons"],
+            serde_json::json!(["coordination-invalid"])
+        );
+    }
+
+    /// A registry from another release generation is recoverable drift, and it
+    /// must be named as such rather than as corruption.
+    #[tokio::test]
+    async fn healthz_names_release_drift_distinctly_from_corruption() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let coordination = tmp.path().join("coordination");
+        std::fs::create_dir_all(&coordination).unwrap();
+        let registry = coordination.join("registry.json");
+        std::fs::write(
+            &registry,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "agent-session.coordination-registry.v9",
+                "fingerprint_epoch": 1,
+                "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "brokers": {},
+                "claims": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (_status, body) = call(router(st.clone()), get("/healthz")).await;
+        assert_eq!(
+            body["data"]["runtime"]["coordination"],
+            "runtime-version-skew"
+        );
+        assert_eq!(body["data"]["health"], "degraded");
+    }
+
+    /// A live session holding a fresh ready broker is protected: its runtime
+    /// must not be restarted out from under an active claim.
+    #[tokio::test]
+    async fn healthz_counts_protected_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let coordination = tmp.path().join("coordination");
+        std::fs::create_dir_all(&coordination).unwrap();
+        let registry = coordination.join("registry.json");
+        std::fs::write(
+            &registry,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "agent-session.coordination-registry.v1",
+                "fingerprint_epoch": 1,
+                "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "brokers": {
+                    "live": {
+                        "session_id": "live",
+                        "incarnation": "inc-live",
+                        "state": "ready",
+                        "heartbeat_epoch": now
+                    },
+                    "stale": {
+                        "session_id": "stale",
+                        "incarnation": "inc-stale",
+                        "state": "ready",
+                        "heartbeat_epoch": 0
+                    }
+                },
+                "claims": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let heartbeat = tmp.path().join("sessions/live/coordination");
+        std::fs::create_dir_all(&heartbeat).unwrap();
+        let heartbeat = heartbeat.join("heartbeat");
+        std::fs::write(&heartbeat, format!("inc-live:{now}\n")).unwrap();
+        std::fs::set_permissions(&heartbeat, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (_status, body) = call(router(st.clone()), get("/healthz")).await;
+        assert_eq!(body["data"]["runtime"]["coordination"], "available");
+        assert_eq!(
+            body["data"]["sessions"]["protected"], 1,
+            "only a fresh heartbeat proves a protected runtime: {}",
+            body["data"]
+        );
     }
 
     #[tokio::test]

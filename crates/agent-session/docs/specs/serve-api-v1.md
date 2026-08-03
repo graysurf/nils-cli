@@ -67,6 +67,30 @@ result schemas, exact admission fences, preservation, receipt TTL/quota,
 idempotency, and stable failure codes are normative in
 [Session Coordination V1](session-coordination-v1.md#operator-provider-turn-reconciliation).
 
+`GET /healthz` additively reports the distinguishable health states a console
+needs. `data.status` keeps its historical meaning — this handler answered — so an
+existing consumer is unaffected. Beyond that:
+
+- `data.health` is `healthy`, `degraded`, or `critical`.
+- `data.runtime.state` is `available`, `degraded`, or `unavailable`, with
+  `data.runtime.reasons` carrying stable codes.
+- `data.runtime.executable_state` is `live`, `replaced`, or `unknown` from
+  `/proc/<pid>/exe`. A daemon answering from a replaced executable is
+  `unavailable`: an upgrade can leave the installation symlink correct while the
+  live process holds a deleted inode.
+- `data.runtime.coordination` is `available`, `absent`, or the stable read
+  failure, where a registry from another release generation reports
+  `runtime-version-skew` rather than `coordination-invalid`.
+- `data.sessions.protected` counts sessions whose broker is ready with a fresh
+  heartbeat. Their runtimes must not be restarted out from under an active claim
+  or an uncertain operation.
+
+`machine offline`, `runtime unavailable`, and `session protected` are three
+different operator situations with three different responses. Machine
+reachability is answered by receiving a response at all; the other two are the
+fields above. Collapsing them into one generic offline state is the reporting gap
+recorded in `sympoies/nils-cli#1409`.
+
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
   additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled, plus
   `data.agent_profiles` containing only ready server-owned
