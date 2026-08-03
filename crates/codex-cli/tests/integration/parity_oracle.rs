@@ -2,14 +2,17 @@ use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
 }
 
-fn gemini_cli_bin() -> PathBuf {
-    bin::resolve("gemini-cli")
+/// `None` means this run cannot compare against `gemini-cli` at all, so the
+/// parity assertions below do not run. `bin::sibling_or_skip` owns why that
+/// happens and when it is legitimate.
+fn gemini_cli_bin_or_skip() -> Option<PathBuf> {
+    bin::sibling_or_skip("gemini-cli", "nils-gemini-cli")
 }
 
 fn run_codex(args: &[&str]) -> CmdOutput {
@@ -17,9 +20,8 @@ fn run_codex(args: &[&str]) -> CmdOutput {
     cmd::run(&bin, args, &[], None)
 }
 
-fn run_gemini(args: &[&str]) -> CmdOutput {
-    let bin = gemini_cli_bin();
-    cmd::run(&bin, args, &[], None)
+fn run_gemini(bin: &Path, args: &[&str]) -> CmdOutput {
+    cmd::run(bin, args, &[], None)
 }
 
 fn extract_commands(help_text: &str) -> Vec<String> {
@@ -53,8 +55,11 @@ fn extract_commands(help_text: &str) -> Vec<String> {
 
 #[test]
 fn parity_oracle_topology_matches_gemini() {
+    let Some(gemini_bin) = gemini_cli_bin_or_skip() else {
+        return;
+    };
     let codex = run_codex(&["--help"]);
-    let gemini = run_gemini(&["--help"]);
+    let gemini = run_gemini(&gemini_bin, &["--help"]);
     assert_eq!(codex.code, 0, "stderr={}", codex.stderr_text());
     assert_eq!(gemini.code, 0, "stderr={}", gemini.stderr_text());
 
@@ -65,8 +70,11 @@ fn parity_oracle_topology_matches_gemini() {
 
 #[test]
 fn parity_oracle_format_flag_visibility_matches_gemini_for_auth_and_diag_help() {
+    let Some(gemini_bin) = gemini_cli_bin_or_skip() else {
+        return;
+    };
     let codex_auth = run_codex(&["auth", "current", "--help"]);
-    let gemini_auth = run_gemini(&["auth", "current", "--help"]);
+    let gemini_auth = run_gemini(&gemini_bin, &["auth", "current", "--help"]);
     assert_eq!(codex_auth.code, 0);
     assert_eq!(gemini_auth.code, 0);
     let codex_auth_text = codex_auth.stdout_text();
@@ -77,7 +85,7 @@ fn parity_oracle_format_flag_visibility_matches_gemini_for_auth_and_diag_help() 
     assert!(!gemini_auth_text.contains("--json"));
 
     let codex_diag = run_codex(&["diag", "rate-limits", "--help"]);
-    let gemini_diag = run_gemini(&["diag", "rate-limits", "--help"]);
+    let gemini_diag = run_gemini(&gemini_bin, &["diag", "rate-limits", "--help"]);
     assert_eq!(codex_diag.code, 0);
     assert_eq!(gemini_diag.code, 0);
     let codex_diag_text = codex_diag.stdout_text();
@@ -92,8 +100,11 @@ fn parity_oracle_format_flag_visibility_matches_gemini_for_auth_and_diag_help() 
 
 #[test]
 fn parity_oracle_auth_json_schema_ids_are_provider_specific() {
+    let Some(gemini_bin) = gemini_cli_bin_or_skip() else {
+        return;
+    };
     let codex = run_codex(&["auth", "current", "--json"]);
-    let gemini = run_gemini(&["auth", "current", "--json"]);
+    let gemini = run_gemini(&gemini_bin, &["auth", "current", "--json"]);
 
     let codex_json: Value = serde_json::from_str(&codex.stdout_text()).expect("codex auth json");
     let gemini_json: Value = serde_json::from_str(&gemini.stdout_text()).expect("gemini auth json");

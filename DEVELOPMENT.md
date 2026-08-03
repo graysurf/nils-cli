@@ -131,6 +131,15 @@ This runs changed-scope validation against `origin/main` by default:
 - the workspace lane runs its tests through `scripts/ci/tempdir-leak-probe.sh`,
   which fails on temp directories the suite leaves behind; see
   `docs/specs/test-temp-directory-policy.md`
+- a package-scoped lane does not build binaries another package owns, so a test
+  that needs one skips with a reason naming the build command; see
+  `bin::sibling_or_skip` in `crates/nils-test-support`. Build the sibling — for
+  example `cargo build -p nils-gemini-cli --bins` — to run those tests locally.
+  A *stale* sibling fails instead of skipping, because an artifact from an
+  earlier release is an operator error rather than a property of the run. The
+  workspace lane and CI build every default-feature binary, and CI additionally
+  sets `NILS_TEST_REQUIRE_SIBLING_BINS=1` so a skip there is a hard failure
+  rather than a silent loss of coverage
 
 Override the base ref when needed:
 

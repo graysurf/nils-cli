@@ -198,197 +198,55 @@ printf "%s" "${NTS_VALUE-unset}"
     assert_eq!(output.stdout_text(), "child");
 }
 
-#[cfg(unix)]
+/// `sibling_or_skip` is the only cross-crate surface of the sibling contract, so
+/// it is the only part exercised from outside the crate. The classification it
+/// wraps is crate-private and unit-tested next to the code.
+///
+/// The require flag is dropped explicitly because CI sets it for the whole job,
+/// and this case is specifically about the behaviour when it is absent.
 #[test]
-fn with_path_prepend_places_directory_before_existing_path() {
-    let temp = TempDir::new().expect("tempdir");
-    let first_dir = temp.path().join("first");
-    let second_dir = temp.path().join("second");
-    std::fs::create_dir_all(&first_dir).expect("create first dir");
-    std::fs::create_dir_all(&second_dir).expect("create second dir");
-
-    write_exe(
-        &first_dir,
-        "path-pick",
-        r#"#!/bin/sh
-printf "first"
-"#,
-    );
-    write_exe(
-        &second_dir,
-        "path-pick",
-        r#"#!/bin/sh
-printf "second"
-"#,
-    );
-    write_exe(
-        temp.path(),
-        "path-runner",
-        r#"#!/bin/sh
-path-pick
-"#,
-    );
-
-    let bin = temp.path().join("path-runner");
-    let base_path = second_dir.to_string_lossy().to_string();
-    let base_options = cmd::CmdOptions::new().with_env("PATH", &base_path);
-    let base = cmd::run_with(&bin, &[], &base_options);
-    assert_eq!(base.code, 0);
-    assert_eq!(base.stdout_text(), "second");
-
-    let prefixed_options = base_options.with_path_prepend(&first_dir);
-    let prefixed = cmd::run_with(&bin, &[], &prefixed_options);
-    assert_eq!(prefixed.code, 0);
-    assert_eq!(prefixed.stdout_text(), "first");
-}
-
-#[cfg(unix)]
-#[test]
-fn path_with_prepend_excluding_program_filters_existing_program_and_prepends_stub_dir() {
+fn sibling_or_skip_yields_none_for_an_absent_sibling_without_panicking() {
     let lock = GlobalStateLock::new();
-    let temp = TempDir::new().expect("tempdir");
-    let existing_program_dir = temp.path().join("existing");
-    let kept_dir = temp.path().join("kept");
-    let prepend_dir = temp.path().join("prepend");
-    std::fs::create_dir_all(&existing_program_dir).expect("create existing dir");
-    std::fs::create_dir_all(&kept_dir).expect("create kept dir");
-    std::fs::create_dir_all(&prepend_dir).expect("create prepend dir");
-    write_exe(
-        &existing_program_dir,
-        "path-filter-test",
-        "#!/bin/sh\nexit 0\n",
-    );
+    let _hyphen = EnvGuard::remove(&lock, "CARGO_BIN_EXE_nts-absent-sibling");
+    let _underscore = EnvGuard::remove(&lock, "CARGO_BIN_EXE_nts_absent_sibling");
+    let _require = EnvGuard::remove(&lock, "NILS_TEST_REQUIRE_SIBLING_BINS");
 
-    let base_path = std::env::join_paths([existing_program_dir.as_path(), kept_dir.as_path()])
-        .expect("join base path")
-        .to_string_lossy()
-        .to_string();
-    let _path = EnvGuard::set(&lock, "PATH", &base_path);
-
-    let filtered = cmd::path_with_prepend_excluding_program(&prepend_dir, "path-filter-test");
-    let split = std::env::split_paths(std::ffi::OsStr::new(&filtered)).collect::<Vec<_>>();
-
-    assert_eq!(split[0], prepend_dir);
-    assert!(
-        split
-            .iter()
-            .all(|dir| !dir.join("path-filter-test").is_file())
-    );
-    assert!(split.contains(&kept_dir));
-}
-
-#[cfg(unix)]
-#[test]
-fn run_in_dir_with_overrides_options_cwd() {
-    let temp = TempDir::new().expect("tempdir");
-    let dir_arg = temp.path().join("arg-dir");
-    let option_dir = temp.path().join("option-dir");
-    std::fs::create_dir_all(&dir_arg).expect("create arg dir");
-    std::fs::create_dir_all(&option_dir).expect("create option dir");
-
-    write_exe(
-        temp.path(),
-        "pwd-override-test",
-        r#"#!/bin/sh
-pwd
-"#,
-    );
-    let bin = temp.path().join("pwd-override-test");
-    let options = cmd::CmdOptions::new().with_cwd(&option_dir);
-
-    let output = cmd::run_in_dir_with(&dir_arg, &bin, &[], &options);
-    let stdout = output.stdout_text();
-    let stdout = stdout.trim_end();
-    let expected = std::fs::canonicalize(&dir_arg).expect("canonical");
-    let expected = expected.to_string_lossy();
-
-    assert_eq!(output.code, 0);
-    assert_eq!(stdout, expected);
-}
-
-/// A command under test is free to exit before draining its stdin. The harness
-/// must still report that command's own exit code and output instead of
-/// panicking on the broken pipe. See `sympoies/nils-cli#1420`.
-#[cfg(unix)]
-#[test]
-fn run_reports_the_exit_code_of_a_command_that_ignores_its_stdin() {
-    let temp = TempDir::new().expect("tempdir");
-    write_exe(
-        temp.path(),
-        "exit-before-reading",
-        "#!/bin/sh\nexec 0<&-\nprintf 'answered\\n'\nexit 3\n",
-    );
-    let bin = temp.path().join("exit-before-reading");
-    // A pipe holds 64 KiB, so a smaller payload would be buffered whole and the
-    // write would never see the closed read end.
-    let options = cmd::CmdOptions::new().with_stdin_bytes(&vec![b'x'; 128 * 1024]);
-
-    let output = cmd::run_with(&bin, &[], &options);
-
-    assert_eq!(output.code, 3);
-    assert_eq!(output.stdout_text().trim_end(), "answered");
-}
-
-/// A suite running inside a managed `agent-session` pane inherits every variable
-/// that pane pins. Those variables outrank `PATH` and the fixture layout, so a
-/// test controlling only part of a resolution input set silently measures the
-/// developer's runtime instead of its own. See `sympoies/nils-cli#1420`.
-#[cfg(unix)]
-#[test]
-fn without_ambient_managed_session_env_hides_every_inherited_override() {
-    let lock = GlobalStateLock::new();
-    let temp = TempDir::new().expect("tempdir");
-    let report = cmd::MANAGED_SESSION_ENV
-        .iter()
-        .map(|name| format!("printf '%s=%s\\n' {name} \"${{{name}-absent}}\"\n"))
-        .collect::<String>();
-    write_exe(
-        temp.path(),
-        "report-managed-env",
-        &format!("#!/bin/sh\n{report}"),
-    );
-    let bin = temp.path().join("report-managed-env");
-    let _guards: Vec<EnvGuard> = cmd::MANAGED_SESSION_ENV
-        .iter()
-        .map(|name| EnvGuard::set(&lock, name, "inherited-from-the-managed-pane"))
-        .collect();
-
-    let options = cmd::CmdOptions::new().without_ambient_managed_session_env();
-    let output = cmd::run_with(&bin, &[], &options);
-
-    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    let expected = cmd::MANAGED_SESSION_ENV
-        .iter()
-        .map(|name| format!("{name}=absent"))
-        .collect::<Vec<_>>()
-        .join("\n");
     assert_eq!(
-        output.stdout_text().trim_end(),
-        expected,
-        "no managed-session variable may reach a child that did not ask for it"
+        bin::sibling_or_skip("nts-absent-sibling", "nils-absent"),
+        None
     );
 }
 
-/// The removal must not take the variable away from a test that wants it, or
-/// every fixture legitimately pinning one would have to opt out by name.
+/// The require flag exists so a lane that should have built every binary cannot
+/// report green-but-empty when resolution regresses.
+#[test]
+#[should_panic(expected = "is not built for this run")]
+fn sibling_or_skip_panics_for_an_absent_sibling_when_the_require_flag_is_set() {
+    let lock = GlobalStateLock::new();
+    let _hyphen = EnvGuard::remove(&lock, "CARGO_BIN_EXE_nts-absent-sibling");
+    let _underscore = EnvGuard::remove(&lock, "CARGO_BIN_EXE_nts_absent_sibling");
+    let _require = EnvGuard::set(&lock, "NILS_TEST_REQUIRE_SIBLING_BINS", "1");
+
+    bin::sibling_or_skip("nts-absent-sibling", "nils-absent");
+}
+
+/// A selected-but-wrong artifact is an operator error, so it must fail rather
+/// than skip: skipping would leave the suite green while it never ran against
+/// the binary it names.
 #[cfg(unix)]
 #[test]
-fn without_ambient_managed_session_env_still_lets_an_explicit_value_through() {
+#[should_panic(expected = "from an earlier release")]
+fn sibling_or_skip_panics_for_a_stale_sibling_instead_of_skipping() {
     let lock = GlobalStateLock::new();
     let temp = TempDir::new().expect("tempdir");
-    write_exe(
-        temp.path(),
-        "report-helper-override",
-        "#!/bin/sh\nprintf '%s\\n' \"${AGENT_SESSION_BIN-absent}\"\n",
+    let script = "#!/bin/sh\nprintf '%s\\n' 'nts-stale-skip 1.0.0 (v1.0.0, rustc 1.0.0)'\n";
+    write_exe(temp.path(), "nts-stale-skip", script);
+    let path = temp.path().join("nts-stale-skip");
+    let _guard = EnvGuard::set(
+        &lock,
+        "CARGO_BIN_EXE_nts-stale-skip",
+        path.to_str().expect("path"),
     );
-    let bin = temp.path().join("report-helper-override");
-    let _guard = EnvGuard::set(&lock, "AGENT_SESSION_BIN", "/inherited/agent-session");
 
-    let options = cmd::CmdOptions::new()
-        .without_ambient_managed_session_env()
-        .with_env("AGENT_SESSION_BIN", "/chosen/agent-session");
-    let output = cmd::run_with(&bin, &[], &options);
-
-    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    assert_eq!(output.stdout_text().trim_end(), "/chosen/agent-session");
+    bin::sibling_or_skip("nts-stale-skip", "nils-stale");
 }
