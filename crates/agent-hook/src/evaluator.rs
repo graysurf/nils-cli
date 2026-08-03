@@ -1456,10 +1456,22 @@ fn run_bounded(
         .map_err(|_| HookError::runtime("capability-unavailable", "capability could not start"))?;
     let input = input.to_vec();
     let input_handle = child.stdin.take().map(|mut stdin| {
-        thread::spawn(move || {
-            stdin.write_all(&input).map_err(|_| {
-                HookError::runtime("capability-input-failed", "capability input failed")
-            })
+        thread::spawn(move || match stdin.write_all(&input) {
+            Ok(()) => Ok(()),
+            // A capability that exits before draining its stdin closes the read
+            // end, and the remaining write returns EPIPE. That is the child's
+            // decision and carries no verdict about the capability: its exit
+            // status and output do. Treating it as an input failure made a
+            // `failure_posture = "closed"` rule block at random whenever the
+            // child won the race, which for a `locked` rule is an unrecoverable
+            // prompt. Sequencing the write before the wait cannot fix it either,
+            // because a child is always free to exit early.
+            // See `sympoies/nils-cli#1420`.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(_) => Err(HookError::runtime(
+                "capability-input-failed",
+                "capability input failed",
+            )),
         })
     });
     let stdout_handle = child
@@ -1869,6 +1881,16 @@ mod tests {
         assert!(started.elapsed() < HANDLER_TIMEOUT);
     }
 
+    /// A child that exits without draining a 1 MiB payload leaves the runner
+    /// mid-write. The property this protects is that the runner returns promptly
+    /// rather than blocking to the timeout.
+    ///
+    /// It used to also require the broken pipe be reported as
+    /// `capability-input-failed`. That was the defect, not the contract: the
+    /// caller turns any capability error into `failure_outcome`, so a child which
+    /// merely stopped reading was scored as a failed capability and blocked a
+    /// `locked` rule at random. The child's exit status is the verdict.
+    /// See `sympoies/nils-cli#1420`.
     #[test]
     fn bounded_runner_handles_child_exit_before_stdin_is_consumed() {
         let mut command = Command::new("sh");
@@ -1879,17 +1901,40 @@ mod tests {
             .stderr(Stdio::piped());
 
         let started = Instant::now();
-        let error = run_bounded(
+        let output = run_bounded(
             command,
             &vec![b'x'; 1024 * 1024],
             HANDLER_TIMEOUT,
             MAX_HANDLER_OUTPUT,
             false,
         )
-        .expect_err("closed child stdin must be reported");
+        .expect("a child that stopped reading is not a failed child");
 
-        assert_eq!(error.code, "capability-input-failed");
+        assert!(output.status.success());
         assert!(started.elapsed() < HANDLER_TIMEOUT);
+    }
+
+    /// The tolerance covers the pipe, not the verdict.
+    #[test]
+    fn bounded_runner_still_reports_a_child_that_fails_before_reading_stdin() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 3"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_bounded(
+            command,
+            &vec![b'x'; 1024 * 1024],
+            HANDLER_TIMEOUT,
+            MAX_HANDLER_OUTPUT,
+            false,
+        )
+        .expect("the broken pipe must not mask the exit status");
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(3));
     }
 
     #[test]

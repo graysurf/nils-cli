@@ -63,6 +63,33 @@ fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
     std::process::ExitStatus::from_raw(raw)
 }
 
+/// Every variable a managed `agent-session` pane pins into the processes it
+/// launches, which a test therefore inherits when the suite itself runs inside
+/// one.
+///
+/// The list mirrors `session_environment_args` in `crates/agent-session/src/lib.rs`
+/// plus `AGENT_HOOK_BIN`, which `agent-session` consults when it invokes the hook.
+/// `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are pinned by the same function but are
+/// omitted here: they are provider config roots that individual fixtures already
+/// own, so removing them centrally would change unrelated expectations.
+///
+/// These are overrides that outrank the inputs a test does control. A fixture
+/// that points `PATH` at an empty directory cannot express "nothing resolves"
+/// while an inherited `AGENT_SESSION_BIN` still names a real helper, so the
+/// assertion never reaches its subject and the suite is green on CI and red on a
+/// managed workstation. See `sympoies/nils-cli#1420`.
+pub const MANAGED_SESSION_ENV: [&str; 9] = [
+    "AGENT_SESSION_ID",
+    "AGENT_SESSION_RUNTIME_ID",
+    "AGENT_SESSION_STATE_DIR",
+    "AGENT_SESSION_COORDINATION_MODE",
+    "AGENT_SESSION_CAPABILITY_FILE",
+    "AGENT_SESSION_CHECKPOINT_FILE",
+    "AGENT_SESSION_ATTENTION_AUTHORITY",
+    "AGENT_SESSION_BIN",
+    "AGENT_HOOK_BIN",
+];
+
 #[derive(Debug, Clone)]
 pub struct CmdOptions {
     pub cwd: Option<PathBuf>,
@@ -113,6 +140,17 @@ impl CmdOptions {
             self = self.with_env_remove(key);
         }
         self
+    }
+
+    /// Drop every [`MANAGED_SESSION_ENV`] variable the caller inherited, so the
+    /// process under test sees only the managed-session inputs the test chose.
+    ///
+    /// This does not take anything away from a test that wants one of them:
+    /// `run_impl_os` applies removals before values, so a later `with_env` for
+    /// the same key still reaches the child. Callers that build a value
+    /// conditionally can therefore apply this first and decide afterwards.
+    pub fn without_ambient_managed_session_env(self) -> Self {
+        self.with_env_remove_many(&MANAGED_SESSION_ENV)
     }
 
     pub fn with_path_prepend(self, dir: &Path) -> Self {
@@ -302,7 +340,17 @@ fn run_impl_os(bin: &Path, args: &[&OsStr], options: &CmdOptions, dir: Option<&P
             cmd.stdin(Stdio::piped());
             let mut child = cmd.spawn().expect("spawn command");
             if let Some(mut writer) = child.stdin.take() {
-                writer.write_all(input).expect("write stdin");
+                match writer.write_all(input) {
+                    Ok(()) => {}
+                    // A command under test may exit before draining its stdin -
+                    // a usage error, an early `--help`, a filter that found what
+                    // it needed. Panicking here would report that as a harness
+                    // failure and lose the exit code and output the test is
+                    // actually asserting on. Same reasoning as the capability
+                    // runner in `agent-hook`; see `sympoies/nils-cli#1420`.
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(error) => panic!("write stdin: {error}"),
+                }
             }
             child.wait_with_output().expect("wait command")
         }

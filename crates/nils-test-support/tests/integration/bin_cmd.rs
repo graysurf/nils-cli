@@ -305,3 +305,90 @@ pwd
     assert_eq!(output.code, 0);
     assert_eq!(stdout, expected);
 }
+
+/// A command under test is free to exit before draining its stdin. The harness
+/// must still report that command's own exit code and output instead of
+/// panicking on the broken pipe. See `sympoies/nils-cli#1420`.
+#[cfg(unix)]
+#[test]
+fn run_reports_the_exit_code_of_a_command_that_ignores_its_stdin() {
+    let temp = TempDir::new().expect("tempdir");
+    write_exe(
+        temp.path(),
+        "exit-before-reading",
+        "#!/bin/sh\nexec 0<&-\nprintf 'answered\\n'\nexit 3\n",
+    );
+    let bin = temp.path().join("exit-before-reading");
+    // A pipe holds 64 KiB, so a smaller payload would be buffered whole and the
+    // write would never see the closed read end.
+    let options = cmd::CmdOptions::new().with_stdin_bytes(&vec![b'x'; 128 * 1024]);
+
+    let output = cmd::run_with(&bin, &[], &options);
+
+    assert_eq!(output.code, 3);
+    assert_eq!(output.stdout_text().trim_end(), "answered");
+}
+
+/// A suite running inside a managed `agent-session` pane inherits every variable
+/// that pane pins. Those variables outrank `PATH` and the fixture layout, so a
+/// test controlling only part of a resolution input set silently measures the
+/// developer's runtime instead of its own. See `sympoies/nils-cli#1420`.
+#[cfg(unix)]
+#[test]
+fn without_ambient_managed_session_env_hides_every_inherited_override() {
+    let lock = GlobalStateLock::new();
+    let temp = TempDir::new().expect("tempdir");
+    let report = cmd::MANAGED_SESSION_ENV
+        .iter()
+        .map(|name| format!("printf '%s=%s\\n' {name} \"${{{name}-absent}}\"\n"))
+        .collect::<String>();
+    write_exe(
+        temp.path(),
+        "report-managed-env",
+        &format!("#!/bin/sh\n{report}"),
+    );
+    let bin = temp.path().join("report-managed-env");
+    let _guards: Vec<EnvGuard> = cmd::MANAGED_SESSION_ENV
+        .iter()
+        .map(|name| EnvGuard::set(&lock, name, "inherited-from-the-managed-pane"))
+        .collect();
+
+    let options = cmd::CmdOptions::new().without_ambient_managed_session_env();
+    let output = cmd::run_with(&bin, &[], &options);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let expected = cmd::MANAGED_SESSION_ENV
+        .iter()
+        .map(|name| format!("{name}=absent"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        output.stdout_text().trim_end(),
+        expected,
+        "no managed-session variable may reach a child that did not ask for it"
+    );
+}
+
+/// The removal must not take the variable away from a test that wants it, or
+/// every fixture legitimately pinning one would have to opt out by name.
+#[cfg(unix)]
+#[test]
+fn without_ambient_managed_session_env_still_lets_an_explicit_value_through() {
+    let lock = GlobalStateLock::new();
+    let temp = TempDir::new().expect("tempdir");
+    write_exe(
+        temp.path(),
+        "report-helper-override",
+        "#!/bin/sh\nprintf '%s\\n' \"${AGENT_SESSION_BIN-absent}\"\n",
+    );
+    let bin = temp.path().join("report-helper-override");
+    let _guard = EnvGuard::set(&lock, "AGENT_SESSION_BIN", "/inherited/agent-session");
+
+    let options = cmd::CmdOptions::new()
+        .without_ambient_managed_session_env()
+        .with_env("AGENT_SESSION_BIN", "/chosen/agent-session");
+    let output = cmd::run_with(&bin, &[], &options);
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_text().trim_end(), "/chosen/agent-session");
+}

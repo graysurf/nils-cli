@@ -37,6 +37,10 @@ Stale-test cleanup sequencing is frozen in
   - `cmd`: run binaries with captured output (`CmdOutput`) and flexible options (`CmdOptions`), including resolved workspace-binary helpers
     (`run_resolved*`)
   - `CmdOptions::with_env_remove_many`: remove multiple env vars in one call for deterministic harness setup
+  - `CmdOptions::without_ambient_managed_session_env`: drop the `cmd::MANAGED_SESSION_ENV` set a managed
+    `agent-session` pane pins, so a suite run inside one does not inherit overrides that outrank `PATH`
+    and the fixture layout. Removals are applied before values, so a later `with_env` for the same key
+    still reaches the child
   - `cmd::path_with_prepend_excluding_program`: construct a PATH that prepends stubs while filtering one real binary
 - Workspace binaries
   - `bin`: `resolve` finds `CARGO_BIN_EXE_*` or falls back to `target/<profile>/<name>`

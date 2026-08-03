@@ -17,7 +17,8 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use pretty_assertions::assert_eq;
+use nils_test_support::{EnvGuard, GlobalStateLock};
+use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::Value;
 
 use support::Fixture;
@@ -293,4 +294,45 @@ fn doctor_fails_when_the_activity_helper_cannot_be_resolved() {
         healthy.stdout_text()
     );
     assert_eq!(healthy.stdout_json()["data"][0]["status"], "converged");
+}
+
+/// The suite itself runs inside a managed session, which pins `AGENT_SESSION_BIN`
+/// since `#1415`. Because that variable outranks `PATH`, every test above that
+/// makes the helper unresolvable by emptying `PATH` was measuring the inherited
+/// helper instead, so the local gate failed for changes that touch none of this.
+/// See `sympoies/nils-cli#1420`.
+#[test]
+fn an_inherited_helper_override_does_not_reach_the_process_under_test() {
+    let lock = GlobalStateLock::new();
+    let fixture = Fixture::new(ACTIVITY_POLICY);
+    // Ambient value that resolves, which is what a managed pane supplies.
+    let inherited = working_helper(&fixture).join("agent-session");
+    assert!(inherited.is_file(), "the inherited override must resolve");
+    let _guard = EnvGuard::set(
+        &lock,
+        "AGENT_SESSION_BIN",
+        inherited.to_str().expect("inherited path"),
+    );
+
+    converge_claude_ingress(&fixture);
+    let empty_dir = fixture.root.join("empty-bin");
+    fs::create_dir_all(&empty_dir).expect("empty directory");
+    let broken = fixture.run_with_env(
+        &["doctor", "--product", "claude", "--format", "json"],
+        None,
+        &[("PATH", empty_dir.to_str().expect("empty dir"))],
+    );
+
+    assert_ne!(
+        broken.code,
+        0,
+        "an inherited override must not resolve a helper this test removed: {}",
+        broken.stdout_text()
+    );
+    assert_eq!(
+        broken.stdout_json()["error"]["code"],
+        "activity-helper-unresolvable",
+        "{}",
+        broken.stdout_text()
+    );
 }
