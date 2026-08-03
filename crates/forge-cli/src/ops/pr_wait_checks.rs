@@ -171,9 +171,19 @@ fn poll_until_terminal_or_timeout<R: BackendRunner, C: Clock>(
     let start = clock.now();
     let deadline = start + timeout;
 
+    // "Never registered" is a property of the whole run, not of the last read.
+    // `pr_checks` normalizes a transient "no checks reported" into an empty
+    // successful snapshot, so classifying from the final poll alone would turn a
+    // run that had been watching real pending checks into `checks_not_registered`
+    // — flipping a retryable UNAVAILABLE 69 into a fatal DATA 65 on exactly the
+    // slow-registration case this exists for.
+    let mut ever_saw_a_check = false;
+
     loop {
         let snapshot = pr_checks::snapshot(runner, global, ctx, snapshot_args)?;
         let snapshot = with_duration(snapshot, ms_between(start, clock.now()));
+        ever_saw_a_check =
+            ever_saw_a_check || !crate::ops::required_check_gate::nothing_was_checked(&snapshot);
         if is_terminal(&snapshot, presence) {
             if snapshot.state == "success" {
                 return Ok(WaitOutcome::Success(snapshot));
@@ -184,8 +194,8 @@ fn poll_until_terminal_or_timeout<R: BackendRunner, C: Clock>(
         if now >= deadline {
             let expired = with_duration(snapshot, ms_between(start, now));
             // Report *why* the budget expired. Nothing ever registered is a
-            // different problem from checks that ran long.
-            if crate::ops::required_check_gate::nothing_was_checked(&expired) {
+            // different problem, with a different fix, from checks that ran long.
+            if !ever_saw_a_check {
                 return Ok(WaitOutcome::NotRegistered(expired));
             }
             return Ok(WaitOutcome::TimedOut(expired));
@@ -455,6 +465,15 @@ mod tests {
         };
         let snapshot = pr_checks::snapshot(&runner, &global, &ctx, &snapshot_args).unwrap();
         assert_eq!(snapshot.state, "success");
+        // Without this the test passes on a single-output stub, where the
+        // `--required` list comes back empty, `build` is never marked required,
+        // and "terminal success" is true only over an empty gating set. Assert
+        // the gating set is real so the doubled fixture is load-bearing.
+        assert_eq!(
+            snapshot.required_count, 1,
+            "the fixture must produce a real gating set, not a vacuous one"
+        );
+        assert_eq!(snapshot.success_count, 1);
         let snapshot = with_duration(snapshot, ms_between(clock.now(), clock.now()));
         assert!(is_terminal(&snapshot, CheckPresence::Required));
     }
@@ -556,6 +575,52 @@ mod tests {
         assert!(
             matches!(outcome, WaitOutcome::NotRegistered(_)),
             "an always-empty snapshot must expire as not-registered"
+        );
+    }
+
+    /// "Never registered" is a property of the run, not of the last poll.
+    ///
+    /// `pr_checks` normalizes a transient "no checks reported" into an empty
+    /// successful snapshot, so a run that watched real pending checks and then
+    /// hit one empty read at the deadline must still expire as `checks_timeout`
+    /// (UNAVAILABLE 69, retryable) — not as `checks_not_registered` (DATA 65,
+    /// fatal). Classifying from the final snapshot alone flips exactly the
+    /// slow-registration case this feature exists for onto the wrong side of
+    /// the retry boundary.
+    #[test]
+    fn a_transient_empty_read_at_the_deadline_is_still_a_timeout() {
+        const ONE_REQUIRED_PENDING: &str =
+            r#"[{"name":"build","bucket":"pending","isRequired":true}]"#;
+        let runner = StubRunner {
+            outputs: RefCell::new(vec![
+                // poll 1: a real pending required check
+                ONE_REQUIRED_PENDING.into(),
+                ONE_REQUIRED_PENDING.into(),
+                // poll 2, at the deadline: a transient empty read
+                "[]".into(),
+                "[]".into(),
+            ]),
+        };
+        let clock = StepClock::new();
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = PrWaitChecksArgs {
+            timeout: Duration::from_millis(2),
+            interval: Duration::from_millis(2),
+            ..make_args("1")
+        };
+        let snapshot_args = PrChecksArgs {
+            id: args.id.clone(),
+            required_only: args.required_only,
+        };
+
+        let outcome =
+            poll_until_terminal_or_timeout(&runner, &clock, &global, &ctx, &args, &snapshot_args)
+                .expect("poll must not error");
+
+        assert!(
+            matches!(outcome, WaitOutcome::TimedOut(_)),
+            "a run that saw checks must expire as a timeout, not as not-registered"
         );
     }
 

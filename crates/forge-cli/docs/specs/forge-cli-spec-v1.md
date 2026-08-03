@@ -982,8 +982,13 @@ backend mapping, validation rules, and output schema versions.
 - Preconditions enforced before invoking the backend:
   - PR exists and is not draft (call `pr ready` first if needed);
   - working tree clean;
-  - required checks all green (re-checked even if `pr wait-checks`
-    succeeded earlier — TTL-zero gate);
+  - required checks all green **and at least one check reported**
+    (re-checked even if `pr wait-checks` succeeded earlier — TTL-zero
+    gate). A head with no required checks and no visible rows is refused
+    with `checks_not_registered`; `--allow-no-checks` with a non-empty
+    `--allow-no-checks-reason` bypasses it and records the reason in
+    `data.no_checks_override_reason`. `pr deliver` accepts the same pair
+    and forwards it to its wait-checks and merge steps;
   - target branch is the repo default branch OR explicitly approved
     via `--allow-non-default-base`;
   - when resolved review convergence is enabled, no current-head native
@@ -1035,8 +1040,10 @@ backend mapping, validation rules, and output schema versions.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
   `data = { number, url, merge_sha, method, deleted_branch,
   unchecked_tasks_override_reason?, unresolved_threads_override_reason?,
+  no_checks_override_reason?,
   stale_thread_dispositions?, review_convergence?, review_loop? }`.
-  `unchecked_tasks_override_reason` / `unresolved_threads_override_reason` are
+  `unchecked_tasks_override_reason` / `unresolved_threads_override_reason` /
+  `no_checks_override_reason` are
   present only when the matching bypass was used; `stale_thread_dispositions`
   lists the outdated threads dispositioned `stale` at rule 13 (omitted when
   none). The additive convergence snapshot contains
@@ -1181,11 +1188,27 @@ backend implementations cannot diverge.
 
    The predicate deliberately requires *both* halves. A repository can run
    CI without branch protection, producing zero required checks alongside
-   visible rows; those are re-gated against the visible set rather than
-   refused. What is refused is the case with nothing to re-gate, which is
-   also what the provider reports during the check-registration window
-   after a force-with-lease — the window in which delivery previously
-   reported success against an unchecked head.
+   visible rows; refusing those would block every such repository. What is
+   refused is the case with nothing to fall back to, which is also what the
+   provider reports during the check-registration window after a
+   force-with-lease — the window in which delivery previously reported
+   success against an unchecked head.
+
+   Be precise about what happens to the zero-required-with-visible-rows
+   case, because the two commands differ. `pr deliver` re-gates those rows
+   against the full visible set — but only on GitHub
+   (`should_gate_visible_checks`). Standalone `pr merge` does **not**
+   re-gate them on any provider: its snapshot is taken with
+   `required_only`, so a non-required failing row is not in `failed` and
+   the gate accepts the head. That gap predates this rule and is not
+   closed by it.
+
+   The rule is provider-neutral, and on GitLab that is a behaviour change
+   worth stating: an MR whose head has no pipeline — no `.gitlab-ci.yml`,
+   excluded by `workflow:rules`, or pipelines disabled on a fork — reports
+   the same empty snapshot and is now refused rather than merged. That is
+   the intended reading of "absence is not success", and
+   `--allow-no-checks` is the declared way to say a project has no CI.
 9. **Merge method.** Default `squash`. Repo override allowed via
    `.forge-cli.toml` `[merge] method = "squash" | "merge" | "rebase"`.
    Per-invocation `--method` overrides the repo override; both are
@@ -1519,14 +1542,14 @@ without exception:
 `nils_common::cli_contract::exit`. Discriminators go in
 `data.error.kind`, not in numeric exit codes.
 
-| Constant      | Value | `forge-cli` triggers                                                                                                                                                                |
-| ------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                                                                              |
-| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                                                                               |
-| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                                                                           |
-| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                                                                                |
-| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks or review-convergence timeout, GitLab VPN probe failure, backend timeout or backend output-limit failure. |
-| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                                                                           |
+| Constant      | Value | `forge-cli` triggers                                                                                                                                                                                                                                                                                         |
+| ------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                                                                                                                                                                                                       |
+| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                                                                                                                                                                                                        |
+| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                                                                                                                                                                                                    |
+| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                                                                                                                                                                                                         |
+| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks expiry when checks were seen but did not finish (an expiry with none ever reported is `DATA 65` / `checks_not_registered`), review-convergence timeout, GitLab VPN probe failure, backend timeout or backend output-limit failure. |
+| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                                                                                                                                                                                                    |
 
 Callers (agent-runtime-kit skills, CI scripts) MUST branch on `error.kind`
 when finer granularity is needed. Numeric exit codes alone are

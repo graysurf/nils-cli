@@ -68,9 +68,10 @@ validations_catalog:
     error_kind: draft_merge_refused
     exit: DATA
   required_checks_green:
-    rule: "every required check is success at merge time"
+    rule: "every required check is success at merge time, and at least one check was reported"
     error_kind: checks_pending     # exit DATA when pending
     failed_error_kind: checks_failed  # exit RUNTIME when failed
+    absent_error_kind: checks_not_registered  # exit DATA when no required checks AND no visible rows; bypass with --allow-no-checks (+ --allow-no-checks-reason)
   merge_method_supported:
     rule: "method in {squash, merge, rebase} and backend supports it"
     error_kind: merge_method_unsupported
@@ -792,6 +793,8 @@ operations:
       - { name: --review-convergence,        type: optional<bool>,               default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                          default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                    default: null }
+      - { name: --allow-no-checks,          type: bool,                          default: false } # requires --allow-no-checks-reason
+      - { name: --allow-no-checks-reason,   type: string,                        default: null }
     validations:
       - worktree_clean
       - test_first_evidence_provider_head_mismatch # when --expected-head is supplied, the first provider snapshot must still match it before merge mutation
@@ -816,6 +819,7 @@ operations:
         deleted_branch: bool
         unchecked_tasks_override_reason?: string # present only when --allow-unchecked-tasks bypass was used
         unresolved_threads_override_reason?: string # present only when --allow-unresolved-threads bypass was used
+        no_checks_override_reason?: string # present only when --allow-no-checks bypass was used; the only durable record that a merge happened with no CI evidence
         stale_thread_dispositions?: 'list<{ thread_id: string, author: string, path: string, summary: string, disposition: "stale", rationale: string }>' # outdated unresolved threads dispositioned stale at rule 13; omitted when none
         review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, semantic_activity, semantic_digest, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
         review_loop: optional<{state_tip_digest,head_sha,round,no_progress_rounds,open_blocking_findings}>
@@ -863,14 +867,25 @@ operations:
       - { name: --timeout,       type: duration,          default: 30m }
       - { name: --interval,      type: duration,          default: 20s }
       - { name: --required-only, type: bool,              default: true }
+      - { name: --allow-no-checks, type: bool,            default: false } # reason-free by design: this op is non-mutating and records no durable decision, so there is no payload field to carry a reason. The mutating siblings (pr.merge, pr.deliver) do require one.
     validations: []
     behaviour: |
-      Polls pr.checks until every required check is terminal. Emits
-      a single envelope at the end. Maps results to exit code:
+      Polls pr.checks until every required check is terminal. An empty gating
+      set is NOT terminal (lock-down rule 8): the poll continues through the
+      provider's check-registration window instead of reading "nothing is
+      failing" as "everything passed". --allow-no-checks makes it terminal for
+      a project that configures none. Emits a single envelope at the end.
+      Maps results to exit code:
         all success         -> SUCCESS 0
         any failure         -> RUNTIME 1, error.kind=checks_failed
         cancelled/timed_out -> RUNTIME 1, error.kind=checks_failed
-        deadline reached    -> UNAVAILABLE 69, error.kind=checks_timeout
+        deadline reached,
+          checks were seen  -> UNAVAILABLE 69, error.kind=checks_timeout
+        deadline reached,
+          none ever seen    -> DATA 65, error.kind=checks_not_registered
+      On the checks_not_registered emission the envelope carries ok=false while
+      data.state is still "success" (the snapshot is reported verbatim), so
+      consumers must gate on ok / error.kind, not on data.state.
     backends: inherits-from-pr.checks
     output: inherits-from-pr.checks
 
@@ -1253,6 +1268,8 @@ macros:
       - { name: --review-convergence,        type: optional<bool>,              default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                         default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                   default: null }
+      - { name: --allow-no-checks,          type: bool,                         default: false } # requires --allow-no-checks-reason
+      - { name: --allow-no-checks-reason,   type: string,                       default: null }
       - { name: --test-first-evidence,      type: path,                         required: false } # forwarded to create and enforced on the adopt path when [test_first].require resolves true
     sequence:
       # Before dry-run/live branching and before provider access, validate
@@ -1272,7 +1289,11 @@ macros:
       # GitHub delivery starts required-only. When that snapshot reports zero
       # required checks but retains visible rows, the macro re-gates those rows
       # as all-checks and polls only if pending, using the same timeout budget.
-      # An empty visible set succeeds immediately; GitLab semantics are unchanged.
+      # A fully empty check set no longer succeeds: wait_checks treats it as
+      # non-terminal and, once the budget expires, fails DATA 65 with
+      # checks_not_registered (lock-down rule 8). This applies on GitLab too,
+      # where an MR with no pipeline reports the same empty snapshot.
+      # --allow-no-checks (+ reason) is the declared opt-out.
       - { step: wait_checks,        op: pr.wait-checks }
       - { step: ready,              op: pr.ready,  skip_when: "--no-merge" }
       - { step: merge,              op: pr.merge,  skip_when: "--no-merge" }

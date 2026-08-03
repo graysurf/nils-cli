@@ -150,12 +150,38 @@ fn review_loop_marker(with_open_finding: bool) -> String {
     .expect("review-loop marker")
 }
 
+/// One passing required check: enough for rule 8 to pass on its own merits, so
+/// tests aimed at the other gates are not silently riding on an empty snapshot.
+const ONE_REQUIRED_PASS_CHECKS: &str =
+    r#"[{"name":"ci","bucket":"pass","state":"COMPLETED","isRequired":true}]"#;
+
+/// What the provider reports for a head with no checks at all.
+const NO_CHECKS: &str = "[]";
+
 fn github_merge_stub_with_ledger(
     stub: &StubEnv,
     review_nodes: &str,
     thread_nodes: &str,
     reject_reviews: bool,
     ledger_marker: Option<String>,
+) -> String {
+    github_merge_stub_with_checks(
+        stub,
+        review_nodes,
+        thread_nodes,
+        reject_reviews,
+        ledger_marker,
+        ONE_REQUIRED_PASS_CHECKS,
+    )
+}
+
+fn github_merge_stub_with_checks(
+    stub: &StubEnv,
+    review_nodes: &str,
+    thread_nodes: &str,
+    reject_reviews: bool,
+    ledger_marker: Option<String>,
+    checks_json: &str,
 ) -> String {
     let merged = stub.tempdir.path().join("github-merged");
     let review_calls = stub.tempdir.path().join("review-calls");
@@ -202,7 +228,7 @@ case "$1 $2" in
   "repo view")
     printf '%s\n' '{{"name":"widgets","owner":{{"login":"acme"}},"url":"https://github.com/acme/widgets","defaultBranchRef":{{"name":"main"}},"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}'
     ;;
-  "pr checks") printf '%s\n' '[{{"name":"ci","bucket":"pass","state":"COMPLETED","isRequired":true}}]' ;;
+  "pr checks") printf '%s\n' '{checks_json}' ;;
   "api graphql")
     case "$*" in
       *"authorAssociation body createdAt"*) printf '%s\n' '{{"data":{{"viewer":{{"login":"maintainer"}},"repository":{{"pullRequest":{{"comments":{{"nodes":[{state_nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}' ;;
@@ -219,6 +245,7 @@ esac
         thread_nodes = thread_nodes,
         state_nodes = state_nodes,
         merged = merged.display(),
+        checks_json = checks_json,
     )
 }
 
@@ -1613,4 +1640,228 @@ fn pr_merge_gitlab_allow_unchecked_tasks_bypasses_gate_and_records_reason() {
         "e2e deferred to follow-up #814"
     );
     assert!(args_log.exists(), "bypassed merge must reach the backend");
+}
+
+/// Rule 8's absence half, end to end: the provider reports no checks for the
+/// head, and the merge is refused rather than passing on a vacuous "all
+/// required checks are green".
+#[test]
+fn pr_merge_github_refuses_a_head_with_no_checks_at_all() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let merged = stub.tempdir.path().join("github-merged");
+    let body = github_merge_stub_with_checks(&stub, "", "", true, None, NO_CHECKS);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "checks_not_registered");
+    assert!(
+        !merged.exists(),
+        "an unchecked head must never reach the provider merge"
+    );
+}
+
+/// The declared opt-out, and the only durable record that a merge happened
+/// without CI evidence.
+#[test]
+fn pr_merge_github_allow_no_checks_bypasses_rule_eight_and_records_the_reason() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let merged = stub.tempdir.path().join("github-merged");
+    let body = github_merge_stub_with_checks(&stub, "", "", true, None, NO_CHECKS);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence=false",
+            "--allow-no-checks",
+            "--allow-no-checks-reason",
+            "this repository configures no CI",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["no_checks_override_reason"],
+        "this repository configures no CI"
+    );
+    assert!(merged.exists(), "the bypassed merge must reach the backend");
+}
+
+/// The field is absent — not null, not empty — when the bypass was not used,
+/// so its presence is itself the audit signal.
+#[test]
+fn pr_merge_omits_the_no_checks_reason_when_the_bypass_was_not_used() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", "", true);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert!(
+        env["data"].get("no_checks_override_reason").is_none(),
+        "an ordinary merge must not carry an override record: {}",
+        out.stdout
+    );
+}
+
+/// `--allow-no-checks` cannot be used without stating why, matching the two
+/// sibling bypasses.
+#[test]
+fn pr_merge_allow_no_checks_requires_a_reason() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--allow-no-checks",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+}
+
+/// Rule 8 is provider-neutral, and on GitLab that is a behaviour change worth
+/// pinning: an MR whose head has no pipeline — no `.gitlab-ci.yml`, excluded by
+/// `workflow:rules`, or pipelines disabled on a fork — reports the same empty
+/// snapshot as an unregistered GitHub head, and is refused for the same reason.
+/// The deliver-side visible-row fallback is GitHub-only, so there is no
+/// mitigation here; `--allow-no-checks` is the declared way through.
+#[test]
+fn pr_merge_gitlab_refuses_an_mr_whose_head_has_no_pipeline() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let sentinel = stub.tempdir.path().join("merged");
+    let body = gitlab_merge_api_stub_full(&stub, "[]", "null").replace(
+        r#""head_pipeline": { "id": 99, "status": "success", "web_url": "https://gitlab.example.com/group/project/-/pipelines/99" }"#,
+        r#""head_pipeline": null"#,
+    );
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.example.com",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence=false",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "checks_not_registered");
+    assert!(!sentinel.exists(), "the merge must not reach the backend");
+}
+
+/// …and the opt-out works there too, which is what makes the refusal
+/// acceptable for projects that genuinely have no CI.
+#[test]
+fn pr_merge_gitlab_allow_no_checks_merges_an_mr_with_no_pipeline() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let sentinel = stub.tempdir.path().join("merged");
+    let body = gitlab_merge_api_stub_full(&stub, "[]", "null").replace(
+        r#""head_pipeline": { "id": 99, "status": "success", "web_url": "https://gitlab.example.com/group/project/-/pipelines/99" }"#,
+        r#""head_pipeline": null"#,
+    );
+    let stub = stub.glab_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.example.com",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence=false",
+            "--allow-no-checks",
+            "--allow-no-checks-reason",
+            "this project has no .gitlab-ci.yml",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["no_checks_override_reason"],
+        "this project has no .gitlab-ci.yml"
+    );
+    assert!(
+        sentinel.exists(),
+        "the bypassed merge must reach the backend"
+    );
 }

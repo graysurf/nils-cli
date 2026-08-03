@@ -116,7 +116,7 @@ pub fn ensure_required_checks_green<R: BackendRunner>(
 /// refusing them here would block every such repository. What must not pass is
 /// the case with no gating set *and* no rows to fall back to: then nothing ran,
 /// and nothing can be re-gated.
-pub fn nothing_was_checked(snapshot: &PrChecksPayload) -> bool {
+pub(crate) fn nothing_was_checked(snapshot: &PrChecksPayload) -> bool {
     snapshot.required_count == 0 && snapshot.checks.is_empty()
 }
 
@@ -351,6 +351,34 @@ mod tests {
         let result = classify(snap, CheckPresence::Required)
             .expect("visible checks mean the head was checked");
         assert_eq!(result.checks.len(), 2);
+    }
+
+    /// Pins a gap this rule does **not** close, so nobody reads the rule as
+    /// wider than it is.
+    ///
+    /// With `required_only`, a non-required row is not in `failed`, so a head
+    /// whose only visible check FAILED still reaches `Ok` here. `pr deliver`
+    /// catches it by re-gating the visible set — on GitHub only — but
+    /// standalone `pr merge` does not, on any provider. That predates this
+    /// change and is out of its scope; the test exists so the behaviour is
+    /// owned and a future fix has something to flip.
+    #[test]
+    fn a_failing_visible_row_with_no_required_checks_still_passes_the_gate() {
+        let mut snap = pass_snapshot();
+        snap.required_count = 0;
+        snap.success_count = 0;
+        for check in &mut snap.checks {
+            check.required = false;
+        }
+        snap.checks[0].state = "failure";
+
+        let result = classify(snap, CheckPresence::Required)
+            .expect("documented current behaviour, not an endorsement");
+        assert_eq!(result.checks[0].state, "failure");
+        assert!(
+            result.failed.is_empty(),
+            "a non-required failure never enters the gating set"
+        );
     }
 
     /// A repository that genuinely configures no checks must still be able to
