@@ -25,6 +25,12 @@ pub enum ReadError {
     Unavailable,
     Untrusted,
     Invalid,
+    /// The registry parsed as this schema family but declares a version this
+    /// release does not implement, so it was written by a different release
+    /// generation. This is recoverable version drift, not corruption; keeping it
+    /// distinct from [`ReadError::Invalid`] is what lets a consumer offer a
+    /// bounded upgrade-recovery path instead of a dead end.
+    Incompatible,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -47,6 +53,11 @@ pub struct BrokerProjection {
     pub coordination_mode: CoordinationMode,
     #[serde(default)]
     pub heartbeat_epoch: i64,
+    /// Release that produced this broker record. Absent for a broker created
+    /// before the field existed, which is compatibility state rather than
+    /// evidence of drift.
+    #[serde(default)]
+    pub binary_version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -119,7 +130,19 @@ pub fn load(state_dir: &Path) -> Result<Option<RegistryProjection>, ReadError> {
     if !matches!(
         projection.schema_version.as_str(),
         REGISTRY_VERSION | CLAIM_FENCE_REGISTRY_VERSION
-    ) || projection.fingerprint_epoch == 0
+    ) {
+        // A well-formed body in this schema family that declares an unknown
+        // version came from another release generation. Report drift so the
+        // consumer can offer recovery; anything else stays corruption.
+        if crate::runtime_compat::registry_generation_drift(
+            &projection.schema_version,
+            &[REGISTRY_VERSION, CLAIM_FENCE_REGISTRY_VERSION],
+        ) {
+            return Err(ReadError::Incompatible);
+        }
+        return Err(ReadError::Invalid);
+    }
+    if projection.fingerprint_epoch == 0
         || projection.fingerprint_key.len() < 32
         || projection
             .claims
@@ -311,6 +334,86 @@ mod tests {
                 "schema_version={schema_version}"
             );
         }
+    }
+
+    #[test]
+    fn another_registry_generation_is_incompatible_while_corruption_stays_invalid() {
+        for (body, expected) in [
+            (
+                serde_json::json!({
+                    "schema_version": "agent-session.coordination-registry.v9",
+                    "fingerprint_epoch": 1,
+                    "fingerprint_key": "k".repeat(32),
+                    "brokers": {},
+                    "claims": []
+                })
+                .to_string(),
+                ReadError::Incompatible,
+            ),
+            (
+                serde_json::json!({
+                    "schema_version": "agent-session.something-else.v1",
+                    "fingerprint_epoch": 1,
+                    "fingerprint_key": "k".repeat(32),
+                    "brokers": {},
+                    "claims": []
+                })
+                .to_string(),
+                ReadError::Invalid,
+            ),
+            ("{".to_string(), ReadError::Invalid),
+        ] {
+            let temporary = tempfile::TempDir::new().expect("temporary state");
+            let coordination = temporary.path().join("coordination");
+            fs::create_dir_all(&coordination).expect("coordination directory");
+            let path = coordination.join("registry.json");
+            fs::write(&path, body.as_bytes()).expect("registry");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure registry");
+
+            assert_eq!(
+                load(temporary.path()).expect_err("classified read failure"),
+                expected,
+                "body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_broker_release_is_projected_and_stays_optional_for_unpublished_records() {
+        let temporary = tempfile::TempDir::new().expect("temporary state");
+        let coordination = temporary.path().join("coordination");
+        fs::create_dir_all(&coordination).expect("coordination directory");
+        let registry = serde_json::json!({
+            "schema_version": REGISTRY_VERSION,
+            "fingerprint_epoch": 1,
+            "fingerprint_key": "k".repeat(32),
+            "brokers": {
+                "published": {
+                    "session_id": "published",
+                    "incarnation": "inc",
+                    "state": "ready",
+                    "binary_version": "1.25.13"
+                },
+                "unpublished": {
+                    "session_id": "unpublished",
+                    "incarnation": "inc",
+                    "state": "ready"
+                }
+            },
+            "claims": []
+        });
+        let path = coordination.join("registry.json");
+        fs::write(&path, serde_json::to_vec(&registry).expect("registry JSON")).expect("registry");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure registry");
+
+        let projection = load(temporary.path())
+            .expect("supported registry")
+            .expect("registry present");
+        assert_eq!(
+            projection.brokers["published"].binary_version.as_deref(),
+            Some("1.25.13")
+        );
+        assert_eq!(projection.brokers["unpublished"].binary_version, None);
     }
 
     #[test]

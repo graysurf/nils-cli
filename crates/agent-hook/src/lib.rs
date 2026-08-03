@@ -2,12 +2,14 @@ mod adapter;
 mod cli;
 mod completion;
 mod contract;
+mod degradation;
 mod degraded;
 mod effect;
 mod error;
 mod evaluator;
 mod liveness;
 mod model;
+mod observe;
 mod path_binding;
 mod paths;
 mod read_only;
@@ -306,11 +308,33 @@ fn run_dispatch(
     let started = Instant::now();
     let raw = match adapter::read_stdin() {
         Ok(raw) => raw,
-        Err(error) => return emit_dispatch_error(args.format, &error, None),
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "stdin",
+                started,
+                &error,
+                args.format,
+                None,
+                &[],
+            );
+        }
     };
     let mut request = match adapter::normalize(args.product, args.event.as_deref(), &raw) {
         Ok(request) => request,
-        Err(error) => return emit_dispatch_error(args.format, &error, None),
+        // Nothing downstream of here can describe this failure, so the plane has
+        // to record it from the stage that actually observed it.
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "normalize",
+                started,
+                &error,
+                args.format,
+                None,
+                &raw,
+            );
+        }
     };
     let unmanaged = liveness::current_process_is_unmanaged();
     let grant = match recovery::consume_for_dispatch(
@@ -319,14 +343,34 @@ fn run_dispatch(
         &request,
     ) {
         Ok(grant) => grant,
-        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "recovery",
+                started,
+                &error,
+                args.format,
+                Some(&request),
+                &raw,
+            );
+        }
     };
     let loaded = match contract::load(layout, policy_override) {
         Ok(loaded) => loaded,
         Err(_error) if !grant.rules.is_empty() => {
             let (decision, coordination_rule) = match emergency_decision(&request, &grant) {
                 Ok(result) => result,
-                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+                Err(error) => {
+                    return fail_dispatch(
+                        args.product,
+                        "recovery",
+                        started,
+                        &error,
+                        args.format,
+                        Some(&request),
+                        &raw,
+                    );
+                }
             };
             let decision = match evaluator::apply_session_coordination(
                 None,
@@ -341,26 +385,80 @@ fn run_dispatch(
                 ),
             ) {
                 Ok(decision) => decision,
-                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+                Err(error) => {
+                    return fail_dispatch(
+                        args.product,
+                        "coordination",
+                        started,
+                        &error,
+                        args.format,
+                        Some(&request),
+                        &raw,
+                    );
+                }
             };
-            return emit_decision(args.format, &decision);
+            let decision = degradation::apply_stop_reentry(&request, &raw, decision);
+            return complete_dispatch(args.format, started, &request, &decision);
         }
-        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "policy",
+                started,
+                &error,
+                args.format,
+                Some(&request),
+                &raw,
+            );
+        }
     };
     let prepared = match evaluator::prepare(&loaded, &request, args.shadow, &grant.rules) {
         Ok(prepared) => prepared,
-        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "policy",
+                started,
+                &error,
+                args.format,
+                Some(&request),
+                &raw,
+            );
+        }
     };
     let mut coordination_mode_override = None;
     let coordination = if prepared.needs_coordination() {
         match liveness::load_snapshot(unmanaged) {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => {
+                if let Some(snapshot) = snapshot.as_ref() {
+                    record_broker_release(&request, &raw, snapshot);
+                }
+                snapshot
+            }
             Err(error) => match liveness::coordination_failure_mode() {
                 Some(mode) => {
                     coordination_mode_override = Some(mode);
                     None
                 }
-                None => return emit_dispatch_error(args.format, &error, Some(&request)),
+                // The conversation and terminal lanes degrade instead of
+                // deadlocking; the mutation lane keeps its fail-closed posture.
+                None => match degradation::degraded_decision(Some(&loaded), &request, &raw, &error)
+                {
+                    Some(decision) => {
+                        return complete_dispatch(args.format, started, &request, &decision);
+                    }
+                    None => {
+                        return fail_dispatch(
+                            args.product,
+                            "coordination",
+                            started,
+                            &error,
+                            args.format,
+                            Some(&request),
+                            &raw,
+                        );
+                    }
+                },
             },
         }
     } else {
@@ -376,8 +474,19 @@ fn run_dispatch(
         unmanaged,
     ) {
         Ok(decision) => decision,
-        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+        Err(error) => {
+            return fail_dispatch(
+                args.product,
+                "evaluate",
+                started,
+                &error,
+                args.format,
+                Some(&request),
+                &raw,
+            );
+        }
     };
+    let decision = degradation::apply_stop_reentry(&request, &raw, decision);
     if args.trace
         && let Err(error) = trace::append(
             &layout.state_root,
@@ -386,9 +495,97 @@ fn run_dispatch(
             started.elapsed().as_micros(),
         )
     {
-        return emit_dispatch_error(args.format, &error, Some(&request));
+        return fail_dispatch(
+            args.product,
+            "trace",
+            started,
+            &error,
+            args.format,
+            Some(&request),
+            &raw,
+        );
     }
-    emit_decision(args.format, &decision)
+    complete_dispatch(args.format, started, &request, &decision)
+}
+
+/// Record the terminal dispatch outcome, then emit it.
+fn complete_dispatch(
+    format: DispatchFormat,
+    started: Instant,
+    request: &model::NormalizedRequest,
+    decision: &NormalizedDecision,
+) -> i32 {
+    observe::Record::new(
+        "dispatch",
+        "dispatch-completed",
+        observe::severity_for(decision.action),
+    )
+    .provider(request.product, &request.event)
+    .disposition(observe::disposition_for(decision.action))
+    .duration_ms(started.elapsed().as_millis() as u64)
+    .emit();
+    emit_decision(format, decision)
+}
+
+/// Record a failing dispatch stage, then emit its provider-appropriate error.
+///
+/// Every early exit routes through here so a hook that never reached a decision
+/// is still visible to `agent-session diagnose`.
+fn fail_dispatch(
+    product: Product,
+    stage: &str,
+    started: Instant,
+    error: &HookError,
+    format: DispatchFormat,
+    request: Option<&model::NormalizedRequest>,
+    raw: &[u8],
+) -> i32 {
+    let mut record = observe::Record::new(stage, &error.code, observe::Severity::Error)
+        .disposition("error")
+        .duration_ms(started.elapsed().as_millis() as u64);
+    record = match request {
+        Some(request) => record.provider(product, &request.event),
+        None => record,
+    };
+    if let Some(fault) = degradation::classify_fault(error) {
+        record = record.recovery(fault.recovery);
+    }
+    record.emit();
+    // Once the provider reports Stop re-entry, rendering a denial repeats a gate
+    // that already failed to converge. Terminate deterministically even for a
+    // fault this release does not classify.
+    if let Some(request) = request
+        && let Some(decision) = degradation::terminal_exit_for_error(request, raw, error)
+    {
+        return emit_decision(format, &decision);
+    }
+    emit_dispatch_error(format, error, request)
+}
+
+/// Record a live broker whose release crosses a generation boundary.
+fn record_broker_release(
+    request: &model::NormalizedRequest,
+    raw: &[u8],
+    snapshot: &liveness::Snapshot,
+) {
+    let Some(peer) = liveness::current_broker_release(snapshot) else {
+        return;
+    };
+    let skew = nils_common::runtime_compat::classify_release(env!("CARGO_PKG_VERSION"), peer);
+    if !skew.crosses_generation() {
+        return;
+    }
+    observe::Record::new(
+        "coordination",
+        "broker-release-skew",
+        observe::Severity::Warn,
+    )
+    .provider(request.product, &request.event)
+    .disposition(skew.as_str())
+    .peer_version(peer)
+    .correlate(request.product, raw)
+    .recovery(observe::RECOVERY_BROKER_RECONCILE)
+    .emit();
 }
 
 fn run_recovery(

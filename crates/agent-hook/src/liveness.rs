@@ -206,7 +206,31 @@ pub fn load_snapshot(unmanaged: bool) -> Result<Option<Snapshot>, HookError> {
                 "coordination-invalid",
                 "coordination registry schema or projection is invalid",
             ),
+            // Drift across a release boundary is recoverable, so it carries its
+            // own code and a bounded next action instead of reading as
+            // corruption. Mutation still fails closed on it.
+            coordination_projection::ReadError::Incompatible => HookError::data_with(
+                crate::degradation::RUNTIME_VERSION_SKEW,
+                "coordination registry was written by a different release generation",
+                serde_json::json!({
+                    "recovery_action": crate::observe::RECOVERY_BROKER_RECONCILE,
+                }),
+            ),
         })
+}
+
+/// Release published by the current principal's live broker, when both the
+/// principal and the record are known.
+///
+/// A broker that predates the field returns `None`: that is compatibility
+/// state, not evidence that a boundary was crossed.
+pub fn current_broker_release(snapshot: &Snapshot) -> Option<&str> {
+    let principal = CurrentPrincipal::from_env()?;
+    let broker = snapshot.registry.brokers.get(&principal.session_id)?;
+    if broker.incarnation != principal.incarnation {
+        return None;
+    }
+    broker.binary_version.as_deref()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

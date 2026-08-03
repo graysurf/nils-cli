@@ -52,6 +52,10 @@ above.
   optional matcher, bounded target/command/snapshot digests, and public boolean
   facts. Raw prompts, tool input, command strings, paths, session IDs, mailbox
   bodies, environment values, and provider payload fragments are never stored.
+  The provider's own Stop re-entry marker (`stop_hook_active`) is projected into
+  one public boolean fact. It is trusted in exactly one direction: `true` may end
+  a turn that is already looping, and it can never grant authority, release a
+  claim, or downgrade a proven owner.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, and config /
   policy digests.
@@ -76,6 +80,15 @@ above.
 - `agent-hook.owner-liveness.v1`: only classification (`active`, `stale`,
   `orphaned`, `unknown`, or `unclaimed`), semantic conflict class, and
   content-free reason codes.
+- `agent-session.observation.v1`: the centralized control-plane event plane.
+  Dispatch records exactly one terminal event per invocation — including
+  outcomes that fail before normalization or policy load — plus non-terminal
+  events for a degraded lane, a terminal Stop exit, a crossed broker release
+  boundary, and a discarded helper override. Recording is unconditional rather
+  than gated behind `--trace`, is independent of any daemon, broker, or
+  capability, and is best-effort so it can never block a session. Schema,
+  privacy budget, spool bounds, and the diagnostic bundle are normative in
+  `agent-session/docs/specs/control-plane-observation-v1.md`.
 
 Service JSON uses the workspace envelope: `schema_version`, `ok`, then `data`;
 failures contain `error.code`, `error.message`, and
@@ -328,6 +341,76 @@ reconciliation after the provider runner exits. Codex `Stop` renders this
 normalized warning as the provider-native neutral `{}` response because that
 event does not support additional context; Claude `Stop` retains its supported
 warning context.
+
+## Interaction lanes and degradation
+
+A capability that cannot prove itself must not admit arbitrary mutation, and it
+must also not take the whole session with it. Every canonical event belongs to one
+lane, and a typed runtime fault is handled per lane:
+
+| Lane | Events | Behavior on a typed runtime fault |
+| --- | --- | --- |
+| conversation | `UserPromptSubmit`, `SessionStart` | degrade to read-only with `coordination-degraded-read-only` |
+| terminal | `Stop`, `StopFailure` | terminal warning with reconciliation-pending evidence |
+| mutation | every other event | unchanged fail-closed posture |
+
+Only faults with a known recovery path are degradable:
+`coordination-unavailable`, `coordination-untrusted`, `coordination-invalid`,
+`runtime-version-skew`, and `activity-helper-unresolvable`. An unrecognized error
+keeps the existing fail-closed handling rather than being degraded on a guess.
+
+A degraded decision carries the fault code first, then the lane code, so
+diagnostics keep the precise cause. Its human context states one primary
+diagnosis and one safe next action instead of a comma-separated list of every
+selected policy; the full reason list remains available in `--format json` and on
+the `agent-session.observation.v1` plane.
+
+Degrading the conversation lane acquires no new authority: the prompt is admitted
+as text, every mutation stays gated, and the original prompt is neither lost nor
+executed more than once because the turn correlation digest bounds replay.
+
+The terminal lane has two degradations. A coordination transaction that cannot
+run at all returns `coordination-stop-reconciliation-required`, mirroring the
+existing `activity-stop-reconciliation-required` boundary — without it the first
+Stop delivery deadlocks before provider re-entry metadata can help. Separately,
+when the provider reports Stop re-entry and the aggregate still blocks, the
+decision becomes a warning with `stop-reentry-reconciliation-pending`: re-entry
+proves the previous block changed nothing the gate awaits, so blocking again only
+consumes the provider's consecutive-block budget. Neither degradation releases or
+alters claims, leases, operations, brokers, worktrees, or session state; every
+original reason is retained on the decision and the evidence is durable, so
+mutation stays gated until an external reconciliation runs.
+
+## Release compatibility
+
+A coordination registry written by a different release generation of the same
+schema family is recoverable version drift, reported as `runtime-version-skew`
+with a bounded `recovery_action` in its error details. A body that does not parse,
+or that belongs to another schema family, remains `coordination-invalid`. Mutation
+still fails closed on drift; the conversation lane degrades so the recovery can be
+requested.
+
+Broker records publish the release that created them. A minor or major difference
+from the dispatching binary is recorded as `broker-release-skew` on the
+observation plane with the peer release and its recovery action. A patch-level
+difference and an unpublished release are not drift.
+
+## Activity helper resolution
+
+`AGENT_SESSION_BIN` outranks `PATH`, so a stale value inherited from a
+long-lived tmux server survived the relocation the `PATH` pin was added to
+prevent. An override that does not resolve to an executable regular file is
+therefore treated as absent, and the daemon-pinned `PATH` decides instead. This is
+a deliberate change to a fail-closed boundary rather than a downgrade: anyone able
+to set `AGENT_SESSION_BIN` can already set `PATH`, and the pinned `PATH` is
+daemon-controlled. The discarded override is recorded as
+`activity-helper-unresolvable` so it cannot silently mask a misconfiguration, and
+an empty assignment is the normalized "resolve through the pinned `PATH`" value.
+
+Ingress registration is not capability health. When the selected policy binds
+`agent-session.activity.v1`, `doctor` resolves the helper to an executable file
+through the override or `PATH` before reporting an otherwise converged provider as
+healthy, and fails with `activity-helper-unresolvable` when it cannot.
 
 Rule modes are `enforce`, `shadow`, and `disabled`. Shadow evaluation records
 only a redacted observation: it cannot affect exit status/output authority,

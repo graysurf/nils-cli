@@ -149,6 +149,7 @@ pub fn normalize(
         // Provider payload fields are untrusted and deliberately ignored. The
         // dispatcher replaces this with a #676 registry-derived projection.
         semantic_conflict: None,
+        stop_reentry: stop_reentry(object),
         target_paths,
         execution_path,
         binding_roots,
@@ -452,6 +453,19 @@ pub fn normalize_activity_event(
             "metadata-only activity event could not be rendered",
         )
     })
+}
+
+/// Project the provider's own Stop re-entry marker into a public boolean fact.
+///
+/// This is the only Stop field that is trusted from the payload, and it is
+/// trusted in exactly one direction: `true` can end a turn that is already
+/// looping, and it can never grant authority or downgrade a proven owner. A
+/// non-boolean or absent value stays `None` so the ordinary posture applies.
+fn stop_reentry(object: &Map<String, Value>) -> Option<bool> {
+    object
+        .get("stop_hook_active")
+        .or_else(|| object.get("stop_hook_reentry"))
+        .and_then(Value::as_bool)
 }
 
 fn string_at<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
