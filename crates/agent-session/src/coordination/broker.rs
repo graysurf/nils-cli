@@ -321,6 +321,7 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
                 .map(|runtime| runtime.identity_digest.clone())
                 .unwrap_or_default(),
             lost_since_epoch: None,
+            binary_version: Some(super::broker_binary_version()),
         },
     );
     if let Err(error) = locked.save() {

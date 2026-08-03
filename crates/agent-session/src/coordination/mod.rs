@@ -102,6 +102,20 @@ pub(crate) struct BrokerRecord {
     pub runtime_identity_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lost_since_epoch: Option<i64>,
+    /// Release that created this broker record.
+    ///
+    /// A live upgrade can leave a consumer reading state an older producer wrote
+    /// (`sympoies/nils-cli#1409`). Publishing the producing release is what lets
+    /// the consumer classify that as recoverable version drift instead of
+    /// reporting corruption. Absent on a record written before this field
+    /// existed, which is compatibility state rather than drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<String>,
+}
+
+/// Release published into broker records created by this binary.
+pub(crate) fn broker_binary_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3455,6 +3469,7 @@ mod tests {
                 runtime_identity: None,
                 runtime_identity_digest: String::new(),
                 lost_since_epoch: None,
+                binary_version: Some(broker_binary_version()),
             },
         );
         {
