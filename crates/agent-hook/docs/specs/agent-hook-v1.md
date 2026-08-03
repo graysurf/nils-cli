@@ -328,6 +328,17 @@ limit. Identical replacements coalesce. Different replacements are an explicit
 posture is typed per rule (`open`, `warn`, or `closed`), while locked privacy,
 writer, transaction, and recovery rules must be `closed`.
 
+An executable capability is judged by its exit status and its output, never by
+how much of its stdin it chose to read. A capability that exits before draining
+the delivered payload closes the read end, and the runner's remaining write
+returns `EPIPE`; that is the child's decision and is not a capability failure.
+The runner returns promptly with the child's own result instead of blocking to
+the timeout, and a capability that stops reading and then fails still takes its
+rule's failure posture. Scoring the broken pipe as a failure made a `closed`
+plus `locked` rule deny at random, because whether the child won the race
+depended on machine load, and a `locked` rule offers no override to recover
+with.
+
 `agent-session.activity.v1` retains one terminal-only degradation boundary.
 Failure to record a `Stop` observation returns the stable warning
 `activity-stop-reconciliation-required` instead of denying provider

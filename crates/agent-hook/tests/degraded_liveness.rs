@@ -1,7 +1,7 @@
 //! Regression coverage for the fail-closed liveness defect in
 //! `sympoies/nils-cli#1409`.
 //!
-//! Two confirmed deadlocks are reproduced here:
+//! Three confirmed defects are reproduced here:
 //!
 //! 1. A coordination subsystem failure blocked `UserPromptSubmit`, so the user
 //!    could not even ask what was wrong. Plain conversation has to survive in a
@@ -10,6 +10,10 @@
 //!    consecutive-block cap force-terminated the turn. Provider re-entry
 //!    metadata has to produce one deterministic terminal result that still
 //!    retains the claim/lease for external reconciliation.
+//! 3. A capability that exited before draining its stdin was scored as a failed
+//!    capability, so a `closed` plus `locked` rule denied at random depending on
+//!    machine load (`sympoies/nils-cli#1420`). Whether a child read its input is
+//!    not a verdict; its exit status is.
 
 mod support;
 
@@ -421,6 +425,112 @@ fn coordination_failure_on_stop_degrades_instead_of_deadlocking() {
             reason_codes(&decision)
                 .contains(&"coordination-stop-reconciliation-required".to_string()),
             "{product} missing the coordination Stop degradation: {decision}"
+        );
+    }
+}
+
+/// One enforced handler on `SessionStart`, fail-closed and locked, so a spurious
+/// failure has nowhere to go but a block the session cannot override.
+const HANDLER_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.session-start"
+products = ["codex", "claude"]
+events = ["SessionStart"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }
+"#;
+
+/// Install a `SessionStart` handler and return a payload too large to fit in the
+/// pipe buffer, so the parent's write is still pending when the handler runs.
+fn stdin_closing_handler(fixture: &Fixture, body: &str) -> String {
+    for provider in [".codex/hooks", ".claude/hooks"] {
+        let hooks = fixture.home.join(provider);
+        fs::create_dir_all(&hooks).expect("hooks directory");
+        let handler = hooks.join("session-start-healthcheck.sh");
+        fs::write(&handler, body).expect("handler");
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+    }
+    // A pipe holds 64 KiB by default, so a smaller payload would be buffered
+    // whole and the race would never be observable. 128 KiB stays well inside
+    // the 1 MiB provider input limit.
+    let padding = "p".repeat(128 * 1024);
+    format!(r#"{{"hook_event_name":"SessionStart","source":"startup","padding":"{padding}"}}"#)
+}
+
+/// A capability that exits without draining its stdin is not a failed
+/// capability. The remaining write returns `EPIPE`, and counting that as an
+/// input failure turned this fail-closed locked rule into a block the session
+/// could not override — at random, because whether the child won the race
+/// depended on machine load. Six tests in this crate flaked on it under
+/// parallel load, each recovering on retry, so the suite hid it.
+/// See `sympoies/nils-cli#1420`.
+#[test]
+fn a_capability_that_stops_reading_stdin_is_judged_by_its_exit_status() {
+    let fixture = Fixture::new(HANDLER_POLICY);
+    let payload = stdin_closing_handler(
+        &fixture,
+        // Close the read end, hold it closed while the parent is still writing,
+        // then answer. `sleep` is what makes the EPIPE deterministic rather than
+        // load-dependent; the defect it pins is the same one.
+        "#!/bin/sh\nexec 0<&-\nsleep 0.3\nprintf '{}\\n'\n",
+    );
+
+    for product in ["codex", "claude"] {
+        let started = fixture.run_with_env(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(&payload),
+            &managed_env(),
+        );
+        assert_eq!(
+            started.code,
+            0,
+            "{product} must not fail-close on a handler that closed its stdin: stdout={} stderr={}",
+            started.stdout_text(),
+            started.stderr_text()
+        );
+        let decision = started.stdout_json();
+        assert_eq!(
+            decision["data"]["action"], "allow",
+            "{product} must honour the handler's own verdict: {decision}"
+        );
+        assert!(
+            !reason_codes(&decision)
+                .iter()
+                .any(|code| code.ends_with("capability-failure-closed")),
+            "{product} recorded a capability failure for a handler that succeeded: {decision}"
+        );
+    }
+}
+
+/// The tolerance is scoped to the pipe, not to the verdict: a handler that stops
+/// reading and then fails must still fail-close, or the fix above would have
+/// turned every early-exiting failure into an allow.
+#[test]
+fn a_capability_that_stops_reading_stdin_and_then_fails_still_fails_closed() {
+    let fixture = Fixture::new(HANDLER_POLICY);
+    let payload = stdin_closing_handler(&fixture, "#!/bin/sh\nexec 0<&-\nsleep 0.3\nexit 3\n");
+
+    for product in ["codex", "claude"] {
+        let started = fixture.run_with_env(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(&payload),
+            &managed_env(),
+        );
+        let decision = started.stdout_json();
+        assert_eq!(
+            decision["data"]["action"], "block",
+            "{product} must still fail-close a handler that failed: {decision}"
+        );
+        assert!(
+            reason_codes(&decision)
+                .contains(&"runtime.session-start:capability-failure-closed".to_string()),
+            "{product} lost the fail-closed classification: {decision}"
         );
     }
 }

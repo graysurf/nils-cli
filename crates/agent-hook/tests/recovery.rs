@@ -3,7 +3,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -231,6 +231,33 @@ fn authorize_for_target(
             .expect("capability id")
             .to_string(),
     }
+}
+
+/// Mint a capability with a TTL short enough to expire during the test, then wait
+/// for it to expire.
+///
+/// The TTL bounds the challenge, and `authorize` runs in a second process, so
+/// minting has to finish inside the very window the test wants to outlive. Under
+/// full-workspace load two process spawns can exceed a one-second TTL, and
+/// `authorize` then rejects its own setup as expired — surfacing as exit 65 from
+/// `authorize` instead of the `capability-expired` this exists to assert.
+///
+/// Re-minting is the fix rather than a longer TTL, because the delay is unbounded:
+/// what is under test is that consume rejects an expired capability, not how fast
+/// the harness can mint one. Expiry stays real and is never simulated; there is
+/// deliberately no clock override on this path. See `sympoies/nils-cli#1420`.
+fn authorize_then_expire(fixture: &Fixture, name: &str, scope: &str) -> Authorized {
+    const TTL: Duration = Duration::from_secs(2);
+    for attempt in 0..5 {
+        let minted = Instant::now();
+        let authorized = authorize(fixture, &format!("{name}-{attempt}"), scope, "2", &[]);
+        let elapsed = minted.elapsed();
+        if elapsed < TTL {
+            thread::sleep(TTL - elapsed + Duration::from_millis(100));
+            return authorized;
+        }
+    }
+    panic!("minting a {TTL:?} capability never finished inside its own TTL in five attempts");
 }
 
 fn dispatch(
@@ -642,8 +669,7 @@ fn one_shot_rejects_binding_drift_revocation_expiry_key_rotation_and_unsafe_mode
         "capability-replay-or-revoked"
     );
 
-    let expired = authorize(&fixture, "expired", "one-shot", "1", &[]);
-    thread::sleep(Duration::from_millis(1_100));
+    let expired = authorize_then_expire(&fixture, "expired", "one-shot");
     let rejected = dispatch(&fixture, &expired, &[]);
     assert_eq!(rejected.code, 65);
     assert_eq!(
