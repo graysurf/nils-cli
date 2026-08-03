@@ -873,6 +873,10 @@ fn observe_help_documents_both_findings_file_shapes_and_the_combined_outcome() {
         "--body-file",
         "forge-cli review ledger",
         "outcome_posted",
+        // The combined form is only correct for a single-shot outcome; a caller
+        // must be able to learn that without reading the spec.
+        "APPLICABILITY",
+        "REFRESH",
     ] {
         assert!(
             out.stdout.contains(expected),

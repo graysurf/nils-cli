@@ -942,7 +942,13 @@ pub struct PrReviewLoopInspectArgs {
       a post-write read-back, never assumed from the flag. A durable hard-stop \
       receipt is always appended without an outcome body.\n  \
       --body-file - consumes stdin once, so do not pipe the same body into a \
-      --dry-run and then a live run.\n\n\
+      --dry-run and then a live run.\n  \
+      APPLICABILITY: use the combined form only when the outcome is decided once \
+      and never revised. A ledger record is immutable and an append is \
+      conditional, so a workflow that must post its outcome after repairs and \
+      REFRESH it on retry has no append to carry the revision and should keep the \
+      outcome as its own comment — the visible metadata line above already stops \
+      ledger comments from rendering blank.\n\n\
       With --dry-run this runs a faithful non-mutating preflight: it reads and \
       validates the findings payload and any outcome body, resolves the pull \
       request, performs the head and state-tip CAS comparisons, evaluates the \

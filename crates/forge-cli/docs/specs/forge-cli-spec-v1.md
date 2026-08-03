@@ -669,6 +669,20 @@ backend mapping, validation rules, and output schema versions.
   record's marker and this outcome, and a durable record whose outcome is not
   visible fails as `review_outcome_not_posted`. A durable hard-stop receipt is
   always appended without an outcome body.
+- Applicability is narrow and deliberate. The combined form fits a caller whose
+  delivery outcome is decided once and never revised, because a ledger record is
+  immutable and an append is conditional: an unchanged observation has no append
+  to carry a revised outcome. It does NOT fit a workflow whose outcome must be
+  posted after repairs and refreshed on retry — there the outcome is a mutable
+  artifact and the ledger is not, so welding them either fails closed, appends a
+  semantically empty generation per refresh, or leaves a stale outcome beside a
+  newer one. `agent-runtime-kit`'s delivery skills are in that second category:
+  their posting-order contract requires the disposition to post last and to be
+  refreshed on merge-convergence retries, so they keep the outcome as its own
+  comment by design. They still benefit from the visible metadata line above,
+  which is what stops a ledger comment from rendering blank. Do not adopt the
+  combined form in a workflow without first checking that its outcome is
+  single-shot.
 - Observation-array rows may include `status` or `disposition` with `open`,
   `fixed`, `accepted`, `preference`, or `follow-up`. Terminal dispositions are
   durable and non-blocking. Omitting an open finding or changing its blocking
