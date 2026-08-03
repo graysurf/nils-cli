@@ -277,9 +277,16 @@ Semantic Commit validation applies to `semantic-commit commit` message input:
 - Body and trailer lines must be at most `100` characters.
 - Git trailers may appear after the header or after a blank separator
   following bullet body lines.
-- Blocked message rules reject known unwanted agent attribution text, including
-  `Co-Authored-By: Claude ...` trailers from either message input or
-  `--trailer`.
+- Blocked message rules reject known unwanted agent attribution text from either
+  message input or `--trailer`:
+  - `claude-coauthor-trailer`: a `Co-Authored-By` trailer whose value names the
+    model family or carries `noreply@anthropic.com`.
+  - `claude-generated-marker`: a generator marker line (`Generated with …`
+    prose, or a `claude.com/claude-code` / `claude.ai/code` link).
+  Both forms are defined in `nils_common::agent_attribution` and shared with
+  `forge-cli`'s Rule 17, so the commit path and the provider path cannot
+  diverge. The commit scan is verbatim — unlike the markdown payload scan it has
+  no code-span exemption, so attribution cannot hide behind backticks.
 
 `fixup` and `squash` do not use this header validation because git generates
 subjects prefixed with `fixup!` or `squash!`.

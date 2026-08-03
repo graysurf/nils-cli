@@ -60,7 +60,11 @@ pub fn markdown_payload_violations(markdown: &str) -> Vec<MarkdownPayloadViolati
 /// replaced with a space (and skipped fenced lines with a newline) so that
 /// neighbouring characters cannot glue into a literal `\n`-style sequence that
 /// was not present in the source.
-fn strip_code_segments(markdown: &str) -> String {
+///
+/// Line count is preserved, so a scan over the stripped text can report line
+/// numbers that still index the original markdown. Shared with
+/// [`crate::agent_attribution`], which needs the same prose-only view.
+pub fn strip_code_segments(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut open_fence: Option<(char, usize)> = None;
 

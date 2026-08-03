@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use nils_common::cli_contract::schema_version_for;
-use nils_common::{markdown, provider_payload};
+use nils_common::{agent_attribution, markdown, provider_payload};
 use serde::Serialize;
 
 use crate::cli::BINARY;
@@ -341,6 +341,32 @@ pub fn no_local_path(text: &str, field: &str) -> Result<(), ForgeError> {
     ))
 }
 
+/// Rule 17 — posted text (title / body / comment) MUST NOT carry agent
+/// self-attribution: a generator marker line (`Generated with …` plus its
+/// claude-code link) or a co-author trailer naming the model or its vendor
+/// no-reply address. The forms are defined once in
+/// [`nils_common::agent_attribution`], shared with `semantic-commit`'s
+/// `claude-coauthor-trailer` / `claude-generated-marker` blocked-message rules,
+/// so the commit path and the provider path cannot diverge — and so the rule
+/// holds regardless of whether the calling agent runtime declares a matching
+/// harness hook of its own. Text *about*
+/// the rule is allowed: fenced blocks and inline code spans are stripped before
+/// the scan. `field` names the offending input without echoing the marker; the
+/// `detail` enumerates each offending line plus its fix. Set
+/// `FORGE_CLI_ALLOW_AGENT_ATTRIBUTION=1` to bypass a verified false positive.
+pub fn no_agent_attribution(text: &str, field: &str) -> Result<(), ForgeError> {
+    let err = match agent_attribution::validate_no_agent_attribution(text, field) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    Err(ForgeError::validation(
+        schema(),
+        agent_attribution::AGENT_ATTRIBUTION_ERROR_KIND,
+        err.message(),
+        Some(err.detail()),
+    ))
+}
+
 /// Escaped-control markdown guard — posted text (title / body / comment) MUST
 /// NOT embed literal escaped-control artifacts (`\n`, `\r`, `\t`) in prose or
 /// structure. These usually mean a payload was double-escaped before being
@@ -506,7 +532,7 @@ pub struct PreflightInputs<'a> {
     pub headings: &'a BodyHeadings,
 }
 
-/// Evaluate the non-mutating lock-down rules (1a, 1b, 3, 2a, 2b, 4, 5)
+/// Evaluate the non-mutating lock-down rules (1a, 1b, 3, 2a, 2b, 4, 5, 11, 17)
 /// without returning early on the first failure, collecting a per-rule
 /// verdict for each. This is the faithful-preflight runner behind
 /// `pr deliver --dry-run`: it never invokes a provider backend, only local
@@ -523,7 +549,7 @@ where
     FS: FnOnce(&Path) -> Result<String, ForgeError>,
     FH: FnOnce(&Path, &str) -> Result<HeadState, ForgeError>,
 {
-    let mut verdicts = Vec::with_capacity(9);
+    let mut verdicts = Vec::with_capacity(11);
 
     // Rule 1a — branch name. Capture the prefix for Rule 1b.
     let branch_result = branch_name(inputs.branch);
@@ -554,6 +580,12 @@ where
         no_local_path(inputs.title, "title"),
     ));
 
+    // Rule 17 (title) — no agent self-attribution in the title.
+    verdicts.push(RuleVerdict::from_result(
+        "title_agent_attribution",
+        no_agent_attribution(inputs.title, "title"),
+    ));
+
     // Rules 2a / 2b — body sections, reported individually so the preflight
     // surfaces every missing section at once.
     verdicts.push(RuleVerdict::from_result(
@@ -569,6 +601,12 @@ where
     verdicts.push(RuleVerdict::from_result(
         "body_local_path",
         no_local_path(inputs.body, "body"),
+    ));
+
+    // Rule 17 (body) — no agent self-attribution in the body.
+    verdicts.push(RuleVerdict::from_result(
+        "body_agent_attribution",
+        no_agent_attribution(inputs.body, "body"),
     ));
 
     // Rule 4 — clean worktree (local git read).
@@ -1021,7 +1059,7 @@ mod tests {
             headings: &headings,
         };
         let verdicts = run_local_preflight(&inputs, Path::new("."), clean_status, pushed_head);
-        assert_eq!(verdicts.len(), 9);
+        assert_eq!(verdicts.len(), 11);
         assert!(verdicts.iter().all(|v| v.ok), "{verdicts:?}");
     }
 
@@ -1130,6 +1168,61 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn no_agent_attribution_accepts_clean_text() {
+        no_agent_attribution("## Summary\n\nfix the thing\n", "body").expect("clean body");
+        no_agent_attribution("fix(core): drop the stale gate", "title").expect("clean title");
+        no_agent_attribution("", "body").expect("empty");
+    }
+
+    #[test]
+    fn no_agent_attribution_rejects_generator_marker() {
+        let err = no_agent_attribution(
+            "## Summary\n\nfix it\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+            "body",
+        )
+        .expect_err("generator marker");
+        assert_eq!(err.kind(), "agent_attribution_present");
+        assert!(
+            err.message().starts_with("body contains 1"),
+            "{}",
+            err.message()
+        );
+        let detail = err.detail().expect("detail present");
+        assert!(
+            detail.contains("line 5: agent generator marker"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("FORGE_CLI_ALLOW_AGENT_ATTRIBUTION"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn no_agent_attribution_rejects_coauthor_trailer() {
+        let err = no_agent_attribution(
+            "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+            "comment",
+        )
+        .expect_err("coauthor trailer");
+        assert_eq!(err.kind(), "agent_attribution_present");
+        let detail = err.detail().expect("detail present");
+        assert!(
+            detail.contains("line 1: agent co-author trailer"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn no_agent_attribution_allows_documenting_the_rule_in_code_spans() {
+        no_agent_attribution(
+            "## Summary\n\nReject `Co-Authored-By: Claude ...` trailers on the egress path.\n",
+            "body",
+        )
+        .expect("code span exempt");
     }
 
     #[test]

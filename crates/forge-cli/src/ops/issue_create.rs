@@ -22,7 +22,9 @@ use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::{no_escaped_control_markdown, no_local_path, title_length};
+use crate::validations::{
+    no_agent_attribution, no_escaped_control_markdown, no_local_path, title_length,
+};
 
 const SCHEMA: &str = "issue.create";
 const SCHEMA_VERSION: u32 = 1;
@@ -66,9 +68,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     )?;
     title_length(&args.title)?;
     no_local_path(&args.title, "title")?;
+    no_agent_attribution(&args.title, "title")?;
     no_escaped_control_markdown(&args.title)?;
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
     no_local_path(&body, "body")?;
+    no_agent_attribution(&body, "body")?;
     no_escaped_control_markdown(&body)?;
     let body_tempfile = write_body_tempfile(&body)?;
     let body_path = body_tempfile.path().to_path_buf();

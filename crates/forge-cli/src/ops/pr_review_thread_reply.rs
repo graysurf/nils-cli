@@ -23,7 +23,7 @@ use crate::ops::pr_comment::read_body;
 use crate::ops::pr_review_threads;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::no_local_path;
+use crate::validations::{no_agent_attribution, no_local_path};
 
 const SCHEMA: &str = "pr.review-threads.reply";
 const SCHEMA_VERSION: u32 = 1;
@@ -75,6 +75,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
     no_local_path(&body, "reply")?;
+    no_agent_attribution(&body, "reply")?;
 
     let call = build_reply_call(&ctx, &args.thread, &body);
 

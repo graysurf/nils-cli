@@ -22,6 +22,7 @@
 //! → Resolved Decision #9.
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
 
+pub mod agent_attribution;
 pub mod cli_contract;
 pub mod clipboard;
 pub mod coordination_projection;

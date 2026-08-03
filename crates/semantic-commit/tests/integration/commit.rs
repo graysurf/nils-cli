@@ -472,6 +472,110 @@ fn commit_validate_only_allows_claude_as_part_of_longer_word() {
     );
 }
 
+#[test]
+fn commit_validate_only_rejects_vendor_noreply_coauthor_trailer() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing",
+            "--trailer",
+            "Co-Authored-By: Some Agent <noreply@anthropic.com>",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("blocked by rule `claude-coauthor-trailer`"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_rejects_generator_marker_in_message() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing\n\n- Ship the thing\n\nX-Origin: https://claude.com/claude-code",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("blocked by rule `claude-generated-marker`"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("source: message line 5"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_rejects_generator_marker_trailer_flag() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing",
+            "--trailer",
+            "X-Origin: https://claude.ai/code",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = as_str(&output.stderr);
+    assert!(
+        stderr.contains("blocked by rule `claude-generated-marker`"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("source: --trailer #1"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn commit_validate_only_allows_unrelated_agent_prose() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let output = common::run_semantic_commit_output(
+        dir.path(),
+        &[
+            "commit",
+            "--validate-only",
+            "--message",
+            "feat(core): add thing\n\n- Reject agent attribution markers on both egress paths",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+}
+
 fn header_with_total_len(total_len: usize) -> String {
     let prefix = "feat: ";
     assert!(total_len > prefix.len());

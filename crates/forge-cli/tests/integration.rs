@@ -3,6 +3,7 @@
 
 mod integration {
     mod activity;
+    mod agent_attribution_guard;
     mod auth_status;
     mod cli;
     mod completion_sync;

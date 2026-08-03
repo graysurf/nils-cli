@@ -43,6 +43,10 @@ validations_catalog:
     rule: "posted title/body/comment text must not embed a machine-local home path (/Users/<owner>/... or /home/<owner>/...); diagnostics name the source and line with a $HOME-relative fix without echoing the original path; allowlist /home/agent, /home/linuxbrew, /home/runner; bypass with FORGE_CLI_ALLOW_LOCAL_PATH=1"
     error_kind: local_path_present
     exit: DATA
+  no_agent_attribution:
+    rule: "posted title/body/comment text must not carry agent self-attribution: a generator marker (Generated with ... prose, claude.com/claude-code or claude.ai/code link) or a Co-Authored-By trailer naming the model family or noreply@anthropic.com; fenced blocks and inline code spans are stripped first so documenting the rule is allowed; forms shared with semantic-commit's claude-coauthor-trailer / claude-generated-marker rules; bypass with FORGE_CLI_ALLOW_AGENT_ATTRIBUTION=1"
+    error_kind: agent_attribution_present
+    exit: DATA
   worktree_clean:
     rule: "git status --porcelain is empty"
     error_kind: dirty_worktree
@@ -188,6 +192,7 @@ operations:
       - branch_kind_matches
       - title_length
       - no_local_path # title + body
+      - no_agent_attribution # title + body
       - body_summary
       - body_test_plan
       - label_catalog # only when --strict-labels is set
@@ -273,6 +278,7 @@ operations:
     validations:
       - title_length   # when --title supplied
       - no_local_path  # title when --title; body when --body / --body-file
+      - no_agent_attribution # title when --title; body when --body / --body-file
       - body_summary   # when --body or --body-file supplied
       - body_test_plan # when --body or --body-file supplied
     backends:
@@ -288,6 +294,7 @@ operations:
       - { name: --body-file, type: path,    required: false }
     validations:
       - no_local_path # comment body
+      - no_agent_attribution # comment body
     backends:
       github: { program: gh,   argv: [pr, comment, "{id}", --body, "{body_or_file}"] }
       gitlab: { program: glab, argv: [mr, note,    "{id}", --message, "{body_or_file}"] }
@@ -308,6 +315,7 @@ operations:
       - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review; max 256 KiB, 50 specs, 1024-byte paths, 16 KiB bodies. Use only for findings that should be repaired then resolved via pr review-threads resolve.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
+      - no_agent_attribution # review comment body, thread spec bodies, AND the generated issue mirror, validated before any post (thread paths carry no prose)
       - no_escaped_control_markdown # review comment body, thread spec bodies/paths, AND the generated issue mirror, validated before any post
     # Op-specific error kinds:
     #   issue_required (DATA 65)       — --mirror-issue without --issue
@@ -381,6 +389,7 @@ operations:
       - { name: --check-diff,   type: bool,    default: false } # GitHub-only in v1; validates thread paths/lines against live PR diff
     validations:
       - no_local_path # review comment body plus thread spec bodies/paths
+      - no_agent_attribution # review comment body plus thread spec bodies
       - no_escaped_control_markdown # review comment body plus thread spec bodies/paths
     # Op-specific error kinds:
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
@@ -450,6 +459,7 @@ operations:
       - { name: --note-file, type: path,    required: false }
     validations:
       - no_local_path # optional reply note
+      - no_agent_attribution # optional reply note
       - review_thread_pr_mismatch # live GitHub only: --thread must belong to <id> before mutation
     backends:
       # With a note: the reply mutation runs first, then resolve. Without a
@@ -477,6 +487,7 @@ operations:
       - { name: --body-file, type: path,    required: false }
     validations:
       - no_local_path # reply body
+      - no_agent_attribution # reply body
       - review_thread_pr_mismatch # live GitHub only: --thread must belong to <id> before mutation
     backends:
       github: { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<addPullRequestReviewThreadReply>", -f, "tid={thread}", -f, "body={body_or_file}"] }
@@ -864,6 +875,7 @@ operations:
     validations:
       - title_length
       - no_local_path # title + body
+      - no_agent_attribution # title + body
     backends:
       github: { program: gh,   argv: [issue, create, --title, "{title}", --body-file, "{body_file_or_temp}"] }
       gitlab: { program: glab, argv: [issue, create, --title, "{title}", --description, "{body_or_file}"] }
@@ -910,6 +922,7 @@ operations:
     validations:
       - title_length   # when --title supplied
       - no_local_path  # title when --title; body when --body / --body-file
+      - no_agent_attribution # title when --title; body when --body / --body-file
     backends:
       github: { program: gh,   argv: [issue, edit,   "{id}"] }
       gitlab: { program: glab, argv: [issue, update, "{id}"] }
@@ -923,6 +936,7 @@ operations:
       - { name: --body-file, type: path,    required: false }
     validations:
       - no_local_path # comment body
+      - no_agent_attribution # comment body
     backends:
       github: { program: gh,   argv: [issue, comment, "{id}", --body, "{body_or_file}"] }
       gitlab: { program: glab, argv: [issue, note,    "{id}", --message, "{body_or_file}"] }

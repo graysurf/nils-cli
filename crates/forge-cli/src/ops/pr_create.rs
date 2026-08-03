@@ -37,7 +37,8 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{
     BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, branch_pushed,
-    git_branch_state, git_status_porcelain, no_local_path, title_length, worktree_clean,
+    git_branch_state, git_status_porcelain, no_agent_attribution, no_local_path, title_length,
+    worktree_clean,
 };
 
 const SCHEMA: &str = "pr.create";
@@ -409,8 +410,10 @@ pub fn run_with<R: BackendRunner>(
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
     no_local_path(&args.title, "title")?;
+    no_agent_attribution(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
+    no_agent_attribution(&body, "body")?;
     let label_target = match ctx.provider {
         Provider::GitHub | Provider::Local => LabelTarget::Pr,
         Provider::GitLab => LabelTarget::Mr,
@@ -542,8 +545,10 @@ fn compute_with_subject_inner<R: BackendRunner>(
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
     no_local_path(&args.title, "title")?;
+    no_agent_attribution(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
+    no_agent_attribution(&body, "body")?;
     if prevalidated_ctx.is_none() {
         let label_target = match ctx.provider {
             Provider::GitHub | Provider::Local => LabelTarget::Pr,
