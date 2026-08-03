@@ -363,9 +363,7 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      # Temporary floor from native run 30743840826 (84.10%). After the runtime-kit
-      # delivery, restore 85 once native full-workspace coverage reaches at least 85%.
-      COVERAGE_FAIL_UNDER_LINES: "84"
+      COVERAGE_FAIL_UNDER_LINES: "85"
     steps:
       # Docs-only and proven release-only change sets skip coverage work at the
       # step level so the required `coverage` job still concludes `success`.

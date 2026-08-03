@@ -1256,4 +1256,310 @@ mod tests {
         assert_eq!(locator, "internal.ghe.com/sympoies/demo");
         assert_eq!(locator.matches("internal.ghe.com").count(), 1);
     }
+
+    // -----------------------------------------------------------------
+    // Direct-main delivery is the one path that writes to a protected
+    // branch. Each guard below is what binds the push to the exact remote,
+    // repository, and reviewed reason the operator authorized.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_push_destination_must_be_exactly_one_url() {
+        assert_eq!(
+            unique_push_url("  git@github.com:acme/widgets.git \n", "origin").expect("single"),
+            "git@github.com:acme/widgets.git"
+        );
+
+        assert_eq!(
+            unique_push_url("\n  \n", "origin")
+                .expect_err("no destination")
+                .kind(),
+            "push_destination_missing"
+        );
+        assert_eq!(
+            unique_push_url("url-a\nurl-b\n", "origin")
+                .expect_err("two destinations")
+                .kind(),
+            "push_destination_ambiguous"
+        );
+    }
+
+    #[test]
+    fn an_http_push_url_may_not_embed_credentials() {
+        for allowed in [
+            "https://github.com/acme/widgets.git",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+            "/srv/mirrors/widgets.git",
+        ] {
+            reject_http_push_url_userinfo(allowed).unwrap_or_else(|error| {
+                panic!("{allowed} must be accepted: {error:?}");
+            });
+        }
+
+        for hostile in [
+            "https://user:token@github.com/acme/widgets.git",
+            "http://token@github.com/acme/widgets.git",
+            "HTTPS://user@github.com/acme/widgets.git",
+        ] {
+            assert_eq!(
+                reject_http_push_url_userinfo(hostile)
+                    .expect_err("userinfo")
+                    .kind(),
+                "push_destination_credentials_unsupported",
+                "{hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_remote_slug_must_match_the_provider_repository() {
+        bind_remote_repository("git@github.com:acme/widgets.git", "acme/widgets")
+            .expect("exact slug");
+        bind_remote_repository("https://github.com/ACME/Widgets.git", "acme/widgets")
+            .expect("slug comparison is case-insensitive");
+
+        assert_eq!(
+            bind_remote_repository("git@github.com:acme/other.git", "acme/widgets")
+                .expect_err("different repo")
+                .kind(),
+            "repository_mismatch"
+        );
+        assert_eq!(
+            bind_remote_repository("not-a-remote-url", "acme/widgets")
+                .expect_err("unparseable remote")
+                .kind(),
+            "repository_mismatch"
+        );
+    }
+
+    #[test]
+    fn the_push_authority_must_match_the_resolved_forge_authority() {
+        bind_remote_authority(
+            Provider::GitHub,
+            "github.com",
+            "git@github.com:acme/widgets.git",
+        )
+        .expect("same authority");
+
+        assert_eq!(
+            bind_remote_authority(
+                Provider::GitHub,
+                "github.com",
+                "git@internal.ghe.com:acme/widgets.git"
+            )
+            .expect_err("different authority")
+            .kind(),
+            "provider_mismatch"
+        );
+        assert_eq!(
+            bind_remote_authority(Provider::GitHub, "github.com", "not-a-url")
+                .expect_err("unparseable push url")
+                .kind(),
+            "provider_mismatch"
+        );
+    }
+
+    #[test]
+    fn provider_metadata_must_describe_the_same_host_and_repository() {
+        bind_remote_metadata(
+            Provider::GitHub,
+            "git@github.com:acme/widgets.git",
+            "https://github.com/acme/widgets",
+            "acme/widgets",
+        )
+        .expect("matching metadata");
+
+        // A metadata record for another host or repository would let a push
+        // be authorized against the wrong destination.
+        for (push, metadata, repository) in [
+            (
+                "git@github.com:acme/widgets.git",
+                "https://internal.ghe.com/acme/widgets",
+                "acme/widgets",
+            ),
+            (
+                "git@github.com:acme/widgets.git",
+                "https://github.com/acme/other",
+                "acme/widgets",
+            ),
+            (
+                "not-a-url",
+                "https://github.com/acme/widgets",
+                "acme/widgets",
+            ),
+            (
+                "git@github.com:acme/widgets.git",
+                "not-a-url",
+                "acme/widgets",
+            ),
+        ] {
+            assert_eq!(
+                bind_remote_metadata(Provider::GitHub, push, metadata, repository)
+                    .expect_err("mismatch")
+                    .kind(),
+                "repository_mismatch",
+                "{push} vs {metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_remote_host_must_agree_with_the_selected_provider() {
+        bind_remote_provider("git@github.com:acme/widgets.git", Provider::GitHub)
+            .expect("github remote with github provider");
+
+        assert_eq!(
+            bind_remote_provider("git@gitlab.com:acme/widgets.git", Provider::GitHub)
+                .expect_err("provider mismatch")
+                .kind(),
+            "provider_mismatch"
+        );
+        assert_eq!(
+            bind_remote_provider("not-a-url", Provider::GitHub)
+                .expect_err("unparseable remote")
+                .kind(),
+            "provider_mismatch"
+        );
+        // The local provider has no protected default branch to push to.
+        assert_eq!(
+            bind_remote_provider("git@github.com:acme/widgets.git", Provider::Local)
+                .expect_err("local provider")
+                .kind(),
+            "provider_unsupported"
+        );
+    }
+
+    #[test]
+    fn only_a_full_hexadecimal_object_id_is_accepted() {
+        let sha1 = "A".repeat(40);
+        assert_eq!(validate_object_id(&sha1).expect("sha1"), "a".repeat(40));
+        let sha256 = "0".repeat(64);
+        assert_eq!(
+            validate_object_id(&format!("  {sha256}\n")).expect("sha256"),
+            sha256
+        );
+
+        for bad in [
+            "".to_string(),
+            "abc".to_string(),
+            "z".repeat(40),
+            "a".repeat(41),
+            "a".repeat(63),
+        ] {
+            assert_eq!(
+                validate_object_id(&bad).expect_err("invalid").kind(),
+                "object_id_invalid",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reason_file_must_be_a_small_regular_utf8_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("reason.md");
+
+        std::fs::write(&path, "  direct main because CI is down\n").unwrap();
+        assert_eq!(
+            read_reason(&path).expect("reason"),
+            "direct main because CI is down"
+        );
+
+        assert_eq!(
+            read_reason(&tmp.path().join("absent.md"))
+                .expect_err("missing file")
+                .kind(),
+            "reason_file_unreadable"
+        );
+
+        assert_eq!(
+            read_reason(tmp.path()).expect_err("directory").kind(),
+            "reason_invalid"
+        );
+
+        std::fs::write(&path, "   \n\t ").unwrap();
+        assert_eq!(
+            read_reason(&path).expect_err("blank").kind(),
+            "reason_invalid"
+        );
+
+        std::fs::write(&path, "x".repeat(MAX_REASON_BYTES + 1)).unwrap();
+        assert_eq!(
+            read_reason(&path).expect_err("oversized").kind(),
+            "reason_invalid"
+        );
+        // Exactly at the limit is still accepted.
+        std::fs::write(&path, "x".repeat(MAX_REASON_BYTES)).unwrap();
+        assert_eq!(
+            read_reason(&path).expect("at limit").len(),
+            MAX_REASON_BYTES
+        );
+
+        std::fs::write(&path, [0x66, 0xff, 0x66]).unwrap();
+        assert_eq!(
+            read_reason(&path).expect_err("invalid utf-8").kind(),
+            "reason_invalid"
+        );
+
+        std::fs::write(&path, "reason with a \u{7} bell").unwrap();
+        assert_eq!(
+            read_reason(&path).expect_err("control character").kind(),
+            "reason_invalid"
+        );
+        // Ordinary whitespace control characters stay allowed.
+        std::fs::write(&path, "line one\nline\ttwo\r\n").unwrap();
+        read_reason(&path).expect("newlines and tabs are fine");
+    }
+
+    #[test]
+    fn a_receipt_path_that_is_not_a_governed_receipt_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("receipt.json");
+        std::fs::write(&path, "{ not a receipt").unwrap();
+
+        let error = read_default_branch_receipt(&path).expect_err("invalid receipt");
+
+        assert_eq!(error.kind(), "default_branch_receipt_invalid");
+        assert!(
+            error.detail().is_some(),
+            "the parse failure must be reported"
+        );
+    }
+
+    #[test]
+    fn text_rendering_distinguishes_a_dry_run_from_a_real_push() {
+        let payload = RepoPushDefaultPayload {
+            provider: "github",
+            repository: "acme/widgets".to_string(),
+            remote: "origin".to_string(),
+            default_branch: "main".to_string(),
+            authoring_branch: "chore/direct".to_string(),
+            head: "chore/direct".to_string(),
+            head_sha: "a".repeat(40),
+            expected_base: "b".repeat(40),
+            reason: "CI is down".to_string(),
+            push_refspec: "HEAD:refs/heads/main".to_string(),
+            pushed: false,
+            observed_remote_sha: String::new(),
+        };
+
+        render_text(&payload);
+        render_text(&RepoPushDefaultPayload {
+            pushed: true,
+            observed_remote_sha: "a".repeat(40),
+            ..payload
+        });
+    }
+
+    #[test]
+    fn schema_versions_are_namespaced_to_this_command() {
+        assert!(schema_success().starts_with("cli.forge-cli."));
+        assert_eq!(schema_error(), "cli.forge-cli.error.v1");
+        assert_eq!(
+            os_args(&["ls-remote", "--exit-code"]),
+            vec![OsString::from("ls-remote"), OsString::from("--exit-code")]
+        );
+        assert_eq!(validation("kind", "message", None).kind(), "kind");
+    }
 }

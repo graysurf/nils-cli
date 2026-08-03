@@ -1988,4 +1988,676 @@ mod tests {
             "/agent-home/out/projects/owner__repo/20260511-121314-bug-sweep"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Cleanup apply is the only destructive surface in this binary. Every
+    // guard below is what keeps a reviewed plan from deleting something the
+    // reviewer never saw, so each one is pinned to its exact error code.
+    // -----------------------------------------------------------------
+
+    fn cache_item(path: &Path, size_bytes: u64, digest: Option<String>) -> CleanupItem {
+        CleanupItem {
+            name: path_name(path),
+            path: display_path(path),
+            kind: entry_kind(path),
+            category: CleanupCategory::Cache,
+            action: CleanupAction::Delete,
+            reason: "release cache is reproducible".to_string(),
+            size_bytes,
+            mtime_unix: path_mtime_unix(path),
+            content_digest: digest,
+            contains_skill_usage: false,
+            contains_test_first_evidence: false,
+        }
+    }
+
+    /// Build an `agent_home` with `out/nils-versions/<file>` populated, plus a
+    /// digest-consistent plan envelope on disk ready for `cleanup apply`.
+    struct ApplyFixture {
+        _tmp: tempfile::TempDir,
+        agent_home: PathBuf,
+        out_root: PathBuf,
+        cache_root: PathBuf,
+        plan_file: PathBuf,
+        plan_digest: String,
+    }
+
+    fn apply_fixture(mutate: impl FnOnce(&mut CleanupPlan)) -> ApplyFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        // `fs::canonicalize` is used by the delete guard, so start from a
+        // canonical root or macOS `/var` -> `/private/var` breaks containment.
+        let agent_home = fs::canonicalize(tmp.path()).unwrap().join("agent-home");
+        let out_root = agent_home.join("out");
+        let cache_root = out_root.join(RELEASE_CACHE_ROOT);
+        fs::create_dir_all(cache_root.join("1.0.0")).unwrap();
+        fs::write(cache_root.join("1.0.0").join("bin"), b"payload").unwrap();
+
+        let item = cache_item(
+            &cache_root,
+            path_size_bytes(&cache_root).unwrap(),
+            Some(path_content_digest(&cache_root).unwrap()),
+        );
+        let mut plan = CleanupPlan {
+            agent_home: display_path(&agent_home),
+            out_root: display_path(&out_root),
+            out_root_exists: true,
+            include_projects: false,
+            summary: cleanup_summary(std::slice::from_ref(&item)),
+            items: vec![item],
+            plan_digest: String::new(),
+        };
+        plan.plan_digest = compute_cleanup_plan_digest(&plan).expect("digest");
+        mutate(&mut plan);
+        let plan_digest = plan.plan_digest.clone();
+
+        let plan_file = agent_home.join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": CLEANUP_PLAN_SCHEMA_VERSION,
+                "command": CLEANUP_PLAN_COMMAND,
+                "ok": true,
+                "result": plan,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ApplyFixture {
+            _tmp: tmp,
+            agent_home,
+            out_root,
+            cache_root,
+            plan_file,
+            plan_digest,
+        }
+    }
+
+    impl ApplyFixture {
+        fn args(&self, confirm_digest: &str) -> CleanupApplyArgs {
+            CleanupApplyArgs {
+                plan_file: self.plan_file.clone(),
+                confirm_digest: confirm_digest.to_string(),
+                agent_home: Some(self.agent_home.clone()),
+                format: CleanupFormat::Json,
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_apply_deletes_a_digest_confirmed_release_cache() {
+        let fixture = apply_fixture(|_| {});
+
+        let report = apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect("apply");
+
+        assert!(report.applied);
+        assert_eq!(report.summary.deleted, 1);
+        assert_eq!(report.summary.skipped, 0);
+        assert!(report.summary.delete_bytes > 0);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].status, "deleted");
+        assert!(
+            !fixture.cache_root.exists(),
+            "the reviewed cache root must be gone"
+        );
+        assert!(
+            fixture.out_root.is_dir(),
+            "out_root itself is never deleted"
+        );
+    }
+
+    #[test]
+    fn cleanup_apply_rejects_a_plan_file_that_cannot_be_read() {
+        let fixture = apply_fixture(|_| {});
+        let mut args = fixture.args(&fixture.plan_digest);
+        args.plan_file = fixture.agent_home.join("missing-plan.json");
+
+        let err = apply_cleanup_plan(&args).expect_err("missing plan file");
+
+        assert_eq!(err.code, "cleanup-plan-read-failed");
+        assert_eq!(err.exit_code, EXIT_DATA);
+    }
+
+    #[test]
+    fn cleanup_apply_rejects_a_plan_file_that_is_not_json() {
+        let fixture = apply_fixture(|_| {});
+        fs::write(&fixture.plan_file, "{ not json").unwrap();
+
+        let err =
+            apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect_err("invalid json");
+
+        assert_eq!(err.code, "cleanup-plan-invalid-json");
+    }
+
+    #[test]
+    fn cleanup_apply_rejects_an_envelope_from_another_command() {
+        let fixture = apply_fixture(|_| {});
+        let raw = fs::read_to_string(&fixture.plan_file).unwrap();
+        let mut value: Value = serde_json::from_str(&raw).unwrap();
+        value["command"] = serde_json::json!("agent-out audit");
+        fs::write(&fixture.plan_file, value.to_string()).unwrap();
+
+        let err =
+            apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect_err("wrong envelope");
+
+        assert_eq!(err.code, "cleanup-plan-invalid");
+    }
+
+    #[test]
+    fn cleanup_apply_rejects_a_plan_whose_digest_does_not_cover_its_contents() {
+        // Tamper after the digest was computed: the recorded digest no longer
+        // describes the item list an operator would have reviewed.
+        let fixture = apply_fixture(|plan| {
+            plan.items[0].reason = "tampered".to_string();
+        });
+
+        let err = apply_cleanup_plan(&fixture.args(&fixture.plan_digest))
+            .expect_err("digest must cover contents");
+
+        assert_eq!(err.code, "cleanup-plan-digest-invalid");
+        assert!(
+            fixture.cache_root.exists(),
+            "nothing may be deleted once the digest check fails"
+        );
+    }
+
+    #[test]
+    fn cleanup_apply_requires_the_operator_to_confirm_the_exact_digest() {
+        let fixture = apply_fixture(|_| {});
+
+        let err = apply_cleanup_plan(&fixture.args("sha256:not-the-plan"))
+            .expect_err("confirmation mismatch");
+
+        assert_eq!(err.code, "cleanup-digest-mismatch");
+        assert!(fixture.cache_root.exists());
+    }
+
+    #[test]
+    fn cleanup_apply_rejects_a_plan_written_for_another_agent_home() {
+        let fixture = apply_fixture(|_| {});
+        let mut args = fixture.args(&fixture.plan_digest);
+        let other = fixture.agent_home.parent().unwrap().join("other-home");
+        fs::create_dir_all(other.join("out")).unwrap();
+        args.agent_home = Some(other);
+
+        let err = apply_cleanup_plan(&args).expect_err("agent home mismatch");
+
+        assert_eq!(err.code, "cleanup-agent-home-mismatch");
+        assert!(fixture.cache_root.exists());
+    }
+
+    #[test]
+    fn cleanup_apply_skips_a_path_that_disappeared_after_the_plan() {
+        let fixture = apply_fixture(|_| {});
+        fs::remove_dir_all(&fixture.cache_root).unwrap();
+
+        let report = apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect("apply");
+
+        assert_eq!(report.summary.deleted, 0);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(report.entries[0].status, "skipped");
+        assert_eq!(report.entries[0].reason, "path no longer exists");
+    }
+
+    #[test]
+    fn cleanup_apply_skips_a_path_that_grew_evidence_after_the_plan() {
+        let fixture = apply_fixture(|_| {});
+        fs::write(fixture.cache_root.join(SKILL_USAGE_MARKER), b"{}").unwrap();
+
+        let report = apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect("apply");
+
+        assert_eq!(report.summary.deleted, 0);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(
+            report.entries[0].reason,
+            "evidence marker appeared after the plan was created"
+        );
+        assert!(fixture.cache_root.exists());
+    }
+
+    #[test]
+    fn cleanup_apply_skips_a_path_whose_contents_changed_after_the_plan() {
+        let fixture = apply_fixture(|_| {});
+        fs::write(fixture.cache_root.join("1.0.0").join("bin"), b"changed!!!").unwrap();
+
+        let report = apply_cleanup_plan(&fixture.args(&fixture.plan_digest)).expect("apply");
+
+        assert_eq!(report.summary.deleted, 0);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(
+            report.entries[0].reason,
+            "path metadata changed after the plan was created"
+        );
+        assert!(fixture.cache_root.exists());
+    }
+
+    #[test]
+    fn cleanup_plan_digest_is_stable_and_content_sensitive() {
+        let fixture = apply_fixture(|_| {});
+        let raw = fs::read_to_string(&fixture.plan_file).unwrap();
+        let envelope: CleanupPlanEnvelope = serde_json::from_str(&raw).unwrap();
+        let mut plan = envelope.result;
+
+        assert_eq!(
+            compute_cleanup_plan_digest(&plan).unwrap(),
+            fixture.plan_digest
+        );
+        plan.include_projects = !plan.include_projects;
+        assert_ne!(
+            compute_cleanup_plan_digest(&plan).unwrap(),
+            fixture.plan_digest
+        );
+    }
+
+    #[test]
+    fn cleanup_plan_paths_must_be_absolute_and_free_of_parent_components() {
+        validate_cleanup_plan_path(Path::new("/out/cache"), "/out/cache").expect("absolute path");
+
+        let relative = validate_cleanup_plan_path(Path::new("out/cache"), "out/cache")
+            .expect_err("relative path");
+        assert_eq!(relative.code, "cleanup-path-outside-out-root");
+
+        let traversal = validate_cleanup_plan_path(Path::new("/out/../etc"), "/out/../etc")
+            .expect_err("parent component");
+        assert_eq!(traversal.code, "cleanup-path-outside-out-root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_a_symlinked_out_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-out");
+        fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("out");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // A missing out_root is not an error here; only a symlink is.
+        reject_cleanup_out_root_symlink_if_exists(&tmp.path().join("absent")).expect("absent ok");
+        reject_cleanup_out_root_symlink_if_exists(&real).expect("real directory ok");
+        let err = reject_cleanup_out_root_symlink_if_exists(&link).expect_err("symlink out_root");
+        assert_eq!(err.code, "cleanup-out-root-symlink-unsupported");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_delete_target_must_resolve_inside_out_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let out_root = root.join("out");
+        let outside = root.join("outside");
+        fs::create_dir_all(&out_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let inside = out_root.join("cache");
+        fs::create_dir_all(&inside).unwrap();
+        let identity = validate_cleanup_delete_target(
+            &inside,
+            &out_root,
+            &fs::symlink_metadata(&inside).unwrap(),
+        )
+        .expect("contained path");
+        assert_eq!(identity, inside);
+
+        // A symlink is identified by its own parent, never by its target, so
+        // the symlink entry itself is what gets removed.
+        let link = out_root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let link_identity =
+            validate_cleanup_delete_target(&link, &out_root, &fs::symlink_metadata(&link).unwrap())
+                .expect("symlink inside out_root");
+        assert_eq!(link_identity, link);
+
+        // A real directory that lives outside out_root must be refused.
+        let err = validate_cleanup_delete_target(
+            &outside,
+            &out_root,
+            &fs::symlink_metadata(&outside).unwrap(),
+        )
+        .expect_err("escapes out_root");
+        assert_eq!(err.code, "cleanup-path-outside-out-root");
+    }
+
+    #[test]
+    fn cleanup_delete_eligibility_is_restricted_to_reviewed_categories() {
+        let out_root = Path::new("/home/tester/agent/out");
+        let cache = out_root.join(RELEASE_CACHE_ROOT);
+
+        let mut item = cache_item(&cache, 10, Some("sha256:x".to_string()));
+        validate_cleanup_delete_eligibility(&item, &cache, out_root).expect("reviewed cache root");
+
+        item.content_digest = None;
+        assert_eq!(
+            validate_cleanup_delete_eligibility(&item, &cache, out_root)
+                .expect_err("cache needs a digest")
+                .code,
+            "cleanup-delete-content-digest-required"
+        );
+
+        // A nested path is never a direct child of out_root.
+        let nested = cache.join("1.0.0");
+        let mut nested_item = cache_item(&nested, 10, Some("sha256:x".to_string()));
+        assert_eq!(
+            validate_cleanup_delete_eligibility(&nested_item, &nested, out_root)
+                .expect_err("nested delete")
+                .code,
+            "cleanup-delete-shape-invalid"
+        );
+
+        // A cache row that is not the release-cache root is refused outright.
+        let other_cache = out_root.join("something-else");
+        nested_item = cache_item(&other_cache, 10, Some("sha256:x".to_string()));
+        assert_eq!(
+            validate_cleanup_delete_eligibility(&nested_item, &other_cache, out_root)
+                .expect_err("non-release cache")
+                .code,
+            "cleanup-delete-shape-invalid"
+        );
+
+        for category in [
+            CleanupCategory::TopLevelNoncanonical,
+            CleanupCategory::AllowedRoot,
+            CleanupCategory::EvidenceSource,
+            CleanupCategory::ProjectArtifact,
+        ] {
+            let mut row = cache_item(&other_cache, 10, None);
+            row.category = category;
+            assert_eq!(
+                validate_cleanup_delete_eligibility(&row, &other_cache, out_root)
+                    .expect_err("category needs policy")
+                    .code,
+                "cleanup-delete-shape-invalid",
+                "category {category:?} must not be auto-deletable"
+            );
+        }
+
+        let elsewhere = Path::new("/tmp/elsewhere");
+        let stray = cache_item(elsewhere, 10, None);
+        assert_eq!(
+            validate_cleanup_delete_eligibility(&stray, elsewhere, out_root)
+                .expect_err("outside out_root")
+                .code,
+            "cleanup-path-outside-out-root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_digest_distinguishes_files_dirs_and_symlink_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let file = root.join("file");
+        fs::write(&file, b"payload").unwrap();
+        let same = root.join("same");
+        fs::write(&same, b"payload").unwrap();
+        let different = root.join("different");
+        fs::write(&different, b"payload!").unwrap();
+
+        // The digest is content-addressed relative to the digested root, so
+        // two identical files hash the same and a changed byte does not.
+        assert_eq!(
+            path_content_digest(&file).unwrap(),
+            path_content_digest(&same).unwrap()
+        );
+        assert_ne!(
+            path_content_digest(&file).unwrap(),
+            path_content_digest(&different).unwrap()
+        );
+
+        let link_a = root.join("link-a");
+        let link_b = root.join("link-b");
+        std::os::unix::fs::symlink("target-a", &link_a).unwrap();
+        std::os::unix::fs::symlink("target-b", &link_b).unwrap();
+        assert_ne!(
+            path_content_digest(&link_a).unwrap(),
+            path_content_digest(&link_b).unwrap(),
+            "a symlink digest must cover its target"
+        );
+
+        let dir = root.join("dir");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested").join("f"), b"x").unwrap();
+        let before = path_content_digest(&dir).unwrap();
+        fs::write(dir.join("nested").join("g"), b"y").unwrap();
+        assert_ne!(
+            before,
+            path_content_digest(&dir).unwrap(),
+            "an added child must change the directory digest"
+        );
+
+        let missing = path_content_digest(&root.join("absent")).expect_err("missing path");
+        assert_eq!(missing.code, "cleanup-stat-failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn size_and_kind_helpers_describe_the_tree_without_following_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a"), b"1234").unwrap();
+        fs::write(dir.join("b"), b"567").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+
+        assert_eq!(path_size_bytes(&dir).unwrap(), 7);
+        assert_eq!(path_size_bytes(&root.join("absent")).unwrap(), 0);
+        assert!(path_shallow_size_bytes(&dir).is_ok());
+        assert_eq!(
+            path_shallow_size_bytes(&root.join("absent"))
+                .expect_err("missing")
+                .code,
+            "cleanup-stat-failed"
+        );
+
+        assert_eq!(entry_kind(&dir), "directory");
+        assert_eq!(entry_kind(&dir.join("a")), "file");
+        assert_eq!(entry_kind(&link), "symlink");
+        assert_eq!(entry_kind(&root.join("absent")), "unknown");
+        assert_eq!(path_name(&dir), "dir");
+        assert_eq!(path_name(Path::new("/")), "");
+
+        assert!(path_mtime_unix(&dir).is_some());
+        assert_eq!(path_mtime_unix(&root.join("absent")), None);
+
+        let children = read_sorted_children(&dir, "cleanup-read-failed").unwrap();
+        assert_eq!(children, vec![dir.join("a"), dir.join("b")]);
+        assert_eq!(
+            read_sorted_children(&root.join("absent"), "cleanup-read-failed")
+                .expect_err("missing dir")
+                .code,
+            "cleanup-read-failed"
+        );
+    }
+
+    #[test]
+    fn marker_flags_find_evidence_anywhere_below_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("run");
+        fs::create_dir_all(root.join("deep").join("deeper")).unwrap();
+
+        assert!(!marker_flags(&root).unwrap().has_evidence());
+        assert!(
+            !marker_flags(&tmp.path().join("absent"))
+                .unwrap()
+                .has_evidence(),
+            "a missing path carries no evidence"
+        );
+
+        fs::write(
+            root.join("deep").join("deeper").join(TEST_FIRST_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        let flags = marker_flags(&root).unwrap();
+        assert!(flags.test_first_evidence);
+        assert!(!flags.skill_usage);
+        assert!(flags.has_evidence());
+
+        fs::write(root.join(SKILL_USAGE_MARKER), b"{}").unwrap();
+        let both = marker_flags(&root).unwrap();
+        assert!(both.skill_usage && both.test_first_evidence);
+    }
+
+    #[test]
+    fn text_renderers_cover_empty_and_populated_reports() {
+        let empty_audit = AuditReport {
+            agent_home: "/home".to_string(),
+            out_root: "/home/out".to_string(),
+            out_root_exists: false,
+            allowed_roots: Vec::new(),
+            violations: Vec::new(),
+            summary: AuditSummary {
+                allowed_roots: 0,
+                violations: 0,
+            },
+        };
+        let rendered = render_audit_text(&empty_audit);
+        assert!(rendered.contains("allowlisted:\n  none"), "{rendered}");
+        assert!(rendered.contains("violations:\n  none"), "{rendered}");
+        assert!(
+            rendered.ends_with("summary: allowed_roots=0 violations=0"),
+            "{rendered}"
+        );
+
+        let entry = AuditEntry {
+            name: "projects".to_string(),
+            path: "/home/out/projects".to_string(),
+            kind: "directory".to_string(),
+            classification: "canonical".to_string(),
+            reason: "canonical project root".to_string(),
+        };
+        let populated = AuditReport {
+            allowed_roots: vec![entry],
+            violations: vec![AuditEntry {
+                name: "stray".to_string(),
+                path: "/home/out/stray".to_string(),
+                kind: "file".to_string(),
+                classification: "noncanonical".to_string(),
+                reason: "not allowlisted".to_string(),
+            }],
+            summary: AuditSummary {
+                allowed_roots: 1,
+                violations: 1,
+            },
+            ..empty_audit
+        };
+        let rendered = render_audit_text(&populated);
+        assert!(
+            rendered.contains("  - projects (directory, canonical): canonical project root"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - stray (file, noncanonical): not allowlisted"),
+            "{rendered}"
+        );
+
+        let mut plan = CleanupPlan {
+            agent_home: "/home".to_string(),
+            out_root: "/home/out".to_string(),
+            out_root_exists: true,
+            include_projects: false,
+            items: Vec::new(),
+            summary: CleanupSummary::default(),
+            plan_digest: "sha256:abc".to_string(),
+        };
+        assert!(render_cleanup_plan_text(&plan).contains("items:\n  none"));
+        plan.items.push(cache_item(
+            Path::new("/home/out/nils-versions"),
+            42,
+            Some("sha256:x".to_string()),
+        ));
+        let rendered = render_cleanup_plan_text(&plan);
+        assert!(
+            rendered.contains("category=cache, action=delete, size=42"),
+            "{rendered}"
+        );
+
+        let mut report = CleanupApplyReport {
+            agent_home: "/home".to_string(),
+            out_root: "/home/out".to_string(),
+            plan_digest: "sha256:abc".to_string(),
+            applied: true,
+            entries: Vec::new(),
+            summary: CleanupApplySummary::default(),
+        };
+        assert!(render_cleanup_apply_text(&report).contains("entries:\n  none"));
+        report.entries.push(CleanupApplyEntry {
+            path: "/home/out/nils-versions".to_string(),
+            action: "delete".to_string(),
+            status: "deleted".to_string(),
+            reason: "release cache is reproducible".to_string(),
+        });
+        assert!(
+            render_cleanup_apply_text(&report)
+                .contains("  - /home/out/nils-versions (delete, deleted): release cache"),
+        );
+    }
+
+    #[test]
+    fn cleanup_labels_are_exhaustive_and_kebab_cased() {
+        assert_eq!(cleanup_action_label(CleanupAction::Delete), "delete");
+        assert_eq!(cleanup_action_label(CleanupAction::Preserve), "preserve");
+        assert_eq!(
+            cleanup_action_label(CleanupAction::NeedsPolicy),
+            "needs-policy"
+        );
+        assert_eq!(
+            cleanup_category_label(CleanupCategory::AllowedRoot),
+            "allowed-root"
+        );
+        assert_eq!(cleanup_category_label(CleanupCategory::Cache), "cache");
+        assert_eq!(
+            cleanup_category_label(CleanupCategory::TopLevelNoncanonical),
+            "top-level-noncanonical"
+        );
+        assert_eq!(
+            cleanup_category_label(CleanupCategory::EvidenceSource),
+            "evidence-source"
+        );
+        assert_eq!(
+            cleanup_category_label(CleanupCategory::ProjectArtifact),
+            "project-artifact"
+        );
+    }
+
+    #[test]
+    fn env_renderers_quote_every_value_for_shell_eval() {
+        let project = ProjectResult {
+            path: "/home/out/projects/o__r/run".to_string(),
+            agent_home: "/home".to_string(),
+            out_root: "/home/out".to_string(),
+            repo: "/repo".to_string(),
+            project_slug: "o__r".to_string(),
+            topic: "it's-tricky".to_string(),
+            run_id: "run".to_string(),
+            created: false,
+        };
+        let rendered = render_project_env(&project);
+        assert!(rendered.starts_with("AGENT_OUT_PATH='/home/out/projects/o__r/run'"));
+        assert!(
+            rendered.contains(r"AGENT_OUT_TOPIC='it'\''s-tricky'"),
+            "a single quote must be escaped for `eval`: {rendered}"
+        );
+        assert_eq!(rendered.lines().count(), 5);
+
+        let path_for = PathForResult {
+            path: project.path.clone(),
+            agent_home: project.agent_home.clone(),
+            out_root: project.out_root.clone(),
+            repo: project.repo.clone(),
+            project_slug: project.project_slug.clone(),
+            domain: "review".to_string(),
+            topic: project.topic.clone(),
+            run_id: project.run_id.clone(),
+            created: false,
+        };
+        let rendered = render_path_for_env(&path_for);
+        assert_eq!(rendered.lines().count(), 6);
+        assert!(rendered.contains("AGENT_OUT_DOMAIN='review'"));
+
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote(""), "''");
+    }
 }

@@ -748,4 +748,129 @@ mod tests {
         let cli = Cli::try_parse_from(["evidence", "catalog", "--json"]).expect("parses");
         assert!(matches!(cli.output_format(), OutputFormat::Json));
     }
+
+    // -----------------------------------------------------------------
+    // Validator dispatch. Each surface must return the shared exit-code
+    // contract (0 on success, `EX_DATAERR` on bad input) for both formats,
+    // and an unreadable input must be an IO error rather than a panic.
+    // -----------------------------------------------------------------
+
+    const VALID_HOSTS: &str = "version: 1\nhosts:\n  github.com:\n    class: personal\n";
+
+    const VALID_ROLLUP: &str = r#"{
+  "schema": "skill-usage.rollup.v1",
+  "id": "id-pass",
+  "archived_at": "2026-06-14T11:00:00Z",
+  "skill": "deliver-pr",
+  "intent": "deliver the rollback plan",
+  "trigger": "user_explicit",
+  "repo": { "host": "github.com", "org": "graysurf", "repo": "kit" },
+  "cwd": "~/Project/kit",
+  "started_at": "2026-06-14T10:00:00Z",
+  "ended_at": "2026-06-14T10:30:00Z",
+  "outcome": { "status": "pass", "summary": "completed via a clean rebase" },
+  "producer": { "tool": "skill-usage", "nils_cli_version": "1.4.0" },
+  "counts": { "validation": 2, "failures": 0 },
+  "linked_evidence": [],
+  "source_digest": "sha256:p"
+}"#;
+
+    fn write(dir: &tempfile::TempDir, name: &str, contents: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn hosts_validation_reports_success_and_failure_for_both_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = write(&tmp, "hosts.yaml", VALID_HOSTS);
+
+        assert_eq!(dispatch_hosts(&good, OutputFormat::Json), exit::SUCCESS);
+        assert_eq!(dispatch_hosts(&good, OutputFormat::Text), exit::SUCCESS);
+
+        let bad = write(&tmp, "bad.yaml", "version: 1\nhosts: not-a-map\n");
+        assert_eq!(dispatch_hosts(&bad, OutputFormat::Json), exit::DATA);
+        assert_eq!(dispatch_hosts(&bad, OutputFormat::Text), exit::DATA);
+    }
+
+    #[test]
+    fn record_validation_reports_success_and_failure_for_both_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = write(&tmp, "rollup.json", VALID_ROLLUP);
+
+        assert_eq!(dispatch_record(&good, OutputFormat::Json), exit::SUCCESS);
+        assert_eq!(dispatch_record(&good, OutputFormat::Text), exit::SUCCESS);
+
+        let bad = write(&tmp, "bad.json", "{ not a rollup }");
+        assert_eq!(dispatch_record(&bad, OutputFormat::Json), exit::DATA);
+        assert_eq!(dispatch_record(&bad, OutputFormat::Text), exit::DATA);
+    }
+
+    #[test]
+    fn local_config_validation_reports_both_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp
+            .path()
+            .join("absent.yaml")
+            .to_string_lossy()
+            .into_owned();
+
+        // A missing machine-local config is not a failure: the validator
+        // reports the documented defaults.
+        assert_eq!(dispatch_local(&missing, OutputFormat::Json), exit::SUCCESS);
+        assert_eq!(dispatch_local(&missing, OutputFormat::Text), exit::SUCCESS);
+
+        let bad = write(&tmp, "local.yaml", "archive_clone_path: []\n");
+        assert_eq!(dispatch_local(&bad, OutputFormat::Json), exit::DATA);
+        assert_eq!(dispatch_local(&bad, OutputFormat::Text), exit::DATA);
+    }
+
+    #[test]
+    fn an_unreadable_input_is_an_io_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp
+            .path()
+            .join("absent.yaml")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(dispatch_hosts(&missing, OutputFormat::Json), exit::DATA);
+        assert_eq!(dispatch_record(&missing, OutputFormat::Text), exit::DATA);
+
+        let error = load_input("hosts", &missing).expect_err("missing file");
+        assert!(
+            error.starts_with("failed to read hosts input `"),
+            "the message must name the label and the path: {error}"
+        );
+    }
+
+    #[test]
+    fn error_emission_uses_the_data_exit_code_for_both_formats() {
+        assert_eq!(
+            emit_error(OutputFormat::Json, "validate-hosts", "some-code", "boom"),
+            exit::DATA
+        );
+        assert_eq!(
+            emit_error(OutputFormat::Text, "validate-hosts", "some-code", "boom"),
+            exit::DATA
+        );
+    }
+
+    #[test]
+    fn clap_errors_render_as_one_leading_line_without_the_error_prefix() {
+        let Err(err) = Cli::try_parse_from(["evidence", "definitely-not-a-subcommand"]) else {
+            panic!("an unknown subcommand must not parse");
+        };
+
+        let message = render_clap_message(&err);
+
+        assert!(!message.is_empty());
+        assert!(!message.starts_with("error:"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(
+            message.contains("definitely-not-a-subcommand"),
+            "the offending argument must survive: {message}"
+        );
+    }
 }

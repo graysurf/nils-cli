@@ -136,3 +136,152 @@ pub struct RecordingDiagnosticsArtifacts {
     pub interval_count: usize,
 }
 use std::path::PathBuf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_state_labels_are_stable_and_lowercase() {
+        assert_eq!(PermissionState::Ready.as_str(), "ready");
+        assert_eq!(PermissionState::Blocked.as_str(), "blocked");
+        assert_eq!(PermissionState::Unknown.as_str(), "unknown");
+        assert_eq!(PermissionState::default(), PermissionState::Unknown);
+
+        assert!(PermissionState::Blocked.is_blocked());
+        assert!(!PermissionState::Ready.is_blocked());
+        assert!(!PermissionState::Unknown.is_blocked());
+    }
+
+    #[test]
+    fn readiness_needs_one_granted_permission_and_no_denial() {
+        use PermissionState::{Blocked, Ready, Unknown};
+
+        // Nothing observed yet is not readiness.
+        assert!(!PermissionStatusSchema::compute_ready(
+            Unknown, Unknown, Unknown
+        ));
+        // One confirmed grant with no denial is enough to proceed.
+        assert!(PermissionStatusSchema::compute_ready(
+            Ready, Unknown, Unknown
+        ));
+        assert!(PermissionStatusSchema::compute_ready(
+            Unknown, Ready, Unknown
+        ));
+        assert!(PermissionStatusSchema::compute_ready(
+            Unknown, Unknown, Ready
+        ));
+        assert!(PermissionStatusSchema::compute_ready(Ready, Ready, Ready));
+        // A single denial disqualifies the whole probe, whatever else is granted.
+        assert!(!PermissionStatusSchema::compute_ready(
+            Ready, Blocked, Unknown
+        ));
+        assert!(!PermissionStatusSchema::compute_ready(
+            Blocked, Ready, Ready
+        ));
+        assert!(!PermissionStatusSchema::compute_ready(
+            Ready, Ready, Blocked
+        ));
+    }
+
+    #[test]
+    fn status_schema_derives_readiness_and_de_duplicates_hints() {
+        let status = PermissionStatusSchema::from_components(
+            PermissionState::Ready,
+            PermissionState::Unknown,
+            PermissionState::Unknown,
+            vec![
+                "grant screen recording".to_string(),
+                "grant screen recording".to_string(),
+                "grant accessibility".to_string(),
+            ],
+        );
+
+        assert!(status.ready);
+        assert_eq!(status.screen_recording, PermissionState::Ready);
+        // Hints keep first-seen order so the operator reads them in the order
+        // the probes produced them, with repeats collapsed.
+        assert_eq!(
+            status.hints,
+            vec![
+                "grant screen recording".to_string(),
+                "grant accessibility".to_string()
+            ]
+        );
+
+        let default = PermissionStatusSchema::default();
+        assert!(!default.ready);
+        assert!(default.hints.is_empty());
+        assert_eq!(default.automation, PermissionState::Unknown);
+    }
+
+    #[test]
+    fn geometry_and_inventory_types_have_usable_defaults() {
+        let rect = Rect::default();
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (0, 0, 0, 0));
+        assert_eq!(
+            Rect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4
+            }
+        );
+
+        let content = ShareableContent::default();
+        assert!(content.displays.is_empty());
+        assert!(content.windows.is_empty());
+        assert!(content.apps.is_empty());
+
+        let window = WindowInfo {
+            id: 7,
+            owner_name: "Terminal".to_string(),
+            title: "zsh".to_string(),
+            bounds: rect,
+            on_screen: true,
+            active: false,
+            owner_pid: 42,
+            z_order: 0,
+        };
+        assert_eq!(window.clone(), window);
+
+        let populated = ShareableContent {
+            displays: vec![DisplayInfo {
+                id: 1,
+                width: 1920,
+                height: 1080,
+            }],
+            windows: vec![window],
+            apps: vec![AppInfo {
+                name: "Terminal".to_string(),
+                pid: 42,
+                bundle_id: "com.apple.Terminal".to_string(),
+            }],
+        };
+        assert_eq!(populated.displays[0].width, 1920);
+        assert_eq!(populated.apps[0].bundle_id, "com.apple.Terminal");
+    }
+
+    #[test]
+    fn diagnostics_artifact_names_are_pinned_to_the_published_contract() {
+        assert_eq!(RECORDING_DIAGNOSTICS_SCHEMA_VERSION, 1);
+        assert_eq!(RECORDING_DIAGNOSTICS_CONTRACT_VERSION, "1.0");
+        assert_eq!(RECORDING_DIAGNOSTICS_ARTIFACT_DIR_SUFFIX, "diagnostics");
+        assert_eq!(CONTACT_SHEET_ARTIFACT_SUFFIX, "contact-sheet.svg");
+        assert_eq!(MOTION_INTERVALS_ARTIFACT_SUFFIX, "motion-intervals.json");
+
+        let artifacts = RecordingDiagnosticsArtifacts {
+            contact_sheet_path: PathBuf::from("/out/run-contact-sheet.svg"),
+            motion_intervals_path: PathBuf::from("/out/run-motion-intervals.json"),
+            interval_count: 3,
+        };
+        assert_eq!(artifacts.clone(), artifacts);
+        assert_eq!(artifacts.interval_count, 3);
+    }
+}

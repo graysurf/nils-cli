@@ -1446,3 +1446,463 @@ impl Violation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+
+    /// A record that satisfies every v1 requirement. Tests mutate one field at
+    /// a time so a reported violation can only come from that mutation.
+    fn valid_v1() -> Value {
+        json!({
+            "schema": RECORD_SCHEMA_VERSION,
+            "skill": "review-evidence",
+            "producer": {"tool": "skill-usage", "nils_cli_version": "1.25.12"},
+            "started_at": "2026-08-03T00:00:00Z",
+            "ended_at": "2026-08-03T00:10:00Z",
+            "cwd": "/repo",
+            "trigger": "user_explicit",
+            "intent": "record review evidence",
+            "inputs": {
+                "user_request_summary": "review the diff",
+                "referenced_files": [],
+                "external_sources": []
+            },
+            "outcome": {"status": "pass", "summary": "completed"},
+            "artifacts": [],
+            "linked_records": [],
+            "validation": [
+                {"command": "cargo test", "status": "pass", "summary": "green"}
+            ],
+            "follow_up": [],
+            "failures": []
+        })
+    }
+
+    fn kinds(value: &Value) -> Vec<String> {
+        validate_record(value)
+            .into_iter()
+            .map(|violation| violation.kind)
+            .collect()
+    }
+
+    /// Assert the mutation produces exactly the expected violation kinds.
+    fn assert_kinds(value: &Value, expected: &[&str]) {
+        let mut actual = kinds(value);
+        actual.sort();
+        let mut expected = expected
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected, "record: {value}");
+    }
+
+    #[test]
+    fn a_complete_v1_record_has_no_violations() {
+        assert_eq!(validate_record(&valid_v1()).len(), 0);
+    }
+
+    #[test]
+    fn a_complete_v2_record_uses_owner_instead_of_skill() {
+        let mut record = valid_v1();
+        record["schema"] = json!(RECORD_SCHEMA_VERSION_V2);
+        record.as_object_mut().unwrap().remove("skill");
+        record["owner"] = json!({"kind": "workflow", "id": "deliver-pr"});
+
+        assert_kinds(&record, &[]);
+
+        for kind in ["skill", "intent"] {
+            record["owner"]["kind"] = json!(kind);
+            assert_kinds(&record, &[]);
+        }
+    }
+
+    #[test]
+    fn a_non_object_root_is_rejected_before_any_field_check() {
+        let violations = validate_record(&json!([1, 2, 3]));
+
+        assert_eq!(violations.len(), 1, "one root violation, not a field sweep");
+        assert_eq!(violations[0].kind, "root_not_object");
+        assert_eq!(violations[0].path, "$");
+    }
+
+    #[test]
+    fn every_required_top_level_field_is_reported_when_absent() {
+        let violations = validate_record(&json!({}));
+        let kinds = violations
+            .iter()
+            .map(|v| v.kind.as_str())
+            .collect::<Vec<_>>();
+
+        for key in [
+            "schema",
+            "started_at",
+            "cwd",
+            "trigger",
+            "intent",
+            "inputs",
+            "outcome",
+            "artifacts",
+            "linked_records",
+            "validation",
+            "follow_up",
+        ] {
+            assert!(
+                kinds.contains(&format!("missing_{key}").as_str()),
+                "missing_{key} not reported: {kinds:?}"
+            );
+        }
+        assert!(kinds.contains(&"invalid_schema"));
+        assert!(kinds.contains(&"missing_final_validation"));
+    }
+
+    #[test]
+    fn the_schema_discriminator_is_closed() {
+        let mut record = valid_v1();
+        record["schema"] = json!("skill-usage.record.v99");
+
+        // An unknown schema disables owner checks, so only the schema is flagged.
+        assert_kinds(&record, &["invalid_schema"]);
+    }
+
+    #[test]
+    fn ownership_fields_are_bound_to_the_schema_version() {
+        // v1 must carry `skill` and must not carry `owner`.
+        let mut record = valid_v1();
+        record["owner"] = json!({"kind": "skill", "id": "x"});
+        assert_kinds(&record, &["unexpected_owner"]);
+
+        let mut record = valid_v1();
+        record["skill"] = json!("   ");
+        assert_kinds(&record, &["invalid_skill"]);
+
+        // v2 must carry `owner` and must not carry `skill`.
+        let mut record = valid_v1();
+        record["schema"] = json!(RECORD_SCHEMA_VERSION_V2);
+        assert_kinds(&record, &["unexpected_skill", "invalid_owner"]);
+
+        let mut record = valid_v1();
+        record["schema"] = json!(RECORD_SCHEMA_VERSION_V2);
+        record.as_object_mut().unwrap().remove("skill");
+        record["owner"] = json!({"kind": "team", "id": ""});
+        assert_kinds(&record, &["invalid_owner_kind", "invalid_owner_id"]);
+    }
+
+    #[test]
+    fn identity_strings_must_be_non_empty() {
+        for key in ["started_at", "cwd", "intent"] {
+            let mut record = valid_v1();
+            record[key] = json!("  ");
+            assert_kinds(&record, &[&format!("invalid_{key}")]);
+
+            let mut record = valid_v1();
+            record[key] = json!(42);
+            assert_kinds(&record, &[&format!("invalid_{key}")]);
+        }
+    }
+
+    #[test]
+    fn the_trigger_vocabulary_is_closed() {
+        for trigger in ["user_explicit", "agent_selected", "project_policy", "other"] {
+            let mut record = valid_v1();
+            record["trigger"] = json!(trigger);
+            assert_kinds(&record, &[]);
+        }
+
+        let mut record = valid_v1();
+        record["trigger"] = json!("vibes");
+        assert_kinds(&record, &["invalid_trigger"]);
+    }
+
+    #[test]
+    fn producer_is_additive_but_complete_when_present() {
+        // Records written before the field existed stay valid.
+        let mut record = valid_v1();
+        record.as_object_mut().unwrap().remove("producer");
+        assert_kinds(&record, &[]);
+
+        let mut record = valid_v1();
+        record["producer"] = json!("skill-usage");
+        assert_kinds(&record, &["invalid_producer"]);
+
+        let mut record = valid_v1();
+        record["producer"] = json!({});
+        assert_kinds(
+            &record,
+            &["missing_producer_tool", "missing_producer_nils_cli_version"],
+        );
+
+        let mut record = valid_v1();
+        record["producer"] = json!({"tool": "", "nils_cli_version": 1});
+        assert_kinds(
+            &record,
+            &["invalid_producer_tool", "invalid_producer_nils_cli_version"],
+        );
+    }
+
+    #[test]
+    fn inputs_require_the_full_provenance_triple() {
+        let mut record = valid_v1();
+        record["inputs"] = json!("summary");
+        assert_kinds(&record, &["invalid_inputs"]);
+
+        let mut record = valid_v1();
+        record["inputs"] = json!({});
+        assert_kinds(
+            &record,
+            &[
+                "missing_input_user_request_summary",
+                "missing_input_referenced_files",
+                "missing_input_external_sources",
+            ],
+        );
+
+        let mut record = valid_v1();
+        record["inputs"] = json!({
+            "user_request_summary": 1,
+            "referenced_files": "a.rs",
+            "external_sources": {}
+        });
+        assert_kinds(
+            &record,
+            &[
+                "invalid_user_request_summary",
+                "invalid_referenced_files",
+                "invalid_external_sources",
+            ],
+        );
+
+        // An empty summary is allowed; only a non-string is not.
+        let mut record = valid_v1();
+        record["inputs"]["user_request_summary"] = json!("");
+        assert_kinds(&record, &[]);
+    }
+
+    #[test]
+    fn the_outcome_status_vocabulary_is_closed() {
+        for status in ["pass", "skipped"] {
+            let mut record = valid_v1();
+            record["outcome"]["status"] = json!(status);
+            assert_kinds(&record, &[]);
+        }
+
+        let mut record = valid_v1();
+        record["outcome"] = json!("pass");
+        assert_kinds(&record, &["invalid_outcome"]);
+
+        let mut record = valid_v1();
+        record["outcome"] = json!({"summary": "done"});
+        assert_kinds(&record, &["missing_outcome_status"]);
+
+        let mut record = valid_v1();
+        record["outcome"] = json!({"status": "partial", "summary": ""});
+        assert_kinds(
+            &record,
+            &["invalid_outcome_status", "invalid_outcome_summary"],
+        );
+    }
+
+    #[test]
+    fn a_non_pass_outcome_must_carry_at_least_one_failure_record() {
+        for status in ["fail", "blocked", "worked_around", "accepted_risk"] {
+            let mut record = valid_v1();
+            record["outcome"]["status"] = json!(status);
+            assert_kinds(&record, &["missing_failure_record"]);
+
+            record["failures"] = json!([{
+                "phase": "execution",
+                "symptom": "it broke",
+                "classification": "script_bug",
+                "diagnosis": "off-by-one",
+                "handling": "fixed the loop",
+                "result": "fixed"
+            }]);
+            assert_kinds(&record, &[]);
+        }
+    }
+
+    #[test]
+    fn failure_entries_are_shape_and_vocabulary_checked() {
+        let mut record = valid_v1();
+        record["failures"] = json!("boom");
+        assert_kinds(&record, &["invalid_failures"]);
+
+        let mut record = valid_v1();
+        record["failures"] = json!(["boom"]);
+        assert_kinds(&record, &["invalid_failure"]);
+
+        let mut record = valid_v1();
+        record["failures"] = json!([{}]);
+        assert_kinds(
+            &record,
+            &[
+                "missing_failure_phase",
+                "missing_failure_symptom",
+                "missing_failure_classification",
+                "missing_failure_diagnosis",
+                "missing_failure_handling",
+                "missing_failure_result",
+            ],
+        );
+
+        let mut record = valid_v1();
+        record["failures"] = json!([{
+            "phase": "teatime",
+            "symptom": "  ",
+            "classification": "cosmic_rays",
+            "diagnosis": 5,
+            "handling": "",
+            "result": "ignored"
+        }]);
+        assert_kinds(
+            &record,
+            &[
+                "invalid_failure_phase",
+                "invalid_failure_classification",
+                "invalid_failure_result",
+                "invalid_failure_symptom",
+                "invalid_failure_diagnosis",
+                "invalid_failure_handling",
+            ],
+        );
+    }
+
+    #[test]
+    fn linked_records_must_name_a_type_and_a_path() {
+        let mut record = valid_v1();
+        record["linked_records"] = json!(["child.json"]);
+        assert_kinds(&record, &["invalid_linked_record"]);
+
+        let mut record = valid_v1();
+        record["linked_records"] = json!([{}]);
+        assert_kinds(
+            &record,
+            &["invalid_linked_record_type", "invalid_linked_record_path"],
+        );
+
+        let mut record = valid_v1();
+        record["linked_records"] = json!([{"type": "test-first-evidence", "path": "child.json"}]);
+        assert_kinds(&record, &[]);
+    }
+
+    #[test]
+    fn validation_is_required_unless_it_is_explicitly_waived() {
+        let mut record = valid_v1();
+        record["validation"] = json!([]);
+        assert_kinds(&record, &["missing_final_validation"]);
+
+        // Opting out requires a written waiver.
+        let mut record = valid_v1();
+        record["validation"] = json!([]);
+        record["validation_required"] = json!(false);
+        assert_kinds(&record, &["missing_validation_waiver"]);
+
+        let mut record = valid_v1();
+        record["validation"] = json!([]);
+        record["validation_required"] = json!(false);
+        record["validation_waiver"] = json!("no runnable suite in this repo");
+        assert_kinds(&record, &[]);
+
+        // A non-boolean flag fails closed to "required".
+        let mut record = valid_v1();
+        record["validation"] = json!([]);
+        record["validation_required"] = json!("false");
+        assert_kinds(
+            &record,
+            &["invalid_validation_required", "missing_final_validation"],
+        );
+    }
+
+    #[test]
+    fn validation_entries_are_shape_and_vocabulary_checked() {
+        let mut record = valid_v1();
+        record["validation"] = json!(["cargo test"]);
+        assert_kinds(&record, &["invalid_validation_item"]);
+
+        let mut record = valid_v1();
+        record["validation"] = json!([{}]);
+        assert_kinds(
+            &record,
+            &[
+                "invalid_validation_command",
+                "invalid_validation_status",
+                "invalid_validation_summary",
+            ],
+        );
+
+        for status in ["pass", "fail", "skipped"] {
+            let mut record = valid_v1();
+            record["validation"] = json!([{"command": "c", "status": status, "summary": "s"}]);
+            assert_kinds(&record, &[]);
+        }
+
+        let mut record = valid_v1();
+        record["validation"] = json!([{"command": "c", "status": "green", "summary": "s"}]);
+        assert_kinds(&record, &["invalid_validation_status"]);
+
+        // A non-array validation field is caught by the array check, and the
+        // item scan then sees nothing to count.
+        let mut record = valid_v1();
+        record["validation"] = json!("cargo test");
+        assert_kinds(&record, &["invalid_validation", "missing_final_validation"]);
+    }
+
+    #[test]
+    fn list_shaped_fields_must_actually_be_arrays() {
+        for key in ["artifacts", "linked_records", "follow_up"] {
+            let mut record = valid_v1();
+            record[key] = json!("not-a-list");
+            assert_kinds(&record, &[&format!("invalid_{key}")]);
+        }
+    }
+
+    #[test]
+    fn a_secret_like_value_anywhere_in_the_record_is_flagged_with_its_path() {
+        let mut record = valid_v1();
+        record["inputs"]["referenced_files"] = json!(["ghp_abcdefghijklmnop"]);
+
+        let violations = validate_record(&record);
+        let secret = violations
+            .iter()
+            .find(|v| v.kind == "secret_like_value")
+            .expect("secret must be reported");
+        assert_eq!(secret.path, "$.inputs.referenced_files[0]");
+
+        // Nested objects are scanned too, and the path names the exact key.
+        let mut record = valid_v1();
+        record["outcome"]["summary"] = json!("Authorization: Bearer abc123");
+        let violations = validate_record(&record);
+        assert_eq!(
+            violations
+                .iter()
+                .find(|v| v.kind == "secret_like_value")
+                .map(|v| v.path.as_str()),
+            Some("$.outcome.summary")
+        );
+
+        // Ordinary prose is not a secret.
+        assert_kinds(&valid_v1(), &[]);
+    }
+
+    #[test]
+    fn the_text_summary_reports_completeness_and_counts() {
+        let record = valid_v1();
+        let result = RecordResult::new(PathBuf::from("/out/skill-usage.record.json"), record);
+
+        assert!(result.complete);
+        assert_eq!(
+            result.text_summary(),
+            "skill-usage: complete=true status=pass validation=1 failures=0"
+        );
+
+        let incomplete = RecordResult::new(PathBuf::from("/out/x.json"), json!({}));
+        assert!(!incomplete.complete);
+        assert_eq!(
+            incomplete.text_summary(),
+            "skill-usage: complete=false status=unknown validation=0 failures=0"
+        );
+    }
+}

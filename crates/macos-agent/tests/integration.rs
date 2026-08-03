@@ -6,6 +6,8 @@ mod backend;
 mod cli_contract;
 #[path = "integration/common.rs"]
 pub mod common;
+#[path = "integration/completion_export.rs"]
+mod completion_export;
 #[path = "integration/journal.rs"]
 mod journal;
 #[path = "integration/mcp.rs"]

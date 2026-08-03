@@ -152,3 +152,248 @@ fn temp_sibling(path: &Path) -> PathBuf {
     name.push(".tmp");
     path.with_file_name(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    use crate::{EXIT_RUNTIME, EXIT_USAGE};
+
+    struct Fixture {
+        _tmp: TempDir,
+        layout: Layout,
+        global: PathBuf,
+    }
+
+    fn fixture(with_index: bool) -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("agent-memory");
+        let global = root.join("global");
+        fs::create_dir_all(&global).unwrap();
+        if with_index {
+            fs::write(global.join("MEMORY.md"), "# Memory\n").unwrap();
+        }
+        Fixture {
+            layout: Layout { root },
+            global,
+            _tmp: tmp,
+        }
+    }
+
+    fn args(name: &str, kind: &str) -> AddArgs {
+        AddArgs {
+            scope: Some("global".to_string()),
+            name: name.to_string(),
+            r#type: kind.to_string(),
+            description: "one-line description".to_string(),
+            title: None,
+            hook: None,
+            body_file: None,
+            body: Some("the fact".to_string()),
+            session_id: None,
+            format: OutputFormat::Text,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn a_note_and_its_index_line_are_written_together() {
+        let fixture = fixture(true);
+
+        let code = run(&fixture.layout, &args("my-note", "project")).expect("add");
+
+        assert_eq!(code, EXIT_OK);
+        let note = fs::read_to_string(fixture.global.join("my-note.md")).expect("note");
+        assert!(note.contains("name: my-note"), "{note}");
+        assert!(note.contains("the fact"), "{note}");
+        let index = fs::read_to_string(fixture.global.join("MEMORY.md")).expect("index");
+        assert!(
+            index.ends_with("- [my-note](my-note.md) — one-line description\n"),
+            "{index}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_title_and_hook_override_the_defaults() {
+        let fixture = fixture(true);
+        let mut args = args("my-note", "reference");
+        args.title = Some("My Note".to_string());
+        args.hook = Some("where the dashboard lives".to_string());
+
+        run(&fixture.layout, &args).expect("add");
+
+        let index = fs::read_to_string(fixture.global.join("MEMORY.md")).expect("index");
+        assert!(
+            index.ends_with("- [My Note](my-note.md) — where the dashboard lives\n"),
+            "{index}"
+        );
+    }
+
+    #[test]
+    fn the_type_and_name_vocabularies_are_closed() {
+        let fixture = fixture(true);
+
+        let bad_type = run(&fixture.layout, &args("my-note", "musings")).expect_err("bad type");
+        assert_eq!(bad_type.exit_code, EXIT_USAGE);
+        assert!(bad_type.message.contains("invalid type 'musings'"));
+
+        for name in ["../escape", "with space", ""] {
+            let bad_name = run(&fixture.layout, &args(name, "project")).expect_err("bad name");
+            assert_eq!(bad_name.exit_code, EXIT_USAGE, "{name}");
+            assert!(bad_name.message.contains("invalid name"), "{name}");
+        }
+
+        for kind in ["user", "feedback", "project", "reference"] {
+            run(&fixture.layout, &args(&format!("note-{kind}"), kind))
+                .unwrap_or_else(|err| panic!("{kind} must be accepted: {}", err.message));
+        }
+    }
+
+    #[test]
+    fn a_missing_scope_or_index_is_refused_before_anything_is_written() {
+        let missing_scope = fixture(true);
+        let mut scoped = args("my-note", "project");
+        scoped.scope = Some("agents/absent".to_string());
+        let err = run(&missing_scope.layout, &scoped).expect_err("missing scope dir");
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+        assert!(err.message.starts_with("not found: "), "{}", err.message);
+
+        // A scope directory without MEMORY.md would leave an unindexed note.
+        let no_index = fixture(false);
+        let err = run(&no_index.layout, &args("my-note", "project")).expect_err("no index");
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+        assert!(
+            err.message.starts_with("no MEMORY.md in "),
+            "{}",
+            err.message
+        );
+        assert!(!no_index.global.join("my-note.md").exists());
+    }
+
+    #[test]
+    fn an_existing_note_is_never_overwritten() {
+        let fixture = fixture(true);
+        fs::write(fixture.global.join("my-note.md"), "original\n").unwrap();
+
+        let err = run(&fixture.layout, &args("my-note", "project")).expect_err("exists");
+
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+        assert!(
+            err.message.starts_with("already exists: "),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.global.join("my-note.md")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_index_update_rolls_the_note_back() {
+        let fixture = fixture(true);
+        // The index itself must stay a real file so the early `is_file()` guard
+        // passes and the failure lands on the atomic write instead. Occupying
+        // the temp sibling with a directory is what makes that write fail,
+        // after the note has already been created.
+        fs::create_dir(fixture.global.join("MEMORY.md.tmp")).unwrap();
+
+        let err = run(&fixture.layout, &args("my-note", "project")).expect_err("index write fails");
+
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+        assert!(
+            !fixture.global.join("my-note.md").exists(),
+            "the note must be rolled back so the store never holds an unindexed note"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.global.join("MEMORY.md")).unwrap(),
+            "# Memory\n",
+            "the index must be untouched"
+        );
+    }
+
+    #[test]
+    fn an_index_without_a_trailing_newline_is_repaired_before_appending() {
+        let fixture = fixture(true);
+        fs::write(fixture.global.join("MEMORY.md"), "# Memory").unwrap();
+
+        run(&fixture.layout, &args("my-note", "project")).expect("add");
+
+        assert_eq!(
+            fs::read_to_string(fixture.global.join("MEMORY.md")).unwrap(),
+            "# Memory\n- [my-note](my-note.md) — one-line description\n"
+        );
+    }
+
+    #[test]
+    fn the_body_comes_from_the_flag_a_file_or_nothing() {
+        let fixture = fixture(true);
+
+        let mut inline = args("inline", "project");
+        inline.body = Some("inline body".to_string());
+        assert_eq!(read_body(&inline).expect("inline"), "inline body");
+
+        let mut empty = args("empty", "project");
+        empty.body = None;
+        assert_eq!(read_body(&empty).expect("empty"), "");
+
+        let body_file = fixture.global.join("body.md");
+        fs::write(&body_file, "from file\n").unwrap();
+        let mut from_file = args("from-file", "project");
+        from_file.body = None;
+        from_file.body_file = Some(body_file.to_string_lossy().into_owned());
+        assert_eq!(read_body(&from_file).expect("file"), "from file\n");
+
+        let mut missing = args("missing", "project");
+        missing.body = None;
+        missing.body_file = Some("/definitely/not/a/body.md".to_string());
+        let err = read_body(&missing).expect_err("missing body file");
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+        assert!(err.message.starts_with("failed to read body file"));
+    }
+
+    #[test]
+    fn json_output_is_selected_by_either_the_flag_or_the_alias() {
+        let fixture = fixture(true);
+        let mut json_flag = args("via-alias", "project");
+        json_flag.json = true;
+        run(&fixture.layout, &json_flag).expect("add");
+
+        let mut json_format = args("via-format", "project");
+        json_format.format = OutputFormat::Json;
+        run(&fixture.layout, &json_format).expect("add");
+
+        let index = fs::read_to_string(fixture.global.join("MEMORY.md")).expect("index");
+        assert!(index.contains("via-alias"), "{index}");
+        assert!(index.contains("via-format"), "{index}");
+    }
+
+    #[test]
+    fn the_temp_sibling_never_escapes_the_target_directory() {
+        assert_eq!(
+            temp_sibling(Path::new("/store/global/note.md")),
+            PathBuf::from("/store/global/note.md.tmp")
+        );
+        // A path with no file name still yields a sibling inside the parent.
+        assert_eq!(temp_sibling(Path::new("/")), PathBuf::from("/.tmp"));
+    }
+
+    #[test]
+    fn an_atomic_write_leaves_no_temp_file_behind() {
+        let fixture = fixture(true);
+        let target = fixture.global.join("atomic.md");
+
+        write_atomic(&target, "content\n").expect("write");
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "content\n");
+        assert!(!temp_sibling(&target).exists());
+
+        // A target whose parent does not exist fails without panicking.
+        let err = write_atomic(&fixture.global.join("absent").join("x.md"), "content")
+            .expect_err("no parent directory");
+        assert_eq!(err.exit_code, EXIT_RUNTIME);
+    }
+}

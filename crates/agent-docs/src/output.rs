@@ -336,3 +336,295 @@ fn render_contract_line(contract: &ValidationContract) -> String {
 fn required_label(doc: &ResolvedDocument) -> &'static str {
     if doc.required { "required" } else { "optional" }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::model::{
+        Context as IntentContext, DocumentSource, DocumentStatus, DocumentValidation,
+        FreshnessCheck, RemoveOutcome, ResolveSummary, Scope,
+    };
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    fn intent(name: &str) -> IntentContext {
+        IntentContext::parse(name).expect("intent")
+    }
+
+    fn document(path: &str, required: bool, present: bool) -> ResolvedDocument {
+        ResolvedDocument {
+            context: intent("project-dev"),
+            scope: Scope::Project,
+            path: PathBuf::from(path),
+            products: Vec::new(),
+            phases: Vec::new(),
+            declared_required: required,
+            required,
+            when: "always".to_string(),
+            when_satisfied: true,
+            status: if present {
+                DocumentStatus::Present
+            } else {
+                DocumentStatus::Missing
+            },
+            validation: if present {
+                DocumentValidation {
+                    exists: true,
+                    non_empty: true,
+                    marker_present: None,
+                    freshness: FreshnessCheck::NotDeclared,
+                    valid: true,
+                }
+            } else {
+                DocumentValidation::missing()
+            },
+            source: DocumentSource::Project,
+            why: "declared in the project catalog".to_string(),
+            content: None,
+        }
+    }
+
+    fn contract(declared: bool) -> ValidationContract {
+        ValidationContract {
+            context: intent("project-dev"),
+            declared,
+            commands: if declared {
+                vec!["cargo test".to_string()]
+            } else {
+                Vec::new()
+            },
+            marker: declared.then(|| "test-marker".to_string()),
+            description: declared.then(|| "run the suite".to_string()),
+        }
+    }
+
+    fn preflight(documents: Vec<ResolvedDocument>) -> PreflightReport {
+        PreflightReport {
+            schema_version: PreflightReport::SCHEMA_VERSION,
+            intent: intent("project-dev"),
+            product: None,
+            phase: None,
+            strict: false,
+            docs_home: PathBuf::from("/home/docs"),
+            project_path: PathBuf::from("/repo"),
+            is_linked_worktree: false,
+            summary: ResolveSummary::from_documents(&documents),
+            documents,
+            validation: contract(true),
+        }
+    }
+
+    #[test]
+    fn json_rendering_is_pretty_printed_and_parses_back() {
+        let report = preflight(vec![document("DEVELOPMENT.md", true, true)]);
+
+        let json = render_preflight(OutputFormat::Json, &report).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            parsed["schema_version"].as_str(),
+            Some(PreflightReport::SCHEMA_VERSION)
+        );
+        assert!(json.contains('\n'), "json output must be pretty-printed");
+    }
+
+    #[test]
+    fn preflight_text_lists_documents_and_a_summary_line() {
+        let report = preflight(vec![
+            document("DEVELOPMENT.md", true, true),
+            document("OPTIONAL.md", false, false),
+        ]);
+
+        let text = render_preflight(OutputFormat::Text, &report).expect("text");
+
+        assert!(text.contains("DEVELOPMENT.md"), "{text}");
+        assert!(text.contains("OPTIONAL.md"), "{text}");
+        assert!(
+            text.contains(
+                "summary: required_total=1 satisfied_required=1 missing_required=0 invalid_required=0 strict=false"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("validation contract (project-dev)"), "{text}");
+    }
+
+    #[test]
+    fn a_list_report_renders_every_section_even_when_empty() {
+        let empty = ListReport {
+            docs_home: PathBuf::from("/home/docs"),
+            project_path: PathBuf::from("/repo"),
+            intents: Vec::new(),
+            documents: Vec::new(),
+            validations: Vec::new(),
+        };
+
+        let text = render_list(OutputFormat::Text, &empty).expect("text");
+        assert!(text.contains("docs_home: /home/docs"), "{text}");
+        assert!(text.contains("project_path: /repo"), "{text}");
+        assert!(text.contains("intents: \n"), "{text}");
+        assert!(text.contains("documents:\n  - (none)"), "{text}");
+        assert!(text.contains("validation contracts:\n  - (none)"), "{text}");
+
+        let populated = ListReport {
+            intents: vec!["project-dev".to_string(), "task-tools".to_string()],
+            documents: vec![document("DEVELOPMENT.md", true, true)],
+            validations: vec![contract(true)],
+            ..empty
+        };
+        let text = render_list(OutputFormat::Text, &populated).expect("text");
+        assert!(text.contains("intents: project-dev, task-tools"), "{text}");
+        assert!(
+            text.contains(
+                "  [required] context=project-dev scope=project DEVELOPMENT.md status=present source=project"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  context=project-dev commands=[\"cargo test\"]"),
+            "{text}"
+        );
+
+        let json = render_list(OutputFormat::Json, &populated).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["intents"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn an_undeclared_intent_names_the_intents_that_do_exist() {
+        let available = vec!["project-dev".to_string(), "task-tools".to_string()];
+
+        let text =
+            render_undeclared_intent_error(OutputFormat::Text, "nope", &available).expect("text");
+        assert_eq!(
+            text,
+            "error: undeclared intent `nope`; available intents: project-dev, task-tools"
+        );
+
+        // With nothing declared the operator still gets an actionable message.
+        let text = render_undeclared_intent_error(OutputFormat::Text, "nope", &[]).expect("text");
+        assert_eq!(
+            text,
+            "error: undeclared intent `nope`; available intents: none"
+        );
+
+        let json =
+            render_undeclared_intent_error(OutputFormat::Json, "nope", &available).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["ok"].as_bool(), Some(false));
+        assert_eq!(parsed["error"]["code"].as_str(), Some("undeclared-intent"));
+        assert_eq!(
+            parsed["error"]["details"]["available_intents"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn explain_renders_a_single_intent_and_the_intent_index() {
+        let documents = vec![document("DEVELOPMENT.md", true, true)];
+        let validation = contract(true);
+        let payload = ExplainIntent {
+            intent: "project-dev",
+            documents: &documents,
+            validation: &validation,
+        };
+
+        let text = render_explain_intent(OutputFormat::Text, &payload).expect("text");
+        assert!(text.starts_with("INTENT: project-dev"), "{text}");
+        assert!(text.contains("marker=test-marker"), "{text}");
+        assert!(text.contains("description=\"run the suite\""), "{text}");
+
+        let empty_validation = contract(false);
+        let empty = ExplainIntent {
+            intent: "project-dev",
+            documents: &[],
+            validation: &empty_validation,
+        };
+        let text = render_explain_intent(OutputFormat::Text, &empty).expect("text");
+        assert!(
+            text.contains("(no documents declared for this intent)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("validation contract: none declared for intent project-dev"),
+            "{text}"
+        );
+
+        let json = render_explain_intent(OutputFormat::Json, &payload).expect("json");
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+
+        let intents = vec!["project-dev".to_string()];
+        let text =
+            render_explain_intents(OutputFormat::Text, &ExplainIntents { intents: &intents })
+                .expect("text");
+        assert!(text.starts_with("INTENTS:\n  - project-dev"), "{text}");
+        let text = render_explain_intents(OutputFormat::Text, &ExplainIntents { intents: &[] })
+            .expect("text");
+        assert_eq!(text, "no intents declared in the catalog");
+        let json =
+            render_explain_intents(OutputFormat::Json, &ExplainIntents { intents: &intents })
+                .expect("json");
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn remove_reports_its_outcome_on_one_line() {
+        let report = RemoveReport {
+            config_path: PathBuf::from("/repo/AGENT_DOCS.toml"),
+            outcome: RemoveOutcome::Removed,
+            context: "project-dev".to_string(),
+            scope: Scope::Project,
+            path: PathBuf::from("DEVELOPMENT.md"),
+            remaining_documents: 2,
+        };
+
+        let text = render_remove(OutputFormat::Text, &report).expect("text");
+        assert_eq!(
+            text,
+            "remove: outcome=removed context=project-dev scope=project path=DEVELOPMENT.md config=/repo/AGENT_DOCS.toml remaining_documents=2"
+        );
+
+        let json = render_remove(OutputFormat::Json, &report).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["outcome"].as_str(), Some("removed"));
+    }
+
+    #[test]
+    fn init_print_mode_emits_the_stub_verbatim_for_every_format() {
+        let report = InitReport {
+            mode: InitMode::Print,
+            target_path: PathBuf::from("/repo/AGENT_DOCS.toml"),
+            wrote: false,
+            stub: "# stub\n[[document]]\n".to_string(),
+        };
+
+        // Print mode is redirected straight into the catalog file, so `--format
+        // json` must not wrap it in an envelope.
+        for format in [OutputFormat::Text, OutputFormat::Json] {
+            assert_eq!(
+                render_init(format, &report).expect("init"),
+                "# stub\n[[document]]\n"
+            );
+        }
+
+        let wrote = InitReport {
+            mode: InitMode::Write,
+            wrote: true,
+            ..report
+        };
+        assert_eq!(
+            render_init(OutputFormat::Text, &wrote).expect("init"),
+            "init: mode=write target=/repo/AGENT_DOCS.toml wrote=true"
+        );
+        let json = render_init(OutputFormat::Json, &wrote).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["wrote"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn the_required_label_reflects_the_resolved_requirement() {
+        assert_eq!(required_label(&document("A.md", true, true)), "required");
+        assert_eq!(required_label(&document("A.md", false, true)), "optional");
+    }
+}

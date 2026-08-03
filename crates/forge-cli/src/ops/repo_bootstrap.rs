@@ -1471,3 +1471,473 @@ fn software_with_detail(message: impl Into<String>, detail: String) -> ForgeErro
 fn error_schema() -> String {
     schema_version_for(BINARY, "error", 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    fn receipt(files: Vec<ReceiptFile>) -> BootstrapReceipt {
+        BootstrapReceipt {
+            schema_version: RECEIPT_SCHEMA.to_string(),
+            provider: "forgejo".to_string(),
+            repository: "acme/widgets".to_string(),
+            owner_kind: RepoBootstrapOwnerKind::User,
+            default_branch: "main".to_string(),
+            message: "chore: bootstrap".to_string(),
+            reason: "new private repository".to_string(),
+            files,
+            create_attempted: false,
+            remote_created: false,
+            local_sha: None,
+            push_attempted: false,
+            default_branch_set: false,
+            complete: false,
+            reconciled: false,
+        }
+    }
+
+    fn write(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn bootstrap_inputs_must_be_named_bounded_regular_files() {
+        let tmp = TempDir::new().unwrap();
+        let readme = write(tmp.path(), "README.md", b"# widgets\n");
+        let license = write(tmp.path(), "LICENSE", b"MIT\n");
+
+        let files = prepare_files(&[readme.clone(), license]).expect("two root files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "README.md");
+        assert_eq!(files[0].bytes, 10);
+        assert_eq!(files[0].sha256, sha256_hex(b"# widgets\n"));
+        assert!(
+            Path::new(&files[0].source).is_absolute(),
+            "the receipt records a canonical source path"
+        );
+
+        // A directory, a missing path, and a duplicate root name are all refused.
+        assert_eq!(
+            prepare_files(&[tmp.path().to_path_buf()])
+                .expect_err("directory")
+                .kind(),
+            "bootstrap_file_invalid"
+        );
+        assert_eq!(
+            prepare_files(&[tmp.path().join("absent")])
+                .expect_err("missing")
+                .kind(),
+            "bootstrap_file_invalid"
+        );
+        let nested = tmp.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let duplicate = write(&nested, "README.md", b"other\n");
+        assert_eq!(
+            prepare_files(&[readme, duplicate])
+                .expect_err("duplicate root name")
+                .kind(),
+            "bootstrap_file_invalid"
+        );
+
+        assert!(prepare_files(&[]).expect("no files").is_empty());
+    }
+
+    #[test]
+    fn a_repository_root_name_may_not_collide_with_git_metadata() {
+        assert!(valid_root_name("README.md"));
+        assert!(valid_root_name("a"));
+        for reserved in ["", ".", "..", ".git", "dir/file", "with\0nul"] {
+            assert!(!valid_root_name(reserved), "{reserved:?}");
+        }
+        assert!(!valid_root_name(&"x".repeat(256)));
+        assert!(valid_root_name(&"x".repeat(255)));
+    }
+
+    #[test]
+    fn the_default_branch_must_be_a_safe_git_ref() {
+        for good in ["main", "release/1.0", "a-b_c.d"] {
+            validate_branch(good).unwrap_or_else(|error| panic!("{good}: {error:?}"));
+        }
+        for bad in [
+            "",
+            "/main",
+            "main/",
+            "main.",
+            "a..b",
+            "a//b",
+            "a/./b",
+            "a/b.lock",
+            "with space",
+            "with~tilde",
+            &"x".repeat(256),
+        ] {
+            assert_eq!(
+                validate_branch(bad).expect_err("unsafe branch").kind(),
+                "bootstrap_default_branch_invalid",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_commit_message_must_be_bounded_non_empty_text() {
+        validate_message("chore: bootstrap").expect("message");
+        for bad in ["", "   ", "with\0nul", &"x".repeat(10_001)] {
+            assert_eq!(
+                validate_message(bad).expect_err("invalid message").kind(),
+                "bootstrap_message_invalid",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_full_object_id_is_accepted_from_git() {
+        validate_oid(&"a".repeat(40)).expect("sha1");
+        validate_oid(&"F".repeat(64)).expect("sha256");
+        for bad in ["", "abc", &"z".repeat(40), &"a".repeat(41)] {
+            assert_eq!(
+                validate_oid(bad).expect_err("invalid oid").kind(),
+                "software_error",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_digest_helper_is_lowercase_hex() {
+        let digest = sha256_hex(b"payload");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_ne!(digest, sha256_hex(b"payload2"));
+    }
+
+    #[test]
+    fn nul_separated_git_output_drops_empty_entries() {
+        assert_eq!(
+            nul_entries("README.md\0LICENSE\0"),
+            vec!["README.md".to_string(), "LICENSE".to_string()]
+        );
+        assert!(nul_entries("").is_empty());
+        assert!(nul_entries("\0\0").is_empty());
+    }
+
+    #[test]
+    fn an_authorization_file_must_be_bounded_non_empty_utf8() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "reason.md", b"  bootstrap the repo \n");
+
+        assert_eq!(
+            read_small_regular_file(&path, 1024, "reason").expect("reason"),
+            "bootstrap the repo"
+        );
+
+        for (contents, label) in [
+            (b"".to_vec(), "empty"),
+            (b"   \n".to_vec(), "blank"),
+            (b"has a \x07 bell".to_vec(), "control byte"),
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert_eq!(
+                read_small_regular_file(&path, 1024, "reason")
+                    .expect_err(label)
+                    .kind(),
+                "bootstrap_authorization_invalid",
+                "{label}"
+            );
+        }
+
+        fs::write(&path, b"x".repeat(2048)).unwrap();
+        assert_eq!(
+            read_small_regular_file(&path, 1024, "reason")
+                .expect_err("oversized")
+                .kind(),
+            "bootstrap_authorization_invalid"
+        );
+
+        assert_eq!(
+            read_small_regular_file(tmp.path(), 1024, "reason")
+                .expect_err("directory")
+                .kind(),
+            "bootstrap_authorization_invalid"
+        );
+        assert_eq!(
+            read_small_regular_file(&tmp.path().join("absent"), 1024, "reason")
+                .expect_err("missing")
+                .kind(),
+            "bootstrap_authorization_invalid"
+        );
+    }
+
+    #[test]
+    fn a_resumed_receipt_must_match_the_exact_requested_inputs() {
+        let expected = receipt(Vec::new());
+        validate_receipt_inputs(&receipt(Vec::new()), &expected).expect("identical inputs");
+
+        for mutate in [
+            (|r: &mut BootstrapReceipt| r.schema_version = "other.v9".to_string())
+                as fn(&mut BootstrapReceipt),
+            |r: &mut BootstrapReceipt| r.provider = "github".to_string(),
+            |r: &mut BootstrapReceipt| r.repository = "acme/other".to_string(),
+            |r: &mut BootstrapReceipt| r.owner_kind = RepoBootstrapOwnerKind::Org,
+            |r: &mut BootstrapReceipt| r.default_branch = "trunk".to_string(),
+            |r: &mut BootstrapReceipt| r.message = "chore: other".to_string(),
+            |r: &mut BootstrapReceipt| r.reason = "other".to_string(),
+            |r: &mut BootstrapReceipt| {
+                r.files = vec![ReceiptFile {
+                    source: "/tmp/README.md".to_string(),
+                    name: "README.md".to_string(),
+                    sha256: sha256_hex(b""),
+                    bytes: 0,
+                }]
+            },
+        ] {
+            let mut actual = receipt(Vec::new());
+            mutate(&mut actual);
+            assert_eq!(
+                validate_receipt_inputs(&actual, &expected)
+                    .expect_err("input drift")
+                    .kind(),
+                "bootstrap_receipt_mismatch"
+            );
+        }
+
+        // Progress fields are allowed to differ; only the inputs are pinned.
+        let mut resumed = receipt(Vec::new());
+        resumed.create_attempted = true;
+        resumed.remote_created = true;
+        resumed.local_sha = Some("a".repeat(40));
+        validate_receipt_inputs(&resumed, &expected).expect("progress may advance");
+    }
+
+    #[test]
+    fn a_provider_branch_read_back_must_carry_a_verified_signature() {
+        let sha = "a".repeat(40);
+        let verified = serde_json::json!({
+            "sha": sha,
+            "commit": {"verification": {"verified": true}}
+        });
+        verify_provider_signature(&verified, &sha).expect("verified");
+
+        let unverified = serde_json::json!({
+            "sha": sha,
+            "commit": {"verification": {"verified": false}}
+        });
+        assert_eq!(
+            verify_provider_signature(&unverified, &sha)
+                .expect_err("unverified")
+                .kind(),
+            "provider_signature_unverified"
+        );
+
+        let drifted = serde_json::json!({
+            "sha": "b".repeat(40),
+            "commit": {"verification": {"verified": true}}
+        });
+        assert_eq!(
+            verify_provider_signature(&drifted, &sha)
+                .expect_err("drift")
+                .kind(),
+            "remote_drift"
+        );
+        assert_eq!(
+            verify_provider_signature(&serde_json::json!({}), &sha)
+                .expect_err("missing sha")
+                .kind(),
+            "remote_drift"
+        );
+    }
+
+    #[test]
+    fn a_branch_read_back_must_expose_its_commit_id() {
+        assert_eq!(branch_sha(None).expect("absent branch"), None);
+        assert_eq!(
+            branch_sha(Some(serde_json::json!({"commit": {"id": "abc"}}))).expect("present"),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            branch_sha(Some(serde_json::json!({})))
+                .expect_err("missing commit id")
+                .kind(),
+            "software_error"
+        );
+    }
+
+    #[test]
+    fn a_receipt_round_trips_through_its_private_on_disk_form() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state").join("receipt.json");
+        let receipt = receipt(Vec::new());
+
+        assert!(load_receipt(&path).expect("absent receipt").is_none());
+
+        create_receipt(&path, &receipt).expect("create");
+        let loaded = load_receipt(&path).expect("load").expect("present");
+        assert_eq!(loaded.repository, receipt.repository);
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the receipt must not be group- or world-readable"
+        );
+
+        // A second create races against the durable receipt and must ask for
+        // an explicit resume rather than overwrite it.
+        assert_eq!(
+            create_receipt(&path, &receipt)
+                .expect_err("already created")
+                .kind(),
+            "bootstrap_resume_required"
+        );
+
+        let mut advanced = receipt;
+        advanced.remote_created = true;
+        persist_receipt(&path, &advanced).expect("persist");
+        assert!(
+            load_receipt(&path)
+                .expect("load")
+                .expect("present")
+                .remote_created
+        );
+    }
+
+    #[test]
+    fn a_world_readable_or_malformed_receipt_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("receipt.json");
+
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            load_receipt(&path).expect_err("world readable").kind(),
+            "bootstrap_receipt_unsafe"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            load_receipt(&path).expect_err("not a receipt").kind(),
+            "bootstrap_receipt_invalid"
+        );
+
+        // A directory in the receipt slot is not a receipt at all.
+        let dir = tmp.path().join("dir-receipt");
+        fs::create_dir(&dir).unwrap();
+        assert_eq!(
+            load_receipt(&dir).expect_err("directory").kind(),
+            "bootstrap_receipt_unsafe"
+        );
+    }
+
+    #[test]
+    fn receipt_bytes_are_bounded_and_pretty_printed() {
+        let bytes = receipt_bytes(&receipt(Vec::new())).expect("bytes");
+
+        assert!(bytes.len() < MAX_RECEIPT_BYTES);
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(text.contains('\n'), "the receipt is pretty-printed");
+        assert!(text.contains(RECEIPT_SCHEMA));
+    }
+
+    #[test]
+    fn the_state_directory_must_be_a_real_private_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("state");
+
+        create_private_dir(&dir).expect("create");
+        assert_eq!(
+            fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        create_private_dir(&dir).expect("idempotent");
+
+        let file = write(tmp.path(), "not-a-dir", b"x");
+        assert_eq!(
+            create_private_dir(&file)
+                .expect_err("file in the way")
+                .kind(),
+            "bootstrap_state_unsafe"
+        );
+    }
+
+    #[test]
+    fn a_managed_checkout_must_hold_exactly_the_receipt_files() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::write(checkout.join("README.md"), b"# widgets\n").unwrap();
+        let files = vec![ReceiptFile {
+            source: "/tmp/README.md".to_string(),
+            name: "README.md".to_string(),
+            sha256: sha256_hex(b"# widgets\n"),
+            bytes: 10,
+        }];
+
+        validate_checkout_files(&checkout, &files).expect("exact match");
+
+        // An extra root file was never authorized.
+        fs::write(checkout.join("EXTRA"), b"x").unwrap();
+        assert_eq!(
+            validate_checkout_files(&checkout, &files)
+                .expect_err("extra file")
+                .kind(),
+            "bootstrap_checkout_mismatch"
+        );
+        fs::remove_file(checkout.join("EXTRA")).unwrap();
+
+        // Changed content must not be delivered under the reviewed digest.
+        fs::write(checkout.join("README.md"), b"# tampered\n").unwrap();
+        assert_eq!(
+            validate_checkout_files(&checkout, &files)
+                .expect_err("content drift")
+                .kind(),
+            "bootstrap_checkout_mismatch"
+        );
+
+        assert_eq!(
+            validate_checkout_files(&tmp.path().join("absent"), &files)
+                .expect_err("missing checkout")
+                .kind(),
+            "bootstrap_checkout_unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_checkout_entry_is_never_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let outside = write(tmp.path(), "outside", b"# widgets\n");
+        std::os::unix::fs::symlink(&outside, checkout.join("README.md")).unwrap();
+        let files = vec![ReceiptFile {
+            source: "/tmp/README.md".to_string(),
+            name: "README.md".to_string(),
+            sha256: sha256_hex(b"# widgets\n"),
+            bytes: 10,
+        }];
+
+        assert_eq!(
+            validate_checkout_files(&checkout, &files)
+                .expect_err("symlinked entry")
+                .kind(),
+            "bootstrap_checkout_mismatch"
+        );
+    }
+
+    #[test]
+    fn remote_drift_names_both_object_ids() {
+        let error = remote_drift("aaa", "bbb");
+
+        assert_eq!(error.kind(), "remote_drift");
+        assert!(error.message().contains("expected aaa"), "{error:?}");
+        assert!(error.message().contains("observed bbb"), "{error:?}");
+    }
+}

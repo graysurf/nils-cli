@@ -97,3 +97,72 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
         Ok(StrictValue(Value::Object(object)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    fn parse(input: &str) -> serde_json::Result<Value> {
+        from_slice(input.as_bytes())
+    }
+
+    #[test]
+    fn every_scalar_kind_round_trips() {
+        assert_eq!(parse("true").unwrap(), json!(true));
+        assert_eq!(parse("false").unwrap(), json!(false));
+        assert_eq!(parse("null").unwrap(), Value::Null);
+        assert_eq!(parse("\"text\"").unwrap(), json!("text"));
+        assert_eq!(parse("-7").unwrap(), json!(-7));
+        assert_eq!(parse("7").unwrap(), json!(7));
+        assert_eq!(parse("1.5").unwrap(), json!(1.5));
+        // A u64 above i64::MAX must not be narrowed.
+        assert_eq!(
+            parse("18446744073709551615").unwrap(),
+            json!(18_446_744_073_709_551_615_u64)
+        );
+    }
+
+    #[test]
+    fn nested_containers_are_reconstructed_in_order() {
+        let value = parse(r#"{"a":[1,{"b":"c"},[]],"d":{}}"#).unwrap();
+
+        assert_eq!(value, json!({"a": [1, {"b": "c"}, []], "d": {}}));
+        assert_eq!(parse("[]").unwrap(), json!([]));
+        assert_eq!(parse("{}").unwrap(), json!({}));
+    }
+
+    #[test]
+    fn a_duplicate_object_key_is_rejected_instead_of_last_write_wins() {
+        // serde_json's own parser silently keeps the last value; a hook payload
+        // must not be able to smuggle a second value past an earlier check.
+        let err = parse(r#"{"decision":"allow","decision":"deny"}"#)
+            .expect_err("duplicate key must be rejected");
+
+        assert!(
+            err.to_string().contains("duplicate object key: decision"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_nested_inside_a_container_is_still_rejected() {
+        let err = parse(r#"{"outer":[{"k":1,"k":2}]}"#).expect_err("nested duplicate");
+        assert!(err.to_string().contains("duplicate object key: k"), "{err}");
+
+        // Distinct keys at the same depth stay valid.
+        assert_eq!(
+            parse(r#"{"outer":[{"k":1},{"k":2}]}"#).unwrap(),
+            json!({"outer": [{"k": 1}, {"k": 2}]}),
+        );
+    }
+
+    #[test]
+    fn malformed_input_still_surfaces_a_parse_error() {
+        assert!(parse("{").is_err());
+        assert!(parse("").is_err());
+        assert!(from_slice(&[0xff, 0xfe]).is_err());
+    }
+}

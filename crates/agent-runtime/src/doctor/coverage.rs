@@ -460,3 +460,358 @@ fn is_executable_file(path: &Path) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const CLI_TOOLS: &str = r#"
+schema_version: 1
+profiles:
+  core: [ripgrep]
+  recommended: [ripgrep, jq]
+  full: [ripgrep, jq, absent-key]
+formulas:
+  ripgrep:
+    brew: ripgrep
+    command: rg
+    categories: [search]
+  jq:
+    brew: jq
+    command: jq
+    categories: [json]
+"#;
+
+    fn skills_yaml(required_clis: &str) -> String {
+        format!(
+            r#"
+schema_version: 1
+skills:
+  - id: sample.one
+    domain: sample
+    source: core/skills/sample
+    products:
+      codex:
+        name: /sample-one
+        render_to: skills/sample/SKILL.md
+    required_clis:
+{required_clis}
+"#
+        )
+    }
+
+    fn source_root(skills: &str, cli_tools: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let manifests = tmp.path().join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(manifests.join("skills.yaml"), skills).unwrap();
+        fs::write(manifests.join("cli-tools.yaml"), cli_tools).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn check_and_status_labels_are_the_published_wire_values() {
+        assert_eq!(CoverageKind::RequiredCli.check(), "required-cli");
+        assert_eq!(CoverageKind::CliTool.check(), "cli-tool");
+        assert_eq!(CoverageStatus::Ok.as_str(), "ok");
+        assert_eq!(CoverageStatus::Missing.as_str(), "missing");
+        assert_eq!(CoverageStatus::Outdated.as_str(), "outdated");
+        assert_eq!(CoverageStatus::Unparseable.as_str(), "unparseable");
+    }
+
+    #[test]
+    fn a_finding_renders_every_populated_field_into_the_doctor_message() {
+        let finding = CoverageFinding {
+            kind: CoverageKind::RequiredCli,
+            name: "agent-out".to_string(),
+            command: "agent-out".to_string(),
+            status: CoverageStatus::Outdated,
+            severity: DoctorSeverity::Warn,
+            required_version: Some(">=0.5.0".to_string()),
+            parsed_version: Some("0.4.0".to_string()),
+            formula: Some("nils-cli".to_string()),
+            message: "below floor".to_string(),
+        };
+
+        let doctor = finding.to_doctor_finding("codex");
+
+        assert_eq!(doctor.product, "codex");
+        assert_eq!(doctor.check, "required-cli");
+        assert_eq!(doctor.severity, DoctorSeverity::Warn);
+        assert_eq!(doctor.entry_id.as_deref(), Some("agent-out"));
+        assert_eq!(
+            doctor.message,
+            "status=outdated command=`agent-out` required=>=0.5.0 parsed=0.4.0 upgrade=`brew upgrade nils-cli`: below floor"
+        );
+    }
+
+    #[test]
+    fn severity_selects_the_doctor_finding_constructor() {
+        let base = CoverageFinding {
+            kind: CoverageKind::CliTool,
+            name: "ripgrep".to_string(),
+            command: "rg".to_string(),
+            status: CoverageStatus::Ok,
+            severity: DoctorSeverity::Ok,
+            required_version: None,
+            parsed_version: None,
+            formula: None,
+            message: String::new(),
+        };
+
+        let ok = base.to_doctor_finding("claude");
+        assert_eq!(ok.severity, DoctorSeverity::Ok);
+        // With every optional field absent the message stays minimal.
+        assert_eq!(ok.message, "status=ok command=`rg`");
+
+        let blocked = CoverageFinding {
+            severity: DoctorSeverity::Block,
+            status: CoverageStatus::Missing,
+            ..base
+        };
+        let blocked = blocked.to_doctor_finding("claude");
+        assert_eq!(blocked.severity, DoctorSeverity::Block);
+        assert_eq!(blocked.check, "cli-tool");
+    }
+
+    #[test]
+    fn a_missing_manifest_names_the_file_it_expected() {
+        let tmp = TempDir::new().unwrap();
+        let err = probe(tmp.path(), "core").expect_err("no manifests");
+
+        match err {
+            CoverageError::Missing { path } => {
+                assert!(path.ends_with("manifests/skills.yaml"), "{path:?}");
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unparseable_manifest_reports_a_parse_error() {
+        let tmp = source_root("schema_version: 1\nskills: [\n", CLI_TOOLS);
+        let err = probe(tmp.path(), "core").expect_err("broken yaml");
+
+        assert!(
+            matches!(err, CoverageError::Parse { .. }),
+            "expected Parse, got {err:?}"
+        );
+        assert!(err.to_string().starts_with("parse error in"));
+    }
+
+    #[test]
+    fn schema_version_drift_is_reported_per_manifest_family() {
+        // skills.yaml accepts a set of versions, so drift lists all of them.
+        let tmp = source_root("schema_version: 9\nskills: []\n", CLI_TOOLS);
+        match probe(tmp.path(), "core").expect_err("skills drift") {
+            CoverageError::SchemaVersions {
+                expected, found, ..
+            } => {
+                assert_eq!(expected, SKILLS_SCHEMA_VERSIONS.to_vec());
+                assert_eq!(found, 9);
+            }
+            other => panic!("expected SchemaVersions, got {other:?}"),
+        }
+
+        // cli-tools.yaml pins exactly one version.
+        let tmp = source_root(
+            "schema_version: 1\nskills: []\n",
+            &CLI_TOOLS.replace("schema_version: 1", "schema_version: 7"),
+        );
+        match probe(tmp.path(), "core").expect_err("cli-tools drift") {
+            CoverageError::SchemaVersion {
+                expected, found, ..
+            } => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(found, 7);
+            }
+            other => panic!("expected SchemaVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_skills_contract_is_reported_before_any_probe() {
+        // schema_version 1 with v2-only fields is a contract violation.
+        let skills = r#"
+schema_version: 1
+skills:
+  - id: sample.one
+    domain: sample
+    source: core/skills/sample
+    invocation:
+      role: workflow
+      intents: [project-dev]
+      example_request: "do the thing"
+      admission_rationale: "because"
+    products:
+      codex:
+        name: /sample-one
+        render_to: skills/sample/SKILL.md
+    required_clis: {}
+"#;
+        let tmp = source_root(skills, CLI_TOOLS);
+
+        let err = probe(tmp.path(), "core").expect_err("invalid contract");
+
+        assert!(
+            matches!(err, CoverageError::InvalidSkills { .. }),
+            "expected InvalidSkills, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_profile_is_rejected_by_name() {
+        let tmp = source_root("schema_version: 1\nskills: []\n", CLI_TOOLS);
+
+        let err = probe(tmp.path(), "everything").expect_err("unknown profile");
+
+        assert_eq!(
+            err.to_string(),
+            "unknown cli-tools profile `everything`; expected core, recommended, or full"
+        );
+    }
+
+    #[test]
+    fn each_profile_selects_its_own_tool_list() {
+        let tmp = source_root("schema_version: 1\nskills: []\n", CLI_TOOLS);
+
+        let core = probe(tmp.path(), "core").expect("core");
+        let recommended = probe(tmp.path(), "recommended").expect("recommended");
+        let full = probe(tmp.path(), "full").expect("full");
+
+        assert_eq!(core.len(), 1);
+        assert_eq!(recommended.len(), 2);
+        assert_eq!(full.len(), 3);
+        assert!(core.iter().all(|f| f.kind == CoverageKind::CliTool));
+    }
+
+    #[test]
+    fn a_profile_key_without_a_formula_is_a_warning_not_a_hard_error() {
+        let tmp = source_root("schema_version: 1\nskills: []\n", CLI_TOOLS);
+
+        let findings = probe(tmp.path(), "full").expect("full profile");
+        let orphan = findings
+            .iter()
+            .find(|f| f.name == "absent-key")
+            .expect("orphan key finding");
+
+        assert_eq!(orphan.status, CoverageStatus::Missing);
+        assert_eq!(orphan.severity, DoctorSeverity::Warn);
+        assert_eq!(orphan.formula, None);
+        assert_eq!(
+            orphan.message,
+            "profile references a formula key that is not declared"
+        );
+    }
+
+    #[test]
+    fn a_required_cli_that_is_not_on_path_blocks() {
+        let tmp = source_root(
+            &skills_yaml("      nils-definitely-absent-binary: \">=1.0.0\""),
+            CLI_TOOLS,
+        );
+
+        let findings = probe(tmp.path(), "core").expect("probe");
+        let required = findings
+            .iter()
+            .find(|f| f.kind == CoverageKind::RequiredCli)
+            .expect("required-cli finding");
+
+        assert_eq!(required.name, "nils-definitely-absent-binary");
+        assert_eq!(required.status, CoverageStatus::Missing);
+        assert_eq!(required.severity, DoctorSeverity::Block);
+        assert_eq!(required.required_version.as_deref(), Some(">=1.0.0"));
+        assert_eq!(required.formula.as_deref(), Some("nils-cli"));
+    }
+
+    #[test]
+    fn the_highest_declared_floor_wins_across_skills() {
+        let skills = r#"
+schema_version: 1
+skills:
+  - id: sample.low
+    domain: sample
+    source: core/skills/low
+    products:
+      codex:
+        name: /low
+        render_to: skills/sample/LOW.md
+    required_clis:
+      agent-out: "0.5.0"
+  - id: sample.high
+    domain: sample
+    source: core/skills/high
+    products:
+      codex:
+        name: /high
+        render_to: skills/sample/HIGH.md
+    required_clis:
+      agent-out: "1.2.0"
+"#;
+        let manifest: SkillsManifest = serde_yaml_ng::from_str(skills).expect("skills");
+
+        let floors = required_cli_floors(&manifest);
+
+        assert_eq!(floors.len(), 1);
+        assert_eq!(floors.get("agent-out").map(String::as_str), Some("1.2.0"));
+    }
+
+    #[test]
+    fn floors_that_cannot_be_parsed_fall_back_to_lexical_order() {
+        assert!(floor_cmp("1.2.0", "1.10.0").is_lt(), "semver, not lexical");
+        assert!(floor_cmp("1.10.0", "1.2.0").is_gt());
+        assert!(floor_cmp("nightly", "stable").is_lt());
+        assert!(floor_cmp("1.0.0", "1.0.0").is_eq());
+    }
+
+    #[test]
+    fn an_explicit_path_is_probed_directly_instead_of_searching_path() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("bin").join("tool");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        // A path-shaped program name is never looked up in PATH; before the
+        // executable bit is set it must not resolve.
+        let name = script.to_string_lossy().to_string();
+        assert_eq!(find_in_path(&name), None);
+        assert!(!is_executable_file(&script));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(find_in_path(&name), Some(script.clone()));
+            assert!(is_executable_file(&script));
+        }
+
+        // A directory and a missing path are never executables.
+        assert!(!is_executable_file(tmp.path()));
+        assert!(!is_executable_file(&tmp.path().join("absent")));
+        assert_eq!(find_in_path("nils-definitely-absent-binary"), None);
+    }
+
+    #[test]
+    fn windows_pathext_defaults_are_normalized_to_dotted_extensions() {
+        let extensions = windows_pathext_extensions();
+
+        assert!(
+            extensions
+                .iter()
+                .all(|ext| ext.to_string_lossy().starts_with('.')),
+            "every extension must be dotted: {extensions:?}"
+        );
+        assert!(!extensions.is_empty());
+    }
+
+    #[test]
+    fn brew_probe_is_inert_when_homebrew_is_absent() {
+        // Whatever the host looks like, the probe must return a bool rather
+        // than panicking or shelling out unconditionally.
+        let _ = brew_reports_outdated("definitely-not-a-formula");
+    }
+}

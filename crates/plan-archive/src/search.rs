@@ -233,3 +233,165 @@ fn emit_error(format: OutputFormat, code: &str, message: &str) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+
+    fn args(term: &str, archive: Option<PathBuf>) -> DispatchArgs {
+        DispatchArgs {
+            term: term.to_string(),
+            archive,
+            format: OutputFormat::Json,
+        }
+    }
+
+    #[test]
+    fn every_error_maps_to_a_stable_machine_code() {
+        assert_eq!(SearchError::EmptyTerm.code(), "search-empty-term");
+        assert_eq!(
+            SearchError::ArchiveCloneMissing(PathBuf::from("/nope")).code(),
+            "search-archive-clone-missing"
+        );
+        assert_eq!(SearchError::Io("boom".into()).code(), "search-io-error");
+        assert_eq!(
+            SearchError::ArchiveCloneMissing(PathBuf::from("/nope")).to_string(),
+            "archive clone path not found at `/nope`"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_term_is_refused_before_any_io() {
+        // The guard must fire before archive resolution, so an unusable
+        // archive path cannot mask the real complaint.
+        let missing = PathBuf::from("/definitely/not/an/archive");
+        assert_eq!(
+            run(&args("", Some(missing.clone())))
+                .expect_err("empty term")
+                .code(),
+            "search-empty-term"
+        );
+        assert_eq!(
+            run(&args("   \t ", Some(missing)))
+                .expect_err("whitespace term")
+                .code(),
+            "search-empty-term"
+        );
+    }
+
+    #[test]
+    fn a_missing_archive_clone_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("absent");
+
+        let err = resolve_archive(Some(&missing)).expect_err("missing archive");
+        assert_eq!(err.code(), "search-archive-clone-missing");
+        assert!(
+            err.to_string().contains(&*missing.to_string_lossy()),
+            "the error must name the path it looked for"
+        );
+
+        // A real directory resolves to itself, unchanged.
+        assert_eq!(
+            resolve_archive(Some(tmp.path())).expect("existing archive"),
+            tmp.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn an_archive_without_an_index_yields_an_empty_result() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run(&args("anything", Some(tmp.path().to_path_buf())))
+            .expect("empty archive is not an error");
+
+        assert_eq!(result.term, "anything");
+        assert_eq!(result.total_hits, 0);
+        assert!(result.hits.is_empty());
+    }
+
+    #[test]
+    fn the_term_is_trimmed_into_the_result_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = run(&args("  spaced  ", Some(tmp.path().to_path_buf()))).expect("search");
+
+        assert_eq!(result.term, "spaced");
+    }
+
+    #[test]
+    fn match_fields_render_with_their_wire_labels() {
+        assert_eq!(field_label(MatchField::Body), "body");
+        assert_eq!(field_label(MatchField::Comment), "comment");
+    }
+
+    #[test]
+    fn emit_reports_success_for_both_formats() {
+        let empty = SearchResult {
+            term: "term".to_string(),
+            total_hits: 0,
+            hits: Vec::new(),
+        };
+        assert_eq!(emit(OutputFormat::Json, &empty), exit::SUCCESS);
+        assert_eq!(emit(OutputFormat::Text, &empty), exit::SUCCESS);
+
+        let populated = SearchResult {
+            term: "term".to_string(),
+            total_hits: 2,
+            hits: vec![
+                SearchHit {
+                    plan: Some("plan-slug".to_string()),
+                    r#ref: "https://github.com/acme/widgets/pull/7".to_string(),
+                    field: MatchField::Body,
+                    snippet: "…term…".to_string(),
+                },
+                SearchHit {
+                    // An unattributed hit still renders; plan attribution is
+                    // best-effort and must never suppress a match.
+                    plan: None,
+                    r#ref: "https://github.com/acme/widgets/issues/8".to_string(),
+                    field: MatchField::Comment,
+                    snippet: "…term…".to_string(),
+                },
+            ],
+        };
+        assert_eq!(emit(OutputFormat::Json, &populated), exit::SUCCESS);
+        assert_eq!(emit(OutputFormat::Text, &populated), exit::SUCCESS);
+    }
+
+    #[test]
+    fn emit_error_uses_the_data_exit_code_for_both_formats() {
+        assert_eq!(
+            emit_error(OutputFormat::Json, "search-empty-term", "empty"),
+            exit::DATA
+        );
+        assert_eq!(
+            emit_error(OutputFormat::Text, "search-empty-term", "empty"),
+            exit::DATA
+        );
+    }
+
+    #[test]
+    fn dispatch_returns_the_emitted_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            dispatch(args("term", Some(tmp.path().to_path_buf()))),
+            exit::SUCCESS
+        );
+        assert_eq!(
+            dispatch(args("", Some(tmp.path().to_path_buf()))),
+            exit::DATA
+        );
+    }
+
+    #[test]
+    fn plan_attribution_is_best_effort_for_an_archive_without_a_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // No catalog to build from: hits would still be emitted, just
+        // unattributed, so the map is empty rather than an error.
+        assert!(plan_map(tmp.path()).is_empty());
+    }
+}

@@ -2476,4 +2476,368 @@ mod tests {
         let out = render_pr_comment(&mixed_merge_result(), RenderContext::default());
         assert_or_bless("pr_comment_mixed.md", &out);
     }
+
+    // -----------------------------------------------------------------
+    // Row-level normalization. A specialist writes JSONL by hand, so every
+    // field guard below is what keeps a malformed row out of the merged
+    // review rather than silently degrading it.
+    // -----------------------------------------------------------------
+
+    fn input() -> PathBuf {
+        PathBuf::from("/repo/findings.jsonl")
+    }
+
+    fn object(value: serde_json::Value) -> serde_json::Map<String, Value> {
+        value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn a_required_string_field_must_be_present_and_non_blank() {
+        let row = object(serde_json::json!({"summary": "text", "blank": "  ", "number": 1}));
+
+        assert_eq!(
+            required_string(&row, "summary", &input(), 3).expect("present"),
+            "text"
+        );
+
+        let missing = required_string(&row, "absent", &input(), 3).expect_err("missing");
+        assert_eq!(missing.source_line, 3);
+        assert_eq!(missing.source_file, "/repo/findings.jsonl");
+        assert_eq!(missing.message, "absent must be a string");
+
+        assert_eq!(
+            required_string(&row, "number", &input(), 3)
+                .expect_err("wrong type")
+                .message,
+            "number must be a string"
+        );
+        assert_eq!(
+            required_string(&row, "blank", &input(), 3)
+                .expect_err("blank")
+                .message,
+            "blank must not be empty"
+        );
+    }
+
+    #[test]
+    fn an_optional_string_treats_null_and_blank_as_absent() {
+        assert_eq!(
+            optional_string(None, "note", &input(), 1).expect("absent"),
+            None
+        );
+        assert_eq!(
+            optional_string(Some(&Value::Null), "note", &input(), 1).expect("null"),
+            None
+        );
+        assert_eq!(
+            optional_string(Some(&serde_json::json!("  ")), "note", &input(), 1).expect("blank"),
+            None
+        );
+        assert_eq!(
+            optional_string(Some(&serde_json::json!("text")), "note", &input(), 1).expect("text"),
+            Some("text".to_string())
+        );
+        assert_eq!(
+            optional_string(Some(&serde_json::json!(7)), "note", &input(), 1)
+                .expect_err("wrong type")
+                .message,
+            "note must be a string"
+        );
+    }
+
+    #[test]
+    fn an_optional_line_number_must_be_a_positive_integer() {
+        assert_eq!(
+            optional_positive_u64(None, &input(), 1).expect("absent"),
+            None
+        );
+        assert_eq!(
+            optional_positive_u64(Some(&Value::Null), &input(), 1).expect("null"),
+            None
+        );
+        assert_eq!(
+            optional_positive_u64(Some(&serde_json::json!(12)), &input(), 1).expect("positive"),
+            Some(12)
+        );
+
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("12"),
+        ] {
+            assert_eq!(
+                optional_positive_u64(Some(&bad), &input(), 1)
+                    .expect_err("invalid line")
+                    .message,
+                "line must be a positive integer when present",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_severity_vocabulary_accepts_its_documented_aliases() {
+        for (raw, expected) in [
+            ("critical", Severity::Critical),
+            ("CRIT", Severity::Critical),
+            ("High", Severity::High),
+            ("medium", Severity::Medium),
+            (" med ", Severity::Medium),
+            ("low", Severity::Low),
+            ("info", Severity::Info),
+            ("informational", Severity::Info),
+        ] {
+            assert_eq!(
+                normalize_severity(raw, &input(), 1).expect("severity"),
+                expected,
+                "{raw}"
+            );
+        }
+
+        let error = normalize_severity("catastrophic", &input(), 4).expect_err("unknown severity");
+        assert_eq!(error.source_line, 4);
+        assert!(
+            error
+                .message
+                .contains("expected critical|high|medium|low|info"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn confidence_must_be_a_number_within_the_unit_interval() {
+        for raw in [
+            serde_json::json!(0.0),
+            serde_json::json!(0.5),
+            serde_json::json!(1.0),
+            serde_json::json!(1),
+        ] {
+            normalize_confidence(&raw, &input(), 1)
+                .unwrap_or_else(|error| panic!("{raw}: {}", error.message));
+        }
+
+        assert_eq!(
+            normalize_confidence(&serde_json::json!("0.5"), &input(), 1)
+                .expect_err("string")
+                .message,
+            "confidence must be a number from 0.0 to 1.0"
+        );
+        for out_of_range in [serde_json::json!(-0.1), serde_json::json!(1.1)] {
+            assert_eq!(
+                normalize_confidence(&out_of_range, &input(), 1)
+                    .expect_err("out of range")
+                    .message,
+                "confidence must be from 0.0 to 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_display_threshold_is_bounded_to_the_unit_interval() {
+        validate_threshold(0.0).expect("lower bound");
+        validate_threshold(1.0).expect("upper bound");
+        assert_eq!(
+            validate_threshold(1.5).expect_err("above").code(),
+            "invalid-threshold"
+        );
+        assert_eq!(
+            validate_threshold(-0.5).expect_err("below").code(),
+            "invalid-threshold"
+        );
+    }
+
+    #[test]
+    fn a_stable_fingerprint_needs_three_lowercase_parts() {
+        validate_stable_fingerprint("correctness:parser:off-by-one", "fingerprint", &input(), 1)
+            .expect("stable");
+        validate_stable_fingerprint("a1:b2:c3", "fingerprint", &input(), 1).expect("digits");
+
+        for bad in [
+            "correctness",
+            "correctness:parser",
+            "a:b:c:d",
+            "Correctness:parser:x",
+            "correctness::x",
+            "-lead:parser:x",
+            "trail-:parser:x",
+            "correctness:parser:under_score",
+        ] {
+            let error =
+                validate_stable_fingerprint(bad, "fingerprint", &input(), 2).expect_err("unstable");
+            assert_eq!(
+                error.code.as_deref(),
+                Some("review_fingerprint_collision"),
+                "{bad}"
+            );
+            assert!(error.message.contains(bad), "{bad}");
+        }
+
+        assert!(stable_fingerprint_part("ok-1"));
+        assert!(!stable_fingerprint_part(""));
+    }
+
+    #[test]
+    fn path_validation_is_skipped_unless_it_is_requested() {
+        let off = PathPolicy {
+            repo: None,
+            validate_paths: false,
+            validate_lines: false,
+        };
+        validate_path_policy("anything/../escape", None, &off, &input(), 1)
+            .expect("no policy, no checks");
+
+        // Asking for validation without a repo root is a configuration error.
+        let no_repo = PathPolicy {
+            repo: None,
+            validate_paths: true,
+            validate_lines: false,
+        };
+        assert!(
+            validate_path_policy("src/lib.rs", None, &no_repo, &input(), 1)
+                .expect_err("no repo")
+                .message
+                .contains("--repo is required")
+        );
+    }
+
+    #[test]
+    fn a_validated_path_must_exist_inside_the_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().to_path_buf();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        let policy = PathPolicy {
+            repo: Some(repo.clone()),
+            validate_paths: true,
+            validate_lines: true,
+        };
+
+        validate_path_policy("src/lib.rs", Some(3), &policy, &input(), 1).expect("in range");
+        validate_path_policy("src/lib.rs", None, &policy, &input(), 1)
+            .expect("no line to validate");
+
+        assert!(
+            validate_path_policy("../outside.rs", None, &policy, &input(), 1)
+                .expect_err("escape")
+                .message
+                .contains("path must be relative to the repo")
+        );
+        assert!(
+            validate_path_policy("src/absent.rs", None, &policy, &input(), 1)
+                .expect_err("missing file")
+                .message
+                .contains("path does not exist")
+        );
+        assert!(
+            validate_path_policy("src/lib.rs", Some(99), &policy, &input(), 1)
+                .expect_err("past end")
+                .message
+                .contains("line 99 is past end of")
+        );
+    }
+
+    #[test]
+    fn delivery_mode_rejects_one_fingerprint_with_two_identities() {
+        let finding = |fingerprint: &str, category: &str| NormalizedFinding {
+            severity: Severity::High,
+            confidence: 0.9,
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            category: category.to_string(),
+            summary: "summary".to_string(),
+            evidence: "evidence".to_string(),
+            recommendation: "fix it".to_string(),
+            fingerprint: fingerprint.to_string(),
+            root_cause_fingerprint: None,
+            specialist: "reviewer-testing".to_string(),
+            test_suggestion: None,
+            source_file: "/repo/findings.jsonl".to_string(),
+            source_line: 1,
+        };
+
+        let consistent = vec![
+            finding("correctness:parser:one", "correctness"),
+            finding("correctness:parser:one", "correctness"),
+        ];
+        validate_delivery_collisions(&consistent, ReviewMode::Delivery).expect("same identity");
+
+        let conflicting = vec![
+            finding("correctness:parser:one", "correctness"),
+            finding("correctness:parser:one", "testing"),
+        ];
+        assert_eq!(
+            validate_delivery_collisions(&conflicting, ReviewMode::Delivery)
+                .expect_err("collision")
+                .code(),
+            "review_fingerprint_collision"
+        );
+
+        // Advisory mode does not carry lifecycle identity, so it is exempt.
+        validate_delivery_collisions(&conflicting, ReviewMode::Advisory)
+            .expect("advisory is exempt");
+    }
+
+    #[test]
+    fn severity_ranks_order_the_merged_report() {
+        assert!(severity_rank(Severity::Critical) < severity_rank(Severity::High));
+        assert!(severity_rank(Severity::High) < severity_rank(Severity::Medium));
+        assert!(severity_rank(Severity::Medium) < severity_rank(Severity::Low));
+        assert!(severity_rank(Severity::Low) < severity_rank(Severity::Info));
+    }
+
+    #[test]
+    fn the_computed_fingerprint_binds_path_line_category_and_summary() {
+        let base = computed_fingerprint("src/lib.rs", Some(10), "testing", "Missing test");
+
+        assert_ne!(
+            base,
+            computed_fingerprint("src/other.rs", Some(10), "testing", "Missing test")
+        );
+        assert_ne!(
+            base,
+            computed_fingerprint("src/lib.rs", Some(11), "testing", "Missing test")
+        );
+        assert_ne!(
+            base,
+            computed_fingerprint("src/lib.rs", Some(10), "security", "Missing test")
+        );
+        assert_ne!(
+            base,
+            computed_fingerprint("src/lib.rs", Some(10), "testing", "Other summary")
+        );
+        // A missing line is its own identity, not line zero.
+        assert_ne!(
+            base,
+            computed_fingerprint("src/lib.rs", None, "testing", "Missing test")
+        );
+        assert_eq!(
+            base.len(),
+            16,
+            "the fingerprint is a fixed-width hex digest"
+        );
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+    }
+
+    #[test]
+    fn a_validation_error_reports_the_first_typed_code_and_the_row_count() {
+        let untyped = validation_error(vec![RowError::new(
+            "/repo/findings.jsonl".to_string(),
+            1,
+            "bad".to_string(),
+        )]);
+        assert_eq!(untyped.code(), "invalid-findings");
+
+        let typed = validation_error(vec![
+            RowError::new("/repo/findings.jsonl".to_string(), 1, "bad".to_string()),
+            RowError::typed(
+                "/repo/findings.jsonl".to_string(),
+                2,
+                "review_fingerprint_collision",
+                "collision",
+            ),
+        ]);
+        assert_eq!(typed.code(), "review_fingerprint_collision");
+    }
 }

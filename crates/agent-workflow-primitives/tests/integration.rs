@@ -8,6 +8,8 @@ mod agent_run_inspect;
 mod agent_run_inspect_unavailable;
 #[path = "integration/cli.rs"]
 mod cli;
+#[path = "integration/completion_export.rs"]
+mod completion_export;
 #[path = "integration/control_plane.rs"]
 mod control_plane;
 #[path = "integration/exit_codes.rs"]

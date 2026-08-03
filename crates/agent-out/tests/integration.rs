@@ -5,6 +5,8 @@
 
 #[path = "integration/cli.rs"]
 mod cli;
+#[path = "integration/completion_export.rs"]
+mod completion_export;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
 #[path = "integration/help_snapshot.rs"]
