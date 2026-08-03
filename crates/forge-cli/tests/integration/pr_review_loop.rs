@@ -53,6 +53,23 @@ exit 99
     )
 }
 
+/// The same stub, plus an empty privileged review-state comment page, so a
+/// genesis observation can reach a completely clean preflight.
+fn gh_stub_with_empty_ledger(stub: &StubEnv, head: &str) -> String {
+    gh_stub_with_head(stub, head).replace(
+        r#"esac
+echo "stub: unscripted gh args: $*" >&2"#,
+        r#"  "api graphql")
+    cat <<'JSON'
+{"data":{"viewer":{"login":"forge-bot"},"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}
+JSON
+    exit 0
+    ;;
+esac
+echo "stub: unscripted gh args: $*" >&2"#,
+    )
+}
+
 fn gh_args_log(stub: &StubEnv) -> String {
     fs::read_to_string(stub.tempdir.path().join("gh-args.log")).unwrap_or_default()
 }
@@ -269,7 +286,165 @@ fn observe_dry_run_reports_the_payload_verdict_when_the_provider_is_unreachable(
 }
 
 #[test]
-fn observe_help_documents_both_findings_file_shapes() {
+fn observe_dry_run_renders_the_exact_combined_comment_it_would_post() {
+    // A marker-only ledger comment renders blank on GitHub, and the final
+    // outcome used to need a second comment. The dry run must show the one
+    // comment that now carries both, and still write nothing.
+    let stub = StubEnv::new();
+    let body = gh_stub_with_empty_ledger(&stub, "provider-head");
+    let findings = write_findings(&stub, "findings.json", "[]");
+    let outcome = stub.tempdir.path().join("outcome.md");
+    fs::write(
+        &outcome,
+        "## Delivery outcome\n\nApproved: bounded review converged.\n",
+    )
+    .expect("write outcome body");
+    let outcome = outcome.to_string_lossy().to_string();
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "pr",
+            "review-loop",
+            "observe",
+            "7",
+            "--expected-head",
+            "provider-head",
+            "--findings-file",
+            &findings,
+            "--body-file",
+            &outcome,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["preflight_ok"], true, "{envelope}");
+    assert_eq!(envelope["data"]["would_append"], true);
+    assert_eq!(preflight_verdict(&envelope, "outcome_body")["ok"], true);
+    assert_eq!(
+        preflight_verdict(&envelope, "state_comment_body")["ok"],
+        true
+    );
+
+    let planned = &envelope["data"]["planned_comment"];
+    assert_eq!(planned["includes_outcome_body"], true, "{envelope}");
+    assert_eq!(
+        planned["visible_metadata"],
+        "forge-cli review ledger · generation 0 · review-loop · head provider-hea"
+    );
+    // The reported size is the complete body that would be posted, which is what
+    // the provider limit is checked against.
+    assert!(
+        planned["bytes"].as_u64().unwrap_or_default() > 0,
+        "{envelope}"
+    );
+    assert!(
+        envelope["data"]["plan"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("in one comment"),
+        "{envelope}"
+    );
+
+    let log = gh_args_log(&stub);
+    for write_marker in ["-X POST", "-X PATCH", "-X PUT", "mutation", "pr comment"] {
+        assert!(
+            !log.contains(write_marker),
+            "a combined dry run must not write ({write_marker}), log={log}"
+        );
+    }
+}
+
+#[test]
+fn observe_dry_run_omits_a_planned_comment_when_the_ledger_is_already_current() {
+    // Nothing is appended, so nothing is planned — and the supplied outcome is
+    // therefore not posted either. This is the retry-deduplication signal the
+    // caller reads instead of guessing.
+    let stub = StubEnv::new();
+    let body = gh_stub_with_head(&stub, "provider-head");
+    let findings = write_findings(&stub, "findings.json", VALID_FINDINGS);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "pr",
+            "review-loop",
+            "observe",
+            "7",
+            "--expected-head",
+            "stale-head",
+            "--findings-file",
+            &findings,
+            "--body",
+            "## Delivery outcome",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert!(
+        envelope["data"].get("planned_comment").is_none(),
+        "no write is planned, so no comment shape is reported: {envelope}"
+    );
+    // The outcome body itself is still validated, independently of the provider.
+    assert_eq!(preflight_verdict(&envelope, "outcome_body")["ok"], true);
+}
+
+#[test]
+fn observe_rejects_both_outcome_body_forms_at_once() {
+    let stub = StubEnv::new();
+    let findings = write_findings(&stub, "findings.json", VALID_FINDINGS);
+    let stub = stub.gh_stub("#!/bin/sh\nexit 99\n");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "pr",
+            "review-loop",
+            "observe",
+            "7",
+            "--expected-head",
+            "provider-head",
+            "--findings-file",
+            &findings,
+            "--body",
+            "inline",
+            "--body-file",
+            "outcome.md",
+        ],
+    );
+
+    assert_eq!(out.code, 64, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("--body-file"),
+        "stderr should name the conflicting flag: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn observe_help_documents_both_findings_file_shapes_and_the_combined_outcome() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["pr", "review-loop", "observe", "--help"]);
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
@@ -278,6 +453,9 @@ fn observe_help_documents_both_findings_file_shapes() {
         "<category>:<component>:<invariant>",
         "disposition",
         "--dry-run",
+        "--body-file",
+        "forge-cli review ledger",
+        "outcome_posted",
     ] {
         assert!(
             out.stdout.contains(expected),

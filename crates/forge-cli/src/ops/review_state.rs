@@ -4,6 +4,12 @@
 //! in an owned HTML marker; each record binds its previous digest and expected
 //! PR head. This module deliberately contains no provider I/O so parsing,
 //! privacy, and fork rules stay deterministic.
+//!
+//! Encoding and presentation are separate concerns here. [`ReviewStateRecord::marker`]
+//! owns the canonical machine encoding that digests and chain validation depend
+//! on; [`render_state_comment_body`] owns the human-facing comment body that
+//! wraps it. Presentation text never reaches a digest, so a rendering change can
+//! never fork or invalidate an existing chain.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +23,13 @@ pub const REVIEW_STATE_SCHEMA: &str = "forge-cli.review-loop.v1";
 const STATE_MARKER_OPEN: &str = "<!-- forge-cli:review-state:v1 ";
 const STATE_MARKER_CLOSE: &str = " -->";
 const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
+/// GitHub caps an issue-comment body at 65536 bytes, and the marker is only one
+/// part of that body once visible text wraps it. The complete rendered body is
+/// what the provider actually stores, so it carries the binding limit.
+const MAX_PROVIDER_STATE_COMMENT_BYTES: usize = 64 * 1024;
+const STATE_COMMENT_LABEL: &str = "forge-cli review ledger";
+/// Abbreviated-SHA width for the visible metadata line.
+const STATE_COMMENT_HEAD_CHARS: usize = 12;
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
 const FINDING_MARKER_PREFIX: &str = "<!-- forge-cli:review-finding:v1 run=";
 const THREAD_DISPOSITION_MARKER_PREFIX: &str = "<!-- forge-cli:thread-disposition:v1 thread=";
@@ -150,6 +163,17 @@ pub enum ReviewStatePayload {
     ReviewLoop { state: ReviewLoopState },
 }
 
+impl ReviewStatePayload {
+    /// The serialized `kind` tag, reused verbatim in the visible metadata line so
+    /// the timeline names the same payload kind the record encodes.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ReviewRunReceipt { .. } => "review-run-receipt",
+            Self::ReviewLoop { .. } => "review-loop",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewStateRecord {
     pub schema: String,
@@ -246,6 +270,106 @@ impl ReviewStateRecord {
             ));
         }
         Ok(marker)
+    }
+}
+
+/// The one-line, non-sensitive description of a ledger record shown in the
+/// provider timeline.
+///
+/// Everything here is already public on the pull request: the generation index,
+/// the payload kind, and an abbreviated head SHA. No credential, environment
+/// value, local path, private identity, or finding body is representable.
+pub fn state_comment_visible_metadata(record: &ReviewStateRecord) -> String {
+    format!(
+        "{STATE_COMMENT_LABEL} · generation {generation} · {kind} · head {head}",
+        generation = record.generation,
+        kind = record.payload.kind(),
+        head = abbreviated_head(&record.expected_head),
+    )
+}
+
+/// Renders the complete provider comment body for one ledger record, optionally
+/// carrying a human-readable delivery outcome in the same comment.
+///
+/// GitHub hides HTML comments when it renders Markdown, so a body that is only
+/// the canonical marker appears in the timeline as a blank comment authored by
+/// the operator. Prefixing the visible metadata line keeps the same append-only
+/// record identifiable as machine metadata. The marker itself is emitted
+/// unchanged and on its own trailing line, so [`parse_state_marker`] — which
+/// already searches within a larger body — reads new and historical bare-marker
+/// comments identically, with no migration.
+///
+/// `visible_outcome`, when supplied, makes the ledger append and the delivery
+/// outcome one provider mutation instead of two. It is rejected if it carries a
+/// state marker of its own: [`parse_state_marker`] takes the first marker in the
+/// body, so an embedded one would silently shadow this record's.
+pub fn render_state_comment_body(
+    record: &ReviewStateRecord,
+    visible_outcome: Option<&str>,
+) -> Result<String, ForgeError> {
+    let marker = record.marker()?;
+    let metadata = state_comment_visible_metadata(record);
+    let body = match visible_outcome {
+        Some(outcome) => {
+            let outcome = validate_visible_outcome(outcome)?;
+            format!("{outcome}\n\n---\n\n{metadata}\n{marker}")
+        }
+        None => format!("{metadata}\n{marker}"),
+    };
+    if body.len() > MAX_PROVIDER_STATE_COMMENT_BYTES {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_state_comment_too_large",
+            "the complete provider review-state comment body exceeds the safe comment-body limit",
+            Some(format!(
+                "comment_bytes={}; marker_bytes={}; max_bytes={MAX_PROVIDER_STATE_COMMENT_BYTES}",
+                body.len(),
+                marker.len()
+            )),
+        ));
+    }
+    Ok(body)
+}
+
+/// Validates a caller-supplied visible outcome body for combined posting.
+///
+/// Only structural safety is checked here; portability rules (local paths,
+/// escaped control markdown) belong to the command layer that owns the flag.
+fn validate_visible_outcome(outcome: &str) -> Result<&str, ForgeError> {
+    let trimmed = outcome.trim();
+    if trimmed.is_empty() {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_state_comment_invalid",
+            "the review-loop outcome body is empty",
+            None,
+        ));
+    }
+    if trimmed.contains(STATE_MARKER_OPEN) {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_state_comment_invalid",
+            "the review-loop outcome body must not contain a review-state marker",
+            Some(format!("marker_prefix={}", STATE_MARKER_OPEN.trim_end())),
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Abbreviates a head SHA for the single-line visible metadata.
+///
+/// The provider supplies the head, so the visible line filters it to characters
+/// that cannot break out of one line of plain Markdown.
+fn abbreviated_head(head: &str) -> String {
+    let abbreviated = head
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .take(STATE_COMMENT_HEAD_CHARS)
+        .collect::<String>();
+    if abbreviated.is_empty() {
+        "-".to_string()
+    } else {
+        abbreviated
     }
 }
 
@@ -1264,6 +1388,248 @@ mod tests {
         );
         let marker = record.marker().expect("marker");
         assert_eq!(parse_state_marker(&marker).expect("parse"), Some(record));
+    }
+
+    // ---------------------------------------------------------------------
+    // A marker-only body is what GitHub renders as a blank comment. These
+    // guards keep the visible wrapper honest without letting presentation
+    // reach the digest, the chain, or the parser.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_rendered_state_comment_is_visibly_identified_and_still_parses() {
+        let record = ReviewStateRecord::new(
+            "acme/widgets",
+            7,
+            "0123456789abcdef0123456789abcdef01234567",
+            3,
+            Some("sha256:previous".to_string()),
+            ReviewStatePayload::ReviewLoop {
+                state: fixture_loop_state(1),
+            },
+        )
+        .expect("record");
+
+        let body = render_state_comment_body(&record, None).expect("rendered body");
+
+        assert_eq!(
+            body,
+            format!(
+                "forge-cli review ledger · generation 3 · review-loop · head 0123456789ab\n{}",
+                record.marker().expect("marker")
+            )
+        );
+        // The visible line is real Markdown text, so the comment can never
+        // render empty.
+        assert!(!body.lines().next().expect("first line").starts_with("<!--"),);
+        assert_eq!(parse_state_marker(&body).expect("parse"), Some(record));
+    }
+
+    #[test]
+    fn a_receipt_comment_names_its_own_payload_kind() {
+        let record = ReviewStateRecord::new(
+            "acme/widgets",
+            7,
+            "head-abc",
+            0,
+            None,
+            ReviewStatePayload::ReviewRunReceipt {
+                receipt: fixture_receipt(),
+            },
+        )
+        .expect("record");
+
+        assert_eq!(
+            state_comment_visible_metadata(&record),
+            "forge-cli review ledger · generation 0 · review-run-receipt · head head-abc"
+        );
+    }
+
+    #[test]
+    fn historical_bare_markers_and_rendered_bodies_validate_as_one_chain() {
+        // Existing history is bare markers; new appends are wrapped. A chain
+        // that mixes both must be indistinguishable from either, with no
+        // migration and no rewrite of historical comments.
+        let genesis = record("head", 0, None, fixture_loop_state(0));
+        let child = record(
+            "head",
+            1,
+            Some(genesis.record_digest.clone()),
+            fixture_loop_state(1),
+        );
+        let historical = genesis.marker().expect("historical marker");
+        let rendered = render_state_comment_body(&child, None).expect("rendered body");
+
+        let mixed =
+            parse_chain([historical.as_str(), rendered.as_str()], REPO, PR).expect("mixed history");
+        let all_legacy = parse_chain(
+            [
+                historical.as_str(),
+                child.marker().expect("marker").as_str(),
+            ],
+            REPO,
+            PR,
+        )
+        .expect("recorded history");
+
+        assert_eq!(mixed, all_legacy);
+        assert_eq!(mixed.tip_digest.as_deref(), Some(&*child.record_digest));
+    }
+
+    #[test]
+    fn visible_presentation_never_reaches_the_record_digest() {
+        let record = record("head", 0, None, fixture_loop_state(0));
+        let plain = render_state_comment_body(&record, None).expect("plain body");
+        let combined =
+            render_state_comment_body(&record, Some("## Approved\n\nEvidence.")).expect("combined");
+
+        let from_plain = parse_state_marker(&plain).expect("parse").expect("record");
+        let from_combined = parse_state_marker(&combined)
+            .expect("parse")
+            .expect("record");
+
+        assert_eq!(from_plain, from_combined);
+        assert_eq!(from_plain.record_digest, record.record_digest);
+        // Two different presentations of one record are still one logical
+        // append, not a fork.
+        let chain =
+            parse_chain([plain.as_str(), combined.as_str()], REPO, PR).expect("deduplicated");
+        assert_eq!(chain.records, vec![record]);
+    }
+
+    #[test]
+    fn a_combined_comment_keeps_the_outcome_visible_and_the_marker_exact() {
+        let record = record("head", 0, None, fixture_loop_state(0));
+        let outcome = "## Delivery outcome\n\n- decision: approve";
+
+        let body = render_state_comment_body(&record, Some(outcome)).expect("combined body");
+
+        assert!(body.starts_with(outcome), "{body}");
+        assert!(body.ends_with(&record.marker().expect("marker")), "{body}");
+        // Stripping owned markers leaves the human-readable outcome intact.
+        assert!(strip_owned_markers(&body).starts_with(outcome));
+        assert_eq!(
+            parse_state_marker(&body).expect("parse").as_ref(),
+            Some(&record)
+        );
+    }
+
+    #[test]
+    fn an_outcome_body_carrying_a_state_marker_is_refused() {
+        // `parse_state_marker` takes the FIRST marker in the body, so an
+        // embedded one would shadow this record's and silently corrupt the
+        // chain the comment claims to extend.
+        let forged = record("head", 0, None, fixture_loop_state(9))
+            .marker()
+            .expect("marker");
+        let record = record("head", 0, None, fixture_loop_state(0));
+
+        for outcome in [
+            forged.clone(),
+            format!("Quoted history: {forged} — see above"),
+            format!("{STATE_MARKER_OPEN}deadbeef{STATE_MARKER_CLOSE}"),
+        ] {
+            let error = render_state_comment_body(&record, Some(&outcome))
+                .expect_err("marker injection must fail closed");
+            assert_eq!(error.kind(), "review_state_comment_invalid");
+        }
+
+        let empty = render_state_comment_body(&record, Some("   \n\t "))
+            .expect_err("an empty outcome is not an outcome");
+        assert_eq!(empty.kind(), "review_state_comment_invalid");
+    }
+
+    #[test]
+    fn the_complete_rendered_body_is_size_checked_before_any_mutation() {
+        let record = record("head", 0, None, fixture_loop_state(0));
+        let marker_bytes = record.marker().expect("marker").len();
+
+        // A marker that fits on its own can still overflow once visible text
+        // wraps it, which is why the limit binds the complete body.
+        let headroom = MAX_PROVIDER_STATE_COMMENT_BYTES - marker_bytes;
+        let error = render_state_comment_body(&record, Some(&"o".repeat(headroom)))
+            .expect_err("oversized combined body must fail before post");
+        assert_eq!(error.kind(), "review_state_comment_too_large");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains(&format!("max_bytes={MAX_PROVIDER_STATE_COMMENT_BYTES}")),
+            "{:?}",
+            error.detail()
+        );
+
+        // Just inside the limit still renders.
+        let fitted = render_state_comment_body(&record, Some(&"o".repeat(headroom / 2)))
+            .expect("a body within the limit renders");
+        assert!(fitted.len() <= MAX_PROVIDER_STATE_COMMENT_BYTES);
+    }
+
+    #[test]
+    fn visible_metadata_exposes_nothing_beyond_public_pull_request_facts() {
+        let record = ReviewStateRecord::new(
+            "acme/widgets",
+            7,
+            "abcdef0123456789abcdef0123456789abcdef01",
+            2,
+            Some("sha256:previous".to_string()),
+            ReviewStatePayload::ReviewRunReceipt {
+                receipt: fixture_receipt(),
+            },
+        )
+        .expect("record");
+
+        let metadata = state_comment_visible_metadata(&record);
+
+        assert_eq!(metadata.lines().count(), 1, "{metadata}");
+        for forbidden in [
+            "token",
+            "secret",
+            "credential",
+            "profile",
+            "/home/",
+            "/Users/",
+            "C:\\",
+            "@",
+            "sha256:",
+        ] {
+            assert!(!metadata.contains(forbidden), "{forbidden} in {metadata}");
+        }
+        // The abbreviated head is a prefix of the public head, never the whole
+        // record or any digest.
+        assert!(record.expected_head.starts_with("abcdef012345"));
+        assert!(metadata.ends_with("head abcdef012345"));
+    }
+
+    #[test]
+    fn an_unusable_head_still_renders_one_plain_line() {
+        // The head comes from the provider. Nothing it contains may break the
+        // visible line into extra Markdown.
+        for (head, expected) in [
+            ("", "-"),
+            ("  ", "-"),
+            ("a\nb", "ab"),
+            ("**bold**", "bold"),
+            ("héad-1234567890", "had-12345678"),
+        ] {
+            let record = ReviewStateRecord::new(
+                "acme/widgets",
+                7,
+                head,
+                0,
+                None,
+                ReviewStatePayload::ReviewRunReceipt {
+                    receipt: fixture_receipt(),
+                },
+            )
+            .expect("record");
+            let metadata = state_comment_visible_metadata(&record);
+            assert_eq!(metadata.lines().count(), 1, "{metadata}");
+            assert!(
+                metadata.ends_with(&format!("head {expected}")),
+                "{metadata}"
+            );
+        }
     }
 
     #[test]

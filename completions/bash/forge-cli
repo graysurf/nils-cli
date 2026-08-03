@@ -5068,7 +5068,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__review__loop__observe)
-            opts="-h --expected-head --findings-file --expected-state --format --remote --provider --host --repo --store-root --dry-run --help"
+            opts="-h --expected-head --findings-file --expected-state --body --body-file --format --remote --provider --host --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5083,6 +5083,14 @@ _forge-cli() {
                     return 0
                     ;;
                 --expected-state)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --body)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --body-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

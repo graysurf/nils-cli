@@ -1814,8 +1814,12 @@ fn ensure_review_run_receipt<R: BackendRunner>(
             receipt: receipt.clone(),
         },
     )?;
-    let marker = record.marker()?;
-    let append_result = runner.run(&build_issue_comment_call(ctx, number, &marker));
+    // The receipt prewrite stays its own comment: transaction recovery requires
+    // durable state to exist before the native-review mutation, so it has no
+    // human-readable outcome to share a body with yet. It still gets the visible
+    // metadata label so the timeline never shows a blank comment.
+    let body = review_state::render_state_comment_body(&record, None)?;
+    let append_result = runner.run(&build_issue_comment_call(ctx, number, &body));
     let observed = read_review_state_after(
         runner,
         ctx,
@@ -1904,15 +1908,37 @@ pub(crate) fn read_review_loop_state_view<R: BackendRunner>(
     })
 }
 
+/// One review-loop ledger append, with its compare-and-swap inputs and the
+/// optional visible outcome that shares its comment.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewLoopAppend<'a> {
+    pub repository: &'a str,
+    pub number: u64,
+    pub expected_head: &'a str,
+    pub expected_tip: Option<&'a str>,
+    pub state: review_state::ReviewLoopState,
+    /// A human-readable delivery outcome posted in the same provider comment as
+    /// the ledger marker. Because the outcome rides the append, it inherits the
+    /// append's idempotency: a transition that changes nothing is not appended
+    /// and therefore posts no outcome either, so an identical retry cannot leave
+    /// a duplicate outcome comment behind.
+    pub visible_outcome: Option<&'a str>,
+}
+
+/// Appends one review-loop generation with head and tip compare-and-swap.
 pub(crate) fn append_review_loop_state<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
-    repository: &str,
-    number: u64,
-    expected_head: &str,
-    expected_tip: Option<&str>,
-    state: review_state::ReviewLoopState,
+    append: ReviewLoopAppend<'_>,
 ) -> Result<review_state::ReviewStateChain, ForgeError> {
+    let ReviewLoopAppend {
+        repository,
+        number,
+        expected_head,
+        expected_tip,
+        state,
+        visible_outcome,
+    } = append;
     let before = read_review_state_snapshot(runner, ctx, repository, number)?;
     if before.chain.tip_digest.as_deref() != expected_tip {
         return Err(ForgeError::validation(
@@ -1934,8 +1960,8 @@ pub(crate) fn append_review_loop_state<R: BackendRunner>(
         before.chain.tip_digest.clone(),
         review_state::ReviewStatePayload::ReviewLoop { state },
     )?;
-    let marker = record.marker()?;
-    let append_result = runner.run(&build_issue_comment_call(ctx, number, &marker));
+    let body = review_state::render_state_comment_body(&record, visible_outcome)?;
+    let append_result = runner.run(&build_issue_comment_call(ctx, number, &body));
     let after = read_review_state_snapshot(runner, ctx, repository, number)?;
     if after
         .chain
@@ -3442,11 +3468,14 @@ mod tests {
         let chain = append_review_loop_state(
             &runner,
             &ctx(Some("acme/widgets")),
-            "acme/widgets",
-            44,
-            "head-44",
-            None,
-            state,
+            ReviewLoopAppend {
+                repository: "acme/widgets",
+                number: 44,
+                expected_head: "head-44",
+                expected_tip: None,
+                state,
+                visible_outcome: None,
+            },
         )
         .expect("append and read back");
 
@@ -3458,6 +3487,95 @@ mod tests {
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 3);
         assert!(calls[1].contains("issues/44/comments"), "{}", calls[1]);
+        // The posted body carries the visible label, not a bare marker: a
+        // marker-only body renders as a blank GitHub comment.
+        assert!(
+            calls[1].contains(&review_state::state_comment_visible_metadata(&record)),
+            "{}",
+            calls[1]
+        );
+    }
+
+    #[test]
+    fn a_combined_append_posts_one_comment_carrying_outcome_and_ledger() {
+        let state = review_state::observe_review_loop(None, "head-44", &[])
+            .expect("genesis transition")
+            .state;
+        let record = review_state::ReviewStateRecord::new(
+            "acme/widgets",
+            44,
+            "head-44",
+            0,
+            None,
+            review_state::ReviewStatePayload::ReviewLoop {
+                state: state.clone(),
+            },
+        )
+        .expect("record");
+        let empty_snapshot = |nodes: serde_json::Value| crate::backend::BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "viewer": {"login": "next-session-bot"},
+                    "repository": {"pullRequest": {"comments": {
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }}}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let body = review_state::render_state_comment_body(&record, Some("## Delivery outcome"))
+            .expect("combined body");
+        let runner = ReceiptRunner {
+            outputs: RefCell::new(vec![
+                empty_snapshot(serde_json::json!([])),
+                crate::backend::BackendSuccess {
+                    stdout: "https://github.com/acme/widgets/issues/44#issuecomment-1".to_string(),
+                    stderr: String::new(),
+                },
+                empty_snapshot(serde_json::json!([{
+                    "author": {"login": "next-session-bot"},
+                    "authorAssociation": "OWNER",
+                    "body": body,
+                    "createdAt": "2026-07-20T00:00:01Z"
+                }])),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let chain = append_review_loop_state(
+            &runner,
+            &ctx(Some("acme/widgets")),
+            ReviewLoopAppend {
+                repository: "acme/widgets",
+                number: 44,
+                expected_head: "head-44",
+                expected_tip: None,
+                state,
+                visible_outcome: Some("## Delivery outcome"),
+            },
+        )
+        .expect("combined append");
+
+        // One provider mutation carries both halves, and the chain still reads
+        // the exact record out of the wrapped body.
+        let calls = runner.calls.borrow();
+        let mutations = calls
+            .iter()
+            .filter(|call| call.contains("issues/44/comments"))
+            .count();
+        assert_eq!(mutations, 1);
+        assert!(calls[1].contains("## Delivery outcome"), "{}", calls[1]);
+        assert!(
+            calls[1].contains(&record.marker().expect("marker")),
+            "{}",
+            calls[1]
+        );
+        assert_eq!(
+            chain.tip_digest.as_deref(),
+            Some(record.record_digest.as_str())
+        );
     }
 
     #[test]

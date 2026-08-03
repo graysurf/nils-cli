@@ -13,10 +13,10 @@ use crate::cli::{
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comments::github_repo_slug_from_url;
-use crate::ops::{pr_review, pr_view, review_state};
+use crate::ops::{pr_comment, pr_review, pr_view, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::RuleVerdict;
+use crate::validations::{RuleVerdict, no_escaped_control_markdown, no_local_path};
 
 const SCHEMA_INSPECT: &str = "pr.review-loop.inspect";
 const SCHEMA_OBSERVE: &str = "pr.review-loop.observe";
@@ -33,6 +33,11 @@ pub struct PrReviewLoopPayload {
     pub generation: Option<u64>,
     pub state: Option<review_state::ReviewLoopState>,
     pub appended: bool,
+    /// Whether a supplied `--body` / `--body-file` delivery outcome was posted.
+    /// Only `observe` can set this, and only together with an append: the outcome
+    /// shares the appended comment, so `appended: false` always means the outcome
+    /// was not posted (the ledger was already current).
+    pub outcome_posted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -65,7 +70,27 @@ struct ReviewLoopObserveDryRunPayload {
     /// chain is already current. `None` when the transition was not evaluated.
     #[serde(skip_serializing_if = "Option::is_none")]
     would_append: Option<bool>,
+    /// The exact provider comment the live append would post. Present only when
+    /// the transition was evaluated and would append; absent when the chain is
+    /// already current, because then nothing is written at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planned_comment: Option<PlannedStateComment>,
     preflight: Vec<RuleVerdict>,
+}
+
+/// The rendered shape of one planned ledger comment.
+///
+/// The rendered body is reported by size and visible label rather than verbatim:
+/// a combined outcome body can approach the provider's 64 KiB comment limit, and
+/// the caller already owns the outcome bytes it supplied.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PlannedStateComment {
+    /// The visible metadata line rendered above the machine marker.
+    visible_metadata: String,
+    /// Whether the supplied delivery outcome shares this one comment.
+    includes_outcome_body: bool,
+    /// Complete rendered body size, the value checked against the safe limit.
+    bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +137,7 @@ pub fn run_inspect_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view.url,
         state_view.chain,
         false,
+        false,
         SCHEMA_INSPECT,
         format,
     )
@@ -138,6 +164,10 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         return emit_observe_dry_run(runner, &ctx, &args, format);
     }
     let observations = read_observations(&args.findings_file)?;
+    // Read and validate the outcome body before the first provider call, so an
+    // unreadable path or a non-portable body cannot fail between the ledger read
+    // and the append.
+    let outcome_body = read_outcome_body(&args)?;
     let (view, repository) = resolve_pr(runner, &ctx, args.id)?;
     ensure_expected_head(view.head_sha.as_deref(), &args.expected_head)?;
     let state_view =
@@ -182,14 +212,19 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                     .hard_stop
                     .clone()
                     .expect("recorded hard stop exists");
+                // A hard stop is a failure receipt, never a delivery outcome, so
+                // the outcome body is deliberately not attached here.
                 let chain = pr_review::append_review_loop_state(
                     runner,
                     &ctx,
-                    &repository,
-                    view.number,
-                    &args.expected_head,
-                    state_view.chain.tip_digest.as_deref(),
-                    stopped,
+                    pr_review::ReviewLoopAppend {
+                        repository: &repository,
+                        number: view.number,
+                        expected_head: &args.expected_head,
+                        expected_tip: state_view.chain.tip_digest.as_deref(),
+                        state: stopped,
+                        visible_outcome: None,
+                    },
                 )?;
                 return Err(durable_hard_stop_error(
                     &error,
@@ -201,11 +236,15 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         };
 
     if !transition.changed {
+        // The ledger is already current, so there is nothing to append and no
+        // comment to carry an outcome. Posting the outcome on its own here would
+        // reintroduce exactly the duplicate an identical retry must not create.
         return emit_state(
             &ctx,
             view.number,
             view.url,
             state_view.chain,
+            false,
             false,
             SCHEMA_OBSERVE,
             format,
@@ -214,11 +253,14 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     let chain = pr_review::append_review_loop_state(
         runner,
         &ctx,
-        &repository,
-        view.number,
-        &args.expected_head,
-        state_view.chain.tip_digest.as_deref(),
-        transition.state,
+        pr_review::ReviewLoopAppend {
+            repository: &repository,
+            number: view.number,
+            expected_head: &args.expected_head,
+            expected_tip: state_view.chain.tip_digest.as_deref(),
+            state: transition.state,
+            visible_outcome: outcome_body.as_deref(),
+        },
     )?;
     emit_state(
         &ctx,
@@ -226,9 +268,38 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view.url,
         chain,
         true,
+        outcome_body.is_some(),
         SCHEMA_OBSERVE,
         format,
     )
+}
+
+/// Reads and validates the optional visible delivery outcome body.
+///
+/// Returns `None` when neither flag was supplied. When one was, the body must be
+/// present and portable: the same no-local-path and escaped-control rules the
+/// review comment surfaces enforce apply, because this text becomes a permanent
+/// provider-visible comment.
+fn read_outcome_body(args: &PrReviewLoopObserveArgs) -> Result<Option<String>, ForgeError> {
+    if args.body.is_none() && args.body_file.is_none() {
+        return Ok(None);
+    }
+    let body = pr_comment::read_body_with_file_flag(
+        args.body.as_deref(),
+        args.body_file.as_deref(),
+        "--body-file",
+    )?;
+    if body.trim().is_empty() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_comment_invalid",
+            "the review-loop outcome body is empty (supply --body or --body-file)",
+            None,
+        ));
+    }
+    no_local_path(&body, "review-loop outcome body")?;
+    no_escaped_control_markdown(&body)?;
+    Ok(Some(body))
 }
 
 pub fn run_extend(
@@ -340,11 +411,14 @@ pub fn run_extend_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     let chain = pr_review::append_review_loop_state(
         runner,
         &ctx,
-        &repository,
-        view.number,
-        &args.expected_head,
-        state_view.chain.tip_digest.as_deref(),
-        extended,
+        pr_review::ReviewLoopAppend {
+            repository: &repository,
+            number: view.number,
+            expected_head: &args.expected_head,
+            expected_tip: state_view.chain.tip_digest.as_deref(),
+            state: extended,
+            visible_outcome: None,
+        },
     )?;
     emit_state(
         &ctx,
@@ -352,6 +426,7 @@ pub fn run_extend_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view.url,
         chain,
         true,
+        false,
         SCHEMA_EXTEND,
         format,
     )
@@ -827,12 +902,14 @@ fn validate_approval(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_state(
     ctx: &ProviderContext,
     number: u64,
     url: String,
     chain: review_state::ReviewStateChain,
     appended: bool,
+    outcome_posted: bool,
     schema: &str,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
@@ -848,15 +925,17 @@ fn emit_state(
             generation,
             state,
             appended,
+            outcome_posted,
         },
         format,
         |payload| {
             println!(
-                "review loop #{number}: round={round} generation={generation} appended={appended}",
+                "review loop #{number}: round={round} generation={generation} appended={appended} outcome_posted={outcome_posted}",
                 number = payload.number,
                 round = payload.state.as_ref().map(|state| state.round).unwrap_or(0),
                 generation = payload.generation.unwrap_or(0),
                 appended = payload.appended,
+                outcome_posted = payload.outcome_posted,
             );
         },
     ))
@@ -877,7 +956,7 @@ fn emit_observe_dry_run<R: BackendRunner>(
     args: &PrReviewLoopObserveArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
-    let mut verdicts: Vec<RuleVerdict> = Vec::with_capacity(5);
+    let mut verdicts: Vec<RuleVerdict> = Vec::with_capacity(7);
 
     // Local first, so it survives an unreachable provider.
     let observations = match read_observations(&args.findings_file) {
@@ -890,8 +969,21 @@ fn emit_observe_dry_run<R: BackendRunner>(
             None
         }
     };
+    let outcome_body = match read_outcome_body(args) {
+        Ok(body) => {
+            if args.body.is_some() || args.body_file.is_some() {
+                verdicts.push(RuleVerdict::from_result("outcome_body", Ok(())));
+            }
+            body
+        }
+        Err(error) => {
+            verdicts.push(RuleVerdict::from_result("outcome_body", Err(error)));
+            None
+        }
+    };
 
     let mut would_append = None;
+    let mut planned_comment = None;
     match resolve_pr(runner, ctx, args.id) {
         Ok((view, repository)) => {
             verdicts.push(RuleVerdict::from_result("provider_pull_request", Ok(())));
@@ -918,6 +1010,11 @@ fn emit_observe_dry_run<R: BackendRunner>(
                                 &args.expected_head,
                                 observations,
                             );
+                            // `state_comment_body` is reported only when a write
+                            // is actually planned. A current chain writes
+                            // nothing, so there is no body to size-check and an
+                            // unconditional verdict would wrongly fail the
+                            // preflight of a legitimate no-op observation.
                             match transition {
                                 Ok(transition) => {
                                     would_append = Some(transition.changed);
@@ -925,6 +1022,28 @@ fn emit_observe_dry_run<R: BackendRunner>(
                                         "observation_transition",
                                         Ok(()),
                                     ));
+                                    if transition.changed {
+                                        match plan_state_comment(
+                                            &repository,
+                                            view.number,
+                                            &args.expected_head,
+                                            &state_view.chain,
+                                            transition.state,
+                                            outcome_body.as_deref(),
+                                        ) {
+                                            Ok(planned) => {
+                                                planned_comment = Some(planned);
+                                                verdicts.push(RuleVerdict::from_result(
+                                                    "state_comment_body",
+                                                    Ok(()),
+                                                ));
+                                            }
+                                            Err(error) => verdicts.push(RuleVerdict::from_result(
+                                                "state_comment_body",
+                                                Err(error),
+                                            )),
+                                        }
+                                    }
                                 }
                                 Err(error) => {
                                     // An extendable budget error is the one
@@ -932,9 +1051,19 @@ fn emit_observe_dry_run<R: BackendRunner>(
                                     // appends a durable hard-stop receipt so a
                                     // restart returns the same stop. Predicting
                                     // "this fails" without that would understate
-                                    // what the real call does.
+                                    // what the real call does. That receipt never
+                                    // carries the outcome body.
                                     if review_state::stop_budget_field(error.kind()).is_some() {
                                         would_append = Some(true);
+                                        planned_comment = plan_hard_stop_comment(
+                                            &repository,
+                                            view.number,
+                                            &args.expected_head,
+                                            &state_view.chain,
+                                            previous,
+                                            observations,
+                                            &error,
+                                        );
                                     }
                                     verdicts.push(RuleVerdict::from_result(
                                         "observation_transition",
@@ -981,16 +1110,20 @@ fn emit_observe_dry_run<R: BackendRunner>(
     }
 
     let preflight_ok = verdicts.iter().all(|verdict| verdict.ok);
+    let combined = args.body.is_some() || args.body_file.is_some();
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA_OBSERVE, SCHEMA_VERSION),
         ReviewLoopObserveDryRunPayload {
             provider: ctx.provider.as_str(),
             plan: vec![
-                "read the chain, evaluate one observation, and append with tip/head CAS"
-                    .to_string(),
+                match combined {
+                    true => "read the chain, evaluate one observation, and append the ledger record together with the delivery outcome in one comment using tip/head CAS".to_string(),
+                    false => "read the chain, evaluate one observation, and append with tip/head CAS".to_string(),
+                },
             ],
             preflight_ok,
             would_append,
+            planned_comment,
             preflight: verdicts,
         },
         format,
@@ -1000,6 +1133,14 @@ fn emit_observe_dry_run<R: BackendRunner>(
                 plan = payload.plan.join(", then "),
                 ok = payload.preflight_ok,
             );
+            if let Some(planned) = payload.planned_comment.as_ref() {
+                println!(
+                    "  comment {bytes} bytes, outcome_body={outcome}: {metadata}",
+                    bytes = planned.bytes,
+                    outcome = planned.includes_outcome_body,
+                    metadata = planned.visible_metadata,
+                );
+            }
             for verdict in &payload.preflight {
                 let status = if verdict.ok { "ok" } else { "FAIL" };
                 let detail = verdict.message.as_deref().unwrap_or("");
@@ -1007,6 +1148,54 @@ fn emit_observe_dry_run<R: BackendRunner>(
             }
         },
     ))
+}
+
+/// Renders the exact comment a live append would post, without posting it.
+fn plan_state_comment(
+    repository: &str,
+    number: u64,
+    expected_head: &str,
+    chain: &review_state::ReviewStateChain,
+    state: review_state::ReviewLoopState,
+    outcome_body: Option<&str>,
+) -> Result<PlannedStateComment, ForgeError> {
+    let record = review_state::ReviewStateRecord::new(
+        repository,
+        number,
+        expected_head,
+        chain.records.len() as u64,
+        chain.tip_digest.clone(),
+        review_state::ReviewStatePayload::ReviewLoop { state },
+    )?;
+    let body = review_state::render_state_comment_body(&record, outcome_body)?;
+    Ok(PlannedStateComment {
+        visible_metadata: review_state::state_comment_visible_metadata(&record),
+        includes_outcome_body: outcome_body.is_some(),
+        bytes: body.len(),
+    })
+}
+
+/// Renders the durable hard-stop receipt an extendable budget failure would
+/// append. Returns `None` when the receipt itself cannot be built, because the
+/// reported `observation_transition` failure is already the actionable verdict.
+fn plan_hard_stop_comment(
+    repository: &str,
+    number: u64,
+    expected_head: &str,
+    chain: &review_state::ReviewStateChain,
+    previous: Option<&review_state::ReviewLoopState>,
+    observations: &[review_state::ReviewFindingObservation],
+    error: &ForgeError,
+) -> Option<PlannedStateComment> {
+    let stopped = review_state::record_review_loop_hard_stop(
+        previous?,
+        expected_head,
+        observations,
+        chain.tip_digest.as_deref()?,
+        error,
+    )
+    .ok()?;
+    plan_state_comment(repository, number, expected_head, chain, stopped, None).ok()
 }
 
 fn emit_dry_run(
@@ -1342,6 +1531,20 @@ mod tests {
             expected_head: expected_head.to_string(),
             findings_file: findings.to_string(),
             expected_state: expected_state.map(str::to_string),
+            body: None,
+            body_file: None,
+        }
+    }
+
+    fn observe_args_with_body(
+        findings: &str,
+        expected_head: &str,
+        expected_state: Option<&str>,
+        body: &str,
+    ) -> PrReviewLoopObserveArgs {
+        PrReviewLoopObserveArgs {
+            body: Some(body.to_string()),
+            ..observe_args(findings, expected_head, expected_state)
         }
     }
 
@@ -1549,6 +1752,254 @@ mod tests {
             Vec::<String>::new(),
             "an unchanged observation must not grow the durable chain"
         );
+    }
+
+    // --- combined delivery outcome ---------------------------------------
+
+    #[test]
+    fn observe_posts_the_delivery_outcome_and_the_ledger_in_one_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let runner = FakeGitHub::new(HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(&findings, HEAD, None, "## Delivery outcome\n\napproved"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("combined observation");
+
+        assert_eq!(code, 0);
+        let bodies = runner.appended_bodies();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "one comment carries both halves: {bodies:?}"
+        );
+        let body = &bodies[0];
+        assert!(body.contains("## Delivery outcome"), "{body}");
+        assert!(
+            body.contains("forge-cli review ledger · generation 0"),
+            "{body}"
+        );
+        // The ledger half is still an exact, parseable record.
+        let chain = review_state::parse_chain([body.as_str()], REPO, PR).expect("appended chain");
+        assert_eq!(chain.records.len(), 1);
+        assert_eq!(
+            review_state::latest_review_loop_state(&chain)
+                .expect("state")
+                .head_sha,
+            HEAD
+        );
+    }
+
+    #[test]
+    fn an_identical_observe_retry_posts_neither_a_ledger_nor_an_outcome_comment() {
+        // The outcome rides the append, so the append's deduplication is also
+        // the outcome's: a retry after a lost response must not leave a second
+        // outcome comment behind.
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let code = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(&findings, HEAD, Some(&tip), "## Delivery outcome"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect("unchanged observation");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            runner.appended_bodies(),
+            Vec::<String>::new(),
+            "an already-current ledger writes nothing at all"
+        );
+    }
+
+    #[test]
+    fn observe_rejects_a_non_portable_outcome_body_before_any_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let runner = FakeGitHub::new(HEAD);
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(
+                &findings,
+                HEAD,
+                None,
+                "outcome recorded at /home/operator/work/report.md",
+            ),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("a local path must not reach a permanent provider comment");
+
+        assert_eq!(error.kind(), "local_path_present");
+        assert_eq!(
+            runner.calls(),
+            Vec::<Vec<String>>::new(),
+            "the body is validated before the first provider read"
+        );
+    }
+
+    #[test]
+    fn observe_rejects_an_outcome_body_flag_with_no_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let runner = FakeGitHub::new(HEAD);
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(&findings, HEAD, None, "   \n  "),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("an empty outcome body is a caller error, not an omission");
+
+        assert_eq!(error.kind(), "review_state_comment_invalid");
+        assert_eq!(runner.calls(), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn observe_dry_run_plans_the_combined_comment_without_posting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let runner = FakeGitHub::new(HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(true),
+            observe_args_with_body(&findings, HEAD, None, "## Delivery outcome"),
+            OutputFormat::Text,
+            github_remote,
+        )
+        .expect("clean combined preflight");
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            runner.appended_bodies(),
+            Vec::<String>::new(),
+            "planning a combined comment must not post one"
+        );
+        assert!(
+            !runner.calls().is_empty(),
+            "the preflight still reads provider state"
+        );
+    }
+
+    #[test]
+    fn observe_dry_run_reports_an_unreadable_outcome_body_file_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let runner = FakeGitHub::new(HEAD);
+        let args = PrReviewLoopObserveArgs {
+            body_file: Some("/definitely/missing-outcome.md".to_string()),
+            ..observe_args(&findings, HEAD, None)
+        };
+
+        let code = run_observe_with(
+            &runner,
+            &flags(true),
+            args,
+            OutputFormat::Text,
+            github_remote,
+        )
+        .expect("a failing preflight rule is reported, not returned as an error");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_durable_hard_stop_receipt_is_appended_without_the_outcome_body() {
+        // A hard stop is a failure receipt. Attaching the delivery outcome to it
+        // would publish an approval narrative on a run that did not converge.
+        const REPAIRED: &str = "head-repaired";
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let mut state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        state.budget.max_repair_rounds = 0;
+        let runner = FakeGitHub::new(REPAIRED).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(&findings, REPAIRED, Some(&tip), "## Delivery outcome"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("an exhausted round budget stops the loop");
+
+        assert_eq!(error.kind(), "review_round_limit_exceeded");
+        let bodies = runner.appended_bodies();
+        assert_eq!(bodies.len(), 1, "the stop receipt is still durable");
+        assert!(
+            !bodies[0].contains("## Delivery outcome"),
+            "a stop receipt must not carry the delivery outcome: {}",
+            bodies[0]
+        );
+        assert!(
+            bodies[0].contains("forge-cli review ledger ·"),
+            "the stop receipt still carries visible metadata: {}",
+            bodies[0]
+        );
+    }
+
+    #[test]
+    fn a_forked_ledger_history_fails_closed_before_any_append() {
+        // Two sessions that each appended generation 1 from the same genesis are
+        // a fork. It must be refused on read, with the supplied outcome body
+        // never reaching the provider.
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let genesis = genesis_state(HEAD, &[]);
+        let runner = FakeGitHub::new(HEAD).with_state(&genesis, HEAD);
+        let genesis_digest = runner.tip_digest().expect("genesis tip");
+        for no_progress in [0, 1] {
+            let mut competing = genesis.clone();
+            competing.no_progress_rounds = no_progress;
+            let record = review_state::ReviewStateRecord::new(
+                REPO,
+                PR,
+                HEAD,
+                1,
+                Some(genesis_digest.clone()),
+                review_state::ReviewStatePayload::ReviewLoop { state: competing },
+            )
+            .expect("competing record");
+            runner.comments.borrow_mut().push(comment_node(
+                &review_state::render_state_comment_body(&record, None).expect("body"),
+                TIP_CREATED_AT,
+            ));
+        }
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(
+                &findings,
+                HEAD,
+                Some(&genesis_digest),
+                "## Delivery outcome",
+            ),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("a forked chain must fail closed");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
     }
 
     #[test]
