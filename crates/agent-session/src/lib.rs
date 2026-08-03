@@ -5,6 +5,7 @@ mod codex_account;
 mod codex_app_server;
 pub mod completion;
 mod coordination;
+mod diagnose;
 mod main_agent;
 mod maintenance;
 mod orchestration;
@@ -241,6 +242,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Show(args) => run_command(&context, args),
         Command::Attach(args) => run_attach(&context, args),
         Command::Logs(args) => run_logs(&context, args),
+        Command::Diagnose(args) => diagnose::run_diagnose(&context, args),
         Command::Send(args) => run_send(&context, args),
         Command::Glance(args) => run_glance(&context, args),
         Command::Resume(args) => run_resume(&context, args),
@@ -337,6 +339,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::List(args) => args.format,
         Command::Show(args) => args.format,
         Command::Logs(args) => args.format,
+        Command::Diagnose(args) => args.format,
         Command::Send(args) => args.format,
         Command::Glance(args) => args.format,
         Command::Resume(args) => args.format,

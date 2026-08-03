@@ -73,6 +73,8 @@ pub enum Command {
     Attach(AttachArgs),
     /// Print captured tmux pane output or a one-shot run log.
     Logs(LogsArgs),
+    /// Print the redacted control-plane diagnostic bundle.
+    Diagnose(DiagnoseArgs),
     /// Send input (literal text and/or special keys) to a live session.
     Send(SendArgs),
     /// Capture the recent pane tail plus live status as a dashboard glance.
@@ -785,6 +787,22 @@ pub struct LogsArgs {
     /// tmux binary override.
     #[arg(long = "tmux-bin", value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub tmux_bin: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+/// Read-only control-plane diagnostics.
+///
+/// This reads only the local observation spool and coordination projection, so it
+/// stays usable when `agent-session serve` is down — which is one of the states
+/// it exists to diagnose.
+#[derive(Debug, Args)]
+pub struct DiagnoseArgs {
+    /// Number of recent observation events to include (default 20, maximum 200).
+    #[arg(long, value_name = "COUNT")]
+    pub limit: Option<usize>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

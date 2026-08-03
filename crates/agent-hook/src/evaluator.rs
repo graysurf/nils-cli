@@ -34,6 +34,12 @@ const TYPED_BOOTSTRAP_AUTHORIZATION_SCHEMA: &str =
 const TYPED_BOOTSTRAP_AUTHORIZATION_CODE: &str = "typed-main-agent-bootstrap-authorized";
 pub(crate) const ACTIVITY_STOP_RECONCILIATION_REQUIRED: &str =
     "activity-stop-reconciliation-required";
+/// Environment variable that overrides how the activity helper is resolved.
+const HELPER_BIN_ENV: &str = "AGENT_SESSION_BIN";
+/// `PATH`-resolvable name of the activity capability helper.
+const ACTIVITY_HELPER: &str = "agent-session";
+/// Stable classification for a helper that cannot be resolved or executed.
+pub(crate) const ACTIVITY_HELPER_UNRESOLVABLE: &str = "activity-helper-unresolvable";
 const SESSION_COORDINATION_TIMEOUT: Duration = RULE_CHILD_DEADLINE;
 
 #[derive(Debug)]
@@ -618,6 +624,43 @@ pub(crate) fn terminal_activity_failure_decision(
         .then_some((DecisionAction::Warn, ACTIVITY_STOP_RECONCILIATION_REQUIRED))
 }
 
+/// Degrade an unavailable coordination transaction on the terminal Stop lane.
+///
+/// This is a liveness boundary, not a release: nothing about the claim, lease,
+/// operation, broker, worktree, or session state changes, so the retained
+/// uncertainty stays visible for typed external reconciliation after the provider
+/// runner exits.
+fn terminal_coordination_failure_outcome(
+    request: &NormalizedRequest,
+    raw: &[u8],
+) -> Option<RuleOutcome> {
+    if crate::degradation::lane(request.event.as_str()) != crate::degradation::Lane::Terminal {
+        return None;
+    }
+    crate::observe::Record::new(
+        "coordination",
+        crate::degradation::STOP_RECONCILIATION_REQUIRED,
+        crate::observe::Severity::Warn,
+    )
+    .provider(request.product, &request.event)
+    .disposition("reconciliation-pending")
+    .correlate(request.product, raw)
+    .recovery(crate::observe::RECOVERY_BROKER_RECONCILE)
+    .emit();
+    Some(RuleOutcome {
+        action: DecisionAction::Warn,
+        code: crate::degradation::STOP_RECONCILIATION_REQUIRED.to_string(),
+        context: Some(format!(
+            "agent-hook terminal degradation: the session coordination transaction is \
+             unavailable, so the turn may end with reconciliation pending. The claim and any \
+             active operation are retained and mutation stays gated. Next: {}.",
+            crate::observe::RECOVERY_BROKER_RECONCILE
+        )),
+        replacement: None,
+        provider_output: None,
+    })
+}
+
 pub fn apply_session_coordination(
     loaded: Option<&LoadedPolicy>,
     mut decision: NormalizedDecision,
@@ -662,7 +705,14 @@ pub fn apply_session_coordination(
             execution.operation_effect,
             raw,
         ),
-        Err(_) => failure_outcome(rule.failure_posture, &rule.id),
+        // The activity capability already degrades a failed terminal observation
+        // rather than denying provider termination. The coordination transaction
+        // needed the same terminal boundary: without it the very first Stop
+        // delivery deadlocks, before provider re-entry metadata can help.
+        Err(_) => match terminal_coordination_failure_outcome(request, raw) {
+            Some(outcome) => outcome,
+            None => failure_outcome(rule.failure_posture, &rule.id),
+        },
     };
     if typed_bootstrap_may_supersede_owner
         && outcome.action == DecisionAction::Allow
@@ -1049,8 +1099,7 @@ fn run_session_activity(
     let Some(event) = crate::adapter::normalize_activity_event(request, raw, &runtime_id)? else {
         return Ok(());
     };
-    let binary = std::env::var_os("AGENT_SESSION_BIN").unwrap_or_else(|| "agent-session".into());
-    let mut command = Command::new(binary);
+    let mut command = Command::new(resolve_activity_helper());
     command
         .args(["activity", "event", "--stdin", &session_id])
         .stdin(Stdio::piped())
@@ -1065,6 +1114,66 @@ fn run_session_activity(
             "agent-session activity capability failed",
         ))
     }
+}
+
+/// Resolve the `agent-session` helper for the activity capability.
+///
+/// `AGENT_SESSION_BIN` outranks `PATH`, and a long-lived tmux server keeps the
+/// environment it started with. A stale override therefore survived the very
+/// relocation the `PATH` pin was added to protect against, and every session
+/// created afterwards fail-closed on its first `UserPromptSubmit`
+/// (`sympoies/nils-cli#1414`).
+///
+/// An override that does not resolve to an executable file is treated as absent
+/// so the daemon-pinned `PATH` decides instead. That is a deliberate change to a
+/// fail-closed boundary and not a downgrade: anyone able to set
+/// `AGENT_SESSION_BIN` can already set `PATH`, and the pinned `PATH` is
+/// daemon-controlled. The discarded override is recorded as a typed
+/// classification so it cannot silently mask a misconfiguration.
+fn resolve_activity_helper() -> std::ffi::OsString {
+    let Some(override_path) = std::env::var_os(HELPER_BIN_ENV) else {
+        return ACTIVITY_HELPER.into();
+    };
+    let candidate = Path::new(&override_path);
+    if candidate.as_os_str().is_empty() {
+        return ACTIVITY_HELPER.into();
+    }
+    if executable_file(candidate) {
+        return override_path;
+    }
+    crate::observe::Record::new(
+        "activity",
+        ACTIVITY_HELPER_UNRESOLVABLE,
+        crate::observe::Severity::Warn,
+    )
+    .disposition("path-fallback")
+    .recovery(crate::observe::RECOVERY_HOOK_DOCTOR)
+    .emit();
+    ACTIVITY_HELPER.into()
+}
+
+/// Locate the helper that would actually run, or `None` when nothing resolves.
+///
+/// `doctor` needs the resolved answer rather than the spawn-time fallback:
+/// reporting a provider as converged while the capability binary cannot execute
+/// is what let `sympoies/nils-cli#1414` stay invisible to every health surface.
+pub(crate) fn locate_activity_helper() -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os(HELPER_BIN_ENV).filter(|value| !value.is_empty())
+    {
+        let candidate = PathBuf::from(override_path);
+        if executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(ACTIVITY_HELPER))
+        .find(|candidate| executable_file(candidate))
+}
+
+/// Whether a path is a regular file the effective user can execute.
+fn executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn run_runtime_handler(
@@ -1231,6 +1340,7 @@ pub(crate) fn validate_policy_handlers(
     product: Product,
 ) -> Result<(), HookError> {
     let mut handlers = BTreeSet::new();
+    let mut needs_activity_helper = false;
     for rule in &loaded.bundle.rules {
         if !rule.products.contains(&product) {
             continue;
@@ -1247,8 +1357,23 @@ pub(crate) fn validate_policy_handlers(
                     SESSION_COORDINATION_HANDLER,
                 ));
             }
+            Capability::SessionActivity { .. } => needs_activity_helper = true,
             _ => {}
         }
+    }
+
+    // Ingress registration is not capability health. A provider can be fully
+    // converged while the activity helper is unexecutable, which is how a stale
+    // `AGENT_SESSION_BIN` deadlocked sessions with every health surface reporting
+    // green (`sympoies/nils-cli#1414`).
+    if needs_activity_helper && locate_activity_helper().is_none() {
+        return Err(HookError::data(
+            ACTIVITY_HELPER_UNRESOLVABLE,
+            format!(
+                "the {ACTIVITY_HELPER} activity capability helper could not be resolved to an \
+                 executable file through {HELPER_BIN_ENV} or PATH"
+            ),
+        ));
     }
 
     let root = runtime_hook_root(product)?;
@@ -1660,6 +1785,7 @@ mod tests {
             snapshot_digest: "sha256:snapshot".to_string(),
             worktree_fingerprint: None,
             semantic_conflict: None,
+            stop_reentry: None,
             target_paths: vec![root.join("target.txt")],
             execution_path: Some(root.to_path_buf()),
             binding_roots: vec![root.to_path_buf()],

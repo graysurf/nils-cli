@@ -247,6 +247,11 @@ pub struct NormalizedRequest {
     pub worktree_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_conflict: Option<SemanticConflict>,
+    /// Public boolean fact projected from the provider's own Stop re-entry
+    /// marker, for example Claude's `stop_hook_active`. `None` means the
+    /// provider did not report re-entry state for this delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reentry: Option<bool>,
     #[serde(skip)]
     pub target_paths: Vec<PathBuf>,
     #[serde(skip)]

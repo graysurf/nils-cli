@@ -467,6 +467,7 @@ mod tests {
             snapshot_digest: "sha256:snapshot".to_string(),
             worktree_fingerprint: None,
             semantic_conflict: None,
+            stop_reentry: None,
             target_paths: Vec::new(),
             execution_path: Some(path.to_path_buf()),
             binding_roots: Vec::new(),

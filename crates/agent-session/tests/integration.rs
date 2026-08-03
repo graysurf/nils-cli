@@ -4,3 +4,5 @@ mod cli;
 mod coordination;
 #[path = "integration/coordination_server.rs"]
 mod coordination_server;
+#[path = "integration/diagnose.rs"]
+mod diagnose;

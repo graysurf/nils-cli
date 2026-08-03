@@ -24,6 +24,9 @@ or integrating a specific subsystem.
   privacy projection, replay, and provider setup behavior.
 - [Activity stream v1](specs/activity-stream-v1.md): SSE stream, replay,
   reset, flow control, and privacy contract.
+- [Control-plane observation v1](specs/control-plane-observation-v1.md): the
+  centralized hook/session event plane, its bounded spool and privacy budget,
+  the `agent-session diagnose` bundle, and broker release publication.
 - [Session maintenance v1](specs/session-maintenance-v1.md): repair and
   maintenance operation contract.
 - [Session maintenance v2](specs/session-maintenance-v2.md): successor contract
