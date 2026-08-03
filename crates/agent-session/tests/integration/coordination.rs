@@ -36785,7 +36785,24 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
             .expect("operations")
             .retain(|operation| operation["lease_id"] != "retire-claim-active-operation");
     });
-    let replayed = run_main_agent(&main_checkout, &retire_args, &envs);
+    // Claim recovery needs the worker runtime live, so the fixture keeps its
+    // process group alive until retire revokes the retained claim. Retire then
+    // tears the session down, and its termination probe can still observe the
+    // boundary as running: that is the documented retryable outcome carrying
+    // `action: retry-delete`. macOS reaches that path where Linux does not, so
+    // honor the retry instead of asserting one-shot success. Only this exact
+    // retryable reason is replayed; every other outcome falls straight through
+    // to the assertions below.
+    let mut replayed = run_main_agent(&main_checkout, &retire_args, &envs);
+    let retire_deadline = Instant::now() + Duration::from_secs(30);
+    while replayed.code != 0
+        && replayed.stdout_json()["error"]["code"] == "session-termination-failed"
+        && replayed.stdout_json()["error"]["details"]["reason"] == "process-still-running"
+        && Instant::now() < retire_deadline
+    {
+        std::thread::sleep(Duration::from_millis(100));
+        replayed = run_main_agent(&main_checkout, &retire_args, &envs);
+    }
     assert_eq!(
         replayed.code,
         0,
