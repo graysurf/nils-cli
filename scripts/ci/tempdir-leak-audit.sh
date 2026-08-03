@@ -2,7 +2,7 @@
 # scripts/ci/tempdir-leak-audit.sh — fail the build on temp-directory patterns
 # whose cleanup can never run.
 #
-# Four patterns are rejected:
+# Three patterns are rejected:
 #
 #   1. A `TempDir` owned by a `static` (`OnceLock`, `LazyLock`, `Lazy`, ...).
 #      Rust never drops statics, so the directory is never removed. Under
@@ -11,13 +11,6 @@
 #   2. `.keep()` / `.into_path()`, which disarm cleanup by design and hand back
 #      a bare path.
 #   3. `mem::forget`, which skips the destructor outright.
-#   4. A literal read-only chmod (`0o4xx` / `0o5xx`). Unlinking an entry needs
-#      write permission on its *directory*, so a read-only directory stops
-#      `remove_dir_all` from emptying it, and a fixture whose restore is a plain
-#      statement becomes unremovable the moment anything between the two
-#      statements panics. Use `nils_test_support::tempdir::RestoredMode`, which
-#      restores from `Drop`. A read-only *file* is unaffected and a permanent
-#      hardening has nothing to restore; both are legitimate allow-marker cases.
 #
 # This audit exists because `tempfile::TempDir`'s own `Drop` discards the
 # `remove_dir_all` result: every failure above is invisible in test output and
@@ -28,10 +21,27 @@
 # Escape hatch: put `tempdir-leak-audit: allow` in a comment on the offending
 # line or the line directly above it, together with the reason.
 #
+# Not a rule here, and #1411 asked for the evaluation rather than the guess: a
+# read-only *directory* whose restore is a plain statement is the class-2 hazard,
+# and a chmod-literal grep cannot gate it. What decides is the chmod *target*,
+# which a line-oriented match cannot see. Measured on this workspace:
+#
+#   * `0o[45]xx` matched 4 sites, **none** of them the hazard — every one was a
+#     file mode or a permanent hardening, while a real `0o000` directory fixture
+#     was accepted;
+#   * widening to any owner digit but 7 — which is the true predicate, since
+#     emptying a directory needs write *and* execute — matched 154 sites,
+#     overwhelmingly legitimate file modes in production code;
+#   * scoping that to `crates/*/tests/` still matched 78, again mostly files.
+#
+# So the class stays a review rule and a policy statement rather than a gate that
+# would train authors to annotate safe code. `nils_test_support::tempdir::RestoredMode`
+# is the discoverable fix. See docs/specs/test-temp-directory-policy.md.
+#
 # Scope limit: this only catches leaks where cleanup *never runs*. A leak where
 # cleanup runs and then a detached child process recreates the directory is not
 # detectable by inspection; that one is a test-authoring rule. See
-# docs/specs/test-temp-directory-policy.md for all three leak classes.
+# docs/specs/test-temp-directory-policy.md for all four leak classes.
 #
 # Compatibility: must run on macOS (system bash 3.2) and Linux runners. Avoid
 # associative arrays, mapfile, and `${var,,}` lowercasing.
@@ -132,8 +142,6 @@ scan "into_path() disarms temp-directory cleanup" \
   '\.into_path\(\)'
 scan "mem::forget skips temp-directory cleanup" \
   'mem::forget'
-scan "a read-only chmod needs a Drop-scoped restore" \
-  '(set_mode|from_mode)\(0o[45][0-9][0-9]\)'
 
 if [ -s "$violations" ]; then
   echo "tempdir-leak-audit: temp-directory cleanup can never run at these sites:" >&2

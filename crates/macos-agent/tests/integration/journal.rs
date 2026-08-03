@@ -383,7 +383,6 @@ fn journal_append_permission_failure_is_typed_and_never_reports_a_step() {
     .expect("journal");
     let steps = root.path().join("steps.jsonl");
     fs::write(&steps, b"").expect("empty step log");
-    // tempdir-leak-audit: allow — a read-only file inside a writable TempDir stays unlinkable.
     fs::set_permissions(&steps, fs::Permissions::from_mode(0o400)).expect("read-only step log");
     let result = journal.record_step(macos_agent::journal::StepInput {
         parent_id: None,

@@ -94,21 +94,26 @@ impl Drop for ScopedTempDir {
     }
 }
 
-/// A directory made read-only for part of a test, restored from `Drop`.
+/// A directory made unwritable for part of a test, restored from `Drop`.
 ///
 /// This is the class-2 hazard in `docs/specs/test-temp-directory-policy.md`, and
-/// the distinction that makes it a hazard is the *target*: unlinking an entry
-/// needs write permission on its **directory**, not on the entry, so a read-only
-/// directory stops `remove_dir_all` from emptying it while a read-only file does
-/// not. A fixture that chmods a directory and restores it with a plain statement
-/// is therefore unremovable the moment anything between those two statements
-/// panics — an unwinding assertion, or a spawn that fails under load — and
-/// because cleanup stops at the first error the leftovers are exactly the
-/// read-only subtree.
+/// the distinction that makes it a hazard is the *target*: emptying a directory
+/// needs write **and execute** on it, so every owner digit except `7` stops
+/// `remove_dir_all` — `0o600` blocks it just as `0o500` does — while a **file** at
+/// any mode is unaffected, because unlink permission comes from the parent. A
+/// fixture that chmods a directory and restores it with a plain statement is
+/// therefore unremovable the moment anything between those two statements panics —
+/// an unwinding assertion, or a spawn that fails under load — and because cleanup
+/// stops at the first error the leftovers are exactly that subtree.
 ///
 /// Restoring from `Drop` closes that window. Prefer this over a manual restore
-/// for any directory a test makes read-only, and pair it with [`ScopedTempDir`]
-/// so a cleanup that still fails is reported rather than leaked.
+/// for any directory a test makes unwritable.
+///
+/// **Declare it after the temp-dir handle it lives inside.** Drop order is
+/// reverse declaration order, so a guard declared first is dropped last - the
+/// directory handle would clean up while the mode is still restricted, which is
+/// the leak this exists to prevent. An explicit `drop(guard)` before the
+/// assertions is the clearer idiom, and both in-tree callers use it.
 #[cfg(unix)]
 pub struct RestoredMode {
     path: PathBuf,
@@ -156,14 +161,22 @@ impl Drop for RestoredMode {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
 
-        // Best-effort by design: the directory may legitimately be gone already,
-        // and a restore failure must never replace the test's own verdict.
+        // Never panic: the directory may legitimately be gone already, and a
+        // restore failure must not replace the test's own verdict. But do not be
+        // silent either — an unrestored mode is exactly the invisibility this
+        // module exists to remove, so report it the way `ScopedTempDir` does.
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             return;
         };
         let mut permissions = metadata.permissions();
         permissions.set_mode(self.mode);
-        let _ = std::fs::set_permissions(&self.path, permissions);
+        if let Err(err) = std::fs::set_permissions(&self.path, permissions) {
+            eprintln!(
+                "restoring mode {:o} on {} failed: {err}",
+                self.mode,
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -219,5 +232,85 @@ mod tests {
 
         drop(restored);
         std::fs::remove_dir_all(&path).expect("cleanup");
+    }
+
+    /// The captured mode is restored, not a hardcoded one.
+    ///
+    /// This is the semantic the `agent-session` conversion relies on: it replaced
+    /// a hardcoded `0o700` restore, so a `Drop` that replayed some fixed mode
+    /// would pass every other test in the workspace while quietly changing that
+    /// fixture's post-condition.
+    #[test]
+    fn restored_mode_replays_the_captured_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScopedTempDir::new();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("create");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751))
+            .expect("seed mode");
+
+        let guard = RestoredMode::read_only(&target);
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o500,
+            "the guard must apply the mode it was asked for"
+        );
+
+        drop(guard);
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o751,
+            "the guard must replay the mode it captured, not a default"
+        );
+    }
+
+    /// Restoring while unwinding is the entire reason this type exists over a
+    /// plain restore statement, so it is worth executing at least once.
+    #[test]
+    fn restored_mode_restores_while_unwinding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ScopedTempDir::new();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("create");
+        std::fs::write(target.join("entry"), "x").expect("populate");
+        // Whatever the umask produced: the guard's contract is to replay what it
+        // captured, so read the expectation rather than assuming a value.
+        let original = std::fs::metadata(&target)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o7777;
+
+        let unwound = std::panic::catch_unwind({
+            let target = target.clone();
+            move || {
+                let _guard = RestoredMode::read_only(&target);
+                panic!("a fixture panic between the chmod and the restore");
+            }
+        });
+        assert!(unwound.is_err(), "the panic must propagate");
+
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o7777,
+            original,
+            "the unwinding path must have restored the mode"
+        );
+        // The point of restoring: a populated directory left without write and
+        // execute cannot be emptied, so this is what would have leaked.
+        std::fs::remove_dir_all(&target).expect("the restored directory must be removable");
     }
 }
