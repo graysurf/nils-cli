@@ -549,7 +549,10 @@ backend mapping, validation rules, and output schema versions.
   conflicting duplicates, forks, missing/unreachable generations, target
   mismatches, malformed markers, or digest mismatches fail as
   `review_state_conflict` before native-review mutation. Encoded state markers
-  are limited to 64 KiB before provider mutation.
+  are limited to 64 KiB before provider mutation, and the complete rendered
+  comment body — visible text plus marker — is limited to 64 KiB before provider
+  mutation. An oversized marker returns `review_state_record_too_large`; an
+  oversized complete body returns `review_state_comment_too_large`.
 - Provider marker grammar is versioned and deterministic:
   `<!-- forge-cli:review-state:v1 <lowercase-hex-record-json> -->`,
   `<!-- forge-cli:review-run:v1 run=<review_run_id> -->`, and
@@ -563,6 +566,28 @@ backend mapping, validation rules, and output schema versions.
   from unprivileged actors cannot extend or poison the transaction chain. This
   lets a later authorized session resume the same provider-visible chain
   without a machine-local ledger.
+- Record encoding and comment presentation are separate. Every state comment the
+  CLI posts leads with a visible metadata line, followed by the unchanged marker
+  on its own line:
+  `forge-cli review ledger · generation <n> · <payload-kind> · head <short-sha>`.
+  GitHub hides HTML comments when it renders Markdown, so a marker-only body
+  appears in the timeline as a blank comment under the operator's identity; the
+  visible line makes the same append-only record identifiable as machine
+  metadata. A combined delivery outcome is appended *after* both, separated by a
+  `---` rule. That ordering is load-bearing, not cosmetic: a Markdown HTML block
+  opened in caller text runs until a line containing `-->`, so caller text placed
+  above the label could swallow both the label and the marker.
+- Presentation text never enters a record digest, the chain order, or the parser,
+  so historical bare-marker comments and new rendered comments validate as one
+  chain with no migration and no edit or deletion of existing comments. The
+  chain therefore deduplicates by *record*, not by comment body: two concurrent
+  sessions that compute the identical transition converge on one record even if
+  their comments differ, so a divergent concurrent outcome is possible and is
+  detected only for the writing session (see `review_outcome_not_posted` below).
+- The visible line carries only facts already public on the pull request:
+  generation, payload kind, and an abbreviated head. The head is filtered to
+  `[0-9A-Za-z._-]` and truncated to twelve characters so the line can never
+  become more than one line of plain Markdown.
 - Receipt fields intentionally exclude authentication tokens, credentials,
   environment-variable values, local paths, and private identity/profile names.
   The durable identity route contains only portable lens names and the semantic
@@ -611,10 +636,39 @@ backend mapping, validation rules, and output schema versions.
 - These GitHub-only commands make the repair/re-review loop resumable from the
   append-only `forge-cli.review-loop.v1` chain. `inspect <id>` validates the
   complete chain and emits its typed latest state. `observe <id>
-  --expected-head <sha> --findings-file <path> [--expected-state <digest>]`
+  --expected-head <sha> --findings-file <path> [--expected-state <digest>]
+  [--body <text> | --body-file <path>]`
   accepts either a delivery-mode `review-specialists merge` envelope or a
   finding-observation array, evaluates one deterministic transition, and uses
   both the exact PR head and state tip as compare-and-swap inputs.
+- `observe --body <text>` / `--body-file <path>` (`-` reads stdin; mutually
+  exclusive) posts a human-readable delivery outcome in the SAME provider comment
+  as the appended ledger record, replacing a separate final outcome comment.
+  Every rule on the body runs before the first provider call, so a dry run
+  returns the same verdict a live run would and a rejected body costs no provider
+  round trip. The body must be non-empty, within the comment-body limit
+  (`review_state_comment_too_large`), free of any HTML comment
+  (`review_state_comment_invalid` — a review-state marker of its own would shadow
+  this record because the parser takes the first marker in a body, and an
+  unterminated `<!--` would hide the visible label), and held to the same
+  portability rules as a review comment (`local_path_present`,
+  `markdown_escaped_control`). Those portability rules are the shared
+  provider-payload guard, which is pattern-based and allowlisted; the outcome body
+  is operator-attested text, not a machine-derived receipt field, so the stronger
+  "review state excludes local paths" clause above is not a guarantee about it.
+  `--body-file -` consumes stdin once, so a dry-run-then-live sequence must not
+  share a piped body.
+- Because the outcome rides the append, it inherits the append's idempotency: an
+  unchanged observation appends nothing, so a supplied outcome is either already
+  present on the pull request from the earlier attempt — reported as
+  `outcome_posted: true` with `appended: false` — or would be silently dropped,
+  which fails closed as `review_outcome_not_posted` instead. An identical retry
+  therefore cannot create a duplicate outcome or ledger comment, and cannot lose
+  one either. `outcome_posted` is never inferred from the flag: it is set only
+  after a post-write read-back confirms a privileged comment carrying both this
+  record's marker and this outcome, and a durable record whose outcome is not
+  visible fails as `review_outcome_not_posted`. A durable hard-stop receipt is
+  always appended without an outcome body.
 - Observation-array rows may include `status` or `disposition` with `open`,
   `fixed`, `accepted`, `preference`, or `follow-up`. Terminal dispositions are
   durable and non-blocking. Omitting an open finding or changing its blocking
@@ -640,19 +694,31 @@ backend mapping, validation rules, and output schema versions.
   `fixed`, then merge at that head. Doing every repair first and then trying to
   record the history is unrecoverable, because the pre-repair head is gone and
   the round count cannot be reconstructed.
-- All three commands emit their own `cli.forge-cli.pr.review-loop.*.v1` schema.
-  `inspect` and `extend` dry-runs are offline and report the command-specific
-  read/transition plan.
+- All three commands emit their own `cli.forge-cli.pr.review-loop.*.v1` schema
+  with `data.appended` and `data.outcome_posted`. Only `observe` can set
+  `outcome_posted`, and never without `appended`. `inspect` and `extend`
+  dry-runs are offline and report the command-specific read/transition plan.
 - `observe --dry-run` is a faithful non-mutating preflight. It reads and
-  validates the findings payload, resolves the pull request, performs the head
-  and state-tip compare-and-swap comparisons, and evaluates the transition,
-  reporting each verdict in `data.preflight[]` — the same element shape as
+  validates the findings payload and any outcome body, resolves the pull request,
+  performs the head
+  and state-tip compare-and-swap comparisons, evaluates the transition, and
+  renders the exact comment the live append would post, then reports each
+  verdict in `data.preflight[]` — the same element shape as
   `pr deliver --dry-run`'s `local_preflight[]`, under a different name because
   these rules include provider reads. `data.preflight_ok` is the conjunction and
   `data.would_append` reports whether the real run would append a new
   generation — true for an accepted state-changing transition, and also for an
   extendable budget error, which appends a durable hard-stop receipt before
-  failing, so predicting only "this fails" would understate it. The sweep does
+  failing, so predicting only "this fails" would understate it. When an
+  unextended durable hard stop already exists the live path returns that stop
+  *without* appending, and the dry run mirrors that: `would_append` is false and
+  no comment is planned.
+  `data.planned_comment` reports the planned write as
+  `{visible_metadata, includes_outcome_body, bytes}`, where `bytes` is the
+  complete rendered body the size limit binds. It is present only when a write is
+  planned, and the `state_comment_body` verdict is likewise reported only then: an
+  already-current chain writes nothing, so there is no body to check and no
+  outcome to post. The sweep does
   not short-circuit, so the local payload verdict is
   reported even when the provider is unreachable; that is the supported way to
   check a findings file without writing durable provider-visible state, which a

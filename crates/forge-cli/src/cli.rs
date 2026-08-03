@@ -925,9 +925,28 @@ pub struct PrReviewLoopInspectArgs {
       2. A bare observation array. Each row needs `lifecycle_fingerprint` and \
       accepts `disposition` (open | fixed | accepted | reopened), which is how \
       dispositions are carried across rounds.\n\n\
+      COMBINED DELIVERY OUTCOME\n  \
+      Every appended ledger comment leads with a visible \
+      `forge-cli review ledger · generation N · <kind> · head <short-sha>` line \
+      above its machine marker, so it never renders as a blank comment.\n  \
+      --body / --body-file additionally posts a human-readable delivery outcome \
+      in that SAME comment, after the marker, replacing a separate final outcome \
+      comment. An outcome body may not contain an HTML comment, and is checked \
+      before the first provider call.\n  \
+      The outcome rides the append, so it inherits the append's idempotency. When \
+      the observation changes nothing the ledger is not appended, so the outcome \
+      is either ALREADY present from the earlier attempt (data.outcome_posted \
+      true, data.appended false) or would be dropped, which fails closed as \
+      `review_outcome_not_posted`. An identical retry therefore cannot duplicate \
+      the outcome, and cannot lose it either. data.outcome_posted is confirmed by \
+      a post-write read-back, never assumed from the flag. A durable hard-stop \
+      receipt is always appended without an outcome body.\n  \
+      --body-file - consumes stdin once, so do not pipe the same body into a \
+      --dry-run and then a live run.\n\n\
       With --dry-run this runs a faithful non-mutating preflight: it reads and \
-      validates the findings payload, resolves the pull request, performs the \
-      head and state-tip CAS comparisons, and evaluates the transition, then \
+      validates the findings payload and any outcome body, resolves the pull \
+      request, performs the head and state-tip CAS comparisons, evaluates the \
+      transition, and renders the exact provider comment it would post, then \
       reports every verdict in data.preflight[] without appending. The sweep \
       does not short-circuit, so the payload verdict is still reported when the \
       provider is unreachable — use it to check a findings file without writing \
@@ -945,6 +964,13 @@ pub struct PrReviewLoopObserveArgs {
     /// Exact current provider-visible state-chain tip; omit only for genesis.
     #[arg(long = "expected-state", value_name = "DIGEST")]
     pub expected_state: Option<String>,
+    /// Human-readable delivery outcome to post in the same comment as this
+    /// ledger record. Mutually exclusive with `--body-file`.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read the delivery outcome body from PATH (`-` reads stdin).
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
