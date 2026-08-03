@@ -1584,6 +1584,18 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
             .any(|pair| { pair == ["-e", &format!("PATH={inherited_path}")] }),
         "new tmux sessions must receive the daemon PATH instead of inheriting a stale tmux-server PATH: {new_session:?}"
     );
+    let launching_helper = nils_test_support::bin::resolve("agent-session");
+    assert!(
+        new_session.windows(2).any(|pair| {
+            pair == [
+                "-e",
+                &format!("AGENT_SESSION_BIN={}", launching_helper.display()),
+            ]
+        }),
+        "AGENT_SESSION_BIN outranks PATH in agent-hook helper resolution, so a new tmux \
+         session must be pinned to the launching executable instead of inheriting a stale \
+         tmux-server value: {new_session:?}"
+    );
 
     let event = |event_id: &str,
                  kind: &str,
@@ -4028,6 +4040,8 @@ fn start_creates_session_state_without_printing_prompt() {
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
             "-e".to_string(),
             format!("PATH={inherited_path}"),
+            "-e".to_string(),
+            format!("AGENT_SESSION_BIN={agent_session_bin}"),
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
@@ -9391,6 +9405,8 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
             "-e".to_string(),
             format!("PATH={inherited_path}"),
+            "-e".to_string(),
+            format!("AGENT_SESSION_BIN={agent_session_bin}"),
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
