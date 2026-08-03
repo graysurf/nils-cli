@@ -438,6 +438,26 @@ fn seed_activity_state(
     current_turn: serde_json::Value,
     last_turn: serde_json::Value,
 ) {
+    seed_activity_state_with_source(
+        state_dir,
+        id,
+        incarnation,
+        phase,
+        "runtime",
+        current_turn,
+        last_turn,
+    );
+}
+
+fn seed_activity_state_with_source(
+    state_dir: &Path,
+    id: &str,
+    incarnation: &str,
+    phase: &str,
+    source_kind: &str,
+    current_turn: serde_json::Value,
+    last_turn: serde_json::Value,
+) {
     let path = state_dir.join("sessions").join(id).join("activity.json");
     write_private_json(
         &path,
@@ -451,7 +471,7 @@ fn seed_activity_state(
                 "phase_changed_at": "2030-01-01T00:00:00Z",
                 "revision": 1,
                 "source": {
-                    "kind": "runtime",
+                    "kind": source_kind,
                     "provider": null,
                     "confidence": "authoritative"
                 },
@@ -27546,6 +27566,135 @@ fn main_agent_supervise_exposes_the_fail_closed_classification_matrix_without_mu
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         expected_diagnose_keys
+    );
+
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-matrix"]["state"] = json!("starting");
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["claim_id"] == "worker-matrix-claim")
+            .expect("worker matrix claim");
+        claim["state"] = json!("released");
+    });
+    let pre_bootstrap = supervise();
+    assert_eq!(
+        pre_bootstrap.code,
+        0,
+        "stderr={}",
+        pre_bootstrap.stderr_text()
+    );
+    assert_eq!(
+        data(&pre_bootstrap)["classification"],
+        "pre_bootstrap_attention_required"
+    );
+    assert_eq!(
+        data(&pre_bootstrap)["schema_version"],
+        "main-agent.worker-supervise-result.v7"
+    );
+    assert_eq!(
+        data(&pre_bootstrap)["last_proven_safe_state"]["attention"]["kind"],
+        "pre_bootstrap"
+    );
+    assert_eq!(
+        data(&pre_bootstrap)["recovery_action"]["kind"],
+        "bounded_bootstrap_attention_recheck"
+    );
+    assert_eq!(data(&pre_bootstrap)["automatic_retry_safe"], false);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-matrix"]["state"] = json!("working");
+    });
+    rewrite_registry(&state_dir, |registry| {
+        let claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["claim_id"] == "worker-matrix-claim")
+            .expect("worker matrix claim");
+        claim["state"] = json!("active");
+    });
+
+    seed_activity_state_with_source(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "waiting",
+        "provider_hook",
+        serde_json::Value::Null,
+        json!({
+            "provider_turn_id": "turn-provider-capacity",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:02Z",
+            "outcome": "failed",
+            "provider_failure_kind": "provider_capacity"
+        }),
+    );
+    let provider_capacity = supervise();
+    assert_eq!(
+        data(&provider_capacity)["classification"],
+        "provider_capacity_attention_required"
+    );
+    assert_eq!(
+        data(&provider_capacity)["schema_version"],
+        "main-agent.worker-supervise-result.v7"
+    );
+    assert_eq!(
+        data(&provider_capacity)["last_proven_safe_state"]["attention"],
+        json!({
+            "kind": "provider_capacity",
+            "source": "provider_protocol",
+            "provider_input_authorized": false,
+            "account_change_authorized": false
+        })
+    );
+    assert_eq!(
+        data(&provider_capacity)["recovery_action"]["kind"],
+        "bounded_provider_capacity_recheck"
+    );
+    assert_eq!(data(&provider_capacity)["automatic_retry_safe"], false);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-matrix"]["state"] = json!("submitted");
+    });
+    let submitted_after_capacity = supervise();
+    assert_eq!(
+        data(&submitted_after_capacity)["classification"],
+        "healthy_progress",
+        "submitted lifecycle state must retire provider-capacity attention"
+    );
+    assert!(
+        data(&submitted_after_capacity)["next_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("validation evidence"))
+    );
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["assignments"]["assignment-matrix"]["state"] = json!("working");
+    });
+    seed_activity_state_with_source(
+        &state_dir,
+        "worker-matrix",
+        "worker-matrix-incarnation",
+        "working",
+        "provider_hook",
+        json!({
+            "provider_turn_id": "turn-after-provider-capacity",
+            "started_at": "2030-01-01T00:00:03Z"
+        }),
+        json!({
+            "provider_turn_id": "turn-provider-capacity",
+            "started_at": "2030-01-01T00:00:01Z",
+            "completed_at": "2030-01-01T00:00:02Z",
+            "outcome": "failed",
+            "provider_failure_kind": "provider_capacity"
+        }),
+    );
+    let resumed_after_capacity = supervise();
+    assert_eq!(
+        data(&resumed_after_capacity)["classification"],
+        "healthy_progress",
+        "a newer active provider turn must retire stale capacity attention"
     );
 
     let progress_file = worker_checkout.join("large-progress.bin");
