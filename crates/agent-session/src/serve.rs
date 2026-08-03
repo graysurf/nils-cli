@@ -2846,6 +2846,13 @@ struct RepoRemoteUrlQuery {
 
 // --- handlers -----------------------------------------------------------------
 
+/// Registry-epoch slack used only to screen protected-session candidates.
+///
+/// Deliberately wider than the sidecar's own freshness window so a broker whose
+/// registry epoch lags its sidecar write is still authenticated rather than
+/// silently dropped. Freshness authority stays with the sidecar.
+const HEARTBEAT_CANDIDATE_WINDOW_SECONDS: i64 = 300;
+
 /// Whether the control-plane runtime can actually serve, independent of whether
 /// this HTTP handler answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2905,17 +2912,28 @@ impl HealthProjection {
                     // A session whose broker is ready with a fresh heartbeat is
                     // protected: its runtime must not be restarted out from
                     // under an active claim or an uncertain operation.
+                    //
+                    // The registry's own heartbeat epoch is a cheap pre-filter
+                    // only. It is not freshness authority — the sidecar is — but
+                    // it can only ever over-report a stale broker as a
+                    // candidate, so screening on it first bounds this open
+                    // loopback route to one private read per plausibly-live
+                    // broker instead of one per record.
                     let protected = registry
                         .brokers
                         .values()
                         .filter(|broker| {
                             broker.state == "ready"
-                                && nils_common::coordination_projection::heartbeat_fresh(
-                                    &state.context.state_dir,
-                                    &broker.session_id,
-                                    &broker.incarnation,
-                                    now,
-                                )
+                                && now.saturating_sub(broker.heartbeat_epoch)
+                                    <= HEARTBEAT_CANDIDATE_WINDOW_SECONDS
+                        })
+                        .filter(|broker| {
+                            nils_common::coordination_projection::heartbeat_fresh(
+                                &state.context.state_dir,
+                                &broker.session_id,
+                                &broker.incarnation,
+                                now,
+                            )
                         })
                         .count();
                     ("available", protected)
@@ -11889,6 +11907,53 @@ esac
             "runtime-version-skew"
         );
         assert_eq!(body["data"]["health"], "degraded");
+    }
+
+    /// The registry epoch is a candidate screen, not freshness authority. A
+    /// broker whose registry epoch lags its sidecar write must still be
+    /// authenticated, or the cheap pre-filter would silently under-report a
+    /// protected runtime and invite a restart that eats an active claim.
+    #[tokio::test]
+    async fn healthz_still_authenticates_a_broker_whose_registry_epoch_lags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let coordination = tmp.path().join("coordination");
+        std::fs::create_dir_all(&coordination).unwrap();
+        let registry = coordination.join("registry.json");
+        std::fs::write(
+            &registry,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "agent-session.coordination-registry.v1",
+                "fingerprint_epoch": 1,
+                "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "brokers": {
+                    "lagging": {
+                        "session_id": "lagging",
+                        "incarnation": "inc-lagging",
+                        "state": "ready",
+                        // Well behind the sidecar below, but inside the screen.
+                        "heartbeat_epoch": now - 120
+                    }
+                },
+                "claims": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let heartbeat = tmp.path().join("sessions/lagging/coordination");
+        std::fs::create_dir_all(&heartbeat).unwrap();
+        let heartbeat = heartbeat.join("heartbeat");
+        std::fs::write(&heartbeat, format!("inc-lagging:{now}\n")).unwrap();
+        std::fs::set_permissions(&heartbeat, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let (_status, body) = call(router(st.clone()), get("/healthz")).await;
+        assert_eq!(
+            body["data"]["sessions"]["protected"], 1,
+            "the sidecar remains freshness authority: {}",
+            body["data"]
+        );
     }
 
     /// A live session holding a fresh ready broker is protected: its runtime
