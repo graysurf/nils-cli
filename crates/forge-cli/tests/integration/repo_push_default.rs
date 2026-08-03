@@ -553,6 +553,23 @@ fn setup_real_git(race: RealGitRace, inherited_push_config: bool) -> RealGitScen
     fs::write(&reason, "Explicitly authorized direct-main hotfix.").expect("reason");
 
     git_output(&["init", "--bare", remote.to_str().expect("remote")]);
+    // A global `core.hooksPath` applies to every repository, including this
+    // fixture's bare remote, so an inherited value silently redirects git away
+    // from the `pre-receive` hook written below and the push-option capture never
+    // appears. Pin the remote to its own hooks directory so the fixture proves
+    // the push contract rather than the developer's git configuration. Agent
+    // runtimes install exactly such a global hooksPath, so without this the test
+    // passes on CI and fails on a managed workstation.
+    git_output(&[
+        "--git-dir",
+        remote.to_str().expect("remote"),
+        "config",
+        "core.hooksPath",
+        remote
+            .join("hooks")
+            .to_str()
+            .expect("remote hooks directory"),
+    ]);
     git_output(&[
         "init",
         "--initial-branch=main",
