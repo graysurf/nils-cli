@@ -1174,6 +1174,27 @@ backend implementations cannot diverge.
     both user and GitHub App installation actors without `GET /user`. GitHub
     exposes no content CAS on delete/discard, so the documented
     final-read-to-delete race remains after exact snapshot guards.
+17. **No agent attribution.** PR/MR and issue title, body, and comment text
+    MUST NOT carry agent self-attribution: a generator marker line
+    (`Generated with …` prose, or a `claude.com/claude-code` /
+    `claude.ai/code` link) or a `Co-Authored-By` trailer whose value names the
+    model family or carries the vendor no-reply address
+    (`noreply@anthropic.com`). The marker forms are defined once in
+    `nils_common::agent_attribution` and shared with `semantic-commit`'s
+    `claude-coauthor-trailer` / `claude-generated-marker` blocked-message rules,
+    so the commit path and the provider path cannot diverge. Enforcement lives
+    in the CLI rather than in an agent-harness hook, so the rule holds whether or
+    not the calling runtime declares a matching hook of its own. Text *about*
+    the rule is allowed: fenced
+    code blocks and inline code spans are stripped before the scan, so a body
+    documenting `` `Co-Authored-By: Claude ...` `` passes while a bare
+    attribution line does not (commit messages get no such exemption — that
+    scan is verbatim). The error `detail` enumerates each offending line and its
+    fix without echoing the marker; set
+    `FORGE_CLI_ALLOW_AGENT_ATTRIBUTION=1` to bypass a verified false positive.
+    Enforced by `pr create`, `pr edit`, `issue create`, `issue edit`,
+    `pr comment`, `issue comment`, `pr review`, `pr review-threads reply`, and
+    `pr review-threads resolve`.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
@@ -1220,6 +1241,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `merge_method_unsupported`                 | 9                    |
 | `keep_branch_conflict`                     | 10                   |
 | `local_path_present`                       | 11                   |
+| `agent_attribution_present`                | 17                   |
 | `review_changes_requested`                 | 12                   |
 | `review_convergence_head_missing`          | 12                   |
 | `review_convergence_head_changed`          | 12                   |

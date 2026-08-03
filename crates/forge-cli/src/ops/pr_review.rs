@@ -24,7 +24,7 @@ use crate::error::ForgeError;
 use crate::ops::{pr_comment, pr_review_threads, pr_reviews, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::{no_escaped_control_markdown, no_local_path};
+use crate::validations::{no_agent_attribution, no_escaped_control_markdown, no_local_path};
 
 const SCHEMA: &str = "pr.review";
 const SCHEMA_VERSION: u32 = 1;
@@ -363,6 +363,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
     if body_present {
         no_local_path(&body, "review comment")?;
+        no_agent_attribution(&body, "review comment")?;
         no_escaped_control_markdown(&body)?;
     }
 
@@ -381,6 +382,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             MIRROR_URL_PENDING,
         );
         no_local_path(&preview, "issue mirror")?;
+        no_agent_attribution(&preview, "issue mirror")?;
         no_escaped_control_markdown(&preview)?;
         Some(issue_number)
     } else {
@@ -741,6 +743,7 @@ fn run_validate_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     let body_present = !body.trim().is_empty();
     if body_present {
         no_local_path(&body, "review comment")?;
+        no_agent_attribution(&body, "review comment")?;
         no_escaped_control_markdown(&body)?;
     }
 
@@ -951,6 +954,7 @@ fn prepare_review_thread_spec(
     }
     no_local_path(&path, "review thread path")?;
     no_local_path(&spec.body, "review thread body")?;
+    no_agent_attribution(&spec.body, "review thread body")?;
     no_escaped_control_markdown(&path)?;
     no_escaped_control_markdown(&spec.body)?;
 

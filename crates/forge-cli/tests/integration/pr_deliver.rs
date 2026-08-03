@@ -487,6 +487,9 @@ fn pr_deliver_dry_run_reports_local_preflight_without_backend() {
     // Rule 11 — the local-path verdicts are present and pass for portable text.
     assert_eq!(lookup("title_local_path")["ok"], true);
     assert_eq!(lookup("body_local_path")["ok"], true);
+    // Rule 17 — the attribution verdicts are present and pass for unattributed text.
+    assert_eq!(lookup("title_agent_attribution")["ok"], true);
+    assert_eq!(lookup("body_agent_attribution")["ok"], true);
     // The worktree/head rules are present too (their verdict depends on the
     // local git state, so only presence is asserted here).
     assert!(preflight.iter().any(|v| v["rule"] == "worktree_clean"));

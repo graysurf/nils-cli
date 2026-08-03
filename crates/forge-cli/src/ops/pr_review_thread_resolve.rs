@@ -26,7 +26,7 @@ use crate::ops::pr_comment::read_body_with_file_flag;
 use crate::ops::{pr_review_threads, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::no_local_path;
+use crate::validations::{no_agent_attribution, no_local_path};
 
 const SCHEMA: &str = "pr.review-threads.resolve";
 const SCHEMA_VERSION: u32 = 1;
@@ -83,6 +83,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         None
     } else {
         no_local_path(&note, "note")?;
+        no_agent_attribution(&note, "note")?;
         Some(format!(
             "{}\n{}",
             note.trim_end(),

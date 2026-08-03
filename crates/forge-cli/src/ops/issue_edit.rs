@@ -19,7 +19,9 @@ use crate::error::ForgeError;
 use crate::ops::issue_view;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::{no_escaped_control_markdown, no_local_path, title_length};
+use crate::validations::{
+    no_agent_attribution, no_escaped_control_markdown, no_local_path, title_length,
+};
 
 const SCHEMA: &str = "issue.edit";
 const SCHEMA_VERSION: u32 = 1;
@@ -64,6 +66,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     if let Some(ref t) = args.title {
         title_length(t)?;
         no_local_path(t, "title")?;
+        no_agent_attribution(t, "title")?;
         no_escaped_control_markdown(t)?;
     }
     let body = if args.body.is_some() || args.body_file.is_some() {
@@ -73,6 +76,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     };
     if let Some(ref b) = body {
         no_local_path(b, "body")?;
+        no_agent_attribution(b, "body")?;
         no_escaped_control_markdown(b)?;
     }
     let call = build_edit_call(&ctx, &args, body.as_deref());

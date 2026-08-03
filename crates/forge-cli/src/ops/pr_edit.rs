@@ -21,7 +21,9 @@ use crate::error::ForgeError;
 use crate::ops::pr_view::{self, PrViewPayload};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::{BodyHeadings, body_summary, body_test_plan, no_local_path, title_length};
+use crate::validations::{
+    BodyHeadings, body_summary, body_test_plan, no_agent_attribution, no_local_path, title_length,
+};
 
 const SCHEMA: &str = "pr.edit";
 const SCHEMA_VERSION: u32 = 1;
@@ -61,12 +63,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     if let Some(title) = &args.title {
         title_length(title)?;
         no_local_path(title, "title")?;
+        no_agent_attribution(title, "title")?;
     }
     if let Some(body) = &new_body {
         let headings = BodyHeadings::default();
         body_summary(body, &headings)?;
         body_test_plan(body, &headings)?;
         no_local_path(body, "body")?;
+        no_agent_attribution(body, "body")?;
     }
 
     let body_tempfile = match (&ctx.provider, &new_body) {
