@@ -40,6 +40,9 @@ Workspace-level keep/delete ownership decisions are tracked in
 - `fs`: atomic write, timestamp write/remove, UTF-8 text write, SHA-256 hashing, and cross-platform replace helpers with structured errors.
 - `markdown`: markdown payload validation (with violation reporting), markdown-table-safe cell canonicalization, markdown heading/code-block
   rendering, and stable JSON pretty-format helpers used by orchestration/reporting CLIs.
+- `agent_attribution`: the single definition of agent self-attribution markers (generator marker lines, model / vendor `Co-Authored-By`
+  trailers) plus a markdown-aware scan and a verbatim per-line predicate pair, shared by `semantic-commit`'s blocked-message rules and
+  `forge-cli`'s provider-egress Rule 17.
 - `provider_runtime`: provider-runtime substrate (paths, profiles, auth persistence, exec invocation, JSON/JWT helpers, structured errors)
   shared by Codex/Gemini-style CLIs without provider-specific UX copy.
 - `provider_usage`: stable provider-neutral usage failure reasons plus HTTP/message classification; callers retain provider-specific UX copy.
