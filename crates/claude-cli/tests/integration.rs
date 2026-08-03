@@ -33,6 +33,24 @@ fn stderr(output: &CmdOutput) -> String {
     output.stderr_text()
 }
 
+/// An endpoint nothing listens on, so a request that escapes a test's control
+/// fails immediately instead of reaching a real host.
+///
+/// `base_options` clears the `CLAUDE_PROMPT` prefix to isolate ambient config,
+/// which also clears `CLAUDE_PROMPT_SEGMENT_ENDPOINT` — and the production
+/// default is `https://api.anthropic.com/...`. A test therefore reached the real
+/// backend by *omission*, and the reach happened in the detached refresh child
+/// rather than in the command under test, so nothing in the test's own output
+/// showed it. Pinning it here makes the safe case the default; a test that wants
+/// a server sets its own endpoint afterwards and wins.
+const UNROUTABLE_ENDPOINT: &str = "http://127.0.0.1:9/usage";
+
+/// An executable that exits non-zero without writing anything, for a test that
+/// wants the spawn itself but nothing the child would do. `gemini-cli` uses the
+/// same value for the same purpose. This suite already assumes a POSIX shell
+/// for its other fixtures.
+const NO_OP_EXE: &str = "/usr/bin/false";
+
 fn base_options(cache_dir: &Path) -> CmdOptions {
     CmdOptions::default()
         .with_env_remove_prefix("CLAUDE_CLI_")
@@ -45,6 +63,7 @@ fn base_options(cache_dir: &Path) -> CmdOptions {
         )
         .with_env("CLAUDE_PROMPT_SEGMENT_CACHE_DIR", &path_str(cache_dir))
         .with_env("CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED", "1")
+        .with_env("CLAUDE_PROMPT_SEGMENT_ENDPOINT", UNROUTABLE_ENDPOINT)
 }
 
 fn path_str(path: &Path) -> String {
@@ -990,10 +1009,38 @@ fn usage_auto_keeps_live_rate_limit_reason_when_expired_cache_is_omitted() {
     );
 }
 
+/// Pins the containment itself, because the failure it prevents is invisible:
+/// the reach happens in a detached child, so a test that lost its endpoint
+/// override would still pass while talking to the real backend.
+#[test]
+fn base_options_pins_an_unroutable_endpoint_for_every_suite_default() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = base_options(tmp.path());
+
+    assert!(
+        options
+            .envs
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_PROMPT_SEGMENT_ENDPOINT"
+                && value == UNROUTABLE_ENDPOINT),
+        "base_options must pin an endpoint: it clears the CLAUDE_PROMPT prefix, and the \
+         production default is a real host, so omission means reaching it; envs={:?}",
+        options.envs
+    );
+}
+
 #[test]
 fn prompt_segment_missing_credentials_and_cache_is_quiet_success() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = run(&["prompt-segment"], &base_options(tmp.path()));
+    // Per-test enumeration (#1412) showed this test does reach
+    // `enqueue_background_refresh` despite having neither credentials nor a
+    // cache, and it was the one spawner in this suite with no containment. The
+    // detached child's first act is `create_dir_all` on the cache directory, so
+    // it could recreate this `tempdir` after teardown removed it. A no-op
+    // executable keeps the spawn under test while giving the child nothing to
+    // write.
+    let options = base_options(tmp.path()).with_env("CLAUDE_PROMPT_SEGMENT_EXE", NO_OP_EXE);
+    let output = run(&["prompt-segment"], &options);
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "");
