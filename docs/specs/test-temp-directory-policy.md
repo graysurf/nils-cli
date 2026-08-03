@@ -19,7 +19,7 @@ orders of magnitude without changing a line of test code.
 | Class | Mechanism | Caught by |
 | --- | --- | --- |
 | 1 | Cleanup never runs: the handle is owned by a `static`, or disarmed with `keep()` / `into_path()` / `mem::forget` | `scripts/ci/tempdir-leak-audit.sh` |
-| 2 | Cleanup runs and fails: a fixture left read-only, a racing writer | `ScopedTempDir` reports instead of swallowing |
+| 2 | Cleanup runs and fails: a fixture left read-only, a racing writer | `RestoredMode` prevents the fixture case; `ScopedTempDir` reports the rest instead of swallowing |
 | 3 | Cleanup succeeds, then background work recreates the path | `scripts/ci/tempdir-leak-probe.sh` |
 | 4 | The write was never inside the fixture: a lock or marker placed as a *sibling* of the fixture root | `scripts/ci/tempdir-leak-probe.sh` |
 
@@ -56,10 +56,31 @@ entries from a read-only directory, so any panic between those two statements �
 an unwinding assertion, a `Command::spawn` that fails under load — hands teardown
 a directory it cannot empty, and the survivors are whatever sits under it.
 Restore from `Drop` instead, so the unwinding path restores it too:
-`RestoredMode` in `crates/codex-cli/tests/integration/rate_limits_async.rs`.
+`nils_test_support::tempdir::RestoredMode`.
 Note that `remove_dir_all` stops at the first error, so the leftovers name the
 read-only subtree and nothing else — sibling fixture directories removed before
 it are already gone.
+
+**The target decides whether this is a hazard at all**, and the threshold is
+narrower than "read-only". Emptying a directory needs write *and execute* on it,
+so every owner digit except `7` blocks `remove_dir_all` — measured on Linux, a
+populated directory at `0o000`, `0o100`, `0o300`, `0o400`, `0o500` and `0o600` all
+fail and only `0o700` succeeds. A **file** at any mode is unaffected, because
+unlink permission comes from the parent directory. And a permanent hardening — a
+binary installed at `0o500` and meant to stay that way — has nothing to restore
+and is not this class either.
+
+**The rule is: a directory a test makes unwritable must use `RestoredMode`.**
+
+A static gate for this was evaluated for #1411 and rejected, because the
+discriminator is the chmod *target* and a line-oriented grep cannot see it.
+Measured on this workspace: matching `0o[45]xx` found four sites, **none** of them
+the hazard, while a real `0o000` directory fixture was accepted; widening to the
+true predicate — any owner digit but `7` — matched 154 sites, overwhelmingly
+legitimate file modes in production code; scoping that to `crates/*/tests/` still
+matched 78, again mostly files. A gate with that ratio would train authors to
+annotate safe code, so the class stays a review rule and this spec, with
+`RestoredMode` as the discoverable fix.
 
 ### Class 4 is a placement bug, not a timing bug
 

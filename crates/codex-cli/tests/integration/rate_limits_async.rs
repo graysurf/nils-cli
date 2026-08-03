@@ -2,12 +2,10 @@ use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::http::{HttpResponse, LoopbackServer, TestServer};
 #[cfg(unix)]
-use nils_test_support::tempdir::ScopedTempDir;
+use nils_test_support::tempdir::{RestoredMode, ScopedTempDir};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,48 +72,6 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// Restores a directory's mode when it drops.
-///
-/// `remove_dir_all` cannot unlink entries from a `0o555` directory, so a fixture
-/// left read-only survives `TempDir` teardown — silently, because `Drop` discards
-/// the error (class 2 in `docs/specs/test-temp-directory-policy.md`). Restoring
-/// from `Drop` instead of an inline statement means an unwinding assertion or a
-/// panic inside `run` cannot leave the fixture unremovable.
-#[cfg(unix)]
-struct RestoredMode {
-    dir: PathBuf,
-    mode: u32,
-}
-
-#[cfg(unix)]
-impl RestoredMode {
-    fn read_only(dir: &Path) -> Self {
-        let permissions = fs::metadata(dir).expect("cache metadata").permissions();
-        let guard = Self {
-            dir: dir.to_path_buf(),
-            mode: permissions.mode() & 0o7777,
-        };
-
-        let mut read_only = permissions;
-        read_only.set_mode(0o555);
-        fs::set_permissions(dir, read_only).expect("make cache read-only");
-
-        guard
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RestoredMode {
-    fn drop(&mut self) {
-        let Ok(metadata) = fs::metadata(&self.dir) else {
-            return;
-        };
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(self.mode);
-        let _ = fs::set_permissions(&self.dir, permissions);
-    }
-}
-
 #[cfg(unix)]
 fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
     // The fixture below is deliberately made read-only for the duration of the
@@ -146,7 +102,7 @@ fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
     // Keep the invalid entry readable while preventing the successful live
     // request from replacing it before collect_async_round performs reset
     // metadata backfill.
-    let restored_mode = RestoredMode::read_only(cache_dir);
+    let restored_mode = RestoredMode::read_only_shared(cache_dir);
 
     let server = LoopbackServer::new().expect("server");
     server.add_route(

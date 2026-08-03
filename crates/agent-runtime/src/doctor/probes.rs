@@ -465,22 +465,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_runtime_root_reports_the_io_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
         for name in ["live", "docs", "state"] {
             fs::create_dir_all(tmp.path().join(name)).unwrap();
         }
         let live = tmp.path().join("live");
-        fs::set_permissions(&live, fs::Permissions::from_mode(0o000)).unwrap();
+        // A directory at 0o000 blocks `remove_dir_all` outright, and the restore
+        // below used to be a plain statement, so a panic in `runtime_roots` left
+        // teardown a directory it could not empty. Restore from `Drop` instead.
+        // Found by the #1411 audit review.
+        let restored_live = nils_test_support::tempdir::RestoredMode::set(&live, 0o000);
         let readable_as_root = fs::read_dir(&live).is_ok();
         if readable_as_root {
-            fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
             return;
         }
 
         let report = runtime_roots(&roots(tmp.path(), None));
-        fs::set_permissions(&live, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(restored_live);
 
         let live = report
             .findings
