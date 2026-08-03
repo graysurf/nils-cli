@@ -10,12 +10,13 @@ use support::Fixture;
 /// The `agent-docs` binary these tests use as a trusted read-only producer.
 ///
 /// It belongs to another package, so a package-scoped run has no reason to have
-/// built it. Worse than absence: an artifact from an earlier build reports an
-/// earlier release, which the producer identity check in
-/// `crates/agent-hook/src/read_only.rs` correctly rejects as
-/// `read-only-producer-mismatch` — turning a build-scope problem into what looks
-/// like a policy defect. Skip on either. See `sympoies/nils-cli#1413`.
-fn agent_docs_producer() -> Option<PathBuf> {
+/// built it and `None` means these assertions do not run. An artifact from an
+/// earlier release is worse than an absent one, because the producer identity
+/// check in `crates/agent-hook/src/read_only.rs` correctly rejects it as
+/// `read-only-producer-mismatch` and a build-scope problem then reads as a policy
+/// defect — so `bin::sibling_or_skip` fails on that rather than skipping.
+/// See `sympoies/nils-cli#1413`.
+fn agent_docs_producer_or_skip() -> Option<PathBuf> {
     let producer = nils_test_support::bin::sibling_or_skip("agent-docs", "nils-agent-docs")?;
 
     Some(
@@ -194,7 +195,7 @@ fn codex_and_claude_record_the_same_shadow_decision_for_equivalent_input() {
 
 #[test]
 fn enforce_accepts_a_valid_same_release_read_only_descriptor() {
-    let Some(producer) = agent_docs_producer() else {
+    let Some(producer) = agent_docs_producer_or_skip() else {
         return;
     };
     let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
@@ -236,9 +237,57 @@ fn enforce_accepts_a_valid_same_release_read_only_descriptor() {
     assert!(output.stdout_json()["data"]["shadow"].is_null());
 }
 
+/// Assert one enforce-mode rejection and return nothing but the check.
+fn assert_enforce_blocks(fixture: &Fixture, command: &str, expected_code: &str) {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": fixture.root,
+        "tool_input": {"command": command}
+    })
+    .to_string();
+    let output = fixture.run(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(&payload),
+    );
+
+    assert_eq!(
+        output.code,
+        1,
+        "command={command}; stderr={}",
+        output.stderr_text()
+    );
+    assert_eq!(output.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][0]["code"],
+        expected_code,
+        "command={command}"
+    );
+    assert!(output.stdout_json()["data"]["shadow"].is_null());
+}
+
+/// Deliberately takes no producer, so it cannot be gated on a sibling binary.
+///
+/// This is the only test asserting enforce-mode rejection of a command that is
+/// not a trusted producer at all — the other two owners of
+/// `read-only-command-unsupported` run in shadow mode and assert `allow`. It was
+/// previously the first case of a loop whose second case needed `agent-docs`, so
+/// gating that loop would have taken this invariant with it.
 #[test]
-fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
-    let Some(producer) = agent_docs_producer() else {
+fn enforce_rejects_an_untrusted_producer_command() {
+    let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
+    let fixture = Fixture::new(&policy);
+
+    assert_enforce_blocks(
+        &fixture,
+        "echo not-a-trusted-producer",
+        "read-only-command-unsupported",
+    );
+}
+
+#[test]
+fn enforce_rejects_a_same_release_mutation_descriptor() {
+    let Some(producer) = agent_docs_producer_or_skip() else {
         return;
     };
     let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
@@ -249,44 +298,13 @@ fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
         fixture.root.display(),
         fixture.root.display()
     );
-    for (command, expected_code) in [
-        (
-            "echo not-a-trusted-producer",
-            "read-only-command-unsupported",
-        ),
-        (mutation.as_str(), "read-only-effect-rejected"),
-    ] {
-        let payload = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "cwd": fixture.root,
-            "tool_input": {"command": command}
-        })
-        .to_string();
-        let output = fixture.run(
-            &["dispatch", "--product", "claude", "--format", "json"],
-            Some(&payload),
-        );
 
-        assert_eq!(
-            output.code,
-            1,
-            "command={command}; stderr={}",
-            output.stderr_text()
-        );
-        assert_eq!(output.stdout_json()["data"]["action"], "block");
-        assert_eq!(
-            output.stdout_json()["data"]["reasons"][0]["code"],
-            expected_code,
-            "command={command}"
-        );
-        assert!(output.stdout_json()["data"]["shadow"].is_null());
-    }
+    assert_enforce_blocks(&fixture, &mutation, "read-only-effect-rejected");
 }
 
 #[test]
 fn enforce_valid_read_only_bypasses_only_the_declared_fallback_handler() {
-    let Some(producer) = agent_docs_producer() else {
+    let Some(producer) = agent_docs_producer_or_skip() else {
         return;
     };
     let policy = format!("{FALLBACK_POLICY}{UNRELATED_HANDLER_RULE}");

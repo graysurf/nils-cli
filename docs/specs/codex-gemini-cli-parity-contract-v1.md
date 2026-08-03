@@ -121,7 +121,13 @@ Per-crate integration tests are consolidated under a single `--test integration`
 
 ## Validation anchors
 
-- `cargo test -p nils-codex-cli --test integration -- parity_oracle`
-- `cargo test -p nils-gemini-cli --test integration -- parity_oracle`
+- `cargo build -p nils-gemini-cli --bins && cargo test -p nils-codex-cli --test integration -- parity_oracle`
+- `cargo build -p nils-codex-cli --bins && cargo test -p nils-gemini-cli --test integration -- parity_oracle`
 - `cargo test -p nils-codex-cli --test integration -- runtime_auth_contract runtime_error_contract runtime_exec_contract runtime_paths_config_contract`
 - `cargo test -p nils-gemini-cli --test integration -- runtime_auth_contract runtime_error_contract runtime_exec_contract runtime_paths_config_contract`
+
+Each parity oracle compares its own CLI against the *other* package's binary,
+which a package-scoped `cargo test` does not build. Without the paired build the
+suite skips and reports green with zero parity assertions, so the build is part
+of the anchor rather than an optimisation. See `bin::sibling_or_skip` in
+`crates/nils-test-support`.

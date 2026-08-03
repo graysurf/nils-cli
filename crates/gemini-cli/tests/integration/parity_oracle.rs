@@ -8,12 +8,10 @@ fn gemini_cli_bin() -> PathBuf {
     bin::resolve("gemini-cli")
 }
 
-/// `codex-cli` belongs to another package, so a package-scoped run has no reason
-/// to have built it, and an artifact left behind by an earlier build would
-/// compare this CLI against a different release. Either way the answer says
-/// nothing about parity, so skip with a reason instead of asserting.
-/// See `sympoies/nils-cli#1413`.
-fn codex_cli_bin() -> Option<PathBuf> {
+/// `None` means this run cannot compare against `codex-cli` at all, so the
+/// parity assertions below do not run. `bin::sibling_or_skip` owns why that
+/// happens and when it is legitimate.
+fn codex_cli_bin_or_skip() -> Option<PathBuf> {
     bin::sibling_or_skip("codex-cli", "nils-codex-cli")
 }
 
@@ -57,7 +55,7 @@ fn extract_commands(help_text: &str) -> Vec<String> {
 
 #[test]
 fn parity_oracle_topology_matches_codex() {
-    let Some(codex_bin) = codex_cli_bin() else {
+    let Some(codex_bin) = codex_cli_bin_or_skip() else {
         return;
     };
     let gemini = run_gemini(&["--help"]);
@@ -72,7 +70,7 @@ fn parity_oracle_topology_matches_codex() {
 
 #[test]
 fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
-    let Some(codex_bin) = codex_cli_bin() else {
+    let Some(codex_bin) = codex_cli_bin_or_skip() else {
         return;
     };
     let gemini_auth = run_gemini(&["auth", "current", "--help"]);
@@ -102,7 +100,7 @@ fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
 
 #[test]
 fn parity_oracle_auth_json_schema_ids_are_provider_specific() {
-    let Some(codex_bin) = codex_cli_bin() else {
+    let Some(codex_bin) = codex_cli_bin_or_skip() else {
         return;
     };
     let gemini = run_gemini(&["auth", "current", "--json"]);

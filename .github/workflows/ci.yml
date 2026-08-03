@@ -231,6 +231,9 @@ jobs:
       - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, tempdir-leak-audit, test-stale-audit)
         env:
           NILS_CLI_TEST_RUNNER: nextest
+          # A skip here would mean a lane that builds every binary lost coverage
+          # silently; make it fatal instead. See `bin::sibling_or_skip`.
+          NILS_TEST_REQUIRE_SIBLING_BINS: "1"
         run: |
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
@@ -316,6 +319,9 @@ jobs:
       - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, tempdir-leak-audit, test-stale-audit)
         env:
           NILS_CLI_TEST_RUNNER: nextest
+          # A skip here would mean a lane that builds every binary lost coverage
+          # silently; make it fatal instead. See `bin::sibling_or_skip`.
+          NILS_TEST_REQUIRE_SIBLING_BINS: "1"
         run: |
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             /opt/homebrew/bin/bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
@@ -364,6 +370,9 @@ jobs:
       pull-requests: write
     env:
       COVERAGE_FAIL_UNDER_LINES: "85"
+      # A skip here would mean a lane that builds every binary lost coverage
+      # silently; make it fatal instead. See `bin::sibling_or_skip`.
+      NILS_TEST_REQUIRE_SIBLING_BINS: "1"
     steps:
       # Docs-only and proven release-only change sets skip coverage work at the
       # step level so the required `coverage` job still concludes `success`.
