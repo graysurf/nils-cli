@@ -131,6 +131,13 @@ This runs changed-scope validation against `origin/main` by default:
 - the workspace lane runs its tests through `scripts/ci/tempdir-leak-probe.sh`,
   which fails on temp directories the suite leaves behind; see
   `docs/specs/test-temp-directory-policy.md`
+- a package-scoped lane does not build binaries another package owns, so tests
+  that need one — the `codex-cli`/`gemini-cli` parity oracles and the
+  `agent-hook` read-only producer cases — skip with a reason naming the build
+  command instead of failing. Build the sibling (for example
+  `cargo build -p nils-gemini-cli --bins`) to run them locally; the workspace
+  lane and CI always build every binary. See `bin::sibling_or_skip` in
+  `crates/nils-test-support`
 
 Override the base ref when needed:
 

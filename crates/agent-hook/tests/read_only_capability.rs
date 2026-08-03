@@ -2,9 +2,28 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use pretty_assertions::assert_eq;
 use support::Fixture;
+
+/// The `agent-docs` binary these tests use as a trusted read-only producer.
+///
+/// It belongs to another package, so a package-scoped run has no reason to have
+/// built it. Worse than absence: an artifact from an earlier build reports an
+/// earlier release, which the producer identity check in
+/// `crates/agent-hook/src/read_only.rs` correctly rejects as
+/// `read-only-producer-mismatch` — turning a build-scope problem into what looks
+/// like a policy defect. Skip on either. See `sympoies/nils-cli#1413`.
+fn agent_docs_producer() -> Option<PathBuf> {
+    let producer = nils_test_support::bin::sibling_or_skip("agent-docs", "nils-agent-docs")?;
+
+    Some(
+        producer
+            .canonicalize()
+            .expect("canonical agent-docs binary"),
+    )
+}
 
 const POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "runtime-kit"
@@ -175,11 +194,11 @@ fn codex_and_claude_record_the_same_shadow_decision_for_equivalent_input() {
 
 #[test]
 fn enforce_accepts_a_valid_same_release_read_only_descriptor() {
+    let Some(producer) = agent_docs_producer() else {
+        return;
+    };
     let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
     let fixture = Fixture::new(&policy);
-    let producer = nils_test_support::bin::resolve("agent-docs")
-        .canonicalize()
-        .expect("canonical agent-docs binary");
     let command = format!(
         "builtin command {} --docs-home {} --project-path {} preflight --intent project-dev --format json",
         producer.display(),
@@ -219,11 +238,11 @@ fn enforce_accepts_a_valid_same_release_read_only_descriptor() {
 
 #[test]
 fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
+    let Some(producer) = agent_docs_producer() else {
+        return;
+    };
     let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
     let fixture = Fixture::new(&policy);
-    let producer = nils_test_support::bin::resolve("agent-docs")
-        .canonicalize()
-        .expect("canonical agent-docs binary");
     let mutation = format!(
         "builtin command {} --docs-home {} --project-path {} init --force",
         producer.display(),
@@ -267,13 +286,13 @@ fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
 
 #[test]
 fn enforce_valid_read_only_bypasses_only_the_declared_fallback_handler() {
+    let Some(producer) = agent_docs_producer() else {
+        return;
+    };
     let policy = format!("{FALLBACK_POLICY}{UNRELATED_HANDLER_RULE}");
     for product in ["codex", "claude"] {
         let fixture = Fixture::new(&policy);
         install_fallback_handler(&fixture);
-        let producer = nils_test_support::bin::resolve("agent-docs")
-            .canonicalize()
-            .expect("canonical agent-docs binary");
         let command = format!(
             "builtin command {} --docs-home {} --project-path {} preflight --intent project-dev --format json",
             producer.display(),

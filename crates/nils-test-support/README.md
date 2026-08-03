@@ -43,7 +43,13 @@ Stale-test cleanup sequencing is frozen in
     still reaches the child
   - `cmd::path_with_prepend_excluding_program`: construct a PATH that prepends stubs while filtering one real binary
 - Workspace binaries
-  - `bin`: `resolve` finds `CARGO_BIN_EXE_*` or falls back to `target/<profile>/<name>`
+  - `bin`: `resolve` finds `CARGO_BIN_EXE_*` or falls back to `target/<profile>/<name>`, panicking when neither
+    yields a path; `resolve_optional` returns `None` instead
+  - `bin::sibling_or_skip`: for a binary **another package** owns. Cargo sets `CARGO_BIN_EXE_*` only for the
+    package under test — a `dev-dependencies` entry neither exports it nor builds the dependency's binary — so a
+    package-scoped run may find nothing, or find an artifact from an earlier release. Both return `None` with a
+    stderr reason naming the build command, so the test skips instead of asserting against the wrong artifact.
+    `bin::sibling` exposes the same classification as a `Sibling` value
 - Git helpers
   - `git`: init temp repos (`InitRepoOptions`), run git commands, and commit files
 - Stubbing external tools

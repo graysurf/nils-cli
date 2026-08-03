@@ -2,6 +2,29 @@ use nils_test_support::{EnvGuard, GlobalStateLock, bin, cmd, write_exe};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+/// Guard both spellings Cargo could have exported for a hyphenated bin name, so
+/// the absent-sibling cases cannot be satisfied by an inherited variable.
+fn without_bin_exe_env(lock: &GlobalStateLock, bin_name: &str) -> Vec<EnvGuard> {
+    vec![
+        EnvGuard::remove(lock, &format!("CARGO_BIN_EXE_{bin_name}")),
+        EnvGuard::remove(
+            lock,
+            &format!("CARGO_BIN_EXE_{}", bin_name.replace('-', "_")),
+        ),
+    ]
+}
+
+/// Write a stub that answers `--version` the way a workspace CLI does, so the
+/// release comparison sees a realistic first line.
+#[cfg(unix)]
+fn write_version_stub(dir: &std::path::Path, bin_name: &str, release: &str) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{bin_name} {release} (v{release}, rustc 1.0.0 (0000000 1970-01-01))'\n"
+    );
+    write_exe(dir, bin_name, &script);
+    dir.join(bin_name)
+}
+
 #[test]
 fn resolve_prefers_env_var_with_hyphen() {
     let lock = GlobalStateLock::new();
@@ -196,6 +219,126 @@ printf "%s" "${NTS_VALUE-unset}"
 
     assert_eq!(output.code, 0);
     assert_eq!(output.stdout_text(), "child");
+}
+
+#[test]
+fn resolve_optional_reports_absence_instead_of_panicking() {
+    let lock = GlobalStateLock::new();
+    let _guards = without_bin_exe_env(&lock, "nts-absent-sibling");
+
+    assert_eq!(bin::resolve_optional("nts-absent-sibling"), None);
+}
+
+#[test]
+fn sibling_is_absent_when_the_binary_was_never_built() {
+    let lock = GlobalStateLock::new();
+    let _guards = without_bin_exe_env(&lock, "nts-absent-sibling");
+
+    assert_eq!(bin::sibling("nts-absent-sibling"), bin::Sibling::Absent);
+}
+
+#[cfg(unix)]
+#[test]
+fn sibling_is_ready_when_the_artifact_reports_this_workspace_release() {
+    let lock = GlobalStateLock::new();
+    let temp = TempDir::new().expect("tempdir");
+    let path = write_version_stub(temp.path(), "nts-current-sibling", bin::WORKSPACE_RELEASE);
+    let _guard = EnvGuard::set(
+        &lock,
+        "CARGO_BIN_EXE_nts-current-sibling",
+        path.to_str().expect("path"),
+    );
+
+    assert_eq!(
+        bin::sibling("nts-current-sibling"),
+        bin::Sibling::Ready(path)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sibling_reports_a_release_mismatch_for_an_artifact_from_an_earlier_build() {
+    let lock = GlobalStateLock::new();
+    let temp = TempDir::new().expect("tempdir");
+    let path = write_version_stub(temp.path(), "nts-stale-sibling", "1.0.0");
+    let _guard = EnvGuard::set(
+        &lock,
+        "CARGO_BIN_EXE_nts-stale-sibling",
+        path.to_str().expect("path"),
+    );
+
+    assert_eq!(
+        bin::sibling("nts-stale-sibling"),
+        bin::Sibling::ReleaseMismatch {
+            reported: Some("1.0.0".to_string())
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sibling_reports_a_release_mismatch_when_version_cannot_be_read() {
+    let lock = GlobalStateLock::new();
+    let temp = TempDir::new().expect("tempdir");
+    write_exe(temp.path(), "nts-broken-sibling", "#!/bin/sh\nexit 1\n");
+    let path = temp.path().join("nts-broken-sibling");
+    let _guard = EnvGuard::set(
+        &lock,
+        "CARGO_BIN_EXE_nts-broken-sibling",
+        path.to_str().expect("path"),
+    );
+
+    assert_eq!(
+        bin::sibling("nts-broken-sibling"),
+        bin::Sibling::ReleaseMismatch { reported: None }
+    );
+}
+
+#[test]
+fn skip_reason_names_the_build_command_for_an_absent_sibling() {
+    let reason = bin::Sibling::Absent
+        .skip_reason("gemini-cli", "nils-gemini-cli")
+        .expect("an absent sibling has a skip reason");
+
+    assert!(reason.contains("gemini-cli"), "reason={reason}");
+    assert!(
+        reason.contains("cargo build -p nils-gemini-cli --bins"),
+        "reason={reason}"
+    );
+}
+
+#[test]
+fn skip_reason_names_both_releases_for_a_stale_sibling() {
+    let reason = bin::Sibling::ReleaseMismatch {
+        reported: Some("1.25.13".to_string()),
+    }
+    .skip_reason("agent-docs", "nils-agent-docs")
+    .expect("a stale sibling has a skip reason");
+
+    assert!(reason.contains("1.25.13"), "reason={reason}");
+    assert!(reason.contains(bin::WORKSPACE_RELEASE), "reason={reason}");
+    assert!(
+        reason.contains("cargo build -p nils-agent-docs --bins"),
+        "reason={reason}"
+    );
+}
+
+#[test]
+fn skip_reason_is_absent_for_a_ready_sibling() {
+    let ready = bin::Sibling::Ready(std::path::PathBuf::from("agent-docs"));
+
+    assert_eq!(ready.skip_reason("agent-docs", "nils-agent-docs"), None);
+}
+
+#[test]
+fn sibling_or_skip_yields_none_for_an_absent_sibling_without_panicking() {
+    let lock = GlobalStateLock::new();
+    let _guards = without_bin_exe_env(&lock, "nts-absent-sibling");
+
+    assert_eq!(
+        bin::sibling_or_skip("nts-absent-sibling", "nils-absent"),
+        None
+    );
 }
 
 #[cfg(unix)]

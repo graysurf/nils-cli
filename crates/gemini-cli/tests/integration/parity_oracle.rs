@@ -2,14 +2,19 @@ use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn gemini_cli_bin() -> PathBuf {
     bin::resolve("gemini-cli")
 }
 
-fn codex_cli_bin() -> PathBuf {
-    bin::resolve("codex-cli")
+/// `codex-cli` belongs to another package, so a package-scoped run has no reason
+/// to have built it, and an artifact left behind by an earlier build would
+/// compare this CLI against a different release. Either way the answer says
+/// nothing about parity, so skip with a reason instead of asserting.
+/// See `sympoies/nils-cli#1413`.
+fn codex_cli_bin() -> Option<PathBuf> {
+    bin::sibling_or_skip("codex-cli", "nils-codex-cli")
 }
 
 fn run_gemini(args: &[&str]) -> CmdOutput {
@@ -17,9 +22,8 @@ fn run_gemini(args: &[&str]) -> CmdOutput {
     cmd::run(&bin, args, &[], None)
 }
 
-fn run_codex(args: &[&str]) -> CmdOutput {
-    let bin = codex_cli_bin();
-    cmd::run(&bin, args, &[], None)
+fn run_codex(bin: &Path, args: &[&str]) -> CmdOutput {
+    cmd::run(bin, args, &[], None)
 }
 
 fn extract_commands(help_text: &str) -> Vec<String> {
@@ -53,8 +57,11 @@ fn extract_commands(help_text: &str) -> Vec<String> {
 
 #[test]
 fn parity_oracle_topology_matches_codex() {
+    let Some(codex_bin) = codex_cli_bin() else {
+        return;
+    };
     let gemini = run_gemini(&["--help"]);
-    let codex = run_codex(&["--help"]);
+    let codex = run_codex(&codex_bin, &["--help"]);
     assert_eq!(gemini.code, 0, "stderr={}", gemini.stderr_text());
     assert_eq!(codex.code, 0, "stderr={}", codex.stderr_text());
 
@@ -65,8 +72,11 @@ fn parity_oracle_topology_matches_codex() {
 
 #[test]
 fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
+    let Some(codex_bin) = codex_cli_bin() else {
+        return;
+    };
     let gemini_auth = run_gemini(&["auth", "current", "--help"]);
-    let codex_auth = run_codex(&["auth", "current", "--help"]);
+    let codex_auth = run_codex(&codex_bin, &["auth", "current", "--help"]);
     assert_eq!(gemini_auth.code, 0);
     assert_eq!(codex_auth.code, 0);
     let gemini_auth_text = gemini_auth.stdout_text();
@@ -77,7 +87,7 @@ fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
     assert!(!codex_auth_text.contains("--json"));
 
     let gemini_diag = run_gemini(&["diag", "rate-limits", "--help"]);
-    let codex_diag = run_codex(&["diag", "rate-limits", "--help"]);
+    let codex_diag = run_codex(&codex_bin, &["diag", "rate-limits", "--help"]);
     assert_eq!(gemini_diag.code, 0);
     assert_eq!(codex_diag.code, 0);
     let gemini_diag_text = gemini_diag.stdout_text();
@@ -92,8 +102,11 @@ fn parity_oracle_format_flag_visibility_matches_codex_for_auth_and_diag_help() {
 
 #[test]
 fn parity_oracle_auth_json_schema_ids_are_provider_specific() {
+    let Some(codex_bin) = codex_cli_bin() else {
+        return;
+    };
     let gemini = run_gemini(&["auth", "current", "--json"]);
-    let codex = run_codex(&["auth", "current", "--json"]);
+    let codex = run_codex(&codex_bin, &["auth", "current", "--json"]);
 
     let gemini_json: Value = serde_json::from_str(&gemini.stdout_text()).expect("gemini auth json");
     let codex_json: Value = serde_json::from_str(&codex.stdout_text()).expect("codex auth json");
