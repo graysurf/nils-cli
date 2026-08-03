@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::backend::{BackendCall, BackendProgram, BackendRunner};
 use crate::cli::{
     BINARY, GlobalFlags, PrReviewLoopExtendArgs, PrReviewLoopInspectArgs, PrReviewLoopObserveArgs,
+    PrReviewLoopValidateArgs,
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
@@ -21,6 +22,7 @@ use crate::validations::{RuleVerdict, no_escaped_control_markdown, no_local_path
 const SCHEMA_INSPECT: &str = "pr.review-loop.inspect";
 const SCHEMA_OBSERVE: &str = "pr.review-loop.observe";
 const SCHEMA_EXTEND: &str = "pr.review-loop.extend";
+const SCHEMA_VALIDATE: &str = "pr.review-loop.validate";
 const SCHEMA_VERSION: u32 = 1;
 const EXTENSION_MARKER_PREFIX: &str = "<!-- forge-cli:review-loop-extension:v1 ";
 
@@ -101,6 +103,155 @@ struct ApprovalComment {
     association: String,
     created_at: String,
     body: String,
+}
+
+/// Envelope payload for `cli.forge-cli.pr.review-loop.validate.v1`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrReviewLoopValidatePayload {
+    /// Which of the two accepted `--findings-file` shapes was read.
+    pub shape: &'static str,
+    pub row_count: usize,
+    /// Rows per disposition, in the order the state machine defines them.
+    pub dispositions: Vec<DispositionCount>,
+    pub blocking_count: usize,
+    /// Fingerprints appearing more than once. Accepted — the last row wins —
+    /// but almost always a copy-paste error, so it is surfaced rather than
+    /// silently collapsed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DispositionCount {
+    pub disposition: &'static str,
+    pub count: usize,
+}
+
+/// Validate a findings payload without a pull request, a provider call, or any
+/// network access.
+///
+/// `observe --dry-run` already reports a payload verdict, but it needs a PR id
+/// and resolves the provider first, so it cannot answer "is this file well
+/// formed" while the file is being written — which is when the question is
+/// actually asked. `pr review validate` has exactly this shape for review
+/// summaries and thread specs; this is the same affordance for the ledger.
+///
+/// Deliberately payload-only. Head and state-tip CAS, the transition, and the
+/// rendered comment all require the provider and stay with `observe --dry-run`.
+/// Passing here does not promise an append will succeed; failing here proves it
+/// cannot.
+pub fn run_validate(
+    args: PrReviewLoopValidateArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    // Read once. The path may be a FIFO or a process substitution, where a
+    // second open yields EOF and would be misreported as invalid JSON.
+    let raw = read_findings_value(&args.findings_file)?;
+    let shape = detect_findings_shape(&raw);
+    let observations = observations_from_value(&raw)?;
+
+    let mut counts: Vec<DispositionCount> =
+        ["open", "fixed", "accepted", "preference", "follow-up"]
+            .into_iter()
+            .map(|disposition| DispositionCount {
+                disposition,
+                count: 0,
+            })
+            .collect();
+    let mut seen: Vec<&str> = Vec::with_capacity(observations.len());
+    let mut duplicates: Vec<String> = Vec::new();
+    let mut blocking_count = 0usize;
+    for observation in &observations {
+        let label = finding_status_label(observation.status);
+        if let Some(entry) = counts.iter_mut().find(|entry| entry.disposition == label) {
+            entry.count += 1;
+        }
+        if observation.blocking {
+            blocking_count += 1;
+        }
+        if seen.contains(&observation.fingerprint.as_str()) {
+            if !duplicates.contains(&observation.fingerprint) {
+                duplicates.push(observation.fingerprint.clone());
+            }
+        } else {
+            seen.push(observation.fingerprint.as_str());
+        }
+    }
+
+    Ok(emit_success(
+        schema_version_for(BINARY, SCHEMA_VALIDATE, SCHEMA_VERSION),
+        PrReviewLoopValidatePayload {
+            shape,
+            row_count: observations.len(),
+            dispositions: counts,
+            blocking_count,
+            duplicate_fingerprints: duplicates,
+        },
+        format,
+        render_validate_text,
+    ))
+}
+
+fn render_validate_text(payload: &PrReviewLoopValidatePayload) {
+    println!(
+        "ok: {rows} observation(s) from a {shape}",
+        rows = payload.row_count,
+        shape = payload.shape,
+    );
+    let breakdown = payload
+        .dispositions
+        .iter()
+        .filter(|entry| entry.count > 0)
+        .map(|entry| format!("{}={}", entry.disposition, entry.count))
+        .collect::<Vec<_>>();
+    if !breakdown.is_empty() {
+        println!("  dispositions: {}", breakdown.join(" "));
+    }
+    println!("  blocking: {}", payload.blocking_count);
+    for fingerprint in &payload.duplicate_fingerprints {
+        println!("  warning: duplicate fingerprint, last row wins: {fingerprint}");
+    }
+}
+
+/// Read the payload as JSON without interpreting its rows, so the shape can be
+/// reported alongside a row-level failure.
+fn read_findings_value(path: &str) -> Result<serde_json::Value, ForgeError> {
+    let body = fs::read_to_string(path).map_err(|error| {
+        ForgeError::validation(
+            schema_err(),
+            "review_findings_invalid",
+            "failed to read review finding observations",
+            Some(format!("path={path}; error={error}")),
+        )
+    })?;
+    serde_json::from_str(&body).map_err(|error| {
+        ForgeError::validation(
+            schema_err(),
+            "review_findings_invalid",
+            "review finding observations are not valid JSON",
+            Some(error.to_string()),
+        )
+    })
+}
+
+/// The two shapes `--findings-file` accepts, named the way the help names them.
+fn detect_findings_shape(value: &serde_json::Value) -> &'static str {
+    let inner = value.get("data").unwrap_or(value);
+    if inner.get("findings").is_some() {
+        "review-specialists merge envelope"
+    } else {
+        "bare observation array"
+    }
+}
+
+fn finding_status_label(status: review_state::ReviewFindingStatus) -> &'static str {
+    match status {
+        review_state::ReviewFindingStatus::Open => "open",
+        review_state::ReviewFindingStatus::Fixed => "fixed",
+        review_state::ReviewFindingStatus::Accepted => "accepted",
+        review_state::ReviewFindingStatus::Preference => "preference",
+        review_state::ReviewFindingStatus::FollowUp => "follow-up",
+    }
 }
 
 pub fn run_inspect(
@@ -685,7 +836,15 @@ fn read_observations(
             Some(error.to_string()),
         )
     })?;
-    let value = value.get("data").unwrap_or(&value);
+    observations_from_value(&value)
+}
+
+/// Row-level parse, split out so a caller that has already read the payload
+/// does not have to open the path a second time.
+fn observations_from_value(
+    value: &serde_json::Value,
+) -> Result<Vec<review_state::ReviewFindingObservation>, ForgeError> {
+    let value = value.get("data").unwrap_or(value);
     let rows = value
         .get("findings")
         .unwrap_or(value)
@@ -1597,6 +1756,159 @@ mod tests {
         let path = dir.path().join("findings.json");
         fs::write(&path, body).expect("write findings");
         path.to_string_lossy().into_owned()
+    }
+
+    fn validate_args(findings: &str) -> PrReviewLoopValidateArgs {
+        PrReviewLoopValidateArgs {
+            findings_file: findings.to_string(),
+        }
+    }
+
+    /// The payload check must not need a pull request, so it takes no id and
+    /// never resolves a provider — that is the whole reason the verb exists.
+    #[test]
+    fn validate_accepts_a_bare_disposition_array_with_no_provider_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"},
+              {"lifecycle_fingerprint":"maintainability:b:two","disposition":"follow-up"}
+            ]"#,
+        );
+
+        let code = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect("a well-formed array must validate");
+
+        assert_eq!(code, 0);
+    }
+
+    /// `preference` and `follow-up` are accepted dispositions; the command help
+    /// used to omit both and advertise `reopened`, which the parser rejects.
+    #[test]
+    fn validate_accepts_every_disposition_the_parser_accepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for disposition in ["open", "fixed", "accepted", "preference", "follow-up"] {
+            let findings = findings_file(
+                &dir,
+                &format!(
+                    r#"[{{"lifecycle_fingerprint":"correctness:a:one","disposition":"{disposition}"}}]"#
+                ),
+            );
+            let code = run_validate(validate_args(&findings), OutputFormat::Json)
+                .unwrap_or_else(|err| panic!("{disposition} must validate: {err}"));
+            assert_eq!(code, 0, "{disposition} must validate");
+        }
+    }
+
+    /// A finding that reappears is submitted as `open`. The state machine
+    /// decides whether that is a reopen, so `reopened` is not an input.
+    #[test]
+    fn validate_rejects_reopened_which_the_help_used_to_advertise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[{"lifecycle_fingerprint":"correctness:a:one","disposition":"reopened"}]"#,
+        );
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("reopened is not an input disposition");
+
+        assert_eq!(err.kind(), "review_findings_invalid");
+    }
+
+    #[test]
+    fn validate_rejects_a_row_without_a_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(&dir, r#"[{"disposition":"fixed"}]"#);
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("a fingerprint is required");
+
+        assert_eq!(err.kind(), "review_fingerprint_required");
+    }
+
+    #[test]
+    fn validate_rejects_a_missing_file_rather_than_reporting_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.json");
+
+        let err = run_validate(
+            validate_args(&missing.to_string_lossy()),
+            OutputFormat::Json,
+        )
+        .expect_err("an unreadable payload is not an empty one");
+
+        assert_eq!(err.kind(), "review_findings_invalid");
+    }
+
+    /// A duplicated fingerprint is accepted — the last row wins — but it is
+    /// almost always a copy-paste error, so the report names it.
+    #[test]
+    fn validate_reports_duplicate_fingerprints_without_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"}
+            ]"#,
+        );
+
+        let code = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect("duplicates are accepted by observe, so validate accepts them too");
+
+        assert_eq!(code, 0);
+    }
+
+    /// The clean-review genesis path: an empty envelope is a valid payload, and
+    /// merge requires an observation even when there are no findings.
+    #[test]
+    fn validate_accepts_an_empty_delivery_envelope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(&dir, r#"{"data":{"findings":[]}}"#);
+
+        let code = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect("an empty envelope is the clean-review genesis payload");
+
+        assert_eq!(code, 0);
+    }
+
+    /// The payload path is opened exactly once.
+    ///
+    /// Reporting the shape and parsing the rows are two questions about one
+    /// file; asking them with two `read_to_string` calls works for a regular
+    /// file and fails for a FIFO or a `<(...)` process substitution, where the
+    /// second open returns EOF and surfaces as "not valid JSON" — a misleading
+    /// error for a payload that was fine. Found by running the command against
+    /// a process substitution.
+    #[test]
+    fn validate_reads_a_single_use_payload_path_only_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("findings.json");
+        fs::write(
+            &path,
+            r#"[{"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"}]"#,
+        )
+        .expect("write findings");
+        let raw = read_findings_value(&path.to_string_lossy()).expect("read once");
+
+        // Both answers must come from that one read.
+        assert_eq!(detect_findings_shape(&raw), "bare observation array");
+        let observations = observations_from_value(&raw).expect("parse from the same value");
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn validate_names_the_shape_it_read() {
+        let envelope: serde_json::Value =
+            serde_json::from_str(r#"{"data":{"findings":[]}}"#).expect("json");
+        assert_eq!(
+            detect_findings_shape(&envelope),
+            "review-specialists merge envelope"
+        );
+        let array: serde_json::Value = serde_json::from_str("[]").expect("json");
+        assert_eq!(detect_findings_shape(&array), "bare observation array");
     }
 
     fn observe_args(
