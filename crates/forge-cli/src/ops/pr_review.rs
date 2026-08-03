@@ -488,7 +488,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                         build_issue_comment_call(
                             &ctx,
                             id,
-                            "<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
+                            // Mirrors the live receipt prewrite body: a visible
+                            // ledger label above the canonical marker. A plan that
+                            // still showed a bare marker would advertise a body the
+                            // live call no longer writes.
+                            "forge-cli review ledger · generation <n> · review-run-receipt · head <short-sha>\n<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
                         )
                         .plan_argv(),
                     ),
@@ -1884,6 +1888,10 @@ pub(crate) fn read_review_state_chain<R: BackendRunner>(
 pub(crate) struct ReviewLoopStateView {
     pub chain: review_state::ReviewStateChain,
     pub tip_created_at: Option<String>,
+    /// Raw bodies of the privileged comments this chain was parsed from. Needed
+    /// to answer presentation questions the chain deliberately cannot, such as
+    /// whether a delivery outcome was already posted alongside the tip record.
+    pub trusted_comment_bodies: Vec<String>,
 }
 
 pub(crate) fn read_review_loop_state_view<R: BackendRunner>(
@@ -1902,9 +1910,15 @@ pub(crate) fn read_review_loop_state_view<R: BackendRunner>(
                 .map(|_| comment.created_at.clone())
         })
     });
+    let trusted_comment_bodies = snapshot
+        .trusted_comments
+        .iter()
+        .map(|comment| comment.body.clone())
+        .collect();
     Ok(ReviewLoopStateView {
         chain: snapshot.chain,
         tip_created_at,
+        trusted_comment_bodies,
     })
 }
 
@@ -1925,12 +1939,23 @@ pub(crate) struct ReviewLoopAppend<'a> {
     pub visible_outcome: Option<&'a str>,
 }
 
+/// The result of one ledger append.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewLoopAppendResult {
+    pub chain: review_state::ReviewStateChain,
+    /// Whether a supplied delivery outcome is confirmed visible on the provider.
+    /// Never inferred from the request: the chain deduplicates by record, and a
+    /// record digest excludes presentation, so a digest-only read-back can be
+    /// satisfied by another session's comment for the same record.
+    pub outcome_posted: bool,
+}
+
 /// Appends one review-loop generation with head and tip compare-and-swap.
 pub(crate) fn append_review_loop_state<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
     append: ReviewLoopAppend<'_>,
-) -> Result<review_state::ReviewStateChain, ForgeError> {
+) -> Result<ReviewLoopAppendResult, ForgeError> {
     let ReviewLoopAppend {
         repository,
         number,
@@ -1960,6 +1985,7 @@ pub(crate) fn append_review_loop_state<R: BackendRunner>(
         before.chain.tip_digest.clone(),
         review_state::ReviewStatePayload::ReviewLoop { state },
     )?;
+    let marker = record.marker()?;
     let body = review_state::render_state_comment_body(&record, visible_outcome)?;
     let append_result = runner.run(&build_issue_comment_call(ctx, number, &body));
     let after = read_review_state_snapshot(runner, ctx, repository, number)?;
@@ -1969,7 +1995,35 @@ pub(crate) fn append_review_loop_state<R: BackendRunner>(
         .iter()
         .any(|observed| observed.record_digest == record.record_digest)
     {
-        return Ok(after.chain);
+        // The record is durable. When an outcome shares the comment, confirm the
+        // outcome itself is visible too: the record could have been made durable
+        // by a concurrent session's outcome-free comment while this session's own
+        // POST failed, and reporting a delivery outcome that reached nobody is
+        // worse than failing.
+        let outcome_posted = match visible_outcome {
+            None => false,
+            Some(outcome) => {
+                let posted = after.trusted_comments.iter().any(|comment| {
+                    review_state::comment_carries_outcome(&comment.body, &marker, outcome)
+                });
+                if !posted {
+                    return Err(ForgeError::validation(
+                        schema_err(),
+                        "review_outcome_not_posted",
+                        "the review-loop record is durable but its delivery outcome is not visible after provider write",
+                        Some(format!(
+                            "record_digest={}; recovery=inspect the pull request and post the outcome separately, or rerun the identical observe against the new tip",
+                            record.record_digest
+                        )),
+                    ));
+                }
+                true
+            }
+        };
+        return Ok(ReviewLoopAppendResult {
+            chain: after.chain,
+            outcome_posted,
+        });
     }
     Err(match append_result {
         Ok(_) => ForgeError::validation(
@@ -3465,7 +3519,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let chain = append_review_loop_state(
+        let appended = append_review_loop_state(
             &runner,
             &ctx(Some("acme/widgets")),
             ReviewLoopAppend {
@@ -3479,9 +3533,10 @@ mod tests {
         )
         .expect("append and read back");
 
-        assert_eq!(chain.records.len(), 1);
+        assert_eq!(appended.chain.records.len(), 1);
+        assert!(!appended.outcome_posted, "no outcome body was supplied");
         assert_eq!(
-            chain.tip_digest.as_deref(),
+            appended.chain.tip_digest.as_deref(),
             Some(record.record_digest.as_str())
         );
         let calls = runner.calls.borrow();
@@ -3544,7 +3599,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
 
-        let chain = append_review_loop_state(
+        let appended = append_review_loop_state(
             &runner,
             &ctx(Some("acme/widgets")),
             ReviewLoopAppend {
@@ -3573,8 +3628,91 @@ mod tests {
             calls[1]
         );
         assert_eq!(
-            chain.tip_digest.as_deref(),
+            appended.chain.tip_digest.as_deref(),
             Some(record.record_digest.as_str())
+        );
+        assert!(
+            appended.outcome_posted,
+            "the read-back saw the outcome in the appended comment"
+        );
+    }
+
+    #[test]
+    fn a_durable_record_without_its_outcome_fails_instead_of_claiming_delivery() {
+        // The chain deduplicates by record and a digest excludes presentation, so
+        // a concurrent session's outcome-free comment can satisfy the read-back
+        // while this session's own POST failed. Reporting a delivery outcome that
+        // reached nobody is worse than failing.
+        let state = review_state::observe_review_loop(None, "head-44", &[])
+            .expect("genesis transition")
+            .state;
+        let record = review_state::ReviewStateRecord::new(
+            "acme/widgets",
+            44,
+            "head-44",
+            0,
+            None,
+            review_state::ReviewStatePayload::ReviewLoop {
+                state: state.clone(),
+            },
+        )
+        .expect("record");
+        let snapshot = |nodes: serde_json::Value| crate::backend::BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "viewer": {"login": "next-session-bot"},
+                    "repository": {"pullRequest": {"comments": {
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }}}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        // The post-write snapshot carries the same record WITHOUT this session's
+        // outcome — the shape a concurrent outcome-free append leaves behind.
+        let other_session = review_state::render_state_comment_body(&record, None)
+            .expect("outcome-free body for the same record");
+        let runner = ReceiptRunner {
+            outputs: RefCell::new(vec![
+                snapshot(serde_json::json!([])),
+                crate::backend::BackendSuccess {
+                    stdout: "https://github.com/acme/widgets/issues/44#issuecomment-1".to_string(),
+                    stderr: String::new(),
+                },
+                snapshot(serde_json::json!([{
+                    "author": {"login": "next-session-bot"},
+                    "authorAssociation": "OWNER",
+                    "body": other_session,
+                    "createdAt": "2026-07-20T00:00:01Z"
+                }])),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let error = append_review_loop_state(
+            &runner,
+            &ctx(Some("acme/widgets")),
+            ReviewLoopAppend {
+                repository: "acme/widgets",
+                number: 44,
+                expected_head: "head-44",
+                expected_tip: None,
+                state,
+                visible_outcome: Some("## Delivery outcome"),
+            },
+        )
+        .expect_err("an unconfirmed outcome must not be reported as posted");
+
+        assert_eq!(error.kind(), "review_outcome_not_posted");
+        assert!(
+            error
+                .detail()
+                .unwrap_or_default()
+                .contains(&record.record_digest),
+            "{:?}",
+            error.detail()
         );
     }
 
@@ -3673,5 +3811,17 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[0].contains("issues/44/comments"), "{}", calls[0]);
         assert!(calls[1].contains("after=state-tip"), "{}", calls[1]);
+        // The prewrite stays its own comment for recovery ordering, but it is not
+        // a bare marker: that is what rendered as a blank GitHub comment.
+        assert!(
+            calls[0].contains(&review_state::state_comment_visible_metadata(&next_record)),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            calls[0].contains(&next_marker),
+            "the canonical marker is unchanged: {}",
+            calls[0]
+        );
     }
 }

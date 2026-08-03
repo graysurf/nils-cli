@@ -28,6 +28,7 @@ const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
 /// what the provider actually stores, so it carries the binding limit.
 const MAX_PROVIDER_STATE_COMMENT_BYTES: usize = 64 * 1024;
 const STATE_COMMENT_LABEL: &str = "forge-cli review ledger";
+const HTML_COMMENT_OPEN: &str = "<!--";
 /// Abbreviated-SHA width for the visible metadata line.
 const STATE_COMMENT_HEAD_CHARS: usize = 12;
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
@@ -293,16 +294,19 @@ pub fn state_comment_visible_metadata(record: &ReviewStateRecord) -> String {
 ///
 /// GitHub hides HTML comments when it renders Markdown, so a body that is only
 /// the canonical marker appears in the timeline as a blank comment authored by
-/// the operator. Prefixing the visible metadata line keeps the same append-only
-/// record identifiable as machine metadata. The marker itself is emitted
-/// unchanged and on its own trailing line, so [`parse_state_marker`] — which
-/// already searches within a larger body — reads new and historical bare-marker
-/// comments identically, with no migration.
+/// the operator. The visible metadata line fixes that, and it is emitted FIRST,
+/// with the marker immediately under it, so no caller-supplied byte can ever
+/// precede the label. That ordering is load-bearing rather than cosmetic: a
+/// Markdown HTML block opened in caller text runs until a line containing
+/// `-->`, so an outcome ending in an unterminated `<!--` placed above the label
+/// would swallow both the label and the marker and render a machine ledger
+/// record as ordinary human prose. The marker stays byte-identical and on its own
+/// line, so [`parse_state_marker`] — which already searches within a larger body
+/// — reads new and historical bare-marker comments identically, with no
+/// migration.
 ///
 /// `visible_outcome`, when supplied, makes the ledger append and the delivery
-/// outcome one provider mutation instead of two. It is rejected if it carries a
-/// state marker of its own: [`parse_state_marker`] takes the first marker in the
-/// body, so an embedded one would silently shadow this record's.
+/// outcome one provider mutation instead of two.
 pub fn render_state_comment_body(
     record: &ReviewStateRecord,
     visible_outcome: Option<&str>,
@@ -310,10 +314,12 @@ pub fn render_state_comment_body(
     let marker = record.marker()?;
     let metadata = state_comment_visible_metadata(record);
     let body = match visible_outcome {
-        Some(outcome) => {
-            let outcome = validate_visible_outcome(outcome)?;
-            format!("{outcome}\n\n---\n\n{metadata}\n{marker}")
-        }
+        // Defence in depth: the command layer validates the same body before its
+        // first provider call, but every writer funnels through here.
+        Some(outcome) => format!(
+            "{metadata}\n{marker}\n\n---\n\n{outcome}",
+            outcome = validate_outcome_body(outcome)?
+        ),
         None => format!("{metadata}\n{marker}"),
     };
     if body.len() > MAX_PROVIDER_STATE_COMMENT_BYTES {
@@ -331,29 +337,74 @@ pub fn render_state_comment_body(
     Ok(body)
 }
 
-/// Validates a caller-supplied visible outcome body for combined posting.
+/// Validates a caller-supplied delivery outcome body and returns it trimmed.
 ///
-/// Only structural safety is checked here; portability rules (local paths,
-/// escaped control markdown) belong to the command layer that owns the flag.
-fn validate_visible_outcome(outcome: &str) -> Result<&str, ForgeError> {
+/// Structural safety only; portability rules (local paths, escaped control
+/// markdown) belong to the command layer that owns the flag. Callers must run
+/// this before their first provider call so a rejected body never costs a
+/// provider round trip, and so a dry run reports the same verdict a live run
+/// would return.
+///
+/// Any HTML comment is refused. Two distinct hazards share that one shape: a
+/// review-state marker of its own would shadow this record's, because
+/// [`parse_state_marker`] takes the first marker in a body; and an unterminated
+/// `<!--` opens a Markdown HTML block that hides whatever follows it.
+pub fn validate_outcome_body(outcome: &str) -> Result<&str, ForgeError> {
     let trimmed = outcome.trim();
     if trimmed.is_empty() {
-        return Err(ForgeError::validation(
-            error_schema(),
-            "review_state_comment_invalid",
+        return Err(comment_invalid(
             "the review-loop outcome body is empty",
             None,
         ));
     }
     if trimmed.contains(STATE_MARKER_OPEN) {
-        return Err(ForgeError::validation(
-            error_schema(),
-            "review_state_comment_invalid",
+        return Err(comment_invalid(
             "the review-loop outcome body must not contain a review-state marker",
             Some(format!("marker_prefix={}", STATE_MARKER_OPEN.trim_end())),
         ));
     }
+    if trimmed.contains(HTML_COMMENT_OPEN) {
+        return Err(comment_invalid(
+            "the review-loop outcome body must not contain an HTML comment",
+            Some(format!(
+                "html_comment_prefix={HTML_COMMENT_OPEN}; reason=an HTML comment can hide the visible ledger label and the machine marker"
+            )),
+        ));
+    }
+    if trimmed.len() > MAX_PROVIDER_STATE_COMMENT_BYTES {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_state_comment_too_large",
+            "the review-loop outcome body exceeds the safe comment-body limit",
+            Some(format!(
+                "outcome_bytes={}; max_bytes={MAX_PROVIDER_STATE_COMMENT_BYTES}",
+                trimmed.len()
+            )),
+        ));
+    }
     Ok(trimmed)
+}
+
+/// Whether `body` is the provider comment that carries both this record's marker
+/// and `outcome`.
+///
+/// The ledger deduplicates by record, and a record digest deliberately excludes
+/// presentation, so a read-back that only matches the digest can be satisfied by
+/// another session's comment for the same record. Confirming the outcome text is
+/// what proves this session's own delivery outcome actually reached the provider.
+/// Containment rather than byte equality keeps the check robust against provider
+/// whitespace normalization.
+pub fn comment_carries_outcome(body: &str, marker: &str, outcome: &str) -> bool {
+    body.contains(marker) && body.contains(outcome.trim())
+}
+
+fn comment_invalid(message: &str, detail: Option<String>) -> ForgeError {
+    ForgeError::validation(
+        error_schema(),
+        "review_state_comment_invalid",
+        message,
+        detail,
+    )
 }
 
 /// Abbreviates a head SHA for the single-line visible metadata.
@@ -1504,14 +1555,84 @@ mod tests {
 
         let body = render_state_comment_body(&record, Some(outcome)).expect("combined body");
 
-        assert!(body.starts_with(outcome), "{body}");
-        assert!(body.ends_with(&record.marker().expect("marker")), "{body}");
+        // The label and marker lead the body; caller text can only follow them.
+        assert!(
+            body.starts_with(&state_comment_visible_metadata(&record)),
+            "{body}"
+        );
+        assert!(body.contains(&record.marker().expect("marker")), "{body}");
+        assert!(body.ends_with(outcome), "{body}");
         // Stripping owned markers leaves the human-readable outcome intact.
-        assert!(strip_owned_markers(&body).starts_with(outcome));
+        assert!(strip_owned_markers(&body).ends_with(outcome));
         assert_eq!(
             parse_state_marker(&body).expect("parse").as_ref(),
             Some(&record)
         );
+    }
+
+    #[test]
+    fn no_outcome_body_can_hide_the_visible_label_or_the_marker() {
+        // A Markdown HTML block opened in caller text runs until a line
+        // containing `-->`. An outcome ending in an unterminated `<!--` placed
+        // above the label would swallow both the label and the marker, rendering
+        // a machine ledger record as ordinary human prose — worse than the blank
+        // comment this change exists to fix. Two independent guards apply.
+        let record = record("head", 0, None, fixture_loop_state(0));
+
+        for hostile in [
+            "Approved.\n\n<!--",
+            "Approved.\n\n<!-- hide the rest",
+            "<!-- forge-cli:review-state:v1 deadbeef -->",
+        ] {
+            let error = render_state_comment_body(&record, Some(hostile))
+                .expect_err("an HTML comment in the outcome must fail closed");
+            assert_eq!(error.kind(), "review_state_comment_invalid", "{hostile}");
+        }
+
+        // Structural guard: even for accepted bodies, nothing precedes the label.
+        let body = render_state_comment_body(&record, Some("Approved.\n\n```\nunclosed fence"))
+            .expect("an unbalanced fence is the caller's own rendering problem");
+        let metadata = state_comment_visible_metadata(&record);
+        assert!(body.starts_with(&metadata), "{body}");
+        assert!(
+            body.find(&record.marker().expect("marker")) < body.find("unclosed fence"),
+            "the marker must precede every caller byte: {body}"
+        );
+    }
+
+    #[test]
+    fn an_outcome_body_is_bounded_before_it_reaches_a_provider() {
+        let oversized = "o".repeat(MAX_PROVIDER_STATE_COMMENT_BYTES + 1);
+
+        let error = validate_outcome_body(&oversized).expect_err("an oversized outcome is refused");
+
+        assert_eq!(error.kind(), "review_state_comment_too_large");
+        assert_eq!(
+            validate_outcome_body("  Approved.  ").expect("trimmed"),
+            "Approved."
+        );
+    }
+
+    #[test]
+    fn an_outcome_is_only_confirmed_when_its_comment_carries_both_halves() {
+        let record = record("head", 0, None, fixture_loop_state(0));
+        let marker = record.marker().expect("marker");
+        let outcome = "## Delivery outcome";
+        let combined = render_state_comment_body(&record, Some(outcome)).expect("combined");
+        let marker_only = render_state_comment_body(&record, None).expect("marker only");
+
+        assert!(comment_carries_outcome(&combined, &marker, outcome));
+        // The same record without this session's outcome must not count: the chain
+        // deduplicates by record, so another session's comment can satisfy a
+        // digest-only read-back.
+        assert!(!comment_carries_outcome(&marker_only, &marker, outcome));
+        assert!(!comment_carries_outcome(outcome, &marker, outcome));
+        // Provider whitespace normalization must not flip the answer.
+        assert!(comment_carries_outcome(
+            &combined,
+            &marker,
+            "  ## Delivery outcome\n"
+        ));
     }
 
     #[test]
@@ -1540,15 +1661,24 @@ mod tests {
     }
 
     #[test]
-    fn the_complete_rendered_body_is_size_checked_before_any_mutation() {
+    fn the_complete_rendered_body_is_size_checked_at_the_exact_boundary() {
         let record = record("head", 0, None, fixture_loop_state(0));
-        let marker_bytes = record.marker().expect("marker").len();
+        // Everything the renderer adds around the caller's outcome: the label,
+        // the marker, and the `\n` + `\n\n---\n\n` separators.
+        let wrapper = render_state_comment_body(&record, Some("x"))
+            .expect("wrapper")
+            .len()
+            - 1;
+        let exact = MAX_PROVIDER_STATE_COMMENT_BYTES - wrapper;
 
         // A marker that fits on its own can still overflow once visible text
         // wraps it, which is why the limit binds the complete body.
-        let headroom = MAX_PROVIDER_STATE_COMMENT_BYTES - marker_bytes;
-        let error = render_state_comment_body(&record, Some(&"o".repeat(headroom)))
-            .expect_err("oversized combined body must fail before post");
+        let fitted = render_state_comment_body(&record, Some(&"o".repeat(exact)))
+            .expect("a body at exactly the limit renders");
+        assert_eq!(fitted.len(), MAX_PROVIDER_STATE_COMMENT_BYTES);
+
+        let error = render_state_comment_body(&record, Some(&"o".repeat(exact + 1)))
+            .expect_err("one byte over the limit must fail before post");
         assert_eq!(error.kind(), "review_state_comment_too_large");
         assert!(
             error
@@ -1558,11 +1688,6 @@ mod tests {
             "{:?}",
             error.detail()
         );
-
-        // Just inside the limit still renders.
-        let fitted = render_state_comment_body(&record, Some(&"o".repeat(headroom / 2)))
-            .expect("a body within the limit renders");
-        assert!(fitted.len() <= MAX_PROVIDER_STATE_COMMENT_BYTES);
     }
 
     #[test]

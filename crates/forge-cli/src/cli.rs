@@ -926,16 +926,23 @@ pub struct PrReviewLoopInspectArgs {
       accepts `disposition` (open | fixed | accepted | reopened), which is how \
       dispositions are carried across rounds.\n\n\
       COMBINED DELIVERY OUTCOME\n  \
-      Every appended ledger comment carries a visible \
+      Every appended ledger comment leads with a visible \
       `forge-cli review ledger · generation N · <kind> · head <short-sha>` line \
       above its machine marker, so it never renders as a blank comment.\n  \
       --body / --body-file additionally posts a human-readable delivery outcome \
-      in that SAME comment, replacing a separate final outcome comment. The \
-      outcome rides the append, so it inherits the append's idempotency: when \
-      the observation changes nothing the ledger is not appended and the outcome \
-      is NOT posted either (data.outcome_posted reports which happened). An \
-      identical retry therefore cannot leave a duplicate outcome behind. A \
-      durable hard-stop receipt is always appended without an outcome body.\n\n\
+      in that SAME comment, after the marker, replacing a separate final outcome \
+      comment. An outcome body may not contain an HTML comment, and is checked \
+      before the first provider call.\n  \
+      The outcome rides the append, so it inherits the append's idempotency. When \
+      the observation changes nothing the ledger is not appended, so the outcome \
+      is either ALREADY present from the earlier attempt (data.outcome_posted \
+      true, data.appended false) or would be dropped, which fails closed as \
+      `review_outcome_not_posted`. An identical retry therefore cannot duplicate \
+      the outcome, and cannot lose it either. data.outcome_posted is confirmed by \
+      a post-write read-back, never assumed from the flag. A durable hard-stop \
+      receipt is always appended without an outcome body.\n  \
+      --body-file - consumes stdin once, so do not pipe the same body into a \
+      --dry-run and then a live run.\n\n\
       With --dry-run this runs a faithful non-mutating preflight: it reads and \
       validates the findings payload and any outcome body, resolves the pull \
       request, performs the head and state-tip CAS comparisons, evaluates the \

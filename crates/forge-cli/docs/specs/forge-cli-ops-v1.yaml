@@ -151,10 +151,10 @@ provider_resolution:
 review_state_contract:
   schema: forge-cli.review-loop.v1
   storage: "append-only provider-visible PR issue comments authored by the current viewer or an OWNER/MEMBER/COLLABORATOR; marker-shaped comments from unprivileged actors are ignored"
-  provider_marker_limit: "64 KiB per encoded state marker (review_state_record_too_large) and 64 KiB per complete rendered comment body (review_state_comment_too_large), both validated before provider mutation"
+  provider_marker_limit: "64 KiB per encoded state marker (review_state_record_too_large) and 64 KiB per complete rendered comment body (review_state_comment_too_large), both validated before provider mutation. The complete-body limit is the binding one, so the effective marker budget is reduced by the rendered wrapper; a chain whose next record would need the top ~80 bytes of the marker budget cannot be appended and has no pruning path, because the ledger is append-only"
   canonical_digest: "sha256:<lowercase hex> over compact UTF-8 JSON in declared field order"
-  comment_body: "visible metadata line `forge-cli review ledger · generation <n> · <payload-kind> · head <short-sha>` followed by the unchanged marker on its own trailing line; GitHub hides HTML comments when rendering Markdown, so a marker-only body renders blank. Presentation never enters a digest, chain order, or the parser, so historical bare-marker comments and rendered comments validate as one chain with no migration and no edit or deletion of history. The abbreviated head is filtered to [0-9A-Za-z._-] and truncated to twelve characters so the line stays one line of plain Markdown"
-  combined_outcome: "pr.review-loop.observe --body/--body-file appends the record and a human-readable delivery outcome in ONE comment; the outcome inherits the append's idempotency, so an unchanged observation posts neither and an identical retry cannot duplicate either. A hard-stop receipt is always appended without an outcome body. An outcome body containing a review-state marker is refused as review_state_comment_invalid because the parser takes the first marker in a body"
+  comment_body: "visible metadata line `forge-cli review ledger · generation <n> · <payload-kind> · head <short-sha>` FIRST, then the unchanged marker on its own line, then — only for a combined delivery outcome — a `---` rule and the outcome. GitHub hides HTML comments when rendering Markdown, so a marker-only body renders blank. The label-first ordering is load-bearing: a Markdown HTML block opened in caller text runs until a line containing `-->`, so caller text above the label could swallow the label and the marker. Presentation never enters a digest, chain order, or the parser, so historical bare-marker comments and rendered comments validate as one chain with no migration and no edit or deletion of history. The abbreviated head is filtered to [0-9A-Za-z._-] and truncated to twelve characters so the line stays one line of plain Markdown"
+  combined_outcome: "pr.review-loop.observe --body/--body-file appends the record and a human-readable delivery outcome in ONE comment. Deduplication is by RECORD, not by comment body, so two concurrent sessions computing the identical transition converge on one record even with divergent outcomes; each session confirms only its own. outcome_posted is set only after a post-write read-back finds a privileged comment carrying both this record's marker and this outcome, and a durable record whose outcome is not visible fails as review_outcome_not_posted. An unchanged observation appends nothing, so a supplied outcome is either already present (outcome_posted true, appended false) or fails closed as review_outcome_not_posted rather than being dropped. A hard-stop receipt is always appended without an outcome body. An outcome body containing any HTML comment is refused as review_state_comment_invalid: a review-state marker of its own would shadow the record, and an unterminated `<!--` would hide the label"
   record:
     required: [schema, repository, pr, expected_head, generation, previous_digest, payload, record_digest]
     chain: "one genesis; zero-based contiguous generations; previous_digest binds the unique prior record; byte-identical append retries are deduplicated, while conflicting duplicates, forks, stale, missing, or unreachable records fail as review_state_conflict"
@@ -717,20 +717,21 @@ operations:
       - review_round_limit_exceeded
       - review_state_comment_invalid
       - review_state_comment_too_large
+      - review_outcome_not_posted
       - local_path_present
       - markdown_escaped_control
     backends:
       github:
         - { program: gh, argv: [pr, view, "{id}", --json, "number,url,...,headRefOid"] }
         - { program: gh, argv: [api, graphql, -f, "query=<complete privileged review-state comments>", -F, "pr={id}"] }
-        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<optional delivery outcome, then visible ledger metadata line, then canonical state marker>"] } # one comment carries both halves; with no --body/--body-file it is metadata plus marker
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<visible ledger metadata line, then canonical state marker, then optional `---` and delivery outcome>"] } # one comment carries both halves; with no --body/--body-file it is metadata plus marker
         - { program: gh, argv: [api, graphql, -f, "query=<complete privileged review-state comments>", -F, "pr={id}"] }
       gitlab: unsupported
       local: unsupported
     output:
       data: object<{provider,number,url,state_tip_digest,generation,state,appended,outcome_posted}>
       dry_run_data: object<{provider,plan,preflight_ok,would_append?,planned_comment?:{visible_metadata,includes_outcome_body,bytes},preflight}>
-    notes: "Defaults are five repair rounds, two consecutive no-progress rounds, and zero automatic reopens. Same-head/same-finding retries append nothing; a same-head subset cannot clear an open finding. Observation rows may carry status/disposition open|fixed|accepted|preference|follow-up, with terminal dispositions recorded non-blocking. A new head advances one round; strict cardinality shrink is the only mechanical progress signal. Extendable terminal errors append a durable hard-stop receipt before returning the exact extension proposal; they never approve, resolve, or merge. --body/--body-file posts the delivery outcome in the same comment as the appended record, so outcome_posted is never true without appended; the outcome body is read and validated before the first provider call, and planned_comment/state_comment_body appear in a dry run only when a write is planned."
+    notes: "Defaults are five repair rounds, two consecutive no-progress rounds, and zero automatic reopens. Same-head/same-finding retries append nothing; a same-head subset cannot clear an open finding. Observation rows may carry status/disposition open|fixed|accepted|preference|follow-up, with terminal dispositions recorded non-blocking. A new head advances one round; strict cardinality shrink is the only mechanical progress signal. Extendable terminal errors append a durable hard-stop receipt before returning the exact extension proposal; they never approve, resolve, or merge. --body/--body-file posts the delivery outcome in the same comment as the appended record, so outcome_posted is never true without appended; every outcome-body rule is enforced before the first provider call, and planned_comment/state_comment_body appear in a dry run only when a write is planned — including the unextended-hard-stop case, where the live path returns the stop without appending. See review_state_contract.combined_outcome for the record-vs-comment deduplication boundary. --body-file - consumes stdin once, so a dry-run-then-live sequence must not share a piped body."
 
   - id: pr.review-loop.extend
     schema_version: cli.forge-cli.pr.review-loop.extend.v1
@@ -749,10 +750,11 @@ operations:
       - review_extension_invalid
       - review_extension_replayed
       - review_extension_approval_invalid
+      - review_state_comment_too_large
     backends:
       github:
         - { program: gh, argv: [api, "repos/{repo}/issues/comments/{approval_comment}"] }
-        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<canonical state marker>"] }
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<visible ledger metadata line plus canonical state marker>"] } # extend never carries a delivery outcome
       gitlab: unsupported
       local: unsupported
     output:

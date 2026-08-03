@@ -214,7 +214,7 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                     .expect("recorded hard stop exists");
                 // A hard stop is a failure receipt, never a delivery outcome, so
                 // the outcome body is deliberately not attached here.
-                let chain = pr_review::append_review_loop_state(
+                let appended = pr_review::append_review_loop_state(
                     runner,
                     &ctx,
                     pr_review::ReviewLoopAppend {
@@ -229,7 +229,7 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 return Err(durable_hard_stop_error(
                     &error,
                     &stop,
-                    chain.tip_digest.as_deref(),
+                    appended.chain.tip_digest.as_deref(),
                 ));
             }
             Err(error) => return Err(error),
@@ -239,18 +239,27 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // The ledger is already current, so there is nothing to append and no
         // comment to carry an outcome. Posting the outcome on its own here would
         // reintroduce exactly the duplicate an identical retry must not create.
+        // But silently dropping it would lose the caller's only copy, so when an
+        // outcome was supplied we must say which of the two happened.
+        let outcome_posted = match outcome_body.as_deref() {
+            None => false,
+            Some(outcome) => {
+                ensure_outcome_already_posted(&state_view, outcome, &args.expected_head)?;
+                true
+            }
+        };
         return emit_state(
             &ctx,
             view.number,
             view.url,
             state_view.chain,
             false,
-            false,
+            outcome_posted,
             SCHEMA_OBSERVE,
             format,
         );
     }
-    let chain = pr_review::append_review_loop_state(
+    let appended = pr_review::append_review_loop_state(
         runner,
         &ctx,
         pr_review::ReviewLoopAppend {
@@ -266,9 +275,9 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         &ctx,
         view.number,
         view.url,
-        chain,
+        appended.chain,
         true,
-        outcome_body.is_some(),
+        appended.outcome_posted,
         SCHEMA_OBSERVE,
         format,
     )
@@ -276,9 +285,12 @@ pub fn run_observe_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
 /// Reads and validates the optional visible delivery outcome body.
 ///
-/// Returns `None` when neither flag was supplied. When one was, the body must be
-/// present and portable: the same no-local-path and escaped-control rules the
-/// review comment surfaces enforce apply, because this text becomes a permanent
+/// Returns `None` when neither flag was supplied. Every rule that governs the
+/// body runs here, before the first provider call, so a rejected body never
+/// costs a provider round trip and a dry run reports the same verdict a live run
+/// returns. The body must be structurally safe ([`review_state::validate_outcome_body`])
+/// and portable: the same no-local-path and escaped-control rules the review
+/// comment surfaces enforce apply, because this text becomes a permanent
 /// provider-visible comment.
 fn read_outcome_body(args: &PrReviewLoopObserveArgs) -> Result<Option<String>, ForgeError> {
     if args.body.is_none() && args.body_file.is_none() {
@@ -289,17 +301,50 @@ fn read_outcome_body(args: &PrReviewLoopObserveArgs) -> Result<Option<String>, F
         args.body_file.as_deref(),
         "--body-file",
     )?;
-    if body.trim().is_empty() {
-        return Err(ForgeError::validation(
-            schema_err(),
-            "review_state_comment_invalid",
-            "the review-loop outcome body is empty (supply --body or --body-file)",
-            None,
-        ));
-    }
+    let body = review_state::validate_outcome_body(&body)?.to_string();
     no_local_path(&body, "review-loop outcome body")?;
     no_escaped_control_markdown(&body)?;
     Ok(Some(body))
+}
+
+/// Confirms a supplied outcome is already on the pull request when the ledger is
+/// already current.
+///
+/// The append is what carries an outcome, so an unchanged observation has no
+/// comment to put one in. That is exactly right for the retry this feature is
+/// built for — the first attempt already posted the combined comment — and
+/// exactly wrong to do silently otherwise, because the caller's outcome would
+/// vanish with a success exit code.
+fn ensure_outcome_already_posted(
+    state_view: &pr_review::ReviewLoopStateView,
+    outcome: &str,
+    expected_head: &str,
+) -> Result<(), ForgeError> {
+    let tip = state_view.chain.records.last().ok_or_else(|| {
+        ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "an unchanged observation requires an existing review-loop chain tip",
+            None,
+        )
+    })?;
+    let marker = tip.marker()?;
+    if state_view
+        .trusted_comment_bodies
+        .iter()
+        .any(|body| review_state::comment_carries_outcome(body, &marker, outcome))
+    {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "review_outcome_not_posted",
+        "the review-loop ledger is already current, so the supplied delivery outcome was not posted",
+        Some(format!(
+            "expected_head={expected_head}; state_tip_digest={}; recovery=this observation appends nothing, so post the outcome separately or observe a new reviewed head",
+            tip.record_digest
+        )),
+    ))
 }
 
 pub fn run_extend(
@@ -408,7 +453,7 @@ pub fn run_extend_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         &args.budget_field,
         args.increment,
     )?;
-    let chain = pr_review::append_review_loop_state(
+    let appended = pr_review::append_review_loop_state(
         runner,
         &ctx,
         pr_review::ReviewLoopAppend {
@@ -424,7 +469,7 @@ pub fn run_extend_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         &ctx,
         view.number,
         view.url,
-        chain,
+        appended.chain,
         true,
         false,
         SCHEMA_EXTEND,
@@ -1053,17 +1098,29 @@ fn emit_observe_dry_run<R: BackendRunner>(
                                     // "this fails" without that would understate
                                     // what the real call does. That receipt never
                                     // carries the outcome body.
+                                    //
+                                    // But an unextended durable stop already
+                                    // exists on the same guard the live path
+                                    // checks first, and the live path then returns
+                                    // WITHOUT appending. Mirror that here, or the
+                                    // preflight advertises an exact provider write
+                                    // that provably never happens.
+                                    let stop_already_durable = previous
+                                        .and_then(|state| state.hard_stop.as_ref())
+                                        .is_some_and(|stop| !stop.extension_applied);
                                     if review_state::stop_budget_field(error.kind()).is_some() {
-                                        would_append = Some(true);
-                                        planned_comment = plan_hard_stop_comment(
-                                            &repository,
-                                            view.number,
-                                            &args.expected_head,
-                                            &state_view.chain,
-                                            previous,
-                                            observations,
-                                            &error,
-                                        );
+                                        would_append = Some(!stop_already_durable);
+                                        if !stop_already_durable {
+                                            planned_comment = plan_hard_stop_comment(
+                                                &repository,
+                                                view.number,
+                                                &args.expected_head,
+                                                &state_view.chain,
+                                                previous,
+                                                observations,
+                                                &error,
+                                            );
+                                        }
                                     }
                                     verdicts.push(RuleVerdict::from_result(
                                         "observation_transition",
@@ -1348,6 +1405,26 @@ mod tests {
         }
 
         fn with_state(self, state: &review_state::ReviewLoopState, head: &str) -> Self {
+            self.seed_state(state, head, None)
+        }
+
+        /// Seeds the same genesis record as a COMBINED comment, i.e. the exact
+        /// comment a prior successful `observe --body` left behind.
+        fn with_state_and_outcome(
+            self,
+            state: &review_state::ReviewLoopState,
+            head: &str,
+            outcome: &str,
+        ) -> Self {
+            self.seed_state(state, head, Some(outcome))
+        }
+
+        fn seed_state(
+            self,
+            state: &review_state::ReviewLoopState,
+            head: &str,
+            outcome: Option<&str>,
+        ) -> Self {
             let record = review_state::ReviewStateRecord::new(
                 REPO,
                 PR,
@@ -1359,10 +1436,11 @@ mod tests {
                 },
             )
             .expect("seed record");
-            let marker = record.marker().expect("seed marker");
+            let body =
+                review_state::render_state_comment_body(&record, outcome).expect("seed body");
             self.comments
                 .borrow_mut()
-                .push(comment_node(&marker, TIP_CREATED_AT));
+                .push(comment_node(&body, TIP_CREATED_AT));
             self
         }
 
@@ -1799,21 +1877,23 @@ mod tests {
     fn an_identical_observe_retry_posts_neither_a_ledger_nor_an_outcome_comment() {
         // The outcome rides the append, so the append's deduplication is also
         // the outcome's: a retry after a lost response must not leave a second
-        // outcome comment behind.
+        // outcome comment behind. The seeded comment is the combined comment the
+        // first attempt already posted.
+        const OUTCOME: &str = "## Delivery outcome";
         let dir = tempfile::tempdir().unwrap();
         let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
         let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
-        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let runner = FakeGitHub::new(HEAD).with_state_and_outcome(&state, HEAD, OUTCOME);
         let tip = runner.tip_digest().expect("seeded tip");
 
         let code = run_observe_with(
             &runner,
             &flags(false),
-            observe_args_with_body(&findings, HEAD, Some(&tip), "## Delivery outcome"),
+            observe_args_with_body(&findings, HEAD, Some(&tip), OUTCOME),
             OutputFormat::Json,
             github_remote,
         )
-        .expect("unchanged observation");
+        .expect("the retry finds its own prior combined comment");
 
         assert_eq!(code, 0);
         assert_eq!(
@@ -1821,6 +1901,35 @@ mod tests {
             Vec::<String>::new(),
             "an already-current ledger writes nothing at all"
         );
+    }
+
+    #[test]
+    fn an_unchanged_observation_refuses_to_silently_drop_a_new_outcome() {
+        // The append is what carries an outcome, so an unchanged observation has
+        // no comment to put one in. Exiting 0 while discarding the caller's only
+        // copy would lose the delivery outcome; this must fail closed instead.
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        let runner = FakeGitHub::new(HEAD).with_state(&state, HEAD);
+        let tip = runner.tip_digest().expect("seeded tip");
+
+        let error = run_observe_with(
+            &runner,
+            &flags(false),
+            observe_args_with_body(&findings, HEAD, Some(&tip), "## Delivery outcome"),
+            OutputFormat::Json,
+            github_remote,
+        )
+        .expect_err("an outcome that cannot be posted must not be dropped silently");
+
+        assert_eq!(error.kind(), "review_outcome_not_posted");
+        assert!(
+            error.detail().unwrap_or_default().contains(&tip),
+            "the detail names the tip that blocks the append: {:?}",
+            error.detail()
+        );
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
     }
 
     #[test]
@@ -1849,6 +1958,84 @@ mod tests {
             Vec::<Vec<String>>::new(),
             "the body is validated before the first provider read"
         );
+    }
+
+    #[test]
+    fn observe_rejects_a_marker_carrying_outcome_body_before_any_provider_call() {
+        // `parse_state_marker` takes the first marker in a body, so an embedded
+        // one would shadow the record the comment claims to append. The rule must
+        // hold before the first provider call, so a dry run reports the same
+        // verdict a live run returns.
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, "[]");
+        let forged = review_state::ReviewStateRecord::new(
+            REPO,
+            PR,
+            HEAD,
+            0,
+            None,
+            review_state::ReviewStatePayload::ReviewLoop {
+                state: genesis_state(HEAD, &[]),
+            },
+        )
+        .expect("forged record")
+        .marker()
+        .expect("forged marker");
+
+        for hostile in [forged.as_str(), "Approved.\n\n<!--"] {
+            let runner = FakeGitHub::new(HEAD);
+            let error = run_observe_with(
+                &runner,
+                &flags(false),
+                observe_args_with_body(&findings, HEAD, None, hostile),
+                OutputFormat::Json,
+                github_remote,
+            )
+            .expect_err("a hidden-HTML outcome body must fail closed");
+
+            assert_eq!(error.kind(), "review_state_comment_invalid", "{hostile}");
+            assert_eq!(
+                runner.calls(),
+                Vec::<Vec<String>>::new(),
+                "no provider round trip may be spent on a rejected body"
+            );
+        }
+    }
+
+    #[test]
+    fn observe_dry_run_does_not_plan_a_hard_stop_receipt_that_already_exists() {
+        // The live path checks the durable unextended stop FIRST and returns
+        // without appending. A dry run that advertises an exact provider write
+        // here would be predicting a mutation that provably never happens.
+        const REPAIRED: &str = "head-repaired";
+        let dir = tempfile::tempdir().unwrap();
+        let findings = findings_file(&dir, r#"[{"fingerprint":"correctness:review-loop:one"}]"#);
+        let mut state = genesis_state(HEAD, &[open_finding("correctness:review-loop:one")]);
+        state.budget.max_repair_rounds = 0;
+        let attempted = [open_finding("correctness:review-loop:one")];
+        let error = review_state::observe_review_loop(Some(&state), REPAIRED, &attempted)
+            .expect_err("round budget exhausted");
+        let stopped = review_state::record_review_loop_hard_stop(
+            &state,
+            REPAIRED,
+            &attempted,
+            "sha256:state-tip",
+            &error,
+        )
+        .expect("durable stop");
+        let runner = FakeGitHub::new(REPAIRED).with_state(&stopped, HEAD);
+
+        let code = run_observe_with(
+            &runner,
+            &flags(true),
+            observe_args(&findings, REPAIRED, None),
+            OutputFormat::Text,
+            github_remote,
+        )
+        .expect("the preflight reports the stop instead of erroring");
+
+        assert_eq!(code, 0);
+        assert_eq!(runner.appended_bodies(), Vec::<String>::new());
     }
 
     #[test]
@@ -1998,7 +2185,14 @@ mod tests {
         )
         .expect_err("a forked chain must fail closed");
 
+        // `review_state_conflict` covers every chain fault, so pin the message:
+        // deleting the competing-generation guard would still fail with this kind
+        // (as an unreachable-record error) and leave the test green.
         assert_eq!(error.kind(), "review_state_conflict");
+        assert_eq!(
+            error.message(),
+            "review-state chain contains competing generations"
+        );
         assert_eq!(runner.appended_bodies(), Vec::<String>::new());
     }
 
