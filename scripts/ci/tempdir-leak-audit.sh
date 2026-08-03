@@ -2,7 +2,7 @@
 # scripts/ci/tempdir-leak-audit.sh — fail the build on temp-directory patterns
 # whose cleanup can never run.
 #
-# Three patterns are rejected:
+# Four patterns are rejected:
 #
 #   1. A `TempDir` owned by a `static` (`OnceLock`, `LazyLock`, `Lazy`, ...).
 #      Rust never drops statics, so the directory is never removed. Under
@@ -11,6 +11,13 @@
 #   2. `.keep()` / `.into_path()`, which disarm cleanup by design and hand back
 #      a bare path.
 #   3. `mem::forget`, which skips the destructor outright.
+#   4. A literal read-only chmod (`0o4xx` / `0o5xx`). Unlinking an entry needs
+#      write permission on its *directory*, so a read-only directory stops
+#      `remove_dir_all` from emptying it, and a fixture whose restore is a plain
+#      statement becomes unremovable the moment anything between the two
+#      statements panics. Use `nils_test_support::tempdir::RestoredMode`, which
+#      restores from `Drop`. A read-only *file* is unaffected and a permanent
+#      hardening has nothing to restore; both are legitimate allow-marker cases.
 #
 # This audit exists because `tempfile::TempDir`'s own `Drop` discards the
 # `remove_dir_all` result: every failure above is invisible in test output and
@@ -125,6 +132,8 @@ scan "into_path() disarms temp-directory cleanup" \
   '\.into_path\(\)'
 scan "mem::forget skips temp-directory cleanup" \
   'mem::forget'
+scan "a read-only chmod needs a Drop-scoped restore" \
+  '(set_mode|from_mode)\(0o[45][0-9][0-9]\)'
 
 if [ -s "$violations" ]; then
   echo "tempdir-leak-audit: temp-directory cleanup can never run at these sites:" >&2

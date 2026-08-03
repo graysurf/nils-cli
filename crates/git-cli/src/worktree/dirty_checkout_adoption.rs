@@ -1451,6 +1451,7 @@ fn install_private_test_worker(
     }
     staged
         .as_file()
+        // tempdir-leak-audit: allow — permanent hardening of an installed copy, not a restorable fixture mode.
         .set_permissions(fs::Permissions::from_mode(0o500))
         .context("private dirty snapshot worker test copy could not be hardened")?;
     staged
@@ -9398,6 +9399,7 @@ mod tests {
 
         // Pre-seed a stale copy (different content/length) at the derived path.
         fs::write(&destination, b"stale").expect("write stale worker copy");
+        // tempdir-leak-audit: allow — a read-only file stays unlinkable, so RemoveOnDrop still cleans it.
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o500))
             .expect("harden stale worker copy");
         let stale_ino = fs::metadata(&destination)

@@ -58,6 +58,7 @@ fn copy_trusted_git_cli_binary(source_path: &Path, destination_path: &Path) -> i
         .open(destination_path)?;
     io::copy(&mut &source, &mut destination)?;
     destination.sync_all()?;
+    // tempdir-leak-audit: allow — permanent hardening of the installed private binary.
     destination.set_permissions(std::fs::Permissions::from_mode(0o500))?;
 
     let current_source_metadata = source.metadata()?;

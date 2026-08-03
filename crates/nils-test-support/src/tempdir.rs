@@ -94,11 +94,82 @@ impl Drop for ScopedTempDir {
     }
 }
 
+/// A directory made read-only for part of a test, restored from `Drop`.
+///
+/// This is the class-2 hazard in `docs/specs/test-temp-directory-policy.md`, and
+/// the distinction that makes it a hazard is the *target*: unlinking an entry
+/// needs write permission on its **directory**, not on the entry, so a read-only
+/// directory stops `remove_dir_all` from emptying it while a read-only file does
+/// not. A fixture that chmods a directory and restores it with a plain statement
+/// is therefore unremovable the moment anything between those two statements
+/// panics — an unwinding assertion, or a spawn that fails under load — and
+/// because cleanup stops at the first error the leftovers are exactly the
+/// read-only subtree.
+///
+/// Restoring from `Drop` closes that window. Prefer this over a manual restore
+/// for any directory a test makes read-only, and pair it with [`ScopedTempDir`]
+/// so a cleanup that still fails is reported rather than leaked.
+#[cfg(unix)]
+pub struct RestoredMode {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl RestoredMode {
+    /// Set `dir` to `mode`, restoring its current mode when the guard drops.
+    pub fn set(dir: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = std::fs::metadata(dir)
+            .unwrap_or_else(|err| panic!("read mode of {}: {err}", dir.display()))
+            .permissions();
+        let guard = Self {
+            path: dir.to_path_buf(),
+            mode: permissions.mode() & 0o7777,
+        };
+
+        let mut updated = permissions;
+        updated.set_mode(mode);
+        std::fs::set_permissions(dir, updated)
+            .unwrap_or_else(|err| panic!("set mode of {}: {err}", dir.display()));
+
+        guard
+    }
+
+    /// Set `dir` to `0o500`: the owner may traverse and read it but not write,
+    /// which is what a fixture proving "the code under test cannot write here"
+    /// usually wants.
+    pub fn read_only(dir: &Path) -> Self {
+        Self::set(dir, 0o500)
+    }
+
+    /// Set `dir` to `0o555`, for a fixture that also needs group and other to
+    /// traverse it.
+    pub fn read_only_shared(dir: &Path) -> Self {
+        Self::set(dir, 0o555)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestoredMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Best-effort by design: the directory may legitimately be gone already,
+        // and a restore failure must never replace the test's own verdict.
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(self.mode);
+        let _ = std::fs::set_permissions(&self.path, permissions);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use super::ScopedTempDir;
+    use super::{RestoredMode, ScopedTempDir};
 
     #[test]
     fn close_removes_the_directory() {
@@ -128,13 +199,15 @@ mod tests {
         let locked = path.join("locked");
         std::fs::create_dir(&locked).expect("create");
         std::fs::write(locked.join("file"), "x").expect("write");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        // This fixture is the hazard the guard exists for, so it uses the guard:
+        // `expect_err` below panics if cleanup unexpectedly succeeds, and a plain
+        // restore statement after it would be skipped, leaving the read-only
+        // subtree behind.
+        let restored = RestoredMode::read_only(&locked);
 
         // Root and CAP_DAC_OVERRIDE ignore the mode bits this fixture relies
         // on, so the assertion below only holds for an unprivileged user.
         if std::fs::write(locked.join("probe"), "x").is_ok() {
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
-                .expect("restore");
             return;
         }
 
@@ -144,7 +217,7 @@ mod tests {
             "the directory that could not be removed must still be reported as present: {err}"
         );
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        drop(restored);
         std::fs::remove_dir_all(&path).expect("cleanup");
     }
 }

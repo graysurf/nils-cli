@@ -9274,9 +9274,14 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         let marker = begin_manual_input_section(&context, &record)
             .unwrap()
             .unwrap();
-        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // `marker.finish` runs between making the directory read-only and
+        // restoring it, so a plain restore statement would be skipped if it
+        // panicked — and `remove_dir_all` cannot empty a read-only directory, so
+        // the fixture would leak. Restore from `Drop` instead.
+        let restored_session_dir =
+            nils_test_support::tempdir::RestoredMode::read_only(&session_dir);
         marker.finish(|| drop(lifecycle_lock));
-        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(restored_session_dir);
         assert!(manual_input_section_path(&context, &record).exists());
         let unrelated_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
         let turn = json!({

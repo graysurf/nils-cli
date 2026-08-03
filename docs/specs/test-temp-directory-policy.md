@@ -56,10 +56,24 @@ entries from a read-only directory, so any panic between those two statements �
 an unwinding assertion, a `Command::spawn` that fails under load — hands teardown
 a directory it cannot empty, and the survivors are whatever sits under it.
 Restore from `Drop` instead, so the unwinding path restores it too:
-`RestoredMode` in `crates/codex-cli/tests/integration/rate_limits_async.rs`.
+`nils_test_support::tempdir::RestoredMode`.
 Note that `remove_dir_all` stops at the first error, so the leftovers name the
 read-only subtree and nothing else — sibling fixture directories removed before
 it are already gone.
+
+**The target decides whether this is a hazard at all.** Unlinking an entry needs
+write permission on its *directory*, not on the entry, so a read-only
+**directory** blocks cleanup while a read-only **file** does not. A permanent
+hardening — a binary installed at `0o500` and meant to stay that way — has
+nothing to restore and is not this class either. `scripts/ci/tempdir-leak-audit.sh`
+flags every literal `0o4xx`/`0o5xx` chmod and expects those two legitimate shapes
+to carry `tempdir-leak-audit: allow` with the reason, so the distinction stays
+recorded at the site rather than rediscovered.
+
+The audit of every site in the workspace (#1411) found three read-only-directory
+fixtures — in `codex-cli`, `agent-session`, and `nils-test-support`'s own
+`ScopedTempDir` test — all of which now use the shared guard, and four legitimate
+sites in `git-cli` and `macos-agent` that are annotated instead.
 
 ### Class 4 is a placement bug, not a timing bug
 
