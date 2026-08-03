@@ -33,6 +33,78 @@ fn stderr(output: &CmdOutput) -> String {
     output.stderr_text()
 }
 
+/// An endpoint nothing listens on, so a request that escapes a test's control
+/// fails immediately instead of reaching a real host.
+///
+/// `base_options` clears the `CLAUDE_PROMPT` prefix to isolate ambient config,
+/// which also clears `CLAUDE_PROMPT_SEGMENT_ENDPOINT` — and the production
+/// default is the real usage endpoint. This is **defence in depth, not a fix for
+/// an observed reach**: the same prefix removal also clears the token variables
+/// and `base_options` disables the keychain, so `refresh_blocking` returns at its
+/// token guard before it would fetch anything. What it buys is that the first
+/// token-bearing test added under this default cannot reach a real host by
+/// omission. A test that wants a server sets its own endpoint afterwards and
+/// wins, because removals are applied before values.
+const UNROUTABLE_ENDPOINT: &str = "http://127.0.0.1:9/usage";
+
+/// Bound the fast-fail so it stays fast on a host that drops rather than refuses
+/// loopback traffic. `gemini-cli` pins its timeouts alongside its unroutable
+/// endpoint for the same reason.
+const FAST_FAIL_MAX_TIME_SECONDS: &str = "1";
+
+/// Keeps a plain `prompt-segment` run from launching a detached refresh child.
+///
+/// A run whose cache is expired calls `enqueue_background_refresh`, which spawns
+/// `prompt-segment --refresh` and returns without waiting. That child outlives the
+/// test, and its first act is `create_dir_all` on the cache directory, so it can
+/// recreate the fixture `TempDir` teardown has already removed — class 3 in
+/// `docs/specs/test-temp-directory-policy.md`.
+///
+/// A test whose subject is rendering rather than refreshing opts out through the
+/// production cooldown instead of racing the child or neutering it: a recent
+/// `usage.refresh.at` plus a long `CLAUDE_PROMPT_SEGMENT_REFRESH_MIN_SECONDS`
+/// makes `enqueue_background_refresh` return before it spawns anything. That is
+/// the approach the policy prefers, and unlike a no-op executable it is
+/// falsifiable — see [`RefreshCooldown::assert_held`].
+struct RefreshCooldown {
+    marker: PathBuf,
+    stamp: String,
+}
+
+impl RefreshCooldown {
+    /// Hold the cooldown for the `usage.json` cache in `cache_dir`.
+    fn hold(cache_dir: &Path) -> Self {
+        std::fs::create_dir_all(cache_dir).expect("cache dir");
+        let marker = cache_dir.join("usage.refresh.at");
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs().saturating_sub(5).max(1))
+            .expect("epoch")
+            .to_string();
+        std::fs::write(&marker, &stamp).expect("write refresh marker");
+
+        Self { marker, stamp }
+    }
+
+    /// The environment that makes the held marker actually gate the spawn.
+    fn env(&self) -> (&'static str, &'static str) {
+        ("CLAUDE_PROMPT_SEGMENT_REFRESH_MIN_SECONDS", "3600")
+    }
+
+    /// Fails when the run spawned a refresh child after all.
+    ///
+    /// `enqueue_background_refresh` rewrites the marker immediately before
+    /// spawning, so an unchanged marker is proof that it returned on the cooldown
+    /// and that no background writer can outlive this test.
+    fn assert_held(&self) {
+        assert_eq!(
+            std::fs::read_to_string(&self.marker).expect("read refresh marker"),
+            self.stamp,
+            "the run spawned a detached refresh child instead of honouring the cooldown"
+        );
+    }
+}
+
 fn base_options(cache_dir: &Path) -> CmdOptions {
     CmdOptions::default()
         .with_env_remove_prefix("CLAUDE_CLI_")
@@ -45,6 +117,11 @@ fn base_options(cache_dir: &Path) -> CmdOptions {
         )
         .with_env("CLAUDE_PROMPT_SEGMENT_CACHE_DIR", &path_str(cache_dir))
         .with_env("CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED", "1")
+        .with_env("CLAUDE_PROMPT_SEGMENT_ENDPOINT", UNROUTABLE_ENDPOINT)
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_MAX_TIME_SECONDS",
+            FAST_FAIL_MAX_TIME_SECONDS,
+        )
 }
 
 fn path_str(path: &Path) -> String {
@@ -769,10 +846,21 @@ fn prompt_segment_does_not_render_cache_older_than_max_stale_age() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
     set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+    // The second uncontained spawner, which the first pass classified wrongly: a
+    // 601s-old cache is display-expired, so this run spawns a detached child that
+    // can recreate `tmp` after teardown. Its subject is max-stale rendering, so
+    // hold the cooldown.
+    //
+    // This one is the falsifiable case: disabling the gate makes the run spawn and
+    // `assert_held` fails with its own message, so the containment is demonstrated
+    // rather than assumed.
+    let cooldown = RefreshCooldown::hold(tmp.path());
 
     let output = run(
         &["prompt-segment", "--ttl", "1h", "--time-format", "%Y-%m-%d"],
-        &base_options(tmp.path()).with_env("NO_COLOR", "1"),
+        &base_options(tmp.path())
+            .with_env("NO_COLOR", "1")
+            .with_env(cooldown.env().0, cooldown.env().1),
     );
 
     assert_exit(&output, 0);
@@ -781,6 +869,7 @@ fn prompt_segment_does_not_render_cache_older_than_max_stale_age() {
         cache_file.is_file(),
         "max-stale handling must not delete cache"
     );
+    cooldown.assert_held();
 }
 
 #[test]
@@ -990,13 +1079,72 @@ fn usage_auto_keeps_live_rate_limit_reason_when_expired_cache_is_omitted() {
     );
 }
 
+/// Pins the containment defaults, asserting the **effective** value rather than
+/// mere presence.
+///
+/// `run_impl_os` replays `envs` in order through `Command::env`, whose map is
+/// last-write-wins per key, and applies `envs_os` after `envs`. So a later entry
+/// for the same key decides what the child sees. An `any()` assertion would stay
+/// green if a future edit appended a live endpoint after the pin — exactly the
+/// regression this guards. `with_path_prepend` in `nils-test-support` reads the
+/// effective value with `rev().find(..)` for the same reason.
+#[test]
+fn base_options_pins_containment_defaults_as_the_effective_values() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = base_options(tmp.path());
+
+    let effective = |key: &str| {
+        assert!(
+            !options.envs_os.iter().any(|(name, _)| name == key),
+            "{key} must not also be set through envs_os, which is applied last"
+        );
+        options
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+
+    assert_eq!(
+        effective("CLAUDE_PROMPT_SEGMENT_ENDPOINT"),
+        Some(UNROUTABLE_ENDPOINT),
+        "base_options must pin the endpoint: it clears the CLAUDE_PROMPT prefix, and the \
+         production default is a real host, so omission means reaching it; envs={:?}",
+        options.envs
+    );
+    assert_eq!(
+        effective("CLAUDE_PROMPT_SEGMENT_MAX_TIME_SECONDS"),
+        Some(FAST_FAIL_MAX_TIME_SECONDS),
+        "the fast-fail must be bounded so the pinned endpoint fails fast on a host that \
+         drops rather than refuses loopback traffic; envs={:?}",
+        options.envs
+    );
+}
+
 #[test]
 fn prompt_segment_missing_credentials_and_cache_is_quiet_success() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let output = run(&["prompt-segment"], &base_options(tmp.path()));
+    // Per-test enumeration (#1412) showed this test reaches
+    // `enqueue_background_refresh` despite having neither credentials nor a
+    // cache, with no containment at all. Its subject is the quiet-success
+    // rendering, not the refresh, so hold the cooldown.
+    //
+    // Measured: with the cooldown held this run enters `enqueue_background_refresh`
+    // and spawns nothing. Unlike the max-stale case below, disabling the gate does
+    // not make it spawn either — holding the cooldown also creates the cache
+    // directory, which changes the rest of the path — so `assert_held` here is a
+    // tripwire that cannot currently fire rather than a proof. Kept because it
+    // costs nothing and would catch the marker being rewritten if that changes.
+    let cooldown = RefreshCooldown::hold(tmp.path());
+    let options = base_options(tmp.path()).with_env(cooldown.env().0, cooldown.env().1);
+
+    let output = run(&["prompt-segment"], &options);
+
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "");
+    cooldown.assert_held();
 }
 
 #[test]
