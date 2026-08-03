@@ -10165,6 +10165,18 @@ fn add_runtime_tmux_environment(
         assignment.push(path);
         command.arg("-e").arg(assignment);
     }
+    // Pinning PATH alone is not enough: AGENT_SESSION_BIN outranks PATH when
+    // agent-hook resolves the activity helper, so a value cached by the tmux
+    // server survives the PATH pin and fail-closes every UserPromptSubmit and
+    // Stop in a session created long after the helper moved. Pin the executable
+    // that is launching this session, which `HELD_LAUNCH_SCRIPT` already binds
+    // as `broker_bin` for the session's whole life, so this adds no lifetime
+    // coupling the runtime does not already have. See sympoies/nils-cli#1414.
+    if let Ok(helper) = resolve_agent_session_executable() {
+        let mut assignment = OsString::from("AGENT_SESSION_BIN=");
+        assignment.push(helper);
+        command.arg("-e").arg(assignment);
+    }
     Ok(())
 }
 
