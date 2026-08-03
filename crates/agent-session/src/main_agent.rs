@@ -3246,7 +3246,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
             run_worker_provider_stop_canary(context, args, true)
         }
         WorkerCommand::ReconcileStopped(args) => run_worker_reconcile_stopped(context, args),
-        WorkerCommand::RevokeClaim(args) => run_worker_revoke_claim(context, args),
+        WorkerCommand::RevokeClaim(args) => run_worker_revoke_claim(context, args, None),
         WorkerCommand::Cancel(args) => run_worker_cancel(context, args),
         WorkerCommand::Reassign(args) => run_worker_reassign(context, args),
     }
@@ -8584,6 +8584,7 @@ fn run_worker_retire(
                     "initial_revision": args.if_revision,
                     "initial_state": "accepted",
                     "release": release,
+                    "claim_revoke": Value::Null,
                     "delete": Value::Null
                 })
             } else {
@@ -8595,6 +8596,7 @@ fn run_worker_retire(
                     "initial_revision": assignment.revision,
                     "initial_state": assignment.state,
                     "release": Value::Null,
+                    "claim_revoke": Value::Null,
                     "delete": Value::Null
                 })
             };
@@ -8649,6 +8651,32 @@ fn run_worker_retire(
         revision = release["assignment"]["revision"]
             .as_u64()
             .ok_or_else(|| invalid_input("worker release result revision is invalid"))?;
+        let claim_revoke = if progress["claim_revoke"].is_null() {
+            recover_released_retire_claim(
+                context,
+                &record,
+                &incarnation,
+                &args,
+                &request_digest,
+                revision,
+            )?
+        } else {
+            Some(progress["claim_revoke"].clone())
+        };
+        if let Some(value) = claim_revoke {
+            revision = value["assignment"]["revision"].as_u64().ok_or_else(|| {
+                invalid_input("worker claim revocation result revision is invalid")
+            })?;
+            progress["claim_revoke"] = value;
+            persist_worker_retire_receipt(
+                context,
+                &record,
+                &incarnation,
+                &args.idempotency_key,
+                &request_digest,
+                progress.clone(),
+            )?;
+        }
     }
     let delete = if progress["delete"].is_null() {
         let value = run_worker_delete(
@@ -8700,6 +8728,81 @@ fn run_worker_retire(
         outcome.clone(),
     )?;
     Ok(outcome)
+}
+
+#[derive(Clone, Debug)]
+struct ReleasedRetireClaimRecovery {
+    retire_idempotency_key: String,
+    retire_request_digest: String,
+    release_revision: u64,
+}
+
+fn recover_released_retire_claim(
+    context: &CliContext,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    args: &AssignmentMutationArgs,
+    retire_request_digest: &str,
+    release_revision: u64,
+) -> Result<Option<Value>, CliError> {
+    let registry = orchestration::load_registry_readonly(context)?;
+    let run = require_current_main(&registry, main, main_incarnation)?;
+    let assignment = registry
+        .assignments
+        .get(&args.assignment_id)
+        .filter(|assignment| assignment.run_id == run.run_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    ensure_primary_manager(assignment, main, main_incarnation)?;
+    let worker = assignment.worker.as_ref().ok_or_else(|| {
+        CliError::data(
+            "worker-incarnation-changed",
+            "released retire progress has no bound worker claim to revoke",
+            None,
+        )
+    })?;
+    let revoke_key = compatible_child_idempotency_key(&args.idempotency_key, "revoke-claim");
+    let prior_revoke =
+        registry
+            .receipts
+            .contains_key(&receipt_key(&main.id, main_incarnation, &revoke_key));
+    if assignment.revision == release_revision {
+        let (active_claim, active_operation) =
+            crate::coordination::session_has_active_claim_or_operation(
+                context,
+                &worker.session_id,
+                &worker.session_incarnation,
+            )?;
+        if !active_claim || active_operation {
+            return Ok(None);
+        }
+    } else if !prior_revoke {
+        return Err(CliError::data(
+            "orchestration-revision-conflict",
+            "released assignment changed before retire claim recovery",
+            Some(json!({
+                "expected_revision": release_revision,
+                "actual_revision": assignment.revision
+            })),
+        ));
+    }
+    let proof = ReleasedRetireClaimRecovery {
+        retire_idempotency_key: args.idempotency_key.clone(),
+        retire_request_digest: retire_request_digest.to_string(),
+        release_revision,
+    };
+    run_worker_revoke_claim(
+        context,
+        WorkerRevokeClaimArgs {
+            assignment_id: args.assignment_id.clone(),
+            worker_incarnation: worker.session_incarnation.clone(),
+            if_revision: release_revision,
+            reason: "released retire replay retained the exact worker claim".to_string(),
+            idempotency_key: revoke_key,
+            format: OutputFormat::Json,
+        },
+        Some(&proof),
+    )
+    .map(Some)
 }
 
 fn persist_worker_retire_receipt(
@@ -12401,7 +12504,10 @@ fn parse_revoke_claim_progress(
     if progress.schema_version != REVOKE_CLAIM_PROGRESS_SCHEMA
         || progress.state != "in_progress"
         || progress.assignment_id != assignment_id
-        || !matches!(progress.assignment_state.as_str(), "working" | "accepted")
+        || !matches!(
+            progress.assignment_state.as_str(),
+            "working" | "accepted" | "released"
+        )
         || progress
             .assignment_revision
             .checked_add(1)
@@ -12731,6 +12837,7 @@ fn pause_revoke_claim_before_worker_lifecycle_for_test() -> Result<(), CliError>
 fn run_worker_revoke_claim(
     context: &CliContext,
     args: WorkerRevokeClaimArgs,
+    released_retire: Option<&ReleasedRetireClaimRecovery>,
 ) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
     orchestration::validate_summary("claim revocation reason", &args.reason)?;
@@ -12773,6 +12880,16 @@ fn run_worker_revoke_claim(
             .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?
             .clone();
         ensure_primary_manager(&assignment, &main, &main_incarnation)?;
+        let released_retire_proven = assignment.state == "released"
+            && released_retire.is_some_and(|proof| {
+                released_retire_claim_recovery_matches(
+                    &registry,
+                    &main,
+                    &main_incarnation,
+                    &assignment,
+                    proof,
+                )
+            });
         let progress = if let Some(progress) = resumed {
             if assignment
                 .claim_revocation
@@ -12819,7 +12936,9 @@ fn run_worker_revoke_claim(
                 &assignment,
                 AssignmentMutationOwner::ClaimRevocation,
             )?;
-            if !matches!(assignment.state.as_str(), "working" | "accepted") {
+            if !matches!(assignment.state.as_str(), "working" | "accepted")
+                && !released_retire_proven
+            {
                 return Err(CliError::data(
                     "assignment-state-conflict",
                     "worker revoke-claim requires a working or accepted assignment",
@@ -13252,10 +13371,10 @@ fn run_worker_revoke_claim(
             "runtime_identity_digest": progress.runtime_identity_digest,
             "authority_fence": "exact-worker-session-quarantine"
         },
-        "next_action": if progress.assignment_state == "accepted" {
-            "retire this exact accepted assignment"
-        } else {
-            "retire this exact cancelled assignment or start a distinct replacement"
+        "next_action": match progress.assignment_state.as_str() {
+            "accepted" => "retire this exact accepted assignment",
+            "released" => "replay the exact in-progress retire request",
+            _ => "retire this exact cancelled assignment or start a distinct replacement",
         }
     });
     store_receipt(
@@ -13271,6 +13390,36 @@ fn run_worker_revoke_claim(
     drop(locked);
     drop(worker_lifecycle);
     Ok(outcome)
+}
+
+fn released_retire_claim_recovery_matches(
+    registry: &orchestration::Registry,
+    main: &SessionRecord,
+    main_incarnation: &str,
+    assignment: &AssignmentRecord,
+    proof: &ReleasedRetireClaimRecovery,
+) -> bool {
+    let Some(receipt) = registry.receipts.get(&receipt_key(
+        &main.id,
+        main_incarnation,
+        &proof.retire_idempotency_key,
+    )) else {
+        return false;
+    };
+    let outcome = &receipt.outcome;
+    receipt.principal_session_id == main.id
+        && receipt.principal_incarnation == main_incarnation
+        && receipt.operation == "worker-retire"
+        && receipt.request_digest == proof.retire_request_digest
+        && outcome["schema_version"] == "main-agent.worker-retire-progress.v1"
+        && outcome["state"] == "in_progress"
+        && outcome["assignment_id"] == assignment.assignment_id
+        && outcome["initial_state"] == "accepted"
+        && outcome["release"]["assignment"]["state"] == "released"
+        && outcome["release"]["assignment"]["revision"].as_u64() == Some(proof.release_revision)
+        && outcome["release"]["assignment"]["worker"]
+            == serde_json::to_value(&assignment.worker).unwrap_or(Value::Null)
+        && outcome["delete"].is_null()
 }
 
 fn clear_exact_terminal_provider_stop_canary_replay(

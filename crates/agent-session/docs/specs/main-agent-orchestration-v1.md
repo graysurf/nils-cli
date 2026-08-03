@@ -1323,7 +1323,11 @@ only and MUST never be accepted automatically.
 Composite commands derive bounded, digest-backed child idempotency keys.
 `worker retire` stores top-level progress before release, after release, and
 after delete, so retrying the original key and revision resumes an accepted
-assignment whose release already committed.
+assignment whose release already committed. When that exact progress proves
+`accepted -> released` but the worker retained its assignment-derived claim,
+retire replay may internally revoke only that quiescent exact claim before
+resuming delete. A nonterminal operation still fences replay, and the public
+`worker revoke-claim` command does not gain general released-state authority.
 
 `closeout` is the run-wide terminal macro. Admission binds the exact active
 controller claim to authenticated provenance retained outside the v1 run
