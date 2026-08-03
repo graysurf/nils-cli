@@ -202,7 +202,7 @@ case "$1 $2" in
   "repo view")
     printf '%s\n' '{{"name":"widgets","owner":{{"login":"acme"}},"url":"https://github.com/acme/widgets","defaultBranchRef":{{"name":"main"}},"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}'
     ;;
-  "pr checks") printf '%s\n' '[]' ;;
+  "pr checks") printf '%s\n' '[{{"name":"ci","bucket":"pass","state":"COMPLETED","isRequired":true}}]' ;;
   "api graphql")
     case "$*" in
       *"authorAssociation body createdAt"*) printf '%s\n' '{{"data":{{"viewer":{{"login":"maintainer"}},"repository":{{"pullRequest":{{"comments":{{"nodes":[{state_nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}' ;;

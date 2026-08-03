@@ -475,11 +475,17 @@ backend mapping, validation rules, and output schema versions.
   without project context fall back to the version-pinned
   `glab ci status -b <branch>` text parser.
 - Terminal states map to envelope `ok`:
-  - all required `success` → `ok = true`.
+  - all required `success`, with at least one check reported → `ok = true`.
   - any required `failure`/`cancelled`/`timed_out` → `ok = false`,
     exit `RUNTIME 1`, `error.kind = "checks_failed"`.
-  - timeout reached → `ok = false`, exit `UNAVAILABLE 69`,
-    `error.kind = "checks_timeout"`.
+  - timeout reached with checks still running → `ok = false`, exit
+    `UNAVAILABLE 69`, `error.kind = "checks_timeout"`.
+  - timeout reached having never seen a required check or a visible row →
+    `ok = false`, exit `DATA 65`, `error.kind = "checks_not_registered"`.
+    An empty snapshot is **not** terminal (rule 8): the poll continues
+    through the provider's check-registration window rather than reading
+    "nothing is failing" as "everything passed". `--allow-no-checks` makes
+    the empty set terminal for a repository that configures none.
 - Output schema: `cli.forge-cli.pr.checks.v1`,
   `data = { state, required_count, success_count, failed:[…], pending:[…], checks:[…], duration_ms, warnings? }`.
 
@@ -1163,6 +1169,23 @@ backend implementations cannot diverge.
    `pr wait-checks` was called earlier in the macro. This is the
    TTL-zero re-check that addresses the
    `github-pr-required-check-gating` operation record.
+
+   **Absence is not success.** "All required checks passed" is vacuously
+   true over an empty set, so a snapshot reporting no required checks
+   *and* no visible check rows means nothing ran — not that everything
+   passed. `pr merge` fails closed with `checks_not_registered`
+   (`DATA 65`) and `pr wait-checks` treats the empty set as non-terminal,
+   polling out its budget before reporting the same kind. Both accept
+   `--allow-no-checks` (with a recorded `--allow-no-checks-reason`) for a
+   repository that genuinely configures none.
+
+   The predicate deliberately requires *both* halves. A repository can run
+   CI without branch protection, producing zero required checks alongside
+   visible rows; those are re-gated against the visible set rather than
+   refused. What is refused is the case with nothing to re-gate, which is
+   also what the provider reports during the check-registration window
+   after a force-with-lease — the window in which delivery previously
+   reported success against an unchecked head.
 9. **Merge method.** Default `squash`. Repo override allowed via
    `.forge-cli.toml` `[merge] method = "squash" | "merge" | "rebase"`.
    Per-invocation `--method` overrides the repo override; both are
@@ -1318,6 +1341,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `draft_merge_refused`                      | 7                    |
 | `checks_pending`                           | 8                    |
 | `checks_failed`                            | 8 (`RUNTIME 1`)      |
+| `checks_not_registered`                    | 8                    |
 | `merge_method_unsupported`                 | 9                    |
 | `keep_branch_conflict`                     | 10                   |
 | `local_path_present`                       | 11                   |

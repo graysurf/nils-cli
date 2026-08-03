@@ -850,6 +850,28 @@ pub struct PrMergeArgs {
         default_missing_value = "true"
     )]
     pub review_convergence: Option<bool>,
+    /// Merge a head for which no required checks are registered. Without this
+    /// flag an empty required-check snapshot triggers `checks_not_registered`,
+    /// because "all required checks passed" is vacuously true over an empty set
+    /// and so proves nothing about the head. Requires
+    /// `--allow-no-checks-reason`.
+    #[arg(
+        long = "allow-no-checks",
+        action = ArgAction::SetTrue,
+        requires = "allow_no_checks_reason"
+    )]
+    pub allow_no_checks: bool,
+    /// Required when `--allow-no-checks` is set. Non-empty free-form text
+    /// describing why merging an unchecked head is safe — normally that the
+    /// repository configures no checks at all; the reason is recorded in the
+    /// merge envelope payload.
+    #[arg(
+        long = "allow-no-checks-reason",
+        value_name = "TEXT",
+        requires = "allow_no_checks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_no_checks_reason: Option<String>,
     /// Merge despite unchecked task-list items in the PR/MR description.
     /// Without this flag, any unchecked `- [ ]` item triggers
     /// `unchecked_task_items`. Requires `--allow-unchecked-tasks-reason`.
@@ -1170,6 +1192,11 @@ pub struct PrWaitChecksArgs {
     /// Pause between polls (default `20s`).
     #[arg(long, value_parser = parse_duration, default_value = "20s")]
     pub interval: Duration,
+    /// Treat a head with no registered checks as complete instead of waiting
+    /// out the timeout. Without it, an empty check set is not terminal and the
+    /// wait expires as `checks_not_registered`.
+    #[arg(long = "allow-no-checks", action = ArgAction::SetTrue)]
+    pub allow_no_checks: bool,
     /// Restrict the gating decision to required checks (default `true`).
     #[arg(
         long = "required-only",
@@ -1481,6 +1508,26 @@ pub struct PrDeliverArgs {
         value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub allow_unchecked_tasks_reason: Option<String>,
+    /// Deliver a head for which no checks are registered. Without this flag,
+    /// delivery waits out its `--timeout` for checks to appear and then fails
+    /// with `checks_not_registered` rather than treating an empty check set as
+    /// a pass. Requires `--allow-no-checks-reason`.
+    #[arg(
+        long = "allow-no-checks",
+        action = ArgAction::SetTrue,
+        requires = "allow_no_checks_reason"
+    )]
+    pub allow_no_checks: bool,
+    /// Required when `--allow-no-checks` is set. Non-empty free-form text
+    /// describing why delivering an unchecked head is safe; the reason is
+    /// recorded in the merge-step payload.
+    #[arg(
+        long = "allow-no-checks-reason",
+        value_name = "TEXT",
+        requires = "allow_no_checks",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_no_checks_reason: Option<String>,
 }
 
 /// `issue` subtree.
