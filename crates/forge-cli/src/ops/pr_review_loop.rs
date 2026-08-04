@@ -11,7 +11,7 @@ use crate::cli::{
     BINARY, GlobalFlags, PrReviewLoopExtendArgs, PrReviewLoopInspectArgs, PrReviewLoopObserveArgs,
     PrReviewLoopValidateArgs,
 };
-use crate::envelope::emit_success;
+use crate::envelope::{emit_success, emit_success_with_warnings};
 use crate::error::ForgeError;
 use crate::ops::pr_comments::github_repo_slug_from_url;
 use crate::ops::{pr_comment, pr_review, pr_view, review_state};
@@ -107,24 +107,33 @@ struct ApprovalComment {
 
 /// Envelope payload for `cli.forge-cli.pr.review-loop.validate.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct PrReviewLoopValidatePayload {
-    /// Which of the two accepted `--findings-file` shapes was read.
-    pub shape: &'static str,
-    pub row_count: usize,
-    /// Rows per disposition, in the order the state machine defines them.
-    pub dispositions: Vec<DispositionCount>,
-    pub blocking_count: usize,
-    /// Fingerprints appearing more than once. Accepted — the last row wins —
-    /// but almost always a copy-paste error, so it is surfaced rather than
-    /// silently collapsed.
+struct PrReviewLoopValidatePayload {
+    /// Stable token for the `--findings-file` shape that was read, not the
+    /// prose the text renderer prints — the wording must stay free to change.
+    shape: &'static str,
+    /// Rows as written in the file, before identities are collapsed.
+    row_count: usize,
+    /// Distinct lifecycle identities after canonicalization. Lower than
+    /// `row_count` only when rows share an identity.
+    identity_count: usize,
+    /// Rows per disposition, over the canonical identities, in
+    /// [`review_state::ReviewFindingStatus::ALL`] order. Sums to
+    /// `identity_count`.
+    dispositions: Vec<DispositionCount>,
+    /// Findings the merge gate would treat as blocking: `open` and blocking.
+    /// A terminal disposition is never blocking, matching the ledger.
+    blocking_count: usize,
+    /// Lifecycle identities carrying more than one row. Reported only when the
+    /// rows are byte-identical — differing rows for one identity are a
+    /// `review_fingerprint_collision` and fail, exactly as they do on append.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub duplicate_fingerprints: Vec<String>,
+    duplicate_identities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct DispositionCount {
-    pub disposition: &'static str,
-    pub count: usize,
+struct DispositionCount {
+    disposition: &'static str,
+    count: usize,
 }
 
 /// Validate a findings payload without a pull request, a provider call, or any
@@ -136,10 +145,17 @@ pub struct DispositionCount {
 /// actually asked. `pr review validate` has exactly this shape for review
 /// summaries and thread specs; this is the same affordance for the ledger.
 ///
-/// Deliberately payload-only. Head and state-tip CAS, the transition, and the
-/// rendered comment all require the provider and stay with `observe --dry-run`.
-/// Passing here does not promise an append will succeed; failing here proves it
-/// cannot.
+/// Deliberately payload-only, and that boundary is drawn where the provider
+/// starts, not sooner. Everything `observe` decides *offline* — fingerprint
+/// form, identity collisions, blocking normalization — is decided here by
+/// calling the same [`review_state::canonicalize_observations`] the append
+/// calls. Only head and state-tip CAS, the transition against stored state, and
+/// the rendered comment need the provider, and those stay with
+/// `observe --dry-run`.
+///
+/// So: failing here proves an append cannot succeed, and passing here means the
+/// payload itself is acceptable. A second, laxer copy of the payload rules is
+/// exactly the drift this command was added to prevent, so there isn't one.
 pub fn run_validate(
     args: PrReviewLoopValidateArgs,
     format: OutputFormat,
@@ -147,57 +163,113 @@ pub fn run_validate(
     // Read once. The path may be a FIFO or a process substitution, where a
     // second open yields EOF and would be misreported as invalid JSON.
     let raw = read_findings_value(&args.findings_file)?;
-    let shape = detect_findings_shape(&raw);
-    let observations = observations_from_value(&raw)?;
-
-    let mut counts: Vec<DispositionCount> =
-        ["open", "fixed", "accepted", "preference", "follow-up"]
-            .into_iter()
-            .map(|disposition| DispositionCount {
-                disposition,
-                count: 0,
-            })
-            .collect();
-    let mut seen: Vec<&str> = Vec::with_capacity(observations.len());
-    let mut duplicates: Vec<String> = Vec::new();
-    let mut blocking_count = 0usize;
-    for observation in &observations {
-        let label = finding_status_label(observation.status);
-        if let Some(entry) = counts.iter_mut().find(|entry| entry.disposition == label) {
-            entry.count += 1;
-        }
-        if observation.blocking {
-            blocking_count += 1;
-        }
-        if seen.contains(&observation.fingerprint.as_str()) {
-            if !duplicates.contains(&observation.fingerprint) {
-                duplicates.push(observation.fingerprint.clone());
-            }
-        } else {
-            seen.push(observation.fingerprint.as_str());
-        }
-    }
-
-    Ok(emit_success(
+    let payload = validate_payload(&raw)?;
+    // Repeated identities are advisory, so they belong in the envelope's
+    // warnings channel — stderr in text mode, `warnings[]` in JSON — not
+    // printed onto stdout where a JSON consumer would never see them.
+    let warnings = payload
+        .duplicate_identities
+        .iter()
+        .map(|identity| format!("identical rows repeated for one identity: {identity}"))
+        .collect::<Vec<_>>();
+    Ok(emit_success_with_warnings(
         schema_version_for(BINARY, SCHEMA_VALIDATE, SCHEMA_VERSION),
-        PrReviewLoopValidatePayload {
-            shape,
-            row_count: observations.len(),
-            dispositions: counts,
-            blocking_count,
-            duplicate_fingerprints: duplicates,
-        },
+        payload,
+        warnings,
         format,
         render_validate_text,
     ))
+}
+
+/// The whole decision, separated from emission so tests can assert the report
+/// rather than only an exit code.
+fn validate_payload(raw: &serde_json::Value) -> Result<PrReviewLoopValidatePayload, ForgeError> {
+    let shape = detect_findings_shape(raw);
+    let observations = observations_from_value(raw)?;
+    // The same canonicalization an append performs: rejects a malformed
+    // lifecycle fingerprint and an identity whose rows disagree, and clears
+    // `blocking` on every terminal disposition.
+    let canonical = review_state::canonicalize_observations(&observations)?;
+
+    let mut counts: Vec<DispositionCount> = review_state::ReviewFindingStatus::ALL
+        .into_iter()
+        .map(|status| DispositionCount {
+            disposition: status.as_str(),
+            count: 0,
+        })
+        .collect();
+    let mut blocking_count = 0usize;
+    for observation in canonical.values() {
+        let label = observation.status.as_str();
+        let entry = counts
+            .iter_mut()
+            .find(|entry| entry.disposition == label)
+            .expect("ReviewFindingStatus::ALL covers every status");
+        entry.count += 1;
+        if observation.blocking {
+            blocking_count += 1;
+        }
+    }
+
+    // Anything that survived canonicalization and still collapsed rows did so
+    // because those rows were identical; a disagreement would have errored.
+    let duplicate_identities = if canonical.len() < observations.len() {
+        collapsed_identities(&observations)
+    } else {
+        Vec::new()
+    };
+
+    Ok(PrReviewLoopValidatePayload {
+        shape,
+        row_count: observations.len(),
+        identity_count: canonical.len(),
+        dispositions: counts,
+        blocking_count,
+        duplicate_identities,
+    })
+}
+
+/// Identities that more than one row maps to, keyed the way the ledger keys
+/// them: the root-cause fingerprint when present, else the row's own.
+fn collapsed_identities(observations: &[review_state::ReviewFindingObservation]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::with_capacity(observations.len());
+    let mut collapsed: Vec<String> = Vec::new();
+    for observation in observations {
+        let identity = observation
+            .root_cause_fingerprint
+            .as_deref()
+            .unwrap_or(&observation.fingerprint);
+        if seen.contains(&identity) {
+            if !collapsed.iter().any(|entry| entry == identity) {
+                collapsed.push(identity.to_string());
+            }
+        } else {
+            seen.push(identity);
+        }
+    }
+    collapsed
+}
+
+/// Prose lives here, not in the payload, so wording can change freely.
+fn shape_prose(shape: &str) -> &str {
+    match shape {
+        SHAPE_MERGE_ENVELOPE => "review-specialists merge envelope",
+        _ => "bare observation array",
+    }
 }
 
 fn render_validate_text(payload: &PrReviewLoopValidatePayload) {
     println!(
         "ok: {rows} observation(s) from a {shape}",
         rows = payload.row_count,
-        shape = payload.shape,
+        shape = shape_prose(payload.shape),
     );
+    if payload.identity_count != payload.row_count {
+        println!(
+            "  identities: {identities} (rows sharing an identity were collapsed)",
+            identities = payload.identity_count,
+        );
+    }
     let breakdown = payload
         .dispositions
         .iter()
@@ -208,13 +280,14 @@ fn render_validate_text(payload: &PrReviewLoopValidatePayload) {
         println!("  dispositions: {}", breakdown.join(" "));
     }
     println!("  blocking: {}", payload.blocking_count);
-    for fingerprint in &payload.duplicate_fingerprints {
-        println!("  warning: duplicate fingerprint, last row wins: {fingerprint}");
-    }
 }
 
-/// Read the payload as JSON without interpreting its rows, so the shape can be
-/// reported alongside a row-level failure.
+/// Read the payload once and parse it as JSON, leaving the rows uninterpreted.
+///
+/// Split from [`read_observations`] so a caller that needs both the raw value
+/// and the parsed rows opens the path exactly once — a FIFO or a `<(...)`
+/// process substitution returns EOF on a second open, which would surface as
+/// invalid JSON for a payload that was fine.
 fn read_findings_value(path: &str) -> Result<serde_json::Value, ForgeError> {
     let body = fs::read_to_string(path).map_err(|error| {
         ForgeError::validation(
@@ -234,23 +307,18 @@ fn read_findings_value(path: &str) -> Result<serde_json::Value, ForgeError> {
     })
 }
 
-/// The two shapes `--findings-file` accepts, named the way the help names them.
+/// Stable wire tokens for the two shapes `--findings-file` accepts. These go in
+/// a versioned envelope, so they are tokens rather than the sentence fragments
+/// the text renderer prints.
+const SHAPE_MERGE_ENVELOPE: &str = "merge-envelope";
+const SHAPE_OBSERVATION_ARRAY: &str = "observation-array";
+
 fn detect_findings_shape(value: &serde_json::Value) -> &'static str {
     let inner = value.get("data").unwrap_or(value);
     if inner.get("findings").is_some() {
-        "review-specialists merge envelope"
+        SHAPE_MERGE_ENVELOPE
     } else {
-        "bare observation array"
-    }
-}
-
-fn finding_status_label(status: review_state::ReviewFindingStatus) -> &'static str {
-    match status {
-        review_state::ReviewFindingStatus::Open => "open",
-        review_state::ReviewFindingStatus::Fixed => "fixed",
-        review_state::ReviewFindingStatus::Accepted => "accepted",
-        review_state::ReviewFindingStatus::Preference => "preference",
-        review_state::ReviewFindingStatus::FollowUp => "follow-up",
+        SHAPE_OBSERVATION_ARRAY
     }
 }
 
@@ -820,23 +888,7 @@ fn ensure_expected_tip(provider: Option<&str>, expected: Option<&str>) -> Result
 fn read_observations(
     path: &str,
 ) -> Result<Vec<review_state::ReviewFindingObservation>, ForgeError> {
-    let body = fs::read_to_string(path).map_err(|error| {
-        ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "failed to read review finding observations",
-            Some(format!("path={path}; error={error}")),
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-        ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "review finding observations are not valid JSON",
-            Some(error.to_string()),
-        )
-    })?;
-    observations_from_value(&value)
+    observations_from_value(&read_findings_value(path)?)
 }
 
 /// Row-level parse, split out so a caller that has already read the payload
@@ -915,20 +967,29 @@ fn observation_from_value(
     })
 }
 
+/// Accept exactly the dispositions the type defines, derived from
+/// [`review_state::ReviewFindingStatus::ALL`] so a new variant is accepted here
+/// the moment it exists rather than silently rejected.
+///
+/// `reopened` is deliberately absent: a finding that reappears is submitted as
+/// `open`, and the state machine decides whether that is a reopen.
 fn parse_finding_status(value: &str) -> Result<review_state::ReviewFindingStatus, ForgeError> {
-    match value {
-        "open" => Ok(review_state::ReviewFindingStatus::Open),
-        "fixed" => Ok(review_state::ReviewFindingStatus::Fixed),
-        "accepted" => Ok(review_state::ReviewFindingStatus::Accepted),
-        "preference" => Ok(review_state::ReviewFindingStatus::Preference),
-        "follow-up" => Ok(review_state::ReviewFindingStatus::FollowUp),
-        _ => Err(ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "review finding disposition is not supported",
-            Some(format!("status={value}")),
-        )),
-    }
+    review_state::ReviewFindingStatus::ALL
+        .into_iter()
+        .find(|status| status.as_str() == value)
+        .ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "review_findings_invalid",
+                "review finding disposition is not supported",
+                Some(format!(
+                    "status={value}; supported={}",
+                    review_state::ReviewFindingStatus::ALL
+                        .map(|status| status.as_str())
+                        .join(" | ")
+                )),
+            )
+        })
 }
 
 fn durable_hard_stop_error(
@@ -1842,10 +1903,11 @@ mod tests {
         assert_eq!(err.kind(), "review_findings_invalid");
     }
 
-    /// A duplicated fingerprint is accepted — the last row wins — but it is
-    /// almost always a copy-paste error, so the report names it.
+    /// Two rows for one identity that DISAGREE are a collision, exactly as on
+    /// append — my first cut documented and tested "last row wins", which is
+    /// not what `canonical_observations` does.
     #[test]
-    fn validate_reports_duplicate_fingerprints_without_failing() {
+    fn validate_rejects_two_rows_that_give_one_identity_incompatible_dispositions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let findings = findings_file(
             &dir,
@@ -1855,10 +1917,133 @@ mod tests {
             ]"#,
         );
 
-        let code = run_validate(validate_args(&findings), OutputFormat::Json)
-            .expect("duplicates are accepted by observe, so validate accepts them too");
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("an identity cannot carry two different dispositions");
 
-        assert_eq!(code, 0);
+        assert_eq!(err.kind(), "review_fingerprint_collision");
+    }
+
+    /// Byte-identical repeats are the only duplicates the ledger really does
+    /// collapse, so they warn rather than fail.
+    #[test]
+    fn validate_reports_identical_repeats_as_one_identity_without_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("identical repeats collapse cleanly");
+
+        assert_eq!(payload.row_count, 2);
+        assert_eq!(payload.identity_count, 1);
+        assert_eq!(payload.duplicate_identities, vec!["correctness:a:one"]);
+    }
+
+    /// Identity is the root-cause fingerprint when present, so two rows with
+    /// different lifecycle fingerprints can still be one identity — and
+    /// disagree.
+    #[test]
+    fn validate_keys_identity_on_the_root_cause_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","root_cause_fingerprint":"correctness:r:root","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:b:two","root_cause_fingerprint":"correctness:r:root","disposition":"fixed"}
+            ]"#,
+        );
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("one root cause with disagreeing rows is a collision");
+
+        assert_eq!(err.kind(), "review_fingerprint_collision");
+    }
+
+    /// A malformed lifecycle fingerprint is a purely local rule, so the offline
+    /// check must catch it rather than leaving it to the append.
+    #[test]
+    fn validate_rejects_a_malformed_lifecycle_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "abc",
+            "a:b",
+            "Maintainability:PrReviewLoop:dup",
+            "-a:b:c",
+            "a::c",
+        ] {
+            let findings = findings_file(
+                &dir,
+                &format!(r#"[{{"lifecycle_fingerprint":"{bad}","disposition":"open"}}]"#),
+            );
+            let err = run_validate(validate_args(&findings), OutputFormat::Json)
+                .expect_err("a malformed lifecycle fingerprint must be rejected offline");
+            assert_eq!(
+                err.kind(),
+                "review_fingerprint_collision",
+                "unexpected kind for {bad}"
+            );
+        }
+    }
+
+    /// The count the merge gate cares about. The ledger clears `blocking` on
+    /// every terminal disposition, so a payload of finished work is zero
+    /// blocking — counting the raw parsed bit reported one per row.
+    #[test]
+    fn validate_blocking_count_matches_what_the_ledger_would_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"},
+              {"lifecycle_fingerprint":"correctness:b:two","disposition":"accepted"},
+              {"lifecycle_fingerprint":"correctness:c:three","disposition":"open"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("valid payload");
+
+        assert_eq!(
+            payload.blocking_count, 1,
+            "only the open row blocks; terminal dispositions never do"
+        );
+    }
+
+    /// The breakdown must account for every identity, so a future disposition
+    /// cannot silently vanish from the report.
+    #[test]
+    fn validate_dispositions_sum_to_the_identity_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:b:two","disposition":"fixed"},
+              {"lifecycle_fingerprint":"correctness:c:three","disposition":"follow-up"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("valid payload");
+
+        assert_eq!(
+            payload.dispositions.iter().map(|d| d.count).sum::<usize>(),
+            payload.identity_count
+        );
+        assert_eq!(
+            payload
+                .dispositions
+                .iter()
+                .map(|d| d.disposition)
+                .collect::<Vec<_>>(),
+            vec!["open", "fixed", "accepted", "preference", "follow-up"],
+            "order comes from ReviewFindingStatus::ALL"
+        );
     }
 
     /// The clean-review genesis path: an empty envelope is a valid payload, and
@@ -1894,7 +2079,7 @@ mod tests {
         let raw = read_findings_value(&path.to_string_lossy()).expect("read once");
 
         // Both answers must come from that one read.
-        assert_eq!(detect_findings_shape(&raw), "bare observation array");
+        assert_eq!(detect_findings_shape(&raw), SHAPE_OBSERVATION_ARRAY);
         let observations = observations_from_value(&raw).expect("parse from the same value");
         assert_eq!(observations.len(), 1);
     }
@@ -1903,12 +2088,12 @@ mod tests {
     fn validate_names_the_shape_it_read() {
         let envelope: serde_json::Value =
             serde_json::from_str(r#"{"data":{"findings":[]}}"#).expect("json");
-        assert_eq!(
-            detect_findings_shape(&envelope),
-            "review-specialists merge envelope"
-        );
+        assert_eq!(detect_findings_shape(&envelope), SHAPE_MERGE_ENVELOPE);
         let array: serde_json::Value = serde_json::from_str("[]").expect("json");
-        assert_eq!(detect_findings_shape(&array), "bare observation array");
+        assert_eq!(detect_findings_shape(&array), SHAPE_OBSERVATION_ARRAY);
+        // Stable tokens, not the prose the text renderer prints.
+        assert_eq!(SHAPE_MERGE_ENVELOPE, "merge-envelope");
+        assert_eq!(SHAPE_OBSERVATION_ARRAY, "observation-array");
     }
 
     fn observe_args(

@@ -631,7 +631,7 @@ backend mapping, validation rules, and output schema versions.
   `pending_review_identity_mismatch`, `pending_review_pr_mismatch`, or
   `pending_review_not_found` with no mutation.
 
-### `pr review-loop inspect` / `observe` / `extend`
+### `pr review-loop inspect` / `observe` / `extend` / `validate`
 
 - These GitHub-only commands make the repair/re-review loop resumable from the
   append-only `forge-cli.review-loop.v1` chain. `inspect <id>` validates the
@@ -708,10 +708,31 @@ backend mapping, validation rules, and output schema versions.
   `fixed`, then merge at that head. Doing every repair first and then trying to
   record the history is unrecoverable, because the pre-repair head is gone and
   the round count cannot be reconstructed.
-- All three commands emit their own `cli.forge-cli.pr.review-loop.*.v1` schema
-  with `data.appended` and `data.outcome_posted`. Only `observe` can set
-  `outcome_posted`, and never without `appended`. `inspect` and `extend`
-  dry-runs are offline and report the command-specific read/transition plan.
+- The three provider-backed commands emit their own
+  `cli.forge-cli.pr.review-loop.*.v1` schema with `data.appended` and
+  `data.outcome_posted`. Only `observe` can set `outcome_posted`, and never
+  without `appended`. `inspect` and `extend` dry-runs are offline and report the
+  command-specific read/transition plan.
+- `validate --findings-file <path>` is the offline payload check, mirroring
+  `pr review validate`. It emits `cli.forge-cli.pr.review-loop.validate.v1` with
+  `data = { shape, row_count, identity_count, dispositions[], blocking_count,
+  duplicate_identities? }` and carries neither `appended` nor `outcome_posted`,
+  because it never appends. It takes no id, resolves no provider context and
+  runs no backend, so it is provider-independent and `--provider`, `--repo`,
+  `--host` and `--dry-run` have no effect on it.
+
+  Its accept/reject decision is not a second implementation of the payload
+  rules: it calls the same canonicalization `observe` calls, so lifecycle
+  fingerprint form, identity collisions (`review_fingerprint_collision`) and
+  blocking normalization for terminal dispositions are decided by one piece of
+  code. Head and state-tip compare-and-swap, the transition against stored
+  state, and the rendered comment need the provider and stay with
+  `observe --dry-run`. Failing `validate` therefore proves an append cannot
+  succeed; passing means the payload itself is acceptable.
+
+  Accepted dispositions are `open`, `fixed`, `accepted`, `preference` and
+  `follow-up`. A finding that reappears is submitted as `open`; the state
+  machine decides whether that is a reopen, and `reopened` is not an input.
 - `observe --dry-run` is a faithful non-mutating preflight. It reads and
   validates the findings payload and any outcome body, resolves the pull request,
   performs the head

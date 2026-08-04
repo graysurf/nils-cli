@@ -915,10 +915,17 @@ pub struct PrReviewLoopInspectArgs {
       without a pull request, a provider call, or any network access. Use it \
       while authoring a findings file.\n\n\
       SCOPE\n  \
-      This validates the payload only. Head and state-tip compare-and-swap, the \
-      transition, and the rendered comment all need the provider, so they stay \
-      with `observe --dry-run`, which remains the full preflight. Passing here \
-      does not mean an append will succeed; failing here means it cannot.\n\n\
+      Everything `observe` decides offline is decided here, by calling the same \
+      canonicalization the append calls: lifecycle fingerprint form, identity \
+      collisions, and blocking normalization for terminal dispositions. Only \
+      head and state-tip compare-and-swap, the transition against stored state, \
+      and the rendered comment need the provider, and those stay with `observe \
+      --dry-run`, which remains the full preflight. Failing here proves an \
+      append cannot succeed; passing means the payload itself is acceptable.\n  \
+      Because it resolves no provider context, --provider, --repo, --host and \
+      --dry-run have NO effect on this subcommand. That is deliberate, not an \
+      oversight: the point is to check a file before any repository is in \
+      scope.\n\n\
       DISPOSITIONS\n  \
       open | fixed | accepted | preference | follow-up. A finding that reappears \
       is submitted as `open` — the state machine decides whether that is a \
