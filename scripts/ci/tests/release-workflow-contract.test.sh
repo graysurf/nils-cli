@@ -124,5 +124,16 @@ assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-
   "reuses that exact-SHA PR CI" \
   "release helper help documents tag-gate CI reuse"
 
+# Both ends of the tap handoff must verify a receiver-side fact. The dispatches
+# endpoint answers 204 with no workflow listening, and a tap run's name is a
+# sender-chosen string whose shape differs per trigger path, so neither is proof
+# that the formula moved.
+assert_contains .github/workflows/release.yml \
+  "listWorkflowRuns" \
+  "release dispatch job confirms a tap run exists instead of trusting HTTP 204"
+assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
+  "read_tap_formula_version" \
+  "tap wait gates on the version published in the tap formula"
+
 echo
 echo "PASS: release-workflow-contract.test.sh"

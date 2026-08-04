@@ -505,39 +505,84 @@ tap_name_from_repo_slug() {
   echo "${owner}/${name}"
 }
 
+# Read the version currently published in the tap's formula at its default
+# branch. This is the one fact in the release path that only the tap can
+# produce: it is independent of which event started the tap workflow, of how
+# that run is named, and of whether the dispatch that was supposed to start it
+# did anything at all. Prints the bare version (e.g. 1.26.2); non-zero when the
+# formula cannot be read or carries no recognizable release URL.
+read_tap_formula_version() {
+  local tap_repo="$1"
+  local tap_formula="$2"
+  local formula_raw
+
+  formula_raw="$(gh api "repos/${tap_repo}/contents/Formula/${tap_formula}.rb" \
+    -H "Accept: application/vnd.github.raw" 2>/dev/null)" || return 1
+
+  python3 - "$formula_raw" <<'PY'
+import re
+import sys
+
+match = re.search(r"/releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/", sys.argv[1])
+if not match:
+    sys.exit(1)
+print(match.group(1))
+PY
+}
+
+# Wait for the tap to actually publish <version>.
+#
+# The gate is the formula at tap main, never the tap run. A run is sender-side
+# evidence twice over: it only exists when the dispatch worked, and it is
+# matched by a human-facing `run-name` whose shape differs per trigger path
+# (`repository_dispatch` renders the v-prefixed tag, `workflow_dispatch` the
+# bare version). Run telemetry is still read, but only to report progress and to
+# fail fast on a red run — it can never stand in for the published artifact.
 wait_for_homebrew_tap_update() {
   local tap_repo="$1"
   local version="$2"
-  local tag="v${version}"
   local max_seconds="${3:-1200}"
+  local tap_formula="${4:-nils-cli}"
+  local tag="v${version}"
   local workflow="${NILS_CLI_TAP_UPDATE_WORKFLOW:-update-nils-cli-formula.yml}"
+  local poll_seconds="${NILS_CLI_TAP_POLL_SECONDS:-15}"
 
   command -v gh >/dev/null 2>&1 || die "gh is required to wait for ${tap_repo} formula update"
 
   local deadline=$((SECONDS + max_seconds))
   local run_id="" status="" conclusion="" url="" title=""
   local failed_run_seen="" failed_run_seen_count=0
+  local published=""
 
   while (( SECONDS < deadline )); do
+    # 1) Receiver-side gate: has the formula itself moved to the target version?
+    published="$(read_tap_formula_version "$tap_repo" "$tap_formula" || true)"
+    if [[ "$published" == "$version" ]]; then
+      note "${tap_repo} Formula/${tap_formula}.rb is published at ${version}"
+      return 0
+    fi
+
+    # 2) Run telemetry: progress reporting and fail-fast only. Matched on the
+    #    bare version so both trigger paths' run-name shapes are recognized.
     local runs_json
     runs_json="$(gh -R "$tap_repo" run list --workflow "$workflow" --limit 30 \
       --json databaseId,status,conclusion,url,displayTitle,event,createdAt 2>/dev/null)" \
-      || { sleep 10; continue; }
+      || { sleep "$poll_seconds"; continue; }
 
     local match
     match="$(
-      python3 - "$tag" "$runs_json" <<'PY'
+      python3 - "$version" "$runs_json" <<'PY'
 from __future__ import annotations
 
 import json
 import sys
 
-tag = sys.argv[1]
+version = sys.argv[1]
 runs = json.loads(sys.argv[2])
 matches = []
 for run in runs:
     title = run.get("displayTitle") or ""
-    if tag in title:
+    if version in title:
         matches.append(run)
 if matches:
     matches.sort(key=lambda run: (run.get("createdAt") or "", run.get("databaseId") or 0), reverse=True)
@@ -553,8 +598,8 @@ PY
     )"
 
     if [[ -z "$match" ]]; then
-      note "waiting for ${tap_repo} ${workflow} run for ${tag}"
-      sleep 15
+      note "waiting for ${tap_repo} to publish ${tap_formula} ${version} (no ${workflow} run for ${tag} yet; formula at ${published:-unknown})"
+      sleep "$poll_seconds"
       continue
     fi
 
@@ -564,12 +609,7 @@ PY
     url="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['url'] or '')" "$match")"
     title="$(python3 -c "import json,sys;print(json.loads(sys.argv[1])['title'] or '')" "$match")"
 
-    if [[ "$status" == "completed" ]]; then
-      if [[ "$conclusion" == "success" ]]; then
-        note "${tap_repo} ${workflow} run ${run_id} completed: ${url}"
-        return 0
-      fi
-
+    if [[ "$status" == "completed" ]] && [[ "$conclusion" != "success" ]]; then
       local failed_key="${run_id}:${conclusion}"
       if [[ "$failed_run_seen" == "$failed_key" ]]; then
         failed_run_seen_count=$((failed_run_seen_count + 1))
@@ -579,21 +619,21 @@ PY
       fi
 
       if (( failed_run_seen_count >= 3 )); then
-        die "${tap_repo} ${workflow} run ${run_id} ended with conclusion='${conclusion}': ${url}"
+        die "${tap_repo} ${workflow} run ${run_id} ended with conclusion='${conclusion}' and Formula/${tap_formula}.rb is still at ${published:-unknown}: ${url}"
       fi
 
       warn "${tap_repo} ${workflow} latest matching run ${run_id} ended with conclusion='${conclusion}'; waiting for a retry run: ${url}"
-      sleep 20
+      sleep "$poll_seconds"
       continue
     fi
 
     failed_run_seen=""
     failed_run_seen_count=0
-    note "waiting for ${tap_repo} ${workflow} run ${run_id} (${status:-pending}, ${title}): ${url}"
-    sleep 20
+    note "waiting for ${tap_repo} ${workflow} run ${run_id} (${status:-pending}, ${title}) to publish ${version}; formula at ${published:-unknown}: ${url}"
+    sleep "$poll_seconds"
   done
 
-  die "timed out after ${max_seconds}s waiting for ${workflow} on ${tap_repo} for ${tag}"
+  die "timed out after ${max_seconds}s waiting for ${tap_repo} to publish ${tap_formula} ${version}; Formula/${tap_formula}.rb at ${tap_repo} default branch is still at ${published:-unknown}"
 }
 
 refresh_local_tap_dir_if_present() {
@@ -1145,7 +1185,7 @@ if [[ "$from_tap" -eq 1 ]]; then
 
   tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
   if [[ "$skip_tap_wait" -eq 0 ]]; then
-    wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}"
+    wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}" "$tap_formula"
   else
     note "--skip-tap-wait set; not waiting for ${tap_repo_slug} formula update"
   fi
@@ -1557,7 +1597,7 @@ wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEAS
 
 tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
 if [[ "$skip_tap_wait" -eq 0 ]]; then
-  wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}"
+  wait_for_homebrew_tap_update "$tap_repo_slug" "$version" "${NILS_CLI_TAP_WAIT_SECONDS:-1200}" "$tap_formula"
 else
   note "--skip-tap-wait set; not waiting for ${tap_repo_slug} formula update"
 fi

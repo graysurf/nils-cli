@@ -238,3 +238,85 @@ jobs:
               return;
             }
             core.info(`Dispatched sympoies/homebrew-tap nils-cli formula update for ${tag}.`);
+
+            // The dispatches endpoint answers 204 whether or not any workflow
+            // starts, so the 204 above proves only that we sent something. A
+            // token GitHub resolves to an Actions identity, for one, is accepted
+            // here and creates no run at all. Confirm a run exists before this
+            // job — the last step of the release — reports success.
+            //
+            // The tap is public, so this job's own token can read its runs; fall
+            // back to the dispatch token if that read is ever refused.
+            const runsUrl =
+              "https://api.github.com/repos/sympoies/homebrew-tap/actions/workflows/" +
+              "update-nils-cli-formula.yml/runs?event=repository_dispatch&per_page=20";
+
+            const listRuns = async () => {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  owner: "sympoies",
+                  repo: "homebrew-tap",
+                  workflow_id: "update-nils-cli-formula.yml",
+                  event: "repository_dispatch",
+                  per_page: 20,
+                });
+                return { runs: data.workflow_runs || [] };
+              } catch (defaultTokenError) {
+                const fallback = await fetch(runsUrl, {
+                  headers: {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": `Bearer ${token}`,
+                    "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                });
+                if (fallback.ok) {
+                  return { runs: (await fallback.json()).workflow_runs || [] };
+                }
+                return {
+                  error:
+                    `default token: ${defaultTokenError.status || defaultTokenError.message}; ` +
+                    `HOMEBREW_TAP_DISPATCH_TOKEN: HTTP ${fallback.status}`,
+                };
+              }
+            };
+
+            // Tolerate clock skew between this runner and the API.
+            const notBefore = Date.now() - 120_000;
+            const deadline = Date.now() + 180_000;
+            let created = null;
+            let readError = null;
+
+            while (Date.now() < deadline) {
+              const { runs, error } = await listRuns();
+              if (error) {
+                readError = error;
+                break;
+              }
+              created = runs.find((run) => Date.parse(run.created_at) >= notBefore);
+              if (created) break;
+              await new Promise((resolve) => setTimeout(resolve, 10_000));
+            }
+
+            if (readError) {
+              core.setFailed(
+                `Dispatched sympoies/homebrew-tap for ${tag} but could not read its workflow runs ` +
+                `(${readError}), so delivery is unproven. Grant the token read access to Actions on ` +
+                `the tap, or verify the formula update by hand before treating this release as done.`,
+              );
+              return;
+            }
+
+            if (!created) {
+              core.setFailed(
+                `Dispatched sympoies/homebrew-tap for ${tag} and got HTTP 204, but no ` +
+                `repository_dispatch run of update-nils-cli-formula.yml appeared within 180s. ` +
+                `The formula was NOT updated. HOMEBREW_TAP_DISPATCH_TOKEN is the thing to check ` +
+                `first: GitHub accepts the dispatch but starts no run when the token resolves to ` +
+                `an Actions identity. Recover with: gh workflow run update-nils-cli-formula.yml ` +
+                `--repo sympoies/homebrew-tap -f version=${version} -f source_repo=${sourceRepo} ` +
+                `-f expected_workflow_sha=<tap main sha>`,
+              );
+              return;
+            }
+
+            core.info(`Confirmed tap run ${created.id} for ${tag}: ${created.html_url}`);
