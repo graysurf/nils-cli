@@ -70,7 +70,7 @@ clap = { version = "4", features = ["derive", "string", "unstable-ext"] }
 # registration stub version-matched to the shipped binary. `clap`'s
 # `unstable-ext` is required for `Arg::add` used to attach dynamic value
 # providers. Both are opt-in per CLI; static `generate()` remains the default.
-clap_complete = { version = "=4.6.7", features = ["unstable-dynamic"] }
+clap_complete = { version = "=4.6.8", features = ["unstable-dynamic"] }
 directories = "6"
 indexmap = { version = "2", features = ["serde"] }
 # Forward-standard datetime library: NEW crates and new date/time code use
