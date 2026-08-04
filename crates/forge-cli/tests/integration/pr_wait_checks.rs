@@ -279,3 +279,75 @@ exit 99
     assert_eq!(env["data"]["state"], "success");
     assert_eq!(env["data"]["required_count"], 1);
 }
+
+const EMPTY_SNAP: &str = "[]";
+
+/// The emitter arm for a head that never registers a check: DATA 65 and its own
+/// kind, not the UNAVAILABLE 69 a genuine timeout gets. The two need different
+/// fixes, so automation must be able to tell them apart.
+#[test]
+fn pr_wait_checks_expires_as_not_registered_when_nothing_is_ever_reported() {
+    let mut stub = StubEnv::new();
+    gh_sequence_stub(&stub, &[EMPTY_SNAP]);
+    let gh_path = stub.tempdir.path().join("gh");
+    stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "wait-checks",
+            "1",
+            "--interval",
+            "10ms",
+            "--timeout",
+            "30ms",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "checks_not_registered");
+    // The snapshot is reported verbatim, so `data.state` is still "success"
+    // while `ok` is false. Consumers must gate on ok / error.kind — this
+    // asserts the combination so any future normalization is deliberate.
+    assert_eq!(env["ok"], false);
+    assert_eq!(env["data"]["state"], "success");
+    assert_eq!(env["data"]["required_count"], 0);
+}
+
+/// The reason-free opt-out on this non-mutating op: a project that configures
+/// no checks terminates immediately instead of burning the whole budget.
+#[test]
+fn pr_wait_checks_allow_no_checks_completes_immediately() {
+    let mut stub = StubEnv::new();
+    gh_sequence_stub(&stub, &[EMPTY_SNAP]);
+    let gh_path = stub.tempdir.path().join("gh");
+    stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "wait-checks",
+            "1",
+            "--interval",
+            "10ms",
+            "--timeout",
+            "30s",
+            "--allow-no-checks",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["required_count"], 0);
+}

@@ -8,7 +8,17 @@
 //! - all required `success` → `SUCCESS 0`
 //! - any required `failure` / `cancelled` / `timed_out` → `RUNTIME 1`,
 //!   `error.kind = "checks_failed"`
-//! - deadline reached → `UNAVAILABLE 69`, `error.kind = "checks_timeout"`
+//! - deadline reached with checks still running → `UNAVAILABLE 69`,
+//!   `error.kind = "checks_timeout"`
+//! - deadline reached with nothing ever reported → `DATA 65`,
+//!   `error.kind = "checks_not_registered"`
+//!
+//! The last case is why an empty snapshot is not terminal. "All required checks
+//! passed" is vacuously true over an empty set, so treating it as terminal
+//! reported success for a head no CI had touched — which is exactly what the
+//! provider returns during its check-registration window after a push or
+//! force-with-lease. Polling through that window is the point of this atom.
+//! `--allow-no-checks` opts a genuinely check-free repository out.
 //!
 //! Polling uses `std::thread::sleep`; the implementation owns the clock
 //! through the [`Clock`] trait so tests can drive deterministic snapshot
@@ -24,6 +34,7 @@ use crate::cli::{BINARY, GlobalFlags, PrChecksArgs, PrWaitChecksArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_checks::{self, PrChecksPayload, SCHEMA, SCHEMA_VERSION};
+use crate::ops::required_check_gate::CheckPresence;
 use crate::provider::{ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 
@@ -104,6 +115,14 @@ pub fn run_with<R: BackendRunner, C: Clock, F: Fn(&str) -> Option<String>>(
             format,
         )),
         WaitOutcome::TimedOut(snapshot) => Ok(emit_timeout(snapshot, format)),
+        WaitOutcome::NotRegistered(snapshot) => Ok(emit_failure(
+            snapshot,
+            "checks_not_registered",
+            "no checks registered for this head within the timeout; \
+             pass --allow-no-checks if this repository genuinely configures none",
+            nils_common::cli_contract::exit::DATA,
+            format,
+        )),
     }
 }
 
@@ -113,6 +132,11 @@ pub enum WaitOutcome {
     Success(PrChecksPayload),
     Failed(PrChecksPayload),
     TimedOut(PrChecksPayload),
+    /// The budget expired with the gating set still empty — no check ever
+    /// registered for this head. Distinct from [`WaitOutcome::TimedOut`],
+    /// where checks existed but had not finished: the two have different
+    /// causes and different fixes, so they must not share an error kind.
+    NotRegistered(PrChecksPayload),
 }
 
 /// Macro-facing entry point: poll until terminal or timeout and return the
@@ -143,13 +167,24 @@ fn poll_until_terminal_or_timeout<R: BackendRunner, C: Clock>(
 ) -> Result<WaitOutcome, ForgeError> {
     let timeout = args.timeout;
     let interval = args.interval;
+    let presence = CheckPresence::from_allow_no_checks(args.allow_no_checks);
     let start = clock.now();
     let deadline = start + timeout;
+
+    // "Never registered" is a property of the whole run, not of the last read.
+    // `pr_checks` normalizes a transient "no checks reported" into an empty
+    // successful snapshot, so classifying from the final poll alone would turn a
+    // run that had been watching real pending checks into `checks_not_registered`
+    // — flipping a retryable UNAVAILABLE 69 into a fatal DATA 65 on exactly the
+    // slow-registration case this exists for.
+    let mut ever_saw_a_check = false;
 
     loop {
         let snapshot = pr_checks::snapshot(runner, global, ctx, snapshot_args)?;
         let snapshot = with_duration(snapshot, ms_between(start, clock.now()));
-        if is_terminal(&snapshot) {
+        ever_saw_a_check =
+            ever_saw_a_check || !crate::ops::required_check_gate::nothing_was_checked(&snapshot);
+        if is_terminal(&snapshot, presence) {
             if snapshot.state == "success" {
                 return Ok(WaitOutcome::Success(snapshot));
             }
@@ -157,8 +192,13 @@ fn poll_until_terminal_or_timeout<R: BackendRunner, C: Clock>(
         }
         let now = clock.now();
         if now >= deadline {
-            let timed_out = with_duration(snapshot, ms_between(start, now));
-            return Ok(WaitOutcome::TimedOut(timed_out));
+            let expired = with_duration(snapshot, ms_between(start, now));
+            // Report *why* the budget expired. Nothing ever registered is a
+            // different problem, with a different fix, from checks that ran long.
+            if !ever_saw_a_check {
+                return Ok(WaitOutcome::NotRegistered(expired));
+            }
+            return Ok(WaitOutcome::TimedOut(expired));
         }
         let remaining = deadline.saturating_duration_since(now);
         let sleep_for = std::cmp::min(interval, remaining);
@@ -178,8 +218,22 @@ fn with_duration(mut snapshot: PrChecksPayload, duration_ms: u64) -> PrChecksPay
     snapshot
 }
 
-fn is_terminal(snapshot: &PrChecksPayload) -> bool {
-    // Terminal iff no entries are pending in the gating set.
+/// Terminal iff nothing in the gating set is still pending **and** the gating
+/// set exists at all.
+///
+/// An empty set is not a terminal pass. `gh pr checks --required` reports "no
+/// required checks reported" during the provider's check-registration window
+/// after a push or force-with-lease, which [`pr_checks`] normalizes to an empty
+/// successful snapshot; polling through that window is the entire point of this
+/// atom, so it keeps waiting instead of declaring the head green. A repository
+/// that configures no checks passes [`CheckPresence::Optional`] so the loop
+/// still terminates immediately.
+fn is_terminal(snapshot: &PrChecksPayload, presence: CheckPresence) -> bool {
+    if presence == CheckPresence::Required
+        && crate::ops::required_check_gate::nothing_was_checked(snapshot)
+    {
+        return false;
+    }
     snapshot.pending.is_empty()
 }
 
@@ -335,6 +389,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             interval: Duration::from_millis(1),
             required_only: true,
+            allow_no_checks: false,
         }
     }
 
@@ -381,12 +436,21 @@ mod tests {
         }
     }
 
+    /// A required-only snapshot costs *two* backend calls — the general check
+    /// list and the `--required` list that names which of them gate — so a stub
+    /// must answer both. Queueing one output leaves the required list empty,
+    /// which used to read as a vacuous "success" and is now correctly rejected
+    /// as an unregistered head.
+    const ONE_REQUIRED_PASS: &str =
+        r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true}]"#;
+
     #[test]
     fn succeeds_when_first_snapshot_is_terminal_success() {
         let runner = StubRunner {
             outputs: RefCell::new(vec![
-                r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true}]"#
-                    .into(),
+                ONE_REQUIRED_PASS.into(),
+                // the `--required` list, naming `build` as gating
+                ONE_REQUIRED_PASS.into(),
             ]),
         };
         let clock = StepClock::new();
@@ -401,17 +465,31 @@ mod tests {
         };
         let snapshot = pr_checks::snapshot(&runner, &global, &ctx, &snapshot_args).unwrap();
         assert_eq!(snapshot.state, "success");
+        // Without this the test passes on a single-output stub, where the
+        // `--required` list comes back empty, `build` is never marked required,
+        // and "terminal success" is true only over an empty gating set. Assert
+        // the gating set is real so the doubled fixture is load-bearing.
+        assert_eq!(
+            snapshot.required_count, 1,
+            "the fixture must produce a real gating set, not a vacuous one"
+        );
+        assert_eq!(snapshot.success_count, 1);
         let snapshot = with_duration(snapshot, ms_between(clock.now(), clock.now()));
-        assert!(is_terminal(&snapshot));
+        assert!(is_terminal(&snapshot, CheckPresence::Required));
     }
 
     #[test]
     fn pending_then_success_succeeds_on_second_poll() {
+        const ONE_REQUIRED_PENDING: &str =
+            r#"[{"name":"build","bucket":"pending","isRequired":true}]"#;
         let runner = StubRunner {
             outputs: RefCell::new(vec![
-                r#"[{"name":"build","bucket":"pending","isRequired":true}]"#.into(),
-                r#"[{"name":"build","bucket":"pass","conclusion":"success","isRequired":true}]"#
-                    .into(),
+                // poll 1: general list, then the `--required` list
+                ONE_REQUIRED_PENDING.into(),
+                ONE_REQUIRED_PENDING.into(),
+                // poll 2: the same check, now passing
+                ONE_REQUIRED_PASS.into(),
+                ONE_REQUIRED_PASS.into(),
             ]),
         };
         let ctx = make_ctx(Provider::GitHub);
@@ -422,10 +500,159 @@ mod tests {
         };
         let s1 = pr_checks::snapshot(&runner, &global, &ctx, &args).unwrap();
         assert_eq!(s1.state, "pending");
-        assert!(!is_terminal(&s1));
+        assert!(!is_terminal(&s1, CheckPresence::Required));
         let s2 = pr_checks::snapshot(&runner, &global, &ctx, &args).unwrap();
         assert_eq!(s2.state, "success");
-        assert!(is_terminal(&s2));
+        assert!(is_terminal(&s2, CheckPresence::Required));
+    }
+
+    /// An empty gating set is the provider saying "I have not registered any
+    /// checks for this head yet", which is the opposite of "they all passed".
+    /// Treating it as terminal is what let delivery report success against a
+    /// head no CI had touched.
+    #[test]
+    fn an_empty_gating_set_is_not_terminal() {
+        let runner = StubRunner {
+            outputs: RefCell::new(vec!["[]".into()]),
+        };
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = PrChecksArgs {
+            id: "1".into(),
+            required_only: true,
+        };
+        let snapshot = pr_checks::snapshot(&runner, &global, &ctx, &args).unwrap();
+        // The read surface still reports "nothing is failing" — that stays true.
+        assert_eq!(snapshot.state, "success");
+        assert_eq!(snapshot.required_count, 0);
+        // The wait loop must not accept it as a terminal pass.
+        assert!(
+            !is_terminal(&snapshot, CheckPresence::Required),
+            "an unregistered head must keep the poll loop running"
+        );
+    }
+
+    /// A repository that genuinely has no checks must still terminate, or
+    /// `pr wait-checks` would hang for its whole timeout on every invocation.
+    #[test]
+    fn an_empty_gating_set_is_terminal_when_no_checks_are_allowed() {
+        let runner = StubRunner {
+            outputs: RefCell::new(vec!["[]".into()]),
+        };
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = PrChecksArgs {
+            id: "1".into(),
+            required_only: true,
+        };
+        let snapshot = pr_checks::snapshot(&runner, &global, &ctx, &args).unwrap();
+        assert!(is_terminal(&snapshot, CheckPresence::Optional));
+    }
+
+    /// Checks that never register must expire as `checks_not_registered`, not
+    /// as `checks_timeout`: the two need different fixes, and "waited and
+    /// nothing ever appeared" is the actionable one.
+    #[test]
+    fn checks_that_never_register_time_out_as_not_registered() {
+        let runner = StubRunner {
+            outputs: RefCell::new(vec!["[]".into(), "[]".into(), "[]".into()]),
+        };
+        let clock = StepClock::new();
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = PrWaitChecksArgs {
+            timeout: Duration::from_millis(3),
+            interval: Duration::from_millis(1),
+            ..make_args("1")
+        };
+        let snapshot_args = PrChecksArgs {
+            id: args.id.clone(),
+            required_only: args.required_only,
+        };
+        let outcome =
+            poll_until_terminal_or_timeout(&runner, &clock, &global, &ctx, &args, &snapshot_args)
+                .expect("poll must not error");
+        assert!(
+            matches!(outcome, WaitOutcome::NotRegistered(_)),
+            "an always-empty snapshot must expire as not-registered"
+        );
+    }
+
+    /// "Never registered" is a property of the run, not of the last poll.
+    ///
+    /// `pr_checks` normalizes a transient "no checks reported" into an empty
+    /// successful snapshot, so a run that watched real pending checks and then
+    /// hit one empty read at the deadline must still expire as `checks_timeout`
+    /// (UNAVAILABLE 69, retryable) — not as `checks_not_registered` (DATA 65,
+    /// fatal). Classifying from the final snapshot alone flips exactly the
+    /// slow-registration case this feature exists for onto the wrong side of
+    /// the retry boundary.
+    #[test]
+    fn a_transient_empty_read_at_the_deadline_is_still_a_timeout() {
+        const ONE_REQUIRED_PENDING: &str =
+            r#"[{"name":"build","bucket":"pending","isRequired":true}]"#;
+        let runner = StubRunner {
+            outputs: RefCell::new(vec![
+                // poll 1: a real pending required check
+                ONE_REQUIRED_PENDING.into(),
+                ONE_REQUIRED_PENDING.into(),
+                // poll 2, at the deadline: a transient empty read
+                "[]".into(),
+                "[]".into(),
+            ]),
+        };
+        let clock = StepClock::new();
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = PrWaitChecksArgs {
+            timeout: Duration::from_millis(2),
+            interval: Duration::from_millis(2),
+            ..make_args("1")
+        };
+        let snapshot_args = PrChecksArgs {
+            id: args.id.clone(),
+            required_only: args.required_only,
+        };
+
+        let outcome =
+            poll_until_terminal_or_timeout(&runner, &clock, &global, &ctx, &args, &snapshot_args)
+                .expect("poll must not error");
+
+        assert!(
+            matches!(outcome, WaitOutcome::TimedOut(_)),
+            "a run that saw checks must expire as a timeout, not as not-registered"
+        );
+    }
+
+    /// The registration window is the real scenario: nothing at first, then the
+    /// provider registers the checks and they pass.
+    #[test]
+    fn checks_registering_late_still_succeed() {
+        let runner = StubRunner {
+            outputs: RefCell::new(vec![
+                // poll 1: the registration window — nothing reported yet
+                "[]".into(),
+                "[]".into(),
+                // poll 2: the checks have registered and passed
+                ONE_REQUIRED_PASS.into(),
+                ONE_REQUIRED_PASS.into(),
+            ]),
+        };
+        let clock = StepClock::new();
+        let ctx = make_ctx(Provider::GitHub);
+        let global = make_global();
+        let args = make_args("1");
+        let snapshot_args = PrChecksArgs {
+            id: args.id.clone(),
+            required_only: args.required_only,
+        };
+        let outcome =
+            poll_until_terminal_or_timeout(&runner, &clock, &global, &ctx, &args, &snapshot_args)
+                .expect("poll must not error");
+        match outcome {
+            WaitOutcome::Success(snapshot) => assert_eq!(snapshot.required_count, 1),
+            _ => panic!("late registration must still reach success"),
+        }
     }
 
     #[test]
@@ -454,7 +681,7 @@ mod tests {
             duration_ms: Some(123),
             warnings: Vec::new(),
         };
-        assert!(is_terminal(&snapshot));
+        assert!(is_terminal(&snapshot, CheckPresence::Required));
         let code = emit_failure(
             snapshot,
             "checks_failed",

@@ -9,6 +9,7 @@
 //! | 6 — default_branch_protected        | PR base ≠ repo default branch, `--allow-non-default-base=0` | `default_branch_protected`| DATA 65    |
 //! | 7 — draft_merge_refused             | `pr view` returns `draft=true`                              | `draft_merge_refused`     | DATA 65    |
 //! | 8 — required_checks_green (TTL=0)   | fresh `pr.checks --required-only` not all green             | `checks_pending`/`failed` | DATA / RT  |
+//! | 8 — checks_registered (TTL=0)       | no required checks *and* no visible rows, `--allow-no-checks=0` | `checks_not_registered` | DATA 65 |
 //! | 9 — merge_method_supported          | resolved method not in `repo.view.merge_methods_allowed`    | `merge_method_unsupported`| DATA 65    |
 //! | 10 — keep_branch_conflict           | `--keep-branch` set while `[merge].delete_branch=true`      | `keep_branch_conflict`    | DATA 65    |
 //! | 12 — review_convergence             | enabled native-review policy has not converged              | review-specific kind       | DATA / UNAV |
@@ -40,7 +41,7 @@ use crate::ops::pr_tasks;
 use crate::ops::pr_view;
 use crate::ops::pr_wait_checks::{Clock, SystemClock};
 use crate::ops::repo_view::{self, RepoViewPayload};
-use crate::ops::required_check_gate::ensure_required_checks_green;
+use crate::ops::required_check_gate::{CheckPresence, ensure_required_checks_green};
 use crate::ops::review_convergence::{self, ReviewConvergenceSnapshot};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
@@ -68,6 +69,11 @@ pub struct PrMergePayload {
     /// gate (rule 13) was explicitly bypassed; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unresolved_threads_override_reason: Option<String>,
+    /// Recorded `--allow-no-checks-reason` when the head merged with no
+    /// required checks registered (rule 8); absent otherwise. This is the only
+    /// durable record that a merge happened without CI evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_checks_override_reason: Option<String>,
     /// Outdated unresolved review threads mechanically dispositioned `stale`
     /// at rule 13 (the anchored diff hunk changed) so they no longer block;
     /// recorded for auditability. Empty/absent when none were dispositioned.
@@ -361,8 +367,15 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
     // Rule 9 — method must be in the repo's allowed list.
     enforce_method_supported(settings.method, &repo)?;
 
-    // Rule 8 — TTL-zero required-check re-check.
-    ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
+    // Rule 8 — TTL-zero required-check re-check. An empty gating set fails
+    // closed here: absence of checks is not evidence the head passed any.
+    ensure_required_checks_green(
+        runner,
+        global,
+        ctx,
+        &args.id.to_string(),
+        CheckPresence::from_allow_no_checks(args.allow_no_checks),
+    )?;
 
     // Durable review-loop gate. Existing ledgers are never bypassed by the
     // independent quiet-convergence flag. Enforced convergence additionally
@@ -496,6 +509,11 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
         },
         unresolved_threads_override_reason: if args.allow_unresolved_threads {
             args.allow_unresolved_threads_reason.clone()
+        } else {
+            None
+        },
+        no_checks_override_reason: if args.allow_no_checks {
+            args.allow_no_checks_reason.clone()
         } else {
             None
         },

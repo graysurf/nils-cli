@@ -802,6 +802,7 @@ _arguments "${_arguments_options[@]}" : \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
 '--allow-unresolved-threads-reason=[Required when \`--allow-unresolved-threads\` is set. Non-empty free-form text describing why the unresolved threads are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--review-convergence=[Override \`\[review_convergence\].require\`. Passing the flag without a value enables it; use \`--review-convergence=false\` to disable a repo or user-global opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
+'--allow-no-checks-reason=[Required when \`--allow-no-checks\` is set. Non-empty free-form text describing why merging an unchecked head is safe — normally that the repository configures no checks at all; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -813,6 +814,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--keep-branch[Skip the post-merge branch deletion (\`--delete-branch\` on gh, \`--remove-source-branch\` on glab). Mutually exclusive with the implicit-true default; flagging both is \`keep_branch_conflict\`]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
 '--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any non-outdated unresolved thread (bot or human) triggers \`unresolved_review_threads\`. Requires \`--allow-unresolved-threads-reason\`]' \
+'--allow-no-checks[Merge a head for which no required checks are registered. Without this flag an empty required-check snapshot triggers \`checks_not_registered\`, because "all required checks passed" is vacuously true over an empty set and so proves nothing about the head. Requires \`--allow-no-checks-reason\`]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\`. Requires \`--allow-unchecked-tasks-reason\`]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -863,6 +865,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
 '--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--allow-no-checks[Treat a head with no registered checks as complete instead of waiting out the timeout. Without it, an empty check set is not terminal and the wait expires as \`checks_not_registered\`]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -886,6 +889,7 @@ _arguments "${_arguments_options[@]}" : \
 '--allow-unresolved-threads-reason=[Required when \`--allow-unresolved-threads\` is set. Non-empty free-form text describing why the unresolved threads are safe to merge past; the reason is recorded in the merge-step payload]:TEXT:_default' \
 '--review-convergence=[Override \`\[review_convergence\].require\` for the merge phase. Passing the flag without a value enables it; \`--review-convergence=false\` disables a configured opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge-step payload]:TEXT:_default' \
+'--allow-no-checks-reason=[Required when \`--allow-no-checks\` is set. Non-empty free-form text describing why delivering an unchecked head is safe; the reason is recorded in the merge-step payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -899,6 +903,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
 '--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any non-outdated unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step. Requires \`--allow-unresolved-threads-reason\`]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\` at the merge step. Requires \`--allow-unchecked-tasks-reason\`]' \
+'--allow-no-checks[Deliver a head for which no checks are registered. Without this flag, delivery waits out its \`--timeout\` for checks to appear and then fails with \`checks_not_registered\` rather than treating an empty check set as a pass. Requires \`--allow-no-checks-reason\`]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \

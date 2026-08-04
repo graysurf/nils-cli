@@ -361,6 +361,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         timeout: args.timeout,
         interval: std::time::Duration::from_secs(20),
         required_only: true,
+        allow_no_checks: args.allow_no_checks,
     };
     let wait_outcome = match pr_wait_checks::compute(runner, clock, global, ctx, &wait_args) {
         Ok(WaitOutcome::Success(snapshot))
@@ -370,8 +371,12 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             // checks. Delivery must still converge those visible checks before
             // it can ready or merge the PR. Keep the explicit wait-checks atom's
             // required-only semantics unchanged and apply this fallback only to
-            // the delivery macro. A genuinely empty check set still completes
-            // from the required-only snapshot above without a second poll.
+            // the delivery macro.
+            //
+            // A *fully* empty check set no longer arrives here as a success:
+            // `poll_until_terminal_or_timeout` treats an empty gating set as
+            // non-terminal and expires it as `NotRegistered`, so the case this
+            // branch used to hand through silently is now gated upstream.
             let visible_snapshot =
                 pr_checks::aggregate(ctx, snapshot.checks.clone(), false, snapshot.duration_ms);
             if visible_snapshot.pending.is_empty() {
@@ -415,6 +420,29 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 schema_version_for(BINARY, "pr.checks", 1),
                 "checks_failed",
                 "delivery checks did not reach success",
+                None,
+            );
+            steps.push(Step {
+                step: "wait_checks",
+                ok: false,
+                schema_version: schema_version_for(BINARY, "pr.checks", 1),
+                payload: to_value(&snapshot),
+            });
+            return Ok(emit_chain_failure(
+                steps,
+                args,
+                ctx,
+                Some((pr_number, pr_url)),
+                &err,
+                format,
+            ));
+        }
+        Ok(WaitOutcome::NotRegistered(snapshot)) => {
+            let err = ForgeError::validation(
+                schema_version_for(BINARY, "pr.checks", 1),
+                "checks_not_registered",
+                "no checks registered for the delivered head within the timeout; \
+                 pass --allow-no-checks if this repository genuinely configures none",
                 None,
             );
             steps.push(Step {
@@ -598,6 +626,8 @@ fn build_merge_args(
         review_convergence: args.review_convergence,
         allow_unchecked_tasks: args.allow_unchecked_tasks,
         allow_unchecked_tasks_reason: args.allow_unchecked_tasks_reason.clone(),
+        allow_no_checks: args.allow_no_checks,
+        allow_no_checks_reason: args.allow_no_checks_reason.clone(),
     }
 }
 
@@ -618,6 +648,9 @@ fn add_duration_prefix(outcome: WaitOutcome, prefix: std::time::Duration) -> Wai
             WaitOutcome::Success(with_total_duration(snapshot, prefix))
         }
         WaitOutcome::Failed(snapshot) => WaitOutcome::Failed(with_total_duration(snapshot, prefix)),
+        WaitOutcome::NotRegistered(snapshot) => {
+            WaitOutcome::NotRegistered(with_total_duration(snapshot, prefix))
+        }
         WaitOutcome::TimedOut(snapshot) => {
             WaitOutcome::TimedOut(with_total_duration(snapshot, prefix))
         }
@@ -1181,6 +1214,8 @@ mod tests {
             review_convergence: None,
             allow_unchecked_tasks: false,
             allow_unchecked_tasks_reason: None,
+            allow_no_checks: false,
+            allow_no_checks_reason: None,
         }
     }
 

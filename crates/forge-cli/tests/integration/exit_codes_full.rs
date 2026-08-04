@@ -84,6 +84,7 @@ const LOCKDOWN_DATA_KINDS: &[&str] = &[
     "default_branch_protected",
     "draft_merge_refused",
     "checks_pending",
+    "checks_not_registered",
     "merge_method_unsupported",
     "keep_branch_conflict",
     "local_path_present",

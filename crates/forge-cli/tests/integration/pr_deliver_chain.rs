@@ -489,6 +489,46 @@ fn run_zero_required_delivery(
     (stub, output)
 }
 
+/// Same delivery, declaring up front that this repository configures no checks.
+fn run_zero_required_delivery_allowing_no_checks(
+    stub: StubEnv,
+    repo_path: &Path,
+    all_checks: &str,
+    timeout: &str,
+) -> (StubEnv, CmdOutput) {
+    let gh_path = write_zero_required_checks_stub(&stub, all_checks);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let output = run_in_repo(
+        &stub,
+        repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: wait for visible checks",
+            "--body",
+            "## Summary\n\nWait for visible checks.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            timeout,
+            "--allow-no-checks",
+            "--allow-no-checks-reason",
+            "this fixture repository configures no checks at all",
+            "--no-merge",
+        ],
+    );
+    (stub, output)
+}
+
 fn assert_no_all_check_call_after_required(calls: &str) {
     let required_index = calls
         .lines()
@@ -1261,15 +1301,41 @@ fn pr_deliver_zero_required_failed_visible_check_blocks_merge() {
     );
 }
 
+/// Contract change: this used to complete immediately with exit 0.
+///
+/// Zero required checks *and* zero visible rows means the provider reported
+/// nothing at all for this head, which is indistinguishable from a repository
+/// that configures no checks — and identical to the check-registration window
+/// after a force-with-lease, where delivery previously reported success against
+/// a head no CI had touched. The default now waits out the budget and fails
+/// closed; a repository that genuinely has no checks says so explicitly.
 #[test]
-fn pr_deliver_zero_required_and_zero_visible_checks_complete_immediately() {
+fn pr_deliver_zero_required_and_zero_visible_checks_are_refused() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let (_stub, out) =
+        run_zero_required_delivery(stub, &repo_path, FIXTURE_EMPTY_CHECKS_JSON, "0s", true);
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "checks_not_registered");
+}
+
+#[test]
+fn pr_deliver_zero_required_and_zero_visible_checks_complete_when_explicitly_allowed() {
     let tempdir = make_git_repo();
     let repo_path = tempdir.path().join("repo");
 
     let stub = StubEnv::new();
     let checks_calls = stub.tempdir.path().join("checks-calls");
-    let (_stub, out) =
-        run_zero_required_delivery(stub, &repo_path, FIXTURE_EMPTY_CHECKS_JSON, "5s", true);
+    let (_stub, out) = run_zero_required_delivery_allowing_no_checks(
+        stub,
+        &repo_path,
+        FIXTURE_EMPTY_CHECKS_JSON,
+        "5s",
+    );
 
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let calls = fs::read_to_string(checks_calls).expect("checks call log");
@@ -1587,6 +1653,8 @@ fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
         review_convergence: None,
         allow_unchecked_tasks: false,
         allow_unchecked_tasks_reason: None,
+        allow_no_checks: false,
+        allow_no_checks_reason: None,
     }
 }
 
