@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::contract::{
     effective_mode_for_product, matcher_expression_matches, runtime_handler_filename,
 };
+use crate::degradation::StopCoordinationOutcome;
 use crate::error::HookError;
 use crate::liveness;
 use crate::model::{
@@ -49,6 +50,20 @@ struct RuleOutcome {
     context: Option<String>,
     replacement: Option<Value>,
     provider_output: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoordinationHandlerStatus {
+    NotRun,
+    Clean,
+    Pending,
+    Unavailable,
+}
+
+#[derive(Debug)]
+struct CoordinationHandlerOutcome {
+    outcome: RuleOutcome,
+    status: CoordinationHandlerStatus,
 }
 
 #[derive(Debug)]
@@ -626,10 +641,10 @@ pub(crate) fn terminal_activity_failure_decision(
 
 /// Degrade an unavailable coordination transaction on the terminal Stop lane.
 ///
-/// This is a liveness boundary, not a release: nothing about the claim, lease,
-/// operation, broker, worktree, or session state changes, so the retained
-/// uncertainty stays visible for typed external reconciliation after the provider
-/// runner exits.
+/// This is a liveness boundary, not a release. Because the transaction did not
+/// return an observed state, the diagnostic must not claim a retained operation
+/// or an effective mutation gate. It names the read-only status lane and leaves
+/// all coordination state untouched.
 fn terminal_coordination_failure_outcome(
     request: &NormalizedRequest,
     raw: &[u8],
@@ -643,18 +658,18 @@ fn terminal_coordination_failure_outcome(
         crate::observe::Severity::Warn,
     )
     .provider(request.product, &request.event)
-    .disposition("reconciliation-pending")
+    .disposition("warn")
     .correlate(request.product, raw)
-    .recovery(crate::observe::RECOVERY_BROKER_RECONCILE)
+    .recovery(crate::observe::RECOVERY_BROKER_STATUS)
     .emit();
     Some(RuleOutcome {
         action: DecisionAction::Warn,
         code: crate::degradation::STOP_RECONCILIATION_REQUIRED.to_string(),
         context: Some(format!(
             "agent-hook terminal degradation: the session coordination transaction is \
-             unavailable, so the turn may end with reconciliation pending. The claim and any \
-             active operation are retained and mutation stays gated. Next: {}.",
-            crate::observe::RECOVERY_BROKER_RECONCILE
+             unavailable, so the turn may end without inferring a retained claim, active \
+             operation, or mutation gate. Coordination state is unchanged. Next: {}.",
+            crate::observe::RECOVERY_BROKER_STATUS
         )),
         replacement: None,
         provider_output: None,
@@ -670,10 +685,20 @@ pub fn apply_session_coordination(
     execution: CoordinationExecution,
 ) -> Result<NormalizedDecision, HookError> {
     let Some(rule) = rule else {
-        return Ok(decision);
+        return Ok(crate::degradation::apply_stop_reentry(
+            request,
+            raw,
+            decision,
+            StopCoordinationOutcome::NotRun,
+        ));
     };
     if execution.unmanaged {
-        return Ok(decision);
+        return Ok(crate::degradation::apply_stop_reentry(
+            request,
+            raw,
+            decision,
+            StopCoordinationOutcome::NotRun,
+        ));
     }
     let typed_bootstrap_may_supersede_owner =
         exact_bootstrap_candidate_for_session_coordination(request, raw, true)
@@ -685,34 +710,61 @@ pub fn apply_session_coordination(
         )
         && !typed_bootstrap_may_supersede_owner
     {
-        return Ok(decision);
+        return Ok(crate::degradation::apply_stop_reentry(
+            request,
+            raw,
+            decision,
+            StopCoordinationOutcome::NotRun,
+        ));
     }
     let Capability::SessionCoordination { reason_code } = &rule.capability else {
         unreachable!("prepared coordination rule has the typed capability")
     };
-    let outcome = match run_session_coordination(request.product, raw) {
-        Ok(mut outcome) => {
-            if outcome.code == SESSION_COORDINATION_HANDLER {
-                outcome.code.clone_from(reason_code);
+    let (outcome, coordination_outcome) = match run_session_coordination(request.product, raw) {
+        Ok(mut handler) => {
+            if handler.outcome.code == SESSION_COORDINATION_HANDLER {
+                handler.outcome.code.clone_from(reason_code);
             }
-            outcome
+            let status = match handler.status {
+                CoordinationHandlerStatus::NotRun => StopCoordinationOutcome::NotRun,
+                CoordinationHandlerStatus::Clean => StopCoordinationOutcome::Clean {
+                    mode: execution.mode,
+                },
+                CoordinationHandlerStatus::Pending => StopCoordinationOutcome::Pending {
+                    mode: execution.mode,
+                },
+                CoordinationHandlerStatus::Unavailable => StopCoordinationOutcome::Unavailable {
+                    mode: execution.mode,
+                },
+            };
+            (handler.outcome, status)
         }
-        Err(error) if error.code == "capability-timeout" => coordination_timeout_outcome(
-            loaded,
-            request,
-            rule,
-            execution.mode,
-            execution.operation_effect,
-            raw,
+        Err(error) if error.code == "capability-timeout" => (
+            coordination_timeout_outcome(
+                loaded,
+                request,
+                rule,
+                execution.mode,
+                execution.operation_effect,
+                raw,
+            ),
+            StopCoordinationOutcome::Unavailable {
+                mode: execution.mode,
+            },
         ),
         // The activity capability already degrades a failed terminal observation
         // rather than denying provider termination. The coordination transaction
         // needed the same terminal boundary: without it the very first Stop
         // delivery deadlocks, before provider re-entry metadata can help.
-        Err(_) => match terminal_coordination_failure_outcome(request, raw) {
-            Some(outcome) => outcome,
-            None => failure_outcome(rule.failure_posture, &rule.id),
-        },
+        Err(_) => (
+            match terminal_coordination_failure_outcome(request, raw) {
+                Some(outcome) => outcome,
+                None => failure_outcome(rule.failure_posture, &rule.id),
+            },
+            StopCoordinationOutcome::Unavailable {
+                mode: execution.mode,
+            },
+        ),
     };
     if typed_bootstrap_may_supersede_owner
         && outcome.action == DecisionAction::Allow
@@ -721,7 +773,12 @@ pub fn apply_session_coordination(
         supersede_owner_active_foreign(loaded, &mut decision);
     }
     merge_coordination_outcome(&mut decision, &rule.id, outcome)?;
-    Ok(decision)
+    Ok(crate::degradation::apply_stop_reentry(
+        request,
+        raw,
+        decision,
+        coordination_outcome,
+    ))
 }
 
 fn owner_active_foreign_is_only_block(
@@ -1212,7 +1269,10 @@ fn run_runtime_handler(
     handler_outcome(handler_id, &output.stdout)
 }
 
-fn run_session_coordination(product: Product, raw: &[u8]) -> Result<RuleOutcome, HookError> {
+fn run_session_coordination(
+    product: Product,
+    raw: &[u8],
+) -> Result<CoordinationHandlerOutcome, HookError> {
     let path = runtime_hook_root(product)?.join(SESSION_COORDINATION_HANDLER);
     validate_handler(&path)?;
     let mut command = Command::new(&path);
@@ -1250,18 +1310,77 @@ struct TypedBootstrapAuthorization {
     authorization: String,
 }
 
-fn session_coordination_outcome(stdout: &[u8]) -> Result<RuleOutcome, HookError> {
+const SESSION_COORDINATION_RESULT_SCHEMA: &str = "runtime-kit.session-coordination-result.v1";
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum TypedCoordinationStatus {
+    NotRun,
+    Clean,
+    Pending,
+    Unavailable,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedSessionCoordinationResult {
+    schema_version: String,
+    status: TypedCoordinationStatus,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "decision")]
+    _legacy_decision: Option<String>,
+    #[serde(default, rename = "reason")]
+    _legacy_reason: Option<String>,
+}
+
+fn session_coordination_outcome(stdout: &[u8]) -> Result<CoordinationHandlerOutcome, HookError> {
     if let Ok(value) = crate::strict_json::from_slice(stdout)
         && let Ok(authorization) = serde_json::from_value::<TypedBootstrapAuthorization>(value)
         && authorization.schema_version == TYPED_BOOTSTRAP_AUTHORIZATION_SCHEMA
         && authorization.authorization == TYPED_BOOTSTRAP_AUTHORIZATION_CODE
     {
-        return Ok(simple(
-            DecisionAction::Allow,
-            TYPED_BOOTSTRAP_AUTHORIZATION_CODE,
-        ));
+        return Ok(CoordinationHandlerOutcome {
+            outcome: simple(DecisionAction::Allow, TYPED_BOOTSTRAP_AUTHORIZATION_CODE),
+            status: CoordinationHandlerStatus::Clean,
+        });
     }
-    handler_outcome(SESSION_COORDINATION_HANDLER, stdout)
+    if let Ok(value) = crate::strict_json::from_slice(stdout)
+        && let Ok(result) = serde_json::from_value::<TypedSessionCoordinationResult>(value)
+        && result.schema_version == SESSION_COORDINATION_RESULT_SCHEMA
+    {
+        let (action, status) = match result.status {
+            TypedCoordinationStatus::NotRun => {
+                (DecisionAction::Allow, CoordinationHandlerStatus::NotRun)
+            }
+            TypedCoordinationStatus::Clean => {
+                (DecisionAction::Allow, CoordinationHandlerStatus::Clean)
+            }
+            TypedCoordinationStatus::Pending => {
+                (DecisionAction::Block, CoordinationHandlerStatus::Pending)
+            }
+            TypedCoordinationStatus::Unavailable => {
+                (DecisionAction::Warn, CoordinationHandlerStatus::Unavailable)
+            }
+        };
+        return Ok(CoordinationHandlerOutcome {
+            outcome: RuleOutcome {
+                action,
+                code: SESSION_COORDINATION_HANDLER.to_string(),
+                context: result.message,
+                replacement: None,
+                provider_output: None,
+            },
+            status,
+        });
+    }
+    Ok(CoordinationHandlerOutcome {
+        outcome: handler_outcome(SESSION_COORDINATION_HANDLER, stdout)?,
+        // Untyped provider payloads do not attest coordination state. They keep
+        // their ordinary admission action, but re-entry diagnostics must not
+        // reinterpret that action as clean or pending broker truth.
+        status: CoordinationHandlerStatus::Unavailable,
+    })
 }
 
 fn handler_outcome(handler_id: &str, stdout: &[u8]) -> Result<RuleOutcome, HookError> {

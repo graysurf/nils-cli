@@ -380,17 +380,34 @@ Degrading the conversation lane acquires no new authority: the prompt is admitte
 as text, every mutation stays gated, and the original prompt is neither lost nor
 executed more than once because the turn correlation digest bounds replay.
 
-The terminal lane has two degradations. A coordination transaction that cannot
-run at all returns `coordination-stop-reconciliation-required`, mirroring the
-existing `activity-stop-reconciliation-required` boundary — without it the first
-Stop delivery deadlocks before provider re-entry metadata can help. Separately,
-when the provider reports Stop re-entry and the aggregate still blocks, the
-decision becomes a warning with `stop-reentry-reconciliation-pending`: re-entry
-proves the previous block changed nothing the gate awaits, so blocking again only
-consumes the provider's consecutive-block budget. Neither degradation releases or
-alters claims, leases, operations, brokers, worktrees, or session state; every
-original reason is retained on the decision and the evidence is durable, so
-mutation stays gated until an external reconciliation runs.
+The terminal lane has two degradation boundaries. A coordination transaction
+that cannot run at all returns the compatibility classification
+`coordination-stop-reconciliation-required`, but its diagnostic makes no
+retained-state or gate claim and routes to read-only `agent-session broker
+status`; without a warning boundary the first Stop delivery deadlocks before
+provider re-entry metadata can help. Separately, when the provider reports Stop
+re-entry and the aggregate still blocks, the decision becomes a warning:
+re-entry proves the previous block changed nothing the gate awaits, so blocking
+again only consumes the provider's consecutive-block budget.
+
+Stop re-entry carries the typed coordination result into the terminal renderer;
+the runtime handler supplies `runtime-kit.session-coordination-result.v1` with
+one of `not-run`, `clean`, `pending`, or `unavailable`. Untyped provider payloads
+are treated as unavailable, never as broker-state proof. The renderer does not
+infer transaction state from generic provider actions or normalized reason
+strings:
+
+| Coordination result | Stable re-entry code | Disposition and recovery |
+| --- | --- | --- |
+| transaction explicitly reports a pending operation | `stop-reentry-reconciliation-pending` | `reconciliation-pending`; prescribe `agent-session broker reconcile` |
+| transaction reports clean | `stop-reentry-terminal-exit` | `terminal-exit`; no recovery mutation |
+| transaction did not run | `stop-reentry-terminal-exit` | `terminal-exit`; no coordination-state or gate claim |
+| transaction result unavailable | `stop-reentry-terminal-exit` | `terminal-exit`; read-only `agent-session broker status`, with no retained-state or gate claim |
+
+Every original reason is retained and no degradation releases or alters claims,
+leases, operations, brokers, worktrees, or session state. A gate assertion is
+made only for a reported pending operation in effective enforce mode; advisory,
+off, skipped, and unavailable outcomes do not manufacture one.
 
 ## Release compatibility
 

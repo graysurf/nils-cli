@@ -397,7 +397,6 @@ fn run_dispatch(
                     );
                 }
             };
-            let decision = degradation::apply_stop_reentry(&request, &raw, decision);
             return complete_dispatch(args.format, started, &request, &decision);
         }
         Err(error) => {
@@ -486,7 +485,6 @@ fn run_dispatch(
             );
         }
     };
-    let decision = degradation::apply_stop_reentry(&request, &raw, decision);
     if args.trace
         && let Err(error) = trace::append(
             &layout.state_root,
