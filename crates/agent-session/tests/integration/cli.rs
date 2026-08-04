@@ -226,6 +226,21 @@ if [ "$1" = "if-shell" ]; then
   exit 0
 fi
 
+if [ "${AGENT_SESSION_FAKE_TMUX_ABSENT_AFTER_KILL:-0}" = "1" ] && { [ "$1" = "display-message" ] || [ "$1" = "has-session" ]; } && [ -f "$AGENT_SESSION_FAKE_TMUX_LOG.killed" ]; then
+  probe_target="$target"
+  if [ "$1" = "has-session" ] && [ -z "$probe_target" ]; then
+    probe_target="${2:-}"
+  fi
+  normalized_target="${probe_target#=}"
+  normalized_target="${normalized_target%%:*}"
+  while IFS= read -r killed_target; do
+    if [ "$killed_target" = "$probe_target" ] || [ "$killed_target" = "$normalized_target" ]; then
+      printf "%s\n" "can't find session: $probe_target" >&2
+      exit 1
+    fi
+  done < "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
+fi
+
 if [ "$1" = "has-session" ]; then
   if [ "${AGENT_SESSION_FAKE_TMUX_HAS_SESSION:-1}" = "0" ]; then
     printf "%s\n" "can't find session: $target" >&2

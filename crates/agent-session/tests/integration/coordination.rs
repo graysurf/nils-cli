@@ -36837,12 +36837,12 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
             "outcome": "completed"
         }),
     );
-    let mut runtime = Some(seed_live_runtime_identity(
+    let runtime = seed_live_runtime_identity(
         &state_dir,
         "worker-retire-claim",
         "worker-retire-claim-incarnation",
         97,
-    ));
+    );
     seed_operation(
         &state_dir,
         "worker-retire-claim",
@@ -36853,11 +36853,7 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
-    let runtime_pid = runtime
-        .as_ref()
-        .expect("retire replay runtime")
-        .pid()
-        .to_string();
+    let runtime_pid = runtime.pid().to_string();
     let state_runtime = state_dir.to_string_lossy().into_owned();
     let envs = [
         ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
@@ -36868,7 +36864,7 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
             "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
             runtime_pid.as_str(),
         ),
-        ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT_AFTER_KILL", "1"),
         ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$97"),
         ("AGENT_SESSION_FAKE_TMUX_PANE_ID", "%97"),
         (
@@ -36938,47 +36934,70 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
             .expect("operations")
             .retain(|operation| operation["lease_id"] != "retire-claim-active-operation");
     });
-    // Claim recovery needs the worker runtime live, so the fixture keeps its
-    // process group alive until retire revokes the retained claim. Retire then
-    // tears the session down, and its termination probe can still observe the
-    // boundary as running: that is the documented retryable outcome carrying
-    // `action: retry-delete`. macOS reaches that path where Linux does not.
-    // Once it does, stop the fixture-owned process group before replaying the
-    // exact retire request; otherwise fake tmux has already recorded the pane
-    // absent while KEEP_PROCESS_GROUP deliberately leaves the process live,
-    // producing the contradictory runtime-identity-unavailable outcome. Only
-    // this exact retryable reason owns the fixture stop and replay.
-    let mut replayed = run_main_agent(&main_checkout, &retire_args, &envs);
-    let retire_deadline = Instant::now() + Duration::from_secs(30);
-    if replayed.code != 0
-        && replayed.stdout_json()["error"]["code"] == "session-termination-failed"
-        && replayed.stdout_json()["error"]["details"]["reason"] == "process-still-running"
-        && replayed.stdout_json()["error"]["details"]["action"] == "retry-delete"
-    {
-        drop(runtime.take());
-    }
-    while replayed.code != 0
-        && replayed.stdout_json()["error"]["code"] == "session-termination-failed"
-        && replayed.stdout_json()["error"]["details"]["reason"] == "process-still-running"
-        && replayed.stdout_json()["error"]["details"]["action"] == "retry-delete"
-        && Instant::now() < retire_deadline
-    {
-        std::thread::sleep(Duration::from_millis(100));
-        replayed = run_main_agent(&main_checkout, &retire_args, &envs);
-    }
-    assert_eq!(
-        replayed.code,
-        0,
-        "stdout={} stderr={}",
-        replayed.stdout_text(),
-        replayed.stderr_text()
+    // Claim recovery needs the worker runtime live until retire revokes the
+    // retained claim. Pause at the durable delete reservation, after that
+    // recovery has committed but before teardown starts, then stage the
+    // already-covered kill-confirmed continuation. This keeps this regression
+    // focused on retained-claim recovery instead of coupling it to a live tmux
+    // teardown race already exercised by the delete integration suite.
+    let delete_barrier = tmp.path().join("retire-replay-delete-reservation");
+    let mut retire = Command::new(bin::resolve("main-agent"));
+    retire
+        .current_dir(&main_checkout)
+        .args(retire_args)
+        .envs(envs)
+        .env(
+            "NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_STAGE",
+            "after_reservation",
+        )
+        .env(
+            "NILS_AGENT_SESSION_TEST_WORKER_DELETE_BARRIER_DIR",
+            &delete_barrier,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut retire = retire.spawn().expect("spawn retire replay");
+    wait_for_barrier_or_child_exit_with_timeout(
+        &delete_barrier,
+        &mut retire,
+        "retire replay delete reservation",
+        Duration::from_secs(10),
     );
-    assert_eq!(data(&replayed)["retired"], true);
-    assert_eq!(data(&replayed)["released"], true);
+    drop(runtime);
+    let worker_record_path = state_dir.join("sessions/worker-retire-claim/session.json");
+    let mut worker_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_record_path).expect("retire replay worker record"),
+    )
+    .expect("retire replay worker JSON");
+    let worker_launch_id = worker_record["runtime"]["launch_id"].clone();
+    worker_record["delete_tmux_termination_state"] = json!({
+        "launch_id": worker_launch_id,
+        "state": "kill-confirmed"
+    });
+    write_private_json(&worker_record_path, &worker_record);
+    fs::write(
+        format!("{}.killed", tmux_log.display()),
+        "hs-codex-worker-retire-claim\n$97\n",
+    )
+    .expect("stage absent worker tmux session");
+    fs::write(delete_barrier.join("release"), b"release").expect("release delete barrier");
+    let replayed = retire.wait_with_output().expect("wait retire replay");
+    let retained_worker = fs::read_to_string(&worker_record_path).unwrap_or_default();
+    let retire_tmux_calls = tmux_calls(&tmux_log);
+    assert!(
+        replayed.status.success(),
+        "stdout={} stderr={} worker={retained_worker} tmux_calls={retire_tmux_calls:?}",
+        String::from_utf8_lossy(&replayed.stdout),
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    let replayed: serde_json::Value =
+        serde_json::from_slice(&replayed.stdout).expect("retire replay JSON");
+    assert_eq!(replayed["data"]["retired"], true);
+    assert_eq!(replayed["data"]["released"], true);
     assert!(!state_dir.join("sessions/worker-retire-claim").exists());
     let terminal_replay = run_main_agent(&main_checkout, &retire_args, &envs);
     assert_eq!(terminal_replay.code, 0);
-    assert_eq!(data(&terminal_replay), data(&replayed));
+    assert_eq!(data(&terminal_replay), replayed["data"]);
 }
 
 #[test]
