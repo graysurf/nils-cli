@@ -745,6 +745,21 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ':id:_default' \
 && ret=0
 ;;
+(validate)
+_arguments "${_arguments_options[@]}" : \
+'--findings-file=[Delivery-mode review-specialists merge envelope or observation array]:PATH:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__help_commands" \
@@ -766,6 +781,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (extend)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(validate)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1058,6 +1077,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (extend)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(validate)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2188,6 +2211,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(validate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -2869,6 +2896,7 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__review-loop_commands() {
 'inspect:Inspect the validated ledger tip and current round state' \
 'observe:Observe one reviewed head and append the resulting state transition' \
 'extend:Consume an exact provider-visible approval to extend one budget' \
+'validate:Validate a findings payload offline, before it reaches the provider' \
     )
     _describe -t commands 'forge-cli help pr review-loop commands' commands "$@"
 }
@@ -2886,6 +2914,11 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__review-loop__subcmd__inspect_comma
 _forge-cli__subcmd__help__subcmd__pr__subcmd__review-loop__subcmd__observe_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help pr review-loop observe commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review-loop__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__review-loop__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr review-loop validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads_commands() {
@@ -3415,6 +3448,7 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__review-loop_commands() {
 'inspect:Inspect the validated ledger tip and current round state' \
 'observe:Observe one reviewed head and append the resulting state transition' \
 'extend:Consume an exact provider-visible approval to extend one budget' \
+'validate:Validate a findings payload offline, before it reaches the provider' \
     )
     _describe -t commands 'forge-cli pr help review-loop commands' commands "$@"
 }
@@ -3432,6 +3466,11 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__review-loop__subcmd__inspect_comma
 _forge-cli__subcmd__pr__subcmd__help__subcmd__review-loop__subcmd__observe_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr help review-loop observe commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review-loop__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__review-loop__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help review-loop validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads_commands() {
@@ -3608,6 +3647,7 @@ _forge-cli__subcmd__pr__subcmd__review-loop_commands() {
 'inspect:Inspect the validated ledger tip and current round state' \
 'observe:Observe one reviewed head and append the resulting state transition' \
 'extend:Consume an exact provider-visible approval to extend one budget' \
+'validate:Validate a findings payload offline, before it reaches the provider' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli pr review-loop commands' commands "$@"
@@ -3623,6 +3663,7 @@ _forge-cli__subcmd__pr__subcmd__review-loop__subcmd__help_commands() {
 'inspect:Inspect the validated ledger tip and current round state' \
 'observe:Observe one reviewed head and append the resulting state transition' \
 'extend:Consume an exact provider-visible approval to extend one budget' \
+'validate:Validate a findings payload offline, before it reaches the provider' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli pr review-loop help commands' commands "$@"
@@ -3647,6 +3688,11 @@ _forge-cli__subcmd__pr__subcmd__review-loop__subcmd__help__subcmd__observe_comma
     local commands; commands=()
     _describe -t commands 'forge-cli pr review-loop help observe commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__help__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__help__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review-loop help validate commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__inspect_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__review-loop__subcmd__inspect_commands() {
     local commands; commands=()
@@ -3656,6 +3702,11 @@ _forge-cli__subcmd__pr__subcmd__review-loop__subcmd__inspect_commands() {
 _forge-cli__subcmd__pr__subcmd__review-loop__subcmd__observe_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr review-loop observe commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__validate_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__review-loop__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr review-loop validate commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__review-threads_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__review-threads_commands() {

@@ -9,8 +9,9 @@ use serde::Serialize;
 use crate::backend::{BackendCall, BackendProgram, BackendRunner};
 use crate::cli::{
     BINARY, GlobalFlags, PrReviewLoopExtendArgs, PrReviewLoopInspectArgs, PrReviewLoopObserveArgs,
+    PrReviewLoopValidateArgs,
 };
-use crate::envelope::emit_success;
+use crate::envelope::{emit_success, emit_success_with_warnings};
 use crate::error::ForgeError;
 use crate::ops::pr_comments::github_repo_slug_from_url;
 use crate::ops::{pr_comment, pr_review, pr_view, review_state};
@@ -21,6 +22,7 @@ use crate::validations::{RuleVerdict, no_escaped_control_markdown, no_local_path
 const SCHEMA_INSPECT: &str = "pr.review-loop.inspect";
 const SCHEMA_OBSERVE: &str = "pr.review-loop.observe";
 const SCHEMA_EXTEND: &str = "pr.review-loop.extend";
+const SCHEMA_VALIDATE: &str = "pr.review-loop.validate";
 const SCHEMA_VERSION: u32 = 1;
 const EXTENSION_MARKER_PREFIX: &str = "<!-- forge-cli:review-loop-extension:v1 ";
 
@@ -101,6 +103,223 @@ struct ApprovalComment {
     association: String,
     created_at: String,
     body: String,
+}
+
+/// Envelope payload for `cli.forge-cli.pr.review-loop.validate.v1`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PrReviewLoopValidatePayload {
+    /// Stable token for the `--findings-file` shape that was read, not the
+    /// prose the text renderer prints — the wording must stay free to change.
+    shape: &'static str,
+    /// Rows as written in the file, before identities are collapsed.
+    row_count: usize,
+    /// Distinct lifecycle identities after canonicalization. Lower than
+    /// `row_count` only when rows share an identity.
+    identity_count: usize,
+    /// Rows per disposition, over the canonical identities, in
+    /// [`review_state::ReviewFindingStatus::ALL`] order. Sums to
+    /// `identity_count`.
+    dispositions: Vec<DispositionCount>,
+    /// Findings the merge gate would treat as blocking: `open` and blocking.
+    /// A terminal disposition is never blocking, matching the ledger.
+    blocking_count: usize,
+    /// Lifecycle identities carrying more than one row. Reported only when the
+    /// rows are byte-identical — differing rows for one identity are a
+    /// `review_fingerprint_collision` and fail, exactly as they do on append.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    duplicate_identities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DispositionCount {
+    disposition: &'static str,
+    count: usize,
+}
+
+/// Validate a findings payload without a pull request, a provider call, or any
+/// network access.
+///
+/// `observe --dry-run` already reports a payload verdict, but it needs a PR id
+/// and resolves the provider first, so it cannot answer "is this file well
+/// formed" while the file is being written — which is when the question is
+/// actually asked. `pr review validate` has exactly this shape for review
+/// summaries and thread specs; this is the same affordance for the ledger.
+///
+/// Deliberately payload-only, and that boundary is drawn where the provider
+/// starts, not sooner. Everything `observe` decides *offline* — fingerprint
+/// form, identity collisions, blocking normalization — is decided here by
+/// calling the same [`review_state::canonicalize_observations`] the append
+/// calls. Only head and state-tip CAS, the transition against stored state, and
+/// the rendered comment need the provider, and those stay with
+/// `observe --dry-run`.
+///
+/// So: failing here proves an append cannot succeed, and passing here means the
+/// payload itself is acceptable. A second, laxer copy of the payload rules is
+/// exactly the drift this command was added to prevent, so there isn't one.
+pub fn run_validate(
+    args: PrReviewLoopValidateArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    // Read once. The path may be a FIFO or a process substitution, where a
+    // second open yields EOF and would be misreported as invalid JSON.
+    let raw = read_findings_value(&args.findings_file)?;
+    let payload = validate_payload(&raw)?;
+    // Repeated identities are advisory, so they belong in the envelope's
+    // warnings channel — stderr in text mode, `warnings[]` in JSON — not
+    // printed onto stdout where a JSON consumer would never see them.
+    let warnings = payload
+        .duplicate_identities
+        .iter()
+        .map(|identity| format!("identical rows repeated for one identity: {identity}"))
+        .collect::<Vec<_>>();
+    Ok(emit_success_with_warnings(
+        schema_version_for(BINARY, SCHEMA_VALIDATE, SCHEMA_VERSION),
+        payload,
+        warnings,
+        format,
+        render_validate_text,
+    ))
+}
+
+/// The whole decision, separated from emission so tests can assert the report
+/// rather than only an exit code.
+fn validate_payload(raw: &serde_json::Value) -> Result<PrReviewLoopValidatePayload, ForgeError> {
+    let shape = detect_findings_shape(raw);
+    let observations = observations_from_value(raw)?;
+    // The same canonicalization an append performs: rejects a malformed
+    // lifecycle fingerprint and an identity whose rows disagree, and clears
+    // `blocking` on every terminal disposition.
+    let canonical = review_state::canonicalize_observations(&observations)?;
+
+    let mut counts: Vec<DispositionCount> = review_state::ReviewFindingStatus::ALL
+        .into_iter()
+        .map(|status| DispositionCount {
+            disposition: status.as_str(),
+            count: 0,
+        })
+        .collect();
+    let mut blocking_count = 0usize;
+    for observation in canonical.values() {
+        let label = observation.status.as_str();
+        let entry = counts
+            .iter_mut()
+            .find(|entry| entry.disposition == label)
+            .expect("ReviewFindingStatus::ALL covers every status");
+        entry.count += 1;
+        if observation.blocking {
+            blocking_count += 1;
+        }
+    }
+
+    // Anything that survived canonicalization and still collapsed rows did so
+    // because those rows were identical; a disagreement would have errored.
+    let duplicate_identities = if canonical.len() < observations.len() {
+        collapsed_identities(&observations)
+    } else {
+        Vec::new()
+    };
+
+    Ok(PrReviewLoopValidatePayload {
+        shape,
+        row_count: observations.len(),
+        identity_count: canonical.len(),
+        dispositions: counts,
+        blocking_count,
+        duplicate_identities,
+    })
+}
+
+/// Identities that more than one row maps to, keyed the way the ledger keys
+/// them: the root-cause fingerprint when present, else the row's own.
+fn collapsed_identities(observations: &[review_state::ReviewFindingObservation]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::with_capacity(observations.len());
+    let mut collapsed: Vec<String> = Vec::new();
+    for observation in observations {
+        let identity = observation
+            .root_cause_fingerprint
+            .as_deref()
+            .unwrap_or(&observation.fingerprint);
+        if seen.contains(&identity) {
+            if !collapsed.iter().any(|entry| entry == identity) {
+                collapsed.push(identity.to_string());
+            }
+        } else {
+            seen.push(identity);
+        }
+    }
+    collapsed
+}
+
+/// Prose lives here, not in the payload, so wording can change freely.
+fn shape_prose(shape: &str) -> &str {
+    match shape {
+        SHAPE_MERGE_ENVELOPE => "review-specialists merge envelope",
+        _ => "bare observation array",
+    }
+}
+
+fn render_validate_text(payload: &PrReviewLoopValidatePayload) {
+    println!(
+        "ok: {rows} observation(s) from a {shape}",
+        rows = payload.row_count,
+        shape = shape_prose(payload.shape),
+    );
+    if payload.identity_count != payload.row_count {
+        println!(
+            "  identities: {identities} (rows sharing an identity were collapsed)",
+            identities = payload.identity_count,
+        );
+    }
+    let breakdown = payload
+        .dispositions
+        .iter()
+        .filter(|entry| entry.count > 0)
+        .map(|entry| format!("{}={}", entry.disposition, entry.count))
+        .collect::<Vec<_>>();
+    if !breakdown.is_empty() {
+        println!("  dispositions: {}", breakdown.join(" "));
+    }
+    println!("  blocking: {}", payload.blocking_count);
+}
+
+/// Read the payload once and parse it as JSON, leaving the rows uninterpreted.
+///
+/// Split from [`read_observations`] so a caller that needs both the raw value
+/// and the parsed rows opens the path exactly once — a FIFO or a `<(...)`
+/// process substitution returns EOF on a second open, which would surface as
+/// invalid JSON for a payload that was fine.
+fn read_findings_value(path: &str) -> Result<serde_json::Value, ForgeError> {
+    let body = fs::read_to_string(path).map_err(|error| {
+        ForgeError::validation(
+            schema_err(),
+            "review_findings_invalid",
+            "failed to read review finding observations",
+            Some(format!("path={path}; error={error}")),
+        )
+    })?;
+    serde_json::from_str(&body).map_err(|error| {
+        ForgeError::validation(
+            schema_err(),
+            "review_findings_invalid",
+            "review finding observations are not valid JSON",
+            Some(error.to_string()),
+        )
+    })
+}
+
+/// Stable wire tokens for the two shapes `--findings-file` accepts. These go in
+/// a versioned envelope, so they are tokens rather than the sentence fragments
+/// the text renderer prints.
+const SHAPE_MERGE_ENVELOPE: &str = "merge-envelope";
+const SHAPE_OBSERVATION_ARRAY: &str = "observation-array";
+
+fn detect_findings_shape(value: &serde_json::Value) -> &'static str {
+    let inner = value.get("data").unwrap_or(value);
+    if inner.get("findings").is_some() {
+        SHAPE_MERGE_ENVELOPE
+    } else {
+        SHAPE_OBSERVATION_ARRAY
+    }
 }
 
 pub fn run_inspect(
@@ -669,23 +888,15 @@ fn ensure_expected_tip(provider: Option<&str>, expected: Option<&str>) -> Result
 fn read_observations(
     path: &str,
 ) -> Result<Vec<review_state::ReviewFindingObservation>, ForgeError> {
-    let body = fs::read_to_string(path).map_err(|error| {
-        ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "failed to read review finding observations",
-            Some(format!("path={path}; error={error}")),
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-        ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "review finding observations are not valid JSON",
-            Some(error.to_string()),
-        )
-    })?;
-    let value = value.get("data").unwrap_or(&value);
+    observations_from_value(&read_findings_value(path)?)
+}
+
+/// Row-level parse, split out so a caller that has already read the payload
+/// does not have to open the path a second time.
+fn observations_from_value(
+    value: &serde_json::Value,
+) -> Result<Vec<review_state::ReviewFindingObservation>, ForgeError> {
+    let value = value.get("data").unwrap_or(value);
     let rows = value
         .get("findings")
         .unwrap_or(value)
@@ -756,20 +967,29 @@ fn observation_from_value(
     })
 }
 
+/// Accept exactly the dispositions the type defines, derived from
+/// [`review_state::ReviewFindingStatus::ALL`] so a new variant is accepted here
+/// the moment it exists rather than silently rejected.
+///
+/// `reopened` is deliberately absent: a finding that reappears is submitted as
+/// `open`, and the state machine decides whether that is a reopen.
 fn parse_finding_status(value: &str) -> Result<review_state::ReviewFindingStatus, ForgeError> {
-    match value {
-        "open" => Ok(review_state::ReviewFindingStatus::Open),
-        "fixed" => Ok(review_state::ReviewFindingStatus::Fixed),
-        "accepted" => Ok(review_state::ReviewFindingStatus::Accepted),
-        "preference" => Ok(review_state::ReviewFindingStatus::Preference),
-        "follow-up" => Ok(review_state::ReviewFindingStatus::FollowUp),
-        _ => Err(ForgeError::validation(
-            schema_err(),
-            "review_findings_invalid",
-            "review finding disposition is not supported",
-            Some(format!("status={value}")),
-        )),
-    }
+    review_state::ReviewFindingStatus::ALL
+        .into_iter()
+        .find(|status| status.as_str() == value)
+        .ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "review_findings_invalid",
+                "review finding disposition is not supported",
+                Some(format!(
+                    "status={value}; supported={}",
+                    review_state::ReviewFindingStatus::ALL
+                        .map(|status| status.as_str())
+                        .join(" | ")
+                )),
+            )
+        })
 }
 
 fn durable_hard_stop_error(
@@ -1597,6 +1817,283 @@ mod tests {
         let path = dir.path().join("findings.json");
         fs::write(&path, body).expect("write findings");
         path.to_string_lossy().into_owned()
+    }
+
+    fn validate_args(findings: &str) -> PrReviewLoopValidateArgs {
+        PrReviewLoopValidateArgs {
+            findings_file: findings.to_string(),
+        }
+    }
+
+    /// The payload check must not need a pull request, so it takes no id and
+    /// never resolves a provider — that is the whole reason the verb exists.
+    #[test]
+    fn validate_accepts_a_bare_disposition_array_with_no_provider_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"},
+              {"lifecycle_fingerprint":"maintainability:b:two","disposition":"follow-up"}
+            ]"#,
+        );
+
+        let code = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect("a well-formed array must validate");
+
+        assert_eq!(code, 0);
+    }
+
+    /// `preference` and `follow-up` are accepted dispositions; the command help
+    /// used to omit both and advertise `reopened`, which the parser rejects.
+    #[test]
+    fn validate_accepts_every_disposition_the_parser_accepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for disposition in ["open", "fixed", "accepted", "preference", "follow-up"] {
+            let findings = findings_file(
+                &dir,
+                &format!(
+                    r#"[{{"lifecycle_fingerprint":"correctness:a:one","disposition":"{disposition}"}}]"#
+                ),
+            );
+            let code = run_validate(validate_args(&findings), OutputFormat::Json)
+                .unwrap_or_else(|err| panic!("{disposition} must validate: {err}"));
+            assert_eq!(code, 0, "{disposition} must validate");
+        }
+    }
+
+    /// A finding that reappears is submitted as `open`. The state machine
+    /// decides whether that is a reopen, so `reopened` is not an input.
+    #[test]
+    fn validate_rejects_reopened_which_the_help_used_to_advertise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[{"lifecycle_fingerprint":"correctness:a:one","disposition":"reopened"}]"#,
+        );
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("reopened is not an input disposition");
+
+        assert_eq!(err.kind(), "review_findings_invalid");
+    }
+
+    #[test]
+    fn validate_rejects_a_row_without_a_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(&dir, r#"[{"disposition":"fixed"}]"#);
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("a fingerprint is required");
+
+        assert_eq!(err.kind(), "review_fingerprint_required");
+    }
+
+    #[test]
+    fn validate_rejects_a_missing_file_rather_than_reporting_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.json");
+
+        let err = run_validate(
+            validate_args(&missing.to_string_lossy()),
+            OutputFormat::Json,
+        )
+        .expect_err("an unreadable payload is not an empty one");
+
+        assert_eq!(err.kind(), "review_findings_invalid");
+    }
+
+    /// Two rows for one identity that DISAGREE are a collision, exactly as on
+    /// append — my first cut documented and tested "last row wins", which is
+    /// not what `canonical_observations` does.
+    #[test]
+    fn validate_rejects_two_rows_that_give_one_identity_incompatible_dispositions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"}
+            ]"#,
+        );
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("an identity cannot carry two different dispositions");
+
+        assert_eq!(err.kind(), "review_fingerprint_collision");
+    }
+
+    /// Byte-identical repeats are the only duplicates the ledger really does
+    /// collapse, so they warn rather than fail.
+    #[test]
+    fn validate_reports_identical_repeats_as_one_identity_without_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("identical repeats collapse cleanly");
+
+        assert_eq!(payload.row_count, 2);
+        assert_eq!(payload.identity_count, 1);
+        assert_eq!(payload.duplicate_identities, vec!["correctness:a:one"]);
+    }
+
+    /// Identity is the root-cause fingerprint when present, so two rows with
+    /// different lifecycle fingerprints can still be one identity — and
+    /// disagree.
+    #[test]
+    fn validate_keys_identity_on_the_root_cause_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","root_cause_fingerprint":"correctness:r:root","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:b:two","root_cause_fingerprint":"correctness:r:root","disposition":"fixed"}
+            ]"#,
+        );
+
+        let err = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect_err("one root cause with disagreeing rows is a collision");
+
+        assert_eq!(err.kind(), "review_fingerprint_collision");
+    }
+
+    /// A malformed lifecycle fingerprint is a purely local rule, so the offline
+    /// check must catch it rather than leaving it to the append.
+    #[test]
+    fn validate_rejects_a_malformed_lifecycle_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "abc",
+            "a:b",
+            "Maintainability:PrReviewLoop:dup",
+            "-a:b:c",
+            "a::c",
+        ] {
+            let findings = findings_file(
+                &dir,
+                &format!(r#"[{{"lifecycle_fingerprint":"{bad}","disposition":"open"}}]"#),
+            );
+            let err = run_validate(validate_args(&findings), OutputFormat::Json)
+                .expect_err("a malformed lifecycle fingerprint must be rejected offline");
+            assert_eq!(
+                err.kind(),
+                "review_fingerprint_collision",
+                "unexpected kind for {bad}"
+            );
+        }
+    }
+
+    /// The count the merge gate cares about. The ledger clears `blocking` on
+    /// every terminal disposition, so a payload of finished work is zero
+    /// blocking — counting the raw parsed bit reported one per row.
+    #[test]
+    fn validate_blocking_count_matches_what_the_ledger_would_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"},
+              {"lifecycle_fingerprint":"correctness:b:two","disposition":"accepted"},
+              {"lifecycle_fingerprint":"correctness:c:three","disposition":"open"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("valid payload");
+
+        assert_eq!(
+            payload.blocking_count, 1,
+            "only the open row blocks; terminal dispositions never do"
+        );
+    }
+
+    /// The breakdown must account for every identity, so a future disposition
+    /// cannot silently vanish from the report.
+    #[test]
+    fn validate_dispositions_sum_to_the_identity_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(
+            &dir,
+            r#"[
+              {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+              {"lifecycle_fingerprint":"correctness:b:two","disposition":"fixed"},
+              {"lifecycle_fingerprint":"correctness:c:three","disposition":"follow-up"}
+            ]"#,
+        );
+        let raw = read_findings_value(&findings).expect("read");
+
+        let payload = validate_payload(&raw).expect("valid payload");
+
+        assert_eq!(
+            payload.dispositions.iter().map(|d| d.count).sum::<usize>(),
+            payload.identity_count
+        );
+        assert_eq!(
+            payload
+                .dispositions
+                .iter()
+                .map(|d| d.disposition)
+                .collect::<Vec<_>>(),
+            vec!["open", "fixed", "accepted", "preference", "follow-up"],
+            "order comes from ReviewFindingStatus::ALL"
+        );
+    }
+
+    /// The clean-review genesis path: an empty envelope is a valid payload, and
+    /// merge requires an observation even when there are no findings.
+    #[test]
+    fn validate_accepts_an_empty_delivery_envelope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let findings = findings_file(&dir, r#"{"data":{"findings":[]}}"#);
+
+        let code = run_validate(validate_args(&findings), OutputFormat::Json)
+            .expect("an empty envelope is the clean-review genesis payload");
+
+        assert_eq!(code, 0);
+    }
+
+    /// The payload path is opened exactly once.
+    ///
+    /// Reporting the shape and parsing the rows are two questions about one
+    /// file; asking them with two `read_to_string` calls works for a regular
+    /// file and fails for a FIFO or a `<(...)` process substitution, where the
+    /// second open returns EOF and surfaces as "not valid JSON" — a misleading
+    /// error for a payload that was fine. Found by running the command against
+    /// a process substitution.
+    #[test]
+    fn validate_reads_a_single_use_payload_path_only_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("findings.json");
+        fs::write(
+            &path,
+            r#"[{"lifecycle_fingerprint":"correctness:a:one","disposition":"fixed"}]"#,
+        )
+        .expect("write findings");
+        let raw = read_findings_value(&path.to_string_lossy()).expect("read once");
+
+        // Both answers must come from that one read.
+        assert_eq!(detect_findings_shape(&raw), SHAPE_OBSERVATION_ARRAY);
+        let observations = observations_from_value(&raw).expect("parse from the same value");
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn validate_names_the_shape_it_read() {
+        let envelope: serde_json::Value =
+            serde_json::from_str(r#"{"data":{"findings":[]}}"#).expect("json");
+        assert_eq!(detect_findings_shape(&envelope), SHAPE_MERGE_ENVELOPE);
+        let array: serde_json::Value = serde_json::from_str("[]").expect("json");
+        assert_eq!(detect_findings_shape(&array), SHAPE_OBSERVATION_ARRAY);
+        // Stable tokens, not the prose the text renderer prints.
+        assert_eq!(SHAPE_MERGE_ENVELOPE, "merge-envelope");
+        assert_eq!(SHAPE_OBSERVATION_ARRAY, "observation-array");
     }
 
     fn observe_args(

@@ -86,6 +86,31 @@ pub enum ReviewFindingStatus {
     FollowUp,
 }
 
+impl ReviewFindingStatus {
+    /// Every disposition, in the order the loop reports them. Callers that
+    /// enumerate the set derive it from here so adding a variant is one edit
+    /// and a compile error rather than a silent omission.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Fixed,
+        Self::Accepted,
+        Self::Preference,
+        Self::FollowUp,
+    ];
+
+    /// The wire name, matching this type's `rename_all = "kebab-case"` derive.
+    /// A round-trip test pins the two together.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Fixed => "fixed",
+            Self::Accepted => "accepted",
+            Self::Preference => "preference",
+            Self::FollowUp => "follow-up",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLoopFinding {
@@ -969,6 +994,20 @@ pub fn apply_review_loop_extension(
     Ok(state)
 }
 
+/// Canonicalize a findings payload exactly as an append would, without touching
+/// the ledger or the provider.
+///
+/// This is the whole offline half of `observe`'s acceptance decision: lifecycle
+/// fingerprint form, root-cause fingerprint form, blocking normalization for
+/// terminal dispositions, thread de-duplication, and identity collisions. An
+/// offline validator that stops short of it would accept payloads the append
+/// rejects, so it is exported rather than re-implemented.
+pub fn canonicalize_observations(
+    observations: &[ReviewFindingObservation],
+) -> Result<BTreeMap<String, ReviewFindingObservation>, ForgeError> {
+    canonical_observations(observations)
+}
+
 fn canonical_observations(
     observations: &[ReviewFindingObservation],
 ) -> Result<BTreeMap<String, ReviewFindingObservation>, ForgeError> {
@@ -1294,6 +1333,45 @@ fn error_schema() -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// `as_str` restates what `rename_all = "kebab-case"` produces, and callers
+    /// enumerate the set through `ALL`. Tie all three together so the hand
+    /// mapping cannot drift from the derive, and so `ALL` cannot go stale when
+    /// a variant is added.
+    #[test]
+    fn finding_status_as_str_round_trips_through_serde_for_every_variant() {
+        for status in ReviewFindingStatus::ALL {
+            assert_eq!(
+                serde_json::to_value(status).expect("serialize"),
+                serde_json::Value::String(status.as_str().to_string()),
+                "as_str must match the serde name for {status:?}"
+            );
+            let parsed: ReviewFindingStatus =
+                serde_json::from_value(serde_json::Value::String(status.as_str().to_string()))
+                    .expect("deserialize");
+            assert_eq!(parsed, status);
+        }
+    }
+
+    /// A new variant must be added to `ALL`, not just to the enum.
+    #[test]
+    fn finding_status_all_covers_every_variant() {
+        // Exhaustive match: adding a variant fails to compile here, which is
+        // the prompt to extend `ALL` below.
+        fn assert_known(status: ReviewFindingStatus) -> &'static str {
+            match status {
+                ReviewFindingStatus::Open => "open",
+                ReviewFindingStatus::Fixed => "fixed",
+                ReviewFindingStatus::Accepted => "accepted",
+                ReviewFindingStatus::Preference => "preference",
+                ReviewFindingStatus::FollowUp => "follow-up",
+            }
+        }
+        assert_eq!(ReviewFindingStatus::ALL.len(), 5);
+        for status in ReviewFindingStatus::ALL {
+            assert_eq!(assert_known(status), status.as_str());
+        }
+    }
 
     fn fixture_receipt() -> ReviewRunReceipt {
         ReviewRunReceipt {

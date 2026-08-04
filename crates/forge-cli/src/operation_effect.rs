@@ -8,7 +8,7 @@ use nils_common::execution_effect::{
 use crate::cli::{
     ActivityArgs, AuthArgs, AuthCommand, Cli, Command, InboxArgs, InboxCommand, IssueArgs,
     IssueCommand, LabelArgs, LabelCommand, PrArgs, PrCommand, PrPendingReviewCommand,
-    PrReviewCommand, RepoArgs, RepoCommand, ReviewThreadsCommand, SearchArgs,
+    PrReviewCommand, PrReviewLoopCommand, RepoArgs, RepoCommand, ReviewThreadsCommand, SearchArgs,
 };
 
 pub fn run(argv: Vec<OsString>, format: OutputFormat) -> i32 {
@@ -102,6 +102,35 @@ fn classify(cli: &Cli) -> (&'static str, Effect, ProviderEffect, Vec<&'static st
             {
                 ("pr.pending-review.inspect", read, network, vec!["provider"])
             }
+            // Without this arm the whole `review-loop` family falls to the
+            // `pr.mutation` / `network_write` default below, which is the right
+            // answer for `observe` and `extend` and the wrong one for the two
+            // that write nothing. `validate` in particular reads one local file
+            // and never opens a socket, so declaring it a network write hands
+            // the permission layer an authority it does not need.
+            PrCommand::ReviewLoop(args) => match &args.command {
+                PrReviewLoopCommand::Validate(_) => (
+                    "pr.review-loop.validate",
+                    read,
+                    ProviderEffect::LocalRead,
+                    vec!["local_inputs"],
+                ),
+                PrReviewLoopCommand::Inspect(_) => {
+                    ("pr.review-loop.inspect", read, network, vec!["provider"])
+                }
+                PrReviewLoopCommand::Observe(_) => (
+                    "pr.review-loop.observe",
+                    mutation,
+                    ProviderEffect::NetworkWrite,
+                    Vec::new(),
+                ),
+                PrReviewLoopCommand::Extend(_) => (
+                    "pr.review-loop.extend",
+                    mutation,
+                    ProviderEffect::NetworkWrite,
+                    Vec::new(),
+                ),
+            },
             _ => (
                 "pr.mutation",
                 mutation,

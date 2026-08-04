@@ -762,6 +762,35 @@ operations:
       data: object<{provider,number,url,state_tip_digest,generation,state,appended:true,outcome_posted:false}>
     notes: "This command is separate from delivery retry paths. It requires an active durable hard-stop receipt, the canonical stop-code/budget-field pair and exact one-step proposal, plus an OWNER/MEMBER/COLLABORATOR approval comment on the same PR that is newer than the stopped state tip and carries the exact marker. One proposal can be consumed once."
 
+  - id: pr.review-loop.validate
+    schema_version: cli.forge-cli.pr.review-loop.validate.v1
+    summary: Check a review-loop findings payload offline, before it reaches the provider.
+    inputs:
+      - { name: --findings-file, type: path, required: true }
+    validations:
+      - review_findings_invalid
+      - review_fingerprint_required
+      - review_fingerprint_collision
+    backends:
+      github: none
+      gitlab: none
+      local: none
+    output:
+      data: object<{shape:enum<merge-envelope|observation-array>,row_count,identity_count,dispositions:[{disposition:enum<open|fixed|accepted|preference|follow-up>,count}],blocking_count,duplicate_identities?}>
+    notes: >-
+      Provider-independent and network-free: the op takes no id, resolves no
+      provider context, and runs no backend, so `--provider`, `--repo`,
+      `--host` and `--dry-run` are accepted by the global parser and have no
+      effect here. It applies exactly the offline half of `pr.review-loop.observe`
+      by calling the same canonicalization the append calls, so the accept/reject
+      decision cannot drift: lifecycle fingerprint form, identity collisions, and
+      blocking normalization for terminal dispositions. Head and state-tip
+      compare-and-swap, the transition against stored state, and the rendered
+      comment need the provider and remain in `observe --dry-run`. Failing here
+      proves an append cannot succeed; passing means the payload itself is
+      acceptable. Unlike its siblings the payload carries neither `appended` nor
+      `outcome_posted`, because nothing is ever appended.
+
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1
     summary: List GFM task-list items in the PR/MR description with their state.

@@ -922,11 +922,40 @@ pub enum PrReviewLoopCommand {
     Observe(PrReviewLoopObserveArgs),
     /// Consume an exact provider-visible approval to extend one budget.
     Extend(PrReviewLoopExtendArgs),
+    /// Validate a findings payload offline, before it reaches the provider.
+    Validate(PrReviewLoopValidateArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct PrReviewLoopInspectArgs {
     pub id: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_help = "\
+      Mirrors `pr review validate`: checks the payload `observe` would consume, \
+      without a pull request, a provider call, or any network access. Use it \
+      while authoring a findings file.\n\n\
+      SCOPE\n  \
+      Everything `observe` decides offline is decided here, by calling the same \
+      canonicalization the append calls: lifecycle fingerprint form, identity \
+      collisions, and blocking normalization for terminal dispositions. Only \
+      head and state-tip compare-and-swap, the transition against stored state, \
+      and the rendered comment need the provider, and those stay with `observe \
+      --dry-run`, which remains the full preflight. Failing here proves an \
+      append cannot succeed; passing means the payload itself is acceptable.\n  \
+      Because it resolves no provider context, --provider, --repo, --host and \
+      --dry-run have NO effect on this subcommand. That is deliberate, not an \
+      oversight: the point is to check a file before any repository is in \
+      scope.\n\n\
+      DISPOSITIONS\n  \
+      open | fixed | accepted | preference | follow-up. A finding that reappears \
+      is submitted as `open` — the state machine decides whether that is a \
+      reopen, and `reopened` is NOT an accepted input.")]
+pub struct PrReviewLoopValidateArgs {
+    /// Delivery-mode review-specialists merge envelope or observation array.
+    #[arg(long = "findings-file", value_name = "PATH")]
+    pub findings_file: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -945,8 +974,12 @@ pub struct PrReviewLoopInspectArgs {
       row's `category`. The envelope schema REJECTS `disposition` as an unknown \
       field.\n  \
       2. A bare observation array. Each row needs `lifecycle_fingerprint` and \
-      accepts `disposition` (open | fixed | accepted | reopened), which is how \
-      dispositions are carried across rounds.\n\n\
+      accepts `disposition` (open | fixed | accepted | preference | follow-up), \
+      which is how dispositions are carried across rounds. A finding that \
+      reappears is submitted as `open`; the state machine decides whether that \
+      is a reopen, and `reopened` is NOT an accepted input.\n  \
+      Check either shape offline, with no pull request and no provider call, \
+      using `pr review-loop validate --findings-file <path>`.\n\n\
       COMBINED DELIVERY OUTCOME\n  \
       Every appended ledger comment leads with a visible \
       `forge-cli review ledger · generation N · <kind> · head <short-sha>` line \
@@ -2115,6 +2148,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             }
             PrReviewLoopCommand::Extend(extend_args) => {
                 ops::pr_review_loop::run_extend(&global, extend_args, format)
+            }
+            PrReviewLoopCommand::Validate(validate_args) => {
+                ops::pr_review_loop::run_validate(validate_args, format)
             }
         },
         Some(Command::Pr(PrArgs {

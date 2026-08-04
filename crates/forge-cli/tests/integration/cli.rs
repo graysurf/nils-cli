@@ -429,3 +429,96 @@ fn dry_run_repo_view_renders_plan_envelope_for_gitlab() {
     assert!(plan.iter().any(|v| v == "-F"));
     assert_eq!(envelope["data"]["provider"], "gitlab");
 }
+
+/// `pr review-loop validate` end to end: the schema literal, the full payload
+/// shape, and the claim the command is built on — that it reaches no backend.
+/// The stub exits 99 on any invocation, so a single provider call fails this.
+#[test]
+fn pr_review_loop_validate_emits_its_schema_without_touching_a_backend() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho 'no backend expected' >&2\nexit 99\n");
+    let findings = stub.tempdir.path().join("findings.json");
+    std::fs::write(
+        &findings,
+        r#"[
+          {"lifecycle_fingerprint":"correctness:a:one","disposition":"open"},
+          {"lifecycle_fingerprint":"maintainability:b:two","disposition":"fixed"}
+        ]"#,
+    )
+    .expect("write findings");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "pr",
+            "review-loop",
+            "validate",
+            "--findings-file",
+            &findings.to_string_lossy(),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["schema_version"],
+        "cli.forge-cli.pr.review-loop.validate.v1"
+    );
+    let data = &envelope["data"];
+    assert_eq!(data["shape"], "observation-array");
+    assert_eq!(data["row_count"], 2);
+    assert_eq!(data["identity_count"], 2);
+    assert_eq!(data["blocking_count"], 1);
+    assert_eq!(
+        data["dispositions"],
+        serde_json::json!([
+            {"disposition": "open", "count": 1},
+            {"disposition": "fixed", "count": 1},
+            {"disposition": "accepted", "count": 0},
+            {"disposition": "preference", "count": 0},
+            {"disposition": "follow-up", "count": 0},
+        ])
+    );
+    assert!(
+        data.get("duplicate_identities").is_none(),
+        "omitted when empty: {}",
+        out.stdout
+    );
+    assert!(
+        envelope.get("warnings").is_none()
+            || envelope["warnings"].as_array().is_none_or(|w| w.is_empty()),
+        "a clean payload warns about nothing: {}",
+        out.stdout
+    );
+}
+
+/// Provider globals are inert here by design; the command must not start
+/// rejecting payloads because a provider was named.
+#[test]
+fn pr_review_loop_validate_ignores_provider_globals() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\nexit 99\n");
+    let findings = stub.tempdir.path().join("findings.json");
+    std::fs::write(
+        &findings,
+        r#"[{"lifecycle_fingerprint":"correctness:a:one","disposition":"open"}]"#,
+    )
+    .expect("write findings");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--format",
+            "json",
+            "--provider",
+            "gitlab",
+            "pr",
+            "review-loop",
+            "validate",
+            "--findings-file",
+            &findings.to_string_lossy(),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+}
