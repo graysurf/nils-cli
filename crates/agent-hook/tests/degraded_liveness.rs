@@ -8,8 +8,8 @@
 //!    read-only lane while arbitrary mutation stays fail-closed.
 //! 2. `Stop` kept re-entering the same failing gate until the provider's
 //!    consecutive-block cap force-terminated the turn. Provider re-entry
-//!    metadata has to produce one deterministic terminal result that still
-//!    retains the claim/lease for external reconciliation.
+//!    metadata has to produce one deterministic terminal result without
+//!    inventing claim, lease, or gate state that coordination did not report.
 //! 3. A capability that exited before draining its stdin was scored as a failed
 //!    capability, so a `closed` plus `locked` rule denied at random depending on
 //!    machine load (`sympoies/nils-cli#1420`). Whether a child read its input is
@@ -68,6 +68,32 @@ override_class = "locked"
 capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
 "#;
 
+/// A non-coordination Stop gate paired with a clean coordination transaction.
+const CLEAN_STOP_REENTRY_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.stop-prerequisite"
+products = ["codex", "claude"]
+events = ["Stop"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "validation-outstanding", message = "validation remains outstanding" }
+
+[[rules]]
+id = "runtime.stop-coordination"
+products = ["codex", "claude"]
+events = ["Stop"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
+"#;
+
 fn break_coordination_registry(fixture: &Fixture) {
     let coordination = fixture.session_state.join("coordination");
     fs::create_dir_all(&coordination).expect("coordination directory");
@@ -83,6 +109,24 @@ fn managed_env<'a>() -> [(&'a str, &'a str); 2] {
         ("AGENT_SESSION_ID", "managed-session"),
         ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
     ]
+}
+
+fn install_session_mode(fixture: &Fixture, mode: &str) {
+    let session = fixture.session_state.join("sessions/managed-session");
+    fs::create_dir_all(&session).expect("session directory");
+    let record = session.join("session.json");
+    fs::write(
+        &record,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.session.v1",
+            "id": "managed-session",
+            "coordination_mode": mode,
+            "runtime": {"launch_id": "managed-runtime"}
+        }))
+        .expect("session JSON"),
+    )
+    .expect("session record");
+    Fixture::set_private(&record);
 }
 
 fn reason_codes(decision: &Value) -> Vec<String> {
@@ -239,7 +283,8 @@ fn degraded_prompt_records_one_replayable_turn_boundary() {
 
 /// Stop re-entry is the loop. The provider tells us it is already inside a Stop
 /// hook; blocking again cannot change the outcome and only burns the provider's
-/// consecutive-block budget. The turn must end while the claim/lease stays held.
+/// consecutive-block budget. The turn must end while retaining only the state
+/// that the coordination transaction actually reported.
 #[test]
 fn stop_reentry_reaches_a_deterministic_terminal_result() {
     let fixture = Fixture::new(STOP_COORDINATION_POLICY);
@@ -251,7 +296,7 @@ fn stop_reentry_reaches_a_deterministic_terminal_result() {
         let handler = directory.join("session-coordination-guard.py");
         fs::write(
             &handler,
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"decision\":\"block\",\"reason\":\"operation-uncertain\"}'\n",
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"schema_version\":\"runtime-kit.session-coordination-result.v1\",\"status\":\"pending\",\"message\":\"operation-uncertain\",\"decision\":\"block\",\"reason\":\"operation-uncertain\"}'\n",
         )
         .expect("coordination handler");
         fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
@@ -331,6 +376,133 @@ fn stop_reentry_reaches_a_deterministic_terminal_result() {
     }
 }
 
+#[test]
+fn clean_coordination_stop_reentry_does_not_prescribe_recovery() {
+    for (mode, expected_context) in [
+        ("advisory", "clean transaction ran in advisory mode"),
+        ("off", "clean transaction ran with coordination off"),
+        ("enforce", "clean enforce-mode transaction"),
+    ] {
+        let fixture = Fixture::new(CLEAN_STOP_REENTRY_POLICY);
+        install_session_mode(&fixture, mode);
+        let hooks = fixture.home.join(".claude/hooks");
+        fs::create_dir_all(&hooks).expect("claude hook directory");
+        let handler = hooks.join("session-coordination-guard.py");
+        fs::write(
+            &handler,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"schema_version\":\"runtime-kit.session-coordination-result.v1\",\"status\":\"clean\"}'\n",
+        )
+        .expect("coordination handler");
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+        let envs = [
+            ("AGENT_SESSION_ID", "managed-session"),
+            ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+            ("AGENT_SESSION_COORDINATION_MODE", mode),
+        ];
+
+        let decision = fixture.run_with_env(
+            &["dispatch", "--product", "claude", "--format", "json"],
+            Some(r#"{"hook_event_name":"Stop","stop_hook_active":true}"#),
+            &envs,
+        );
+        assert_eq!(
+            decision.code,
+            0,
+            "mode={mode} stderr={}",
+            decision.stderr_text()
+        );
+        let decision = decision.stdout_json();
+        assert_eq!(decision["data"]["action"], "warn", "mode={mode} {decision}");
+        let codes = reason_codes(&decision);
+        assert!(
+            codes.contains(&"stop-reentry-terminal-exit".to_string()),
+            "mode={mode} clean coordination needs the terminal classification: {decision}"
+        );
+        assert!(
+            !codes.contains(&"stop-reentry-reconciliation-pending".to_string()),
+            "mode={mode} clean coordination must not claim reconciliation is pending: {decision}"
+        );
+        let context = decision["data"]["context"].as_str().unwrap_or_default();
+        assert!(context.contains(expected_context), "mode={mode} {context}");
+        assert!(
+            !context.contains("broker reconcile"),
+            "mode={mode} {context}"
+        );
+        assert!(
+            !context.contains("claim and any active operation"),
+            "mode={mode} {context}"
+        );
+        assert!(
+            !context.contains("mutation stays gated"),
+            "mode={mode} {context}"
+        );
+
+        let spool = fixture.session_state.join("observation/spool");
+        let mut body = String::new();
+        for entry in fs::read_dir(&spool).expect("spool entries") {
+            body.push_str(&fs::read_to_string(entry.expect("entry").path()).expect("segment"));
+        }
+        let terminal: Vec<Value> = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("event JSON"))
+            .filter(|event| event["code"] == "stop-reentry-terminal-exit")
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "mode={mode} terminal evidence: {terminal:?}"
+        );
+        assert_eq!(terminal[0]["severity"], "warn", "mode={mode}");
+        assert_eq!(terminal[0]["disposition"], "terminal-exit", "mode={mode}");
+        assert!(
+            terminal[0]["recovery_action"].is_null(),
+            "mode={mode} clean exit must not prescribe recovery: {}",
+            terminal[0]
+        );
+    }
+}
+
+#[test]
+fn untyped_coordination_output_does_not_claim_pending_broker_state() {
+    let fixture = Fixture::new(CLEAN_STOP_REENTRY_POLICY);
+    install_session_mode(&fixture, "enforce");
+    let hooks = fixture.home.join(".claude/hooks");
+    fs::create_dir_all(&hooks).expect("claude hook directory");
+    let handler = hooks.join("session-coordination-guard.py");
+    fs::write(
+        &handler,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"decision\":\"block\",\"reason\":\"arbitrary untyped block\"}'\n",
+    )
+    .expect("untyped coordination handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+    let envs = [
+        ("AGENT_SESSION_ID", "managed-session"),
+        ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+        ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+    ];
+
+    let decision = fixture.run_with_env(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(r#"{"hook_event_name":"Stop","stop_hook_active":true}"#),
+        &envs,
+    );
+    assert_eq!(decision.code, 0, "stderr={}", decision.stderr_text());
+    let decision = decision.stdout_json();
+    let codes = reason_codes(&decision);
+    assert!(
+        codes.contains(&"stop-reentry-terminal-exit".to_string()),
+        "{decision}"
+    );
+    assert!(
+        !codes.contains(&"stop-reentry-reconciliation-pending".to_string()),
+        "untyped provider output is not pending-state proof: {decision}"
+    );
+    let context = decision["data"]["context"].as_str().unwrap_or_default();
+    assert!(context.contains("broker status"), "{context}");
+    assert!(!context.contains("broker reconcile"), "{context}");
+}
+
 /// The liveness rule cannot depend on recognizing the fault. Once the provider
 /// reports Stop re-entry, a stage that fails outright must still terminate rather
 /// than render another denial the gate cannot converge on.
@@ -374,9 +546,12 @@ fn stop_reentry_terminates_even_for_an_unclassified_stage_failure() {
     assert_eq!(decision["data"]["action"], "warn", "{decision}");
     let codes = reason_codes(&decision);
     assert!(
-        codes.contains(&"stop-reentry-reconciliation-pending".to_string()),
+        codes.contains(&"stop-reentry-terminal-exit".to_string()),
         "{decision}"
     );
+    let context = decision["data"]["context"].as_str().unwrap_or_default();
+    assert!(context.contains("broker status"), "{context}");
+    assert!(!context.contains("broker reconcile"), "{context}");
     assert_eq!(
         codes.len(),
         2,
@@ -425,6 +600,16 @@ fn coordination_failure_on_stop_degrades_instead_of_deadlocking() {
             reason_codes(&decision)
                 .contains(&"coordination-stop-reconciliation-required".to_string()),
             "{product} missing the coordination Stop degradation: {decision}"
+        );
+        let context = decision["data"]["context"].as_str().unwrap_or_default();
+        assert!(context.contains("broker status"), "{product}: {context}");
+        assert!(
+            !context.contains("broker reconcile"),
+            "{product}: {context}"
+        );
+        assert!(
+            !context.contains("mutation stays gated"),
+            "{product}: {context}"
         );
     }
 }

@@ -15,10 +15,11 @@
 //! * [`Lane::Mutation`] — tool admission. Unchanged: a fault that cannot be
 //!   proven still fails closed.
 //! * [`Lane::Terminal`] — the Stop family. A fault, or provider re-entry
-//!   metadata, produces one deterministic terminal result with durable
-//!   reconciliation-pending evidence. Claims, leases, and operations are
-//!   retained, so mutation stays gated until an external reconciliation runs.
+//!   metadata, produces one deterministic terminal result. Recovery is named
+//!   only when the observed coordination outcome requires it; unrelated Stop
+//!   blocks do not manufacture claim, operation, or gating assertions.
 
+use nils_common::coordination_projection::CoordinationMode;
 use nils_common::observation::Severity;
 
 use crate::error::HookError;
@@ -41,8 +42,29 @@ pub(crate) const CONVERSATION_DEGRADED: &str = "coordination-degraded-read-only"
 pub(crate) const STOP_RECONCILIATION_REQUIRED: &str = "coordination-stop-reconciliation-required";
 /// Stable classification for a terminal exit forced by provider Stop re-entry.
 pub(crate) const STOP_REENTRY_PENDING: &str = "stop-reentry-reconciliation-pending";
+/// Stable classification for a terminal exit whose coordination outcome is clean.
+pub(crate) const STOP_REENTRY_TERMINAL: &str = "stop-reentry-terminal-exit";
 /// Stable disposition recorded for a retained-lease terminal exit.
 const RECONCILIATION_PENDING: &str = "reconciliation-pending";
+/// Stable disposition for a re-entry exit that prescribes no recovery mutation.
+const TERMINAL_EXIT: &str = "terminal-exit";
+
+/// Typed result of the coordination stage that preceded Stop re-entry.
+///
+/// Keep this separate from normalized decision reasons: those strings are a
+/// presentation contract and cannot distinguish a skipped transaction from a
+/// clean one or an unavailable result from a reported pending operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopCoordinationOutcome {
+    /// No coordination transaction ran for this evaluation.
+    NotRun,
+    /// The transaction ran and did not report a pending operation.
+    Clean { mode: Option<CoordinationMode> },
+    /// The transaction ran and explicitly reported a pending operation.
+    Pending { mode: Option<CoordinationMode> },
+    /// The transaction was selected but its result could not be observed.
+    Unavailable { mode: Option<CoordinationMode> },
+}
 
 /// Which interaction lane a provider event belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,15 +242,16 @@ pub(crate) fn terminal_exit_for_error(
             },
             DecisionReason {
                 rule_id: DEGRADATION_RULE_ID.to_string(),
-                code: STOP_REENTRY_PENDING.to_string(),
+                code: STOP_REENTRY_TERMINAL.to_string(),
                 disposition: "warn".to_string(),
             },
         ],
         context: Some(format!(
             "agent-hook terminal exit: this Stop hook already re-entered and the hook could not \
-             complete ({}), so the turn ends with reconciliation pending. The claim and any \
-             active operation are retained and mutation stays gated. Next: {}.",
-            error.code, RECOVERY_BROKER_RECONCILE
+             complete ({}), so the turn ends without repeating the block. Coordination state \
+             was not observed, so no retained claim, active operation, gate, or recovery \
+             mutation is inferred. Next: {}.",
+            error.code, RECOVERY_BROKER_STATUS
         )),
         replacement: None,
         shadow: Vec::new(),
@@ -237,11 +260,11 @@ pub(crate) fn terminal_exit_for_error(
         recovery_applied: false,
         provider_output: None,
     };
-    Record::new("stop", STOP_REENTRY_PENDING, Severity::Warn)
+    Record::new("stop", STOP_REENTRY_TERMINAL, Severity::Warn)
         .provider(request.product, &request.event)
-        .disposition(RECONCILIATION_PENDING)
+        .disposition(TERMINAL_EXIT)
         .correlate(request.product, raw)
-        .recovery(RECOVERY_BROKER_RECONCILE)
+        .recovery(RECOVERY_BROKER_STATUS)
         .emit();
     Some(decision)
 }
@@ -251,14 +274,16 @@ pub(crate) fn terminal_exit_for_error(
 ///
 /// Re-entry proves the previous Stop block did not change anything the gate is
 /// waiting on, so blocking again cannot converge — it only consumes the
-/// provider's consecutive-block budget until the turn is force-terminated. The
-/// exit is not a release: every original reason is retained on the decision, the
-/// evidence is durable, and no claim, lease, or operation is touched, so mutation
-/// stays gated until an external reconciliation runs.
+/// provider's consecutive-block budget until the turn is force-terminated.
+/// Every original reason is retained and no coordination state is changed. A
+/// broker reconciliation is prescribed only when the typed coordination result
+/// explicitly reports a pending operation; clean, skipped, and unavailable
+/// outcomes do not manufacture a retained-state or mutation-gate claim.
 pub(crate) fn apply_stop_reentry(
     request: &NormalizedRequest,
     raw: &[u8],
     mut decision: NormalizedDecision,
+    coordination: StopCoordinationOutcome,
 ) -> NormalizedDecision {
     if decision.action != DecisionAction::Block
         || lane(&request.event) != Lane::Terminal
@@ -269,27 +294,99 @@ pub(crate) fn apply_stop_reentry(
     decision.action = DecisionAction::Warn;
     // A block-shaped provider payload would re-render the block we just resolved.
     decision.provider_output = None;
+    let reconciliation_pending = matches!(coordination, StopCoordinationOutcome::Pending { .. });
+    let reentry_code = if reconciliation_pending {
+        STOP_REENTRY_PENDING
+    } else {
+        STOP_REENTRY_TERMINAL
+    };
     decision.reasons.push(DecisionReason {
         rule_id: DEGRADATION_RULE_ID.to_string(),
-        code: STOP_REENTRY_PENDING.to_string(),
+        code: reentry_code.to_string(),
         disposition: "warn".to_string(),
     });
-    let context = format!(
-        "agent-hook terminal exit: this Stop hook already re-entered, so the turn ends with \
-         reconciliation pending. The claim and any active operation are retained and mutation \
-         stays gated. Next: {RECOVERY_BROKER_RECONCILE}."
-    );
+    let context = if reconciliation_pending {
+        format!(
+            "agent-hook terminal exit: this Stop hook already re-entered, so the turn ends with \
+             reconciliation pending as reported by the coordination transaction. This exit \
+             does not change coordination state. {} Next: {RECOVERY_BROKER_RECONCILE}.",
+            coordination_context(coordination)
+        )
+    } else {
+        format!(
+            "agent-hook terminal exit: this Stop hook already re-entered, so the turn ends \
+             without repeating the block. No recovery mutation is prescribed. {} The original \
+             Stop reason remains visible for the next turn.",
+            coordination_context(coordination)
+        )
+    };
     decision.context = Some(match decision.context.take() {
         Some(existing) => format!("{existing}\n{context}"),
         None => context,
     });
-    Record::new("stop", STOP_REENTRY_PENDING, Severity::Warn)
+    let record = Record::new("stop", reentry_code, Severity::Warn)
         .provider(request.product, &request.event)
-        .disposition(RECONCILIATION_PENDING)
-        .correlate(request.product, raw)
-        .recovery(RECOVERY_BROKER_RECONCILE)
-        .emit();
+        .disposition(if reconciliation_pending {
+            RECONCILIATION_PENDING
+        } else {
+            TERMINAL_EXIT
+        })
+        .correlate(request.product, raw);
+    match coordination {
+        StopCoordinationOutcome::Pending { .. } => {
+            record.recovery(RECOVERY_BROKER_RECONCILE).emit();
+        }
+        StopCoordinationOutcome::Unavailable { .. } => {
+            record.recovery(RECOVERY_BROKER_STATUS).emit();
+        }
+        StopCoordinationOutcome::NotRun | StopCoordinationOutcome::Clean { .. } => {
+            record.emit();
+        }
+    }
     decision
+}
+
+fn coordination_context(outcome: StopCoordinationOutcome) -> &'static str {
+    match outcome {
+        StopCoordinationOutcome::NotRun => {
+            "No coordination transaction ran, so no coordination-state or gate claim is made."
+        }
+        StopCoordinationOutcome::Clean {
+            mode: Some(CoordinationMode::Advisory),
+        } => {
+            "The clean transaction ran in advisory mode and reported no pending operation; no mutation gate is claimed."
+        }
+        StopCoordinationOutcome::Clean {
+            mode: Some(CoordinationMode::Off),
+        } => {
+            "The clean transaction ran with coordination off and reported no pending operation; no mutation gate is claimed."
+        }
+        StopCoordinationOutcome::Clean {
+            mode: Some(CoordinationMode::Enforce),
+        } => "The clean enforce-mode transaction reported no pending operation.",
+        StopCoordinationOutcome::Clean { mode: None } => {
+            "The transaction reported no pending operation, but no effective coordination mode was observed; no gate claim is made."
+        }
+        StopCoordinationOutcome::Pending {
+            mode: Some(CoordinationMode::Enforce),
+        } => "Enforce-mode mutation remains gated by the reported pending transaction.",
+        StopCoordinationOutcome::Pending {
+            mode: Some(CoordinationMode::Advisory),
+        } => {
+            "The advisory transaction reported a pending operation, but this message does not claim an enforce-mode mutation gate."
+        }
+        StopCoordinationOutcome::Pending {
+            mode: Some(CoordinationMode::Off),
+        } => {
+            "The transaction reported a pending operation while coordination was off, but this message does not claim a mutation gate."
+        }
+        StopCoordinationOutcome::Pending { mode: None } => {
+            "The transaction reported a pending operation, but no effective coordination mode was observed; no gate claim is made."
+        }
+        StopCoordinationOutcome::Unavailable { .. } => {
+            "The coordination result was unavailable, so no retained-state or gate claim is made; inspect agent-session broker status read-only."
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,11 +487,23 @@ mod tests {
     fn stop_reentry_only_resolves_a_block_on_the_terminal_lane() {
         // Not re-entering: the authoritative block stands.
         assert_eq!(
-            apply_stop_reentry(&request("Stop", Some(false)), b"{}", blocked("Stop")).action,
+            apply_stop_reentry(
+                &request("Stop", Some(false)),
+                b"{}",
+                blocked("Stop"),
+                StopCoordinationOutcome::Pending { mode: None },
+            )
+            .action,
             DecisionAction::Block
         );
         assert_eq!(
-            apply_stop_reentry(&request("Stop", None), b"{}", blocked("Stop")).action,
+            apply_stop_reentry(
+                &request("Stop", None),
+                b"{}",
+                blocked("Stop"),
+                StopCoordinationOutcome::Pending { mode: None },
+            )
+            .action,
             DecisionAction::Block
         );
         // Re-entry metadata on another lane must not resolve its block.
@@ -402,7 +511,8 @@ mod tests {
             apply_stop_reentry(
                 &request("PreToolUse", Some(true)),
                 b"{}",
-                blocked("PreToolUse")
+                blocked("PreToolUse"),
+                StopCoordinationOutcome::Pending { mode: None },
             )
             .action,
             DecisionAction::Block
@@ -411,7 +521,14 @@ mod tests {
 
     #[test]
     fn a_reentered_stop_terminates_while_retaining_its_original_evidence() {
-        let resolved = apply_stop_reentry(&request("Stop", Some(true)), b"{}", blocked("Stop"));
+        let resolved = apply_stop_reentry(
+            &request("Stop", Some(true)),
+            b"{}",
+            blocked("Stop"),
+            StopCoordinationOutcome::Pending {
+                mode: Some(CoordinationMode::Enforce),
+            },
+        );
 
         assert_eq!(resolved.action, DecisionAction::Warn);
         assert_eq!(
@@ -428,11 +545,46 @@ mod tests {
             "a block-shaped provider payload must not re-render the resolved block"
         );
         let context = resolved.context.expect("terminal context");
-        assert!(context.contains("retained"), "context={context}");
+        assert!(
+            context.contains("reported by the coordination transaction"),
+            "context={context}"
+        );
+        assert!(!context.contains("claim and any active operation"));
+        assert!(!context.contains("mutation stays gated"));
         assert!(
             context.contains(RECOVERY_BROKER_RECONCILE),
             "context={context}"
         );
+    }
+
+    #[test]
+    fn a_clean_advisory_reentry_prescribes_no_recovery_or_gate() {
+        let mut decision = blocked("Stop");
+        decision.reasons[0].rule_id = "runtime.stop-prerequisite".to_string();
+        decision.reasons.push(DecisionReason {
+            rule_id: "runtime.stop-coordination".to_string(),
+            code: "coordination-admitted".to_string(),
+            disposition: "allow".to_string(),
+        });
+
+        let resolved = apply_stop_reentry(
+            &request("Stop", Some(true)),
+            b"{}",
+            decision,
+            StopCoordinationOutcome::Clean {
+                mode: Some(CoordinationMode::Advisory),
+            },
+        );
+
+        assert_eq!(resolved.action, DecisionAction::Warn);
+        assert_eq!(
+            resolved.reasons.last().map(|reason| reason.code.as_str()),
+            Some(STOP_REENTRY_TERMINAL)
+        );
+        let context = resolved.context.expect("terminal context");
+        assert!(context.contains("advisory mode"), "{context}");
+        assert!(context.contains("recovery mutation"), "{context}");
+        assert!(!context.contains(RECOVERY_BROKER_RECONCILE));
     }
 
     #[test]
