@@ -36837,12 +36837,12 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
             "outcome": "completed"
         }),
     );
-    let runtime = seed_live_runtime_identity(
+    let mut runtime = Some(seed_live_runtime_identity(
         &state_dir,
         "worker-retire-claim",
         "worker-retire-claim-incarnation",
         97,
-    );
+    ));
     seed_operation(
         &state_dir,
         "worker-retire-claim",
@@ -36853,7 +36853,11 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let tmux_arg = tmux_bin.to_string_lossy().into_owned();
     let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
-    let runtime_pid = runtime.pid().to_string();
+    let runtime_pid = runtime
+        .as_ref()
+        .expect("retire replay runtime")
+        .pid()
+        .to_string();
     let state_runtime = state_dir.to_string_lossy().into_owned();
     let envs = [
         ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
@@ -36938,15 +36942,25 @@ fn main_agent_retire_replays_released_worker_with_retained_claim() {
     // process group alive until retire revokes the retained claim. Retire then
     // tears the session down, and its termination probe can still observe the
     // boundary as running: that is the documented retryable outcome carrying
-    // `action: retry-delete`. macOS reaches that path where Linux does not, so
-    // honor the retry instead of asserting one-shot success. Only this exact
-    // retryable reason is replayed; every other outcome falls straight through
-    // to the assertions below.
+    // `action: retry-delete`. macOS reaches that path where Linux does not.
+    // Once it does, stop the fixture-owned process group before replaying the
+    // exact retire request; otherwise fake tmux has already recorded the pane
+    // absent while KEEP_PROCESS_GROUP deliberately leaves the process live,
+    // producing the contradictory runtime-identity-unavailable outcome. Only
+    // this exact retryable reason owns the fixture stop and replay.
     let mut replayed = run_main_agent(&main_checkout, &retire_args, &envs);
     let retire_deadline = Instant::now() + Duration::from_secs(30);
+    if replayed.code != 0
+        && replayed.stdout_json()["error"]["code"] == "session-termination-failed"
+        && replayed.stdout_json()["error"]["details"]["reason"] == "process-still-running"
+        && replayed.stdout_json()["error"]["details"]["action"] == "retry-delete"
+    {
+        drop(runtime.take());
+    }
     while replayed.code != 0
         && replayed.stdout_json()["error"]["code"] == "session-termination-failed"
         && replayed.stdout_json()["error"]["details"]["reason"] == "process-still-running"
+        && replayed.stdout_json()["error"]["details"]["action"] == "retry-delete"
         && Instant::now() < retire_deadline
     {
         std::thread::sleep(Duration::from_millis(100));
