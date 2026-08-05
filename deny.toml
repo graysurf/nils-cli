@@ -47,8 +47,11 @@ skip = [
     { crate = "roxmltree@0.20.0", reason = "usvg pulls 0.20; workspace on 0.21" },
     # TLS stack pulls an older untrusted on one webpki path.
     { crate = "untrusted@0.7.1", reason = "older untrusted via a TLS dependency path" },
-    # wasm bindgen for the image-webp decode path.
-    { crate = "wit-bindgen@0.51.0", reason = "image-webp wasm decode; upstream transition" },
+    # syn 2 -> 3 generation split: the workspace's central macro crates
+    # (serde_derive, thiserror-impl, clap_derive) are on the syn 3 line while
+    # other proc-macro deps still pull syn 2. Skip the lagging 2.x line until
+    # the proc-macro ecosystem finishes moving to 3.
+    { crate = "syn@2.0.117", reason = "syn 2/3 ecosystem transition; workspace macro crates on 3" },
     # `unstable-dynamic` also pulls `is_executable 1.0.6`, whose Windows-target
     # dependency is `windows-sys 0.60`; the workspace mainline is `windows-sys
     # 0.61` (via clap -> anstyle). Skip the lagging 0.60 line (checked across
