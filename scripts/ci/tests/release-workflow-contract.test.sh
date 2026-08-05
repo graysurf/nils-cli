@@ -135,5 +135,15 @@ assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-
   "read_tap_formula_version" \
   "tap wait gates on the version published in the tap formula"
 
+# PR-mode delivery must leave a window between opening the PR and merging it: the
+# ledger merge gate needs an observation at the current head, and the chain
+# refuses an append at a stale head.
+assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
+  "record_release_review_genesis" \
+  "release PR delivery records the review-loop ledger genesis before merging"
+assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
+  "mode delivery" \
+  "release genesis envelope comes from the review-specialists delivery generator"
+
 echo
 echo "PASS: release-workflow-contract.test.sh"

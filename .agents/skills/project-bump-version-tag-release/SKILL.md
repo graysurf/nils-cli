@@ -62,7 +62,10 @@ Inputs:
   - `NILS_CLI_CI_WAIT_SECONDS` (env var; direct-push only: max seconds to wait for the bump commit's
     `ci.yml`, default 1800)
   - `NILS_CLI_PR_WAIT` (env var; PR mode only: budget passed to `forge-cli pr deliver --timeout`,
-    default `30m`)
+    default `60m`. Keep it above the slowest lane a release PR can land on, not the
+    expected one: the reduced release-only lane needs the exact base `main` SHA to
+    already have one trusted successful full CI run, and a release cut soon after a
+    merge falls back to full PR CI where `test_macos` has measured 31m45s)
 - Optional (tap stage):
   - `--tap-repo <owner/repo>` (tap repo to wait on, default `sympoies/homebrew-tap`;
     env `NILS_CLI_HOMEBREW_TAP_REPO`)
@@ -86,9 +89,18 @@ Default delivery mode (PR-based):
 - Switches from `main` to a fresh `chore/release-X-Y-Z` branch before bumping any versions.
   (If the user is already on that branch, it is reused; any other starting branch is rejected
   so that `--direct-push` is an explicit opt-in.)
-- After commit, pushes the branch and invokes `forge-cli pr deliver --kind chore --method squash`,
-  which opens a draft PR, waits for required status checks to pass, promotes it to ready, and
-  squash-merges into `main` (deleting the source branch).
+- After commit, pushes the branch and invokes `forge-cli pr deliver --kind chore --method squash
+  --no-merge`, which opens a draft PR, waits for required status checks to pass, and promotes it
+  to ready.
+- Then records the review-loop ledger genesis for that PR and merges it as a separate step.
+  `forge-cli pr merge` fails closed with `review_state_conflict` when the ledger carries no
+  observation for the current head, and the chain refuses an append at a stale head, so the
+  genesis has to land between delivery and merge — a macro that merges in the same step leaves
+  nowhere to put it. A canonical release PR is a generated version-only diff, so the genesis is
+  the empty envelope `review-specialists bundle --mode delivery` produces; the schema rejects a
+  hand-rolled lookalike. The script then posts a `comments-only` delivery outcome recording that
+  the empty finding set is what the checks gated, rather than claiming a review that did not
+  happen, and merges with `--expected-head` bound to the observed head.
 - A canonical single-commit version-only release PR uses the reduced release-only CI lane only
   when protected base policy recognizes the change and the exact base `main` SHA has one trusted
   successful full CI run. Missing or ambiguous proof falls back to full PR CI; the required check

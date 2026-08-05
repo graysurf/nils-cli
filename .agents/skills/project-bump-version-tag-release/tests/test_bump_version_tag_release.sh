@@ -1057,10 +1057,39 @@ PY
   assert_not_contains "$formula_path" 'v0.6.4/nils-cli-v0.6.4'
 }
 
+# Assert that one logged call happened before another. The review-loop ledger
+# rejects a `fixed` disposition at the head where a finding was first recorded and
+# refuses an append at a stale head, so genesis has to precede the merge rather
+# than merely coexist with it. Only ordering proves that.
+assert_precedes() {
+  local file="$1"
+  local earlier="$2"
+  local later="$3"
+  local earlier_line later_line
+  earlier_line="$(rg -n --fixed-strings -- "$earlier" "$file" | head -1 | cut -d: -f1)"
+  later_line="$(rg -n --fixed-strings -- "$later" "$file" | head -1 | cut -d: -f1)"
+  if [[ -z "$earlier_line" ]]; then
+    echo "error: expected '$earlier' in $file" >&2
+    sed -n '1,220p' "$file" >&2 || true
+    exit 1
+  fi
+  if [[ -z "$later_line" ]]; then
+    echo "error: expected '$later' in $file" >&2
+    sed -n '1,220p' "$file" >&2 || true
+    exit 1
+  fi
+  if ((earlier_line >= later_line)); then
+    echo "error: expected '$earlier' before '$later' in $file" >&2
+    sed -n '1,220p' "$file" >&2 || true
+    exit 1
+  fi
+}
+
 create_mock_forge_cli_deliver() {
-  # The mock simulates a successful PR deliver by fast-forwarding the bare
-  # remote's main to the freshly pushed release branch, then printing a final
-  # status line the way `forge-cli pr deliver` does.
+  # The mock walks the same sequence the release script drives: deliver the PR
+  # without merging, read its head, record the review-loop genesis, post the
+  # delivery outcome, then merge. `pr merge` is what fast-forwards the bare
+  # remote's main onto the pushed release branch.
   local bin_dir="$1"
   local bare_remote="$2"
   cat > "${bin_dir}/forge-cli" <<EOF
@@ -1068,37 +1097,120 @@ create_mock_forge_cli_deliver() {
 set -euo pipefail
 
 log_file="\${MOCK_LOG:?}"
-echo "forge-cli:\$*" >> "\$log_file"
-
-if [[ "\${1:-}" != "pr" || "\${2:-}" != "deliver" ]]; then
-  echo "unexpected forge-cli command: \$*" >&2
-  exit 1
-fi
-
-# Determine the branch that was just pushed by inspecting the bare remote.
-release_branch="\$(git -C "${bare_remote}" symbolic-ref --short HEAD 2>/dev/null || true)"
-# Find which branch ref was most recently advanced ahead of main.
-for ref in \$(git -C "${bare_remote}" for-each-ref --format='%(refname:short)' refs/heads); do
-  if [[ "\$ref" == "main" ]]; then
-    continue
-  fi
-  release_branch="\$ref"
-  break
+# Drop --format json so the logged shape stays stable for assertions.
+args=()
+for arg in "\$@"; do
+  [[ "\$arg" == "--format" || "\$arg" == "json" ]] && continue
+  args+=("\$arg")
 done
+echo "forge-cli:\${args[*]}" >> "\$log_file"
 
-if [[ -z "\$release_branch" ]]; then
-  echo "mock forge-cli: could not detect release branch on remote" >&2
-  exit 1
-fi
+detect_release_branch() {
+  local ref
+  for ref in \$(git -C "${bare_remote}" for-each-ref --format='%(refname:short)' refs/heads); do
+    [[ "\$ref" == "main" ]] && continue
+    printf '%s\n' "\$ref"
+    return 0
+  done
+  return 1
+}
 
-# Fast-forward main to the release branch on the bare remote (simulates squash-merge).
-release_sha="\$(git -C "${bare_remote}" rev-parse "refs/heads/\$release_branch")"
-git -C "${bare_remote}" update-ref refs/heads/main "\$release_sha"
-git -C "${bare_remote}" update-ref -d "refs/heads/\$release_branch"
+release_head() {
+  local branch
+  branch="\$(detect_release_branch)" || return 1
+  git -C "${bare_remote}" rev-parse "refs/heads/\$branch"
+}
 
-echo "merged #999 via squash → \$release_sha (branch deleted)"
+case "\${args[0]:-} \${args[1]:-} \${args[2]:-}" in
+  "pr deliver"*)
+    if [[ " \${args[*]} " != *" --no-merge "* ]]; then
+      echo "mock forge-cli: pr deliver must not merge; the ledger genesis has to be recorded first" >&2
+      exit 1
+    fi
+    printf '{"schema_version":"cli.forge-cli.pr.deliver.v1","ok":true,"data":{"pr":{"number":999,"url":"https://example.test/pr/999","merged":false}}}\n'
+    ;;
+  "pr view"*)
+    head="\$(release_head)" || { echo "mock forge-cli: no release branch on remote" >&2; exit 1; }
+    printf '{"schema_version":"cli.forge-cli.pr.view.v1","ok":true,"data":{"number":999,"head_sha":"%s","draft":false,"state":"open"}}\n' "\$head"
+    ;;
+  "pr review-loop inspect"*)
+    # MOCK_LEDGER_TIP models a chain that already has state, which is what a
+    # resumed release meets. The observe call must then carry it as the CAS input.
+    if [[ -n "\${MOCK_LEDGER_TIP:-}" ]]; then
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.inspect.v1","ok":true,"data":{"number":999,"state_tip_digest":"%s","appended":true}}\n' "\${MOCK_LEDGER_TIP}"
+    else
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.inspect.v1","ok":true,"data":{"number":999,"state_tip_digest":null,"appended":false}}\n'
+    fi
+    ;;
+  "pr review-loop observe"*)
+    if [[ -n "\${MOCK_LEDGER_TIP:-}" && " \${args[*]} " != *" --expected-state \${MOCK_LEDGER_TIP} "* ]]; then
+      echo "mock forge-cli: observe must carry --expected-state \${MOCK_LEDGER_TIP} on a chain that already has a tip" >&2
+      exit 1
+    fi
+    if [[ " \${args[*]} " == *" --dry-run "* ]]; then
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.observe.v1","ok":true,"data":{"preflight_ok":true,"would_append":true}}\n'
+    else
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.observe.v1","ok":true,"data":{"appended":true,"generation":0,"state_tip_digest":"sha256:mockdigest","state":{"round":0,"findings":{}}}}\n'
+    fi
+    ;;
+  "pr review"*)
+    printf '{"schema_version":"cli.forge-cli.pr.review.v1","ok":true,"data":{"number":999,"decision":"comments-only"}}\n'
+    ;;
+  "pr ready"*)
+    printf '{"schema_version":"cli.forge-cli.pr.ready.v1","ok":true,"data":{"number":999,"draft":false}}\n'
+    ;;
+  "pr merge"*)
+    branch="\$(detect_release_branch)" || { echo "mock forge-cli: no release branch on remote" >&2; exit 1; }
+    sha="\$(git -C "${bare_remote}" rev-parse "refs/heads/\$branch")"
+    git -C "${bare_remote}" update-ref refs/heads/main "\$sha"
+    git -C "${bare_remote}" update-ref -d "refs/heads/\$branch"
+    printf '{"schema_version":"cli.forge-cli.pr.merge.v1","ok":true,"data":{"number":999,"merge_sha":"%s","method":"squash","deleted_branch":true}}\n' "\$sha"
+    echo "merged #999 via squash → \$sha (branch deleted)" >&2
+    ;;
+  *)
+    echo "unexpected forge-cli command: \${args[*]}" >&2
+    exit 1
+    ;;
+esac
 EOF
   chmod +x "${bin_dir}/forge-cli"
+}
+
+create_mock_review_specialists() {
+  # `review-specialists bundle --mode delivery` generates the envelope the ledger
+  # requires. An empty input is the honest genesis for a generated version-only
+  # release diff, and the schema rejects a hand-rolled lookalike, which is why the
+  # script must call the real generator rather than writing the payload itself.
+  local bin_dir="$1"
+  cat > "${bin_dir}/review-specialists" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file="${MOCK_LOG:?}"
+echo "review-specialists:$*" >> "$log_file"
+
+out_dir=""
+prev=""
+for arg in "$@"; do
+  [[ "$prev" == "--out-dir" ]] && out_dir="$arg"
+  prev="$arg"
+done
+
+if [[ "${1:-}" != "bundle" || -z "$out_dir" ]]; then
+  echo "unexpected review-specialists command: $*" >&2
+  exit 1
+fi
+if [[ " $* " != *" --mode delivery "* ]]; then
+  echo "review-specialists: the ledger genesis requires --mode delivery" >&2
+  exit 1
+fi
+
+mkdir -p "$out_dir"
+printf '{"schema":"review-specialists.merged.v2","counts":{"merged":0},"findings":[]}\n' \
+  >"${out_dir}/findings.merged.json"
+printf '{"schema_version":"cli.review-specialists.bundle.v1","ok":true,"data":{"counts":{"merged":0}}}\n'
+EOF
+  chmod +x "${bin_dir}/review-specialists"
 }
 
 test_pr_mode_default_opens_pr_and_tags_merge_commit() {
@@ -1121,6 +1233,7 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   git -C "$repo" push -u origin main >/dev/null
 
   create_mock_forge_cli_deliver "$bin_dir" "$remote"
+  create_mock_review_specialists "$bin_dir"
 
   (
     cd "$repo"
@@ -1134,6 +1247,28 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   assert_contains "$log_file" 'forge-cli:pr deliver --kind chore'
   assert_contains "$log_file" 'bump cli versions to 0.6.5'
   assert_contains "$log_file" '--method squash'
+
+  # The review-loop ledger genesis is what lets the merge gate pass. `pr merge`
+  # fails closed with `review_state_conflict` when no observation exists for the
+  # head, and an observation cannot be backfilled at a stale head, so the order
+  # matters as much as the presence.
+  assert_contains "$log_file" 'review-specialists:bundle'
+  assert_contains "$log_file" '--mode delivery'
+  assert_contains "$log_file" 'forge-cli:pr review-loop observe 999'
+  assert_precedes "$log_file" 'pr review-loop observe 999' 'pr merge 999'
+  # Genesis is validated before it is written: a live observe appends durable
+  # provider-visible state, so it is not a probe.
+  assert_precedes "$log_file" '--dry-run' 'pr merge 999'
+
+  # Delivery must stop before merging so the genesis can be recorded between the
+  # two, and the check wait must exceed the slowest CI lane a release PR can land
+  # on -- full PR CI has measured test_macos at 31m45s.
+  assert_contains "$log_file" '--no-merge'
+  local delivered_wait
+  delivered_wait="$(sed -n 's/.*--timeout \([0-9]\{1,\}\)m.*/\1/p' "$log_file" | head -1)"
+  [[ -n "$delivered_wait" ]] || fail "release delivery carried no --timeout budget"
+  ((delivered_wait >= 60)) ||
+    fail "release delivery wait budget ${delivered_wait}m is below the 60m full-CI lane worst case"
   # The release branch existed on the remote before merge and is gone now.
   if git -C "$remote" rev-parse --verify "refs/heads/chore/release-0-6-5" >/dev/null 2>&1; then
     fail "mock forge-cli left release branch behind on remote"
@@ -1158,6 +1293,49 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   fi
 }
 
+# Every failure path leaves the release branch in place for recovery, so a second
+# run meets a chain that already has a tip. Appending without the observed tip
+# would write onto state the run never read, which is what the chain's
+# compare-and-swap exists to prevent. Regression for sympoies/nils-cli#1446.
+test_pr_mode_carries_the_observed_ledger_tip_on_a_resumed_chain() {
+  local tmp repo remote bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  remote="${tmp}/repo.git"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  git init --bare "$remote" >/dev/null
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+
+  create_mock_forge_cli_deliver "$bin_dir" "$remote"
+  create_mock_review_specialists "$bin_dir"
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      MOCK_LEDGER_TIP="sha256:resumedtip" \
+      "$entrypoint" --version v0.6.5 --skip-tap
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  # The mock fails the observe outright when the tip is missing, so reaching a
+  # merge at all proves the CAS input was carried.
+  assert_contains "$log_file" '--expected-state sha256:resumedtip'
+  assert_precedes "$log_file" 'pr review-loop inspect 999' 'pr review-loop observe 999'
+  assert_contains "$log_file" 'forge-cli:pr merge 999'
+  assert_contains "$stderr_file" 'review-loop chain for #999 already at sha256:resumedtip'
+}
+
 test_pr_mode_from_linked_worktree_tags_without_checkout_main() {
   local tmp repo remote wt bin_dir log_file stderr_file
   tmp="$(mktemp -d)"
@@ -1179,6 +1357,7 @@ test_pr_mode_from_linked_worktree_tags_without_checkout_main() {
   git -C "$repo" push -u origin main >/dev/null
 
   create_mock_forge_cli_deliver "$bin_dir" "$remote"
+  create_mock_review_specialists "$bin_dir"
 
   # Dedicated release worktree on the release branch, while the primary checkout
   # ($repo) keeps `main` checked out. This is the shared-worktree-isolation
@@ -1299,6 +1478,7 @@ run_all() {
     test_from_tap_wait_reports_unreadable_tap_formula
     test_formula_inplace_editor_idempotent
     test_pr_mode_default_opens_pr_and_tags_merge_commit
+    test_pr_mode_carries_the_observed_ledger_tip_on_a_resumed_chain
     test_pr_mode_from_linked_worktree_tags_without_checkout_main
     test_pr_mode_rejects_non_chore_release_branch
   )
