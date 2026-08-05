@@ -24,7 +24,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 nils-common = { version = "1.26.2", path = "../nils-common", package = "nils-common" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["randr"] }
+x11rb = { version = "0.14", features = ["randr"] }
 zbus = { version = "5", features = ["blocking"] }
 libc = "0.2"
 
