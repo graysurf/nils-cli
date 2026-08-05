@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `81089842ee31bfcde89d05e78392ef4f4e173c12e9c17934fea1d871bed1bf91`
-- Third-party crates (`source != null`): 497
+- Cargo.lock SHA256: `c7d6d40eaed0b2dda48aee2241f4c23d717dfcf15962a5f695ff641dd76fe1ba`
+- Third-party crates (`source != null`): 501
 - Workspace crates (`source == null`, excluded below): 46
 
 ## Notes
@@ -17,7 +17,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 233 |
+| MIT OR Apache-2.0 | 237 |
 | MIT | 98 |
 | Apache-2.0 OR MIT | 40 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
@@ -103,6 +103,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | cc | 1.2.64 | MIT OR Apache-2.0 | crates.io |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 | crates.io |
 | cfg_aliases | 0.2.1 | MIT | crates.io |
+| chacha20 | 0.10.1 | MIT OR Apache-2.0 | crates.io |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | crates.io |
 | chrono-tz | 0.10.4 | MIT OR Apache-2.0 | crates.io |
 | clap | 4.6.2 | MIT OR Apache-2.0 | crates.io |
@@ -330,15 +331,18 @@ This file documents third-party Rust crate licenses used by this workspace.
 | pxfm | 0.1.29 | BSD-3-Clause OR Apache-2.0 | crates.io |
 | quick-error | 2.0.1 | MIT/Apache-2.0 | crates.io |
 | quinn | 0.11.9 | MIT OR Apache-2.0 | crates.io |
-| quinn-proto | 0.11.14 | MIT OR Apache-2.0 | crates.io |
+| quinn-proto | 0.11.16 | MIT OR Apache-2.0 | crates.io |
 | quinn-udp | 0.5.14 | MIT OR Apache-2.0 | crates.io |
 | quote | 1.0.45 | MIT OR Apache-2.0 | crates.io |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | crates.io |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later | crates.io |
+| rand | 0.10.2 | MIT OR Apache-2.0 | crates.io |
 | rand | 0.9.4 | MIT OR Apache-2.0 | crates.io |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | crates.io |
+| rand_core | 0.10.1 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | crates.io |
+| rand_pcg | 0.10.2 | MIT OR Apache-2.0 | crates.io |
 | redox_syscall | 0.5.18 | MIT | crates.io |
 | ref-cast | 1.0.26 | MIT OR Apache-2.0 | crates.io |
 | ref-cast-impl | 1.0.26 | MIT OR Apache-2.0 | crates.io |
