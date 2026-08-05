@@ -1134,9 +1134,19 @@ case "\${args[0]:-} \${args[1]:-} \${args[2]:-}" in
     printf '{"schema_version":"cli.forge-cli.pr.view.v1","ok":true,"data":{"number":999,"head_sha":"%s","draft":false,"state":"open"}}\n' "\$head"
     ;;
   "pr review-loop inspect"*)
-    printf '{"schema_version":"cli.forge-cli.pr.review-loop.inspect.v1","ok":true,"data":{"number":999,"state_tip_digest":null,"appended":false}}\n'
+    # MOCK_LEDGER_TIP models a chain that already has state, which is what a
+    # resumed release meets. The observe call must then carry it as the CAS input.
+    if [[ -n "\${MOCK_LEDGER_TIP:-}" ]]; then
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.inspect.v1","ok":true,"data":{"number":999,"state_tip_digest":"%s","appended":true}}\n' "\${MOCK_LEDGER_TIP}"
+    else
+      printf '{"schema_version":"cli.forge-cli.pr.review-loop.inspect.v1","ok":true,"data":{"number":999,"state_tip_digest":null,"appended":false}}\n'
+    fi
     ;;
   "pr review-loop observe"*)
+    if [[ -n "\${MOCK_LEDGER_TIP:-}" && " \${args[*]} " != *" --expected-state \${MOCK_LEDGER_TIP} "* ]]; then
+      echo "mock forge-cli: observe must carry --expected-state \${MOCK_LEDGER_TIP} on a chain that already has a tip" >&2
+      exit 1
+    fi
     if [[ " \${args[*]} " == *" --dry-run "* ]]; then
       printf '{"schema_version":"cli.forge-cli.pr.review-loop.observe.v1","ok":true,"data":{"preflight_ok":true,"would_append":true}}\n'
     else
@@ -1283,6 +1293,49 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   fi
 }
 
+# Every failure path leaves the release branch in place for recovery, so a second
+# run meets a chain that already has a tip. Appending without the observed tip
+# would write onto state the run never read, which is what the chain's
+# compare-and-swap exists to prevent. Regression for sympoies/nils-cli#1446.
+test_pr_mode_carries_the_observed_ledger_tip_on_a_resumed_chain() {
+  local tmp repo remote bin_dir log_file stderr_file
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  remote="${tmp}/repo.git"
+  bin_dir="${tmp}/bin"
+  log_file="${tmp}/mock.log"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_cargo "$bin_dir"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+
+  git init --bare "$remote" >/dev/null
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+
+  create_mock_forge_cli_deliver "$bin_dir" "$remote"
+  create_mock_review_specialists "$bin_dir"
+
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_LOG="$log_file" \
+      MOCK_LEDGER_TIP="sha256:resumedtip" \
+      "$entrypoint" --version v0.6.5 --skip-tap
+  ) >"${tmp}/stdout.log" 2>"${stderr_file}"
+
+  # The mock fails the observe outright when the tip is missing, so reaching a
+  # merge at all proves the CAS input was carried.
+  assert_contains "$log_file" '--expected-state sha256:resumedtip'
+  assert_precedes "$log_file" 'pr review-loop inspect 999' 'pr review-loop observe 999'
+  assert_contains "$log_file" 'forge-cli:pr merge 999'
+  assert_contains "$stderr_file" 'review-loop chain for #999 already at sha256:resumedtip'
+}
+
 test_pr_mode_from_linked_worktree_tags_without_checkout_main() {
   local tmp repo remote wt bin_dir log_file stderr_file
   tmp="$(mktemp -d)"
@@ -1425,6 +1478,7 @@ run_all() {
     test_from_tap_wait_reports_unreadable_tap_formula
     test_formula_inplace_editor_idempotent
     test_pr_mode_default_opens_pr_and_tags_merge_commit
+    test_pr_mode_carries_the_observed_ledger_tip_on_a_resumed_chain
     test_pr_mode_from_linked_worktree_tags_without_checkout_main
     test_pr_mode_rejects_non_chore_release_branch
   )

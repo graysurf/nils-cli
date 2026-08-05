@@ -551,11 +551,36 @@ print(head)
 '
   )" || { rm -rf "$review_dir"; die "could not read release PR #${pr_number} head"; }
 
+  # Append against the tip we actually observed. Every failure path in this
+  # script leaves the release branch in place for recovery, so a second run on a
+  # chain that already has a tip is a designed case: without this compare-and-swap
+  # a retry would write onto state it never read.
+  local state_tip
+  state_tip="$(
+    forge-cli --format json pr review-loop inspect "$pr_number" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+data = payload.get("data") if payload.get("ok") is True else None
+if not isinstance(data, dict):
+    raise SystemExit("review-loop inspect did not return a readable chain")
+print(data.get("state_tip_digest") or "")
+'
+  )" || { rm -rf "$review_dir"; die "could not inspect the review-loop chain for #${pr_number}"; }
+
+  local -a state_args=()
+  if [[ -n "$state_tip" ]]; then
+    state_args=(--expected-state "$state_tip")
+    note "review-loop chain for #${pr_number} already at ${state_tip}"
+  fi
+
   # Validate before writing: a live observe appends durable, provider-visible
   # state, so it is not a probe.
   note "validating release review-loop genesis for #${pr_number} at ${pr_head}"
   forge-cli --format json pr review-loop observe "$pr_number" \
-    --expected-head "$pr_head" --findings-file "$envelope" --dry-run |
+    --expected-head "$pr_head" "${state_args[@]}" \
+    --findings-file "$envelope" --dry-run |
     python3 -c '
 import json
 import sys
@@ -567,7 +592,8 @@ if not isinstance(data, dict) or data.get("preflight_ok") is not True:
 ' || { rm -rf "$review_dir"; die "release review-loop genesis preflight failed for #${pr_number}"; }
 
   forge-cli --format json pr review-loop observe "$pr_number" \
-    --expected-head "$pr_head" --findings-file "$envelope" >/dev/null ||
+    --expected-head "$pr_head" "${state_args[@]}" \
+    --findings-file "$envelope" >/dev/null ||
     { rm -rf "$review_dir"; die "failed to append the release review-loop genesis for #${pr_number}"; }
   note "recorded release review-loop genesis for #${pr_number}"
 
