@@ -87,7 +87,7 @@ struct ReviewLoopObserveDryRunPayload {
 /// the caller already owns the outcome bytes it supplied.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct PlannedStateComment {
-    /// The visible metadata line rendered above the machine marker.
+    /// The visible notice rendered above the machine marker.
     visible_metadata: String,
     /// Whether the supplied delivery outcome shares this one comment.
     includes_outcome_body: bool,
@@ -2356,7 +2356,7 @@ mod tests {
         let body = &bodies[0];
         assert!(body.contains("## Delivery outcome"), "{body}");
         assert!(
-            body.contains("forge-cli review ledger · generation 0"),
+            body.contains("Review checkpoint — review progress recorded."),
             "{body}"
         );
         // The ledger half is still an exact, parseable record.
@@ -2634,8 +2634,8 @@ mod tests {
             bodies[0]
         );
         assert!(
-            bodies[0].contains("forge-cli review ledger ·"),
-            "the stop receipt still carries visible metadata: {}",
+            bodies[0].contains("Review checkpoint — review progress recorded."),
+            "the stop receipt still carries a visible notice: {}",
             bodies[0]
         );
     }

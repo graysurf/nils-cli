@@ -27,10 +27,8 @@ const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
 /// part of that body once visible text wraps it. The complete rendered body is
 /// what the provider actually stores, so it carries the binding limit.
 const MAX_PROVIDER_STATE_COMMENT_BYTES: usize = 64 * 1024;
-const STATE_COMMENT_LABEL: &str = "forge-cli review ledger";
+const STATE_COMMENT_NOTICE: &str = "Review checkpoint — review progress recorded.";
 const HTML_COMMENT_OPEN: &str = "<!--";
-/// Abbreviated-SHA width for the visible metadata line.
-const STATE_COMMENT_HEAD_CHARS: usize = 12;
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
 const FINDING_MARKER_PREFIX: &str = "<!-- forge-cli:review-finding:v1 run=";
 const THREAD_DISPOSITION_MARKER_PREFIX: &str = "<!-- forge-cli:thread-disposition:v1 thread=";
@@ -190,8 +188,7 @@ pub enum ReviewStatePayload {
 }
 
 impl ReviewStatePayload {
-    /// The serialized `kind` tag, reused verbatim in the visible metadata line so
-    /// the timeline names the same payload kind the record encodes.
+    /// The serialized `kind` tag used by the canonical state record.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ReviewRunReceipt { .. } => "review-run-receipt",
@@ -299,19 +296,15 @@ impl ReviewStateRecord {
     }
 }
 
-/// The one-line, non-sensitive description of a ledger record shown in the
-/// provider timeline.
+/// The one-line, tool-neutral notice shown in the provider timeline.
 ///
-/// Everything here is already public on the pull request: the generation index,
-/// the payload kind, and an abbreviated head SHA. No credential, environment
-/// value, local path, private identity, or finding body is representable.
-pub fn state_comment_visible_metadata(record: &ReviewStateRecord) -> String {
-    format!(
-        "{STATE_COMMENT_LABEL} · generation {generation} · {kind} · head {head}",
-        generation = record.generation,
-        kind = record.payload.kind(),
-        head = abbreviated_head(&record.expected_head),
-    )
+/// The function retains its established name because the v1 dry-run response
+/// exposes this presentation string as `visible_metadata`. The machine marker
+/// already owns generation, payload-kind, and head details; repeating them in
+/// the visible timeline is unnecessary noise for readers who do not use
+/// `forge-cli`.
+pub fn state_comment_visible_metadata(_record: &ReviewStateRecord) -> String {
+    STATE_COMMENT_NOTICE.to_string()
 }
 
 /// Renders the complete provider comment body for one ledger record, optionally
@@ -319,12 +312,12 @@ pub fn state_comment_visible_metadata(record: &ReviewStateRecord) -> String {
 ///
 /// GitHub hides HTML comments when it renders Markdown, so a body that is only
 /// the canonical marker appears in the timeline as a blank comment authored by
-/// the operator. The visible metadata line fixes that, and it is emitted FIRST,
+/// the operator. The visible notice fixes that, and it is emitted FIRST,
 /// with the marker immediately under it, so no caller-supplied byte can ever
-/// precede the label. That ordering is load-bearing rather than cosmetic: a
+/// precede the notice. That ordering is load-bearing rather than cosmetic: a
 /// Markdown HTML block opened in caller text runs until a line containing
-/// `-->`, so an outcome ending in an unterminated `<!--` placed above the label
-/// would swallow both the label and the marker and render a machine ledger
+/// `-->`, so an outcome ending in an unterminated `<!--` placed above the notice
+/// would swallow both the notice and the marker and render a machine ledger
 /// record as ordinary human prose. The marker stays byte-identical and on its own
 /// line, so [`parse_state_marker`] — which already searches within a larger body
 /// — reads new and historical bare-marker comments identically, with no
@@ -430,23 +423,6 @@ fn comment_invalid(message: &str, detail: Option<String>) -> ForgeError {
         message,
         detail,
     )
-}
-
-/// Abbreviates a head SHA for the single-line visible metadata.
-///
-/// The provider supplies the head, so the visible line filters it to characters
-/// that cannot break out of one line of plain Markdown.
-fn abbreviated_head(head: &str) -> String {
-    let abbreviated = head
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        .take(STATE_COMMENT_HEAD_CHARS)
-        .collect::<String>();
-    if abbreviated.is_empty() {
-        "-".to_string()
-    } else {
-        abbreviated
-    }
 }
 
 pub fn parse_chain<'a>(
@@ -1526,7 +1502,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn a_rendered_state_comment_is_visibly_identified_and_still_parses() {
+    fn a_rendered_state_comment_uses_a_tool_neutral_notice_and_still_parses() {
         let record = ReviewStateRecord::new(
             "acme/widgets",
             7,
@@ -1544,7 +1520,7 @@ mod tests {
         assert_eq!(
             body,
             format!(
-                "forge-cli review ledger · generation 3 · review-loop · head 0123456789ab\n{}",
+                "Review checkpoint — review progress recorded.\n{}",
                 record.marker().expect("marker")
             )
         );
@@ -1555,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_comment_names_its_own_payload_kind() {
+    fn every_record_kind_uses_the_same_tool_neutral_notice() {
         let record = ReviewStateRecord::new(
             "acme/widgets",
             7,
@@ -1570,7 +1546,7 @@ mod tests {
 
         assert_eq!(
             state_comment_visible_metadata(&record),
-            "forge-cli review ledger · generation 0 · review-run-receipt · head head-abc"
+            "Review checkpoint — review progress recorded."
         );
     }
 
@@ -1649,10 +1625,10 @@ mod tests {
     }
 
     #[test]
-    fn no_outcome_body_can_hide_the_visible_label_or_the_marker() {
+    fn no_outcome_body_can_hide_the_visible_notice_or_the_marker() {
         // A Markdown HTML block opened in caller text runs until a line
         // containing `-->`. An outcome ending in an unterminated `<!--` placed
-        // above the label would swallow both the label and the marker, rendering
+        // above the notice would swallow both the notice and the marker, rendering
         // a machine ledger record as ordinary human prose — worse than the blank
         // comment this change exists to fix. Two independent guards apply.
         let record = record("head", 0, None, fixture_loop_state(0));
@@ -1769,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_metadata_exposes_nothing_beyond_public_pull_request_facts() {
+    fn visible_notice_does_not_expose_record_details() {
         let record = ReviewStateRecord::new(
             "acme/widgets",
             7,
@@ -1798,23 +1774,15 @@ mod tests {
         ] {
             assert!(!metadata.contains(forbidden), "{forbidden} in {metadata}");
         }
-        // The abbreviated head is a prefix of the public head, never the whole
-        // record or any digest.
-        assert!(record.expected_head.starts_with("abcdef012345"));
-        assert!(metadata.ends_with("head abcdef012345"));
+        assert_eq!(metadata, STATE_COMMENT_NOTICE);
+        assert!(!metadata.contains("abcdef012345"));
+        assert!(!metadata.contains("generation"));
+        assert!(!metadata.contains(record.payload.kind()));
     }
 
     #[test]
-    fn an_unusable_head_still_renders_one_plain_line() {
-        // The head comes from the provider. Nothing it contains may break the
-        // visible line into extra Markdown.
-        for (head, expected) in [
-            ("", "-"),
-            ("  ", "-"),
-            ("a\nb", "ab"),
-            ("**bold**", "bold"),
-            ("héad-1234567890", "had-12345678"),
-        ] {
+    fn provider_head_never_changes_the_visible_notice() {
+        for head in ["", "  ", "a\nb", "**bold**", "héad-1234567890"] {
             let record = ReviewStateRecord::new(
                 "acme/widgets",
                 7,
@@ -1827,11 +1795,7 @@ mod tests {
             )
             .expect("record");
             let metadata = state_comment_visible_metadata(&record);
-            assert_eq!(metadata.lines().count(), 1, "{metadata}");
-            assert!(
-                metadata.ends_with(&format!("head {expected}")),
-                "{metadata}"
-            );
+            assert_eq!(metadata, STATE_COMMENT_NOTICE);
         }
     }
 

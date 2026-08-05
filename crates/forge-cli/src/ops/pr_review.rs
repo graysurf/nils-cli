@@ -489,10 +489,10 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                             &ctx,
                             id,
                             // Mirrors the live receipt prewrite body: a visible
-                            // ledger label above the canonical marker. A plan that
+                            // tool-neutral notice above the canonical marker. A plan that
                             // still showed a bare marker would advertise a body the
                             // live call no longer writes.
-                            "forge-cli review ledger · generation <n> · review-run-receipt · head <short-sha>\n<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
+                            "Review checkpoint — review progress recorded.\n<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
                         )
                         .plan_argv(),
                     ),
