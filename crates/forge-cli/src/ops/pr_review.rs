@@ -482,22 +482,26 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 })?;
             let state_plan =
                 build_github_review_state_comments_call(&ctx, repository, id).plan_argv();
+            let receipt_body = format!(
+                "{}\n<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
+                review_state::STATE_COMMENT_NOTICE
+            );
             (
-                    Some(state_plan.clone()),
-                    Some(
-                        build_issue_comment_call(
-                            &ctx,
-                            id,
-                            // Mirrors the live receipt prewrite body: a visible
-                            // tool-neutral notice above the canonical marker. A plan that
-                            // still showed a bare marker would advertise a body the
-                            // live call no longer writes.
-                            "Review checkpoint — review progress recorded.\n<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->",
-                        )
-                        .plan_argv(),
-                    ),
-                    Some(state_plan),
-                )
+                Some(state_plan.clone()),
+                Some(
+                    build_issue_comment_call(
+                        &ctx,
+                        id,
+                        // Mirrors the live receipt prewrite body: a visible
+                        // tool-neutral notice above the canonical marker. A plan that
+                        // still showed a bare marker would advertise a body the
+                        // live call no longer writes.
+                        &receipt_body,
+                    )
+                    .plan_argv(),
+                ),
+                Some(state_plan),
+            )
         } else {
             (None, None, None)
         };

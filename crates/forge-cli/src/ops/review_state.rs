@@ -27,7 +27,7 @@ const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
 /// part of that body once visible text wraps it. The complete rendered body is
 /// what the provider actually stores, so it carries the binding limit.
 const MAX_PROVIDER_STATE_COMMENT_BYTES: usize = 64 * 1024;
-const STATE_COMMENT_NOTICE: &str = "Review checkpoint — review progress recorded.";
+pub(crate) const STATE_COMMENT_NOTICE: &str = "Review checkpoint — review progress recorded.";
 const HTML_COMMENT_OPEN: &str = "<!--";
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
 const FINDING_MARKER_PREFIX: &str = "<!-- forge-cli:review-finding:v1 run=";

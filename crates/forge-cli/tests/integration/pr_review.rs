@@ -1987,6 +1987,27 @@ fn pr_review_thread_file_dry_run_renders_thread_creation_plan() {
             "{field}: {plan}"
         );
     }
+    let receipt_plan = env["data"]["review_receipt_plan"]
+        .as_array()
+        .expect("review_receipt_plan present")
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        receipt_plan.contains("Review checkpoint — review progress recorded."),
+        "review receipt should use the tool-neutral notice: {receipt_plan}"
+    );
+    assert!(
+        receipt_plan.contains(
+            "<!-- forge-cli:review-state:v1 <record-dependent-on-provider-chain-tip> -->"
+        ),
+        "review receipt should retain the state marker placeholder: {receipt_plan}"
+    );
+    assert!(
+        !receipt_plan.contains("forge-cli review ledger"),
+        "{receipt_plan}"
+    );
 }
 
 #[test]
