@@ -251,6 +251,14 @@ EOF
 #                            `workflow_dispatch` renders the bare version.
 #   MOCK_TAP_FORMULA_VERSION version actually published in Formula/nils-cli.rb at
 #                            tap main — the only fact the tap alone can produce.
+#   MOCK_TAP_FORMULA_VERSION_LINUX
+#                            optional; version for the Linux URLs, so a formula
+#                            whose platform URLs disagree can be modelled.
+#                            Defaults to MOCK_TAP_FORMULA_VERSION.
+#   MOCK_TAP_FORMULA_UNREADABLE
+#                            when set, the formula read fails, as it would for a
+#                            bad repo slug, a renamed formula, or a token without
+#                            read access.
 create_mock_gh_tap_state() {
   local bin_dir="$1"
   cat > "${bin_dir}/gh" <<'EOF'
@@ -277,11 +285,28 @@ JSON
 fi
 
 if [[ "$*" == *"contents/Formula/"* ]]; then
+  if [[ -n "${MOCK_TAP_FORMULA_UNREADABLE:-}" ]]; then
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+  fi
   version="${MOCK_TAP_FORMULA_VERSION:?}"
+  linux_version="${MOCK_TAP_FORMULA_VERSION_LINUX:-${version}}"
   cat <<RUBY
 class NilsCli < Formula
   on_macos do
-    url "https://github.com/test-org/test-repo/releases/download/v${version}/nils-cli-v${version}-aarch64-apple-darwin.tar.gz"
+    if Hardware::CPU.arm?
+      url "https://github.com/test-org/test-repo/releases/download/v${version}/nils-cli-v${version}-aarch64-apple-darwin.tar.gz"
+    else
+      url "https://github.com/test-org/test-repo/releases/download/v${version}/nils-cli-v${version}-x86_64-apple-darwin.tar.gz"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/test-org/test-repo/releases/download/v${linux_version}/nils-cli-v${linux_version}-aarch64-unknown-linux-gnu.tar.gz"
+    else
+      url "https://github.com/test-org/test-repo/releases/download/v${linux_version}/nils-cli-v${linux_version}-x86_64-unknown-linux-gnu.tar.gz"
+    end
   end
 end
 RUBY
@@ -835,6 +860,93 @@ test_from_tap_wait_fails_when_tap_formula_stale() {
   assert_contains "$stderr_file" '0.9.8'
 }
 
+# The formula carries one release URL per platform target. A partially updated
+# formula must not satisfy the gate on whichever URL happens to come first, or the
+# release completes while brew on the remaining platforms resolves the old build.
+test_from_tap_wait_rejects_mixed_version_tap_formula() {
+  local tmp repo bin_dir stderr_file rc
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+  create_mock_gh_tap_state "$bin_dir"
+  create_mock_cargo "$bin_dir"
+
+  git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
+  git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
+
+  set +e
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_TAP_RUN_TITLE="Update nils-cli v0.9.9" \
+      MOCK_TAP_FORMULA_VERSION="0.9.9" \
+      MOCK_TAP_FORMULA_VERSION_LINUX="0.9.8" \
+      NILS_CLI_TAP_WAIT_SECONDS=5 \
+      NILS_CLI_TAP_POLL_SECONDS=1 \
+      "$entrypoint" --version 0.9.9 --from-tap --tap-dir "${tmp}/tap" \
+      --skip-tap-tag --skip-dev-clean --skip-local-brew-upgrade \
+      >"${tmp}/stdout.log" 2>"${stderr_file}"
+  )
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    fail "expected a formula whose platform URLs disagree to fail the release wait"
+  fi
+  # Reported as unpublished, not as the macOS URL's 0.9.9.
+  assert_contains "$stderr_file" 'still at unknown'
+}
+
+# A formula that cannot be read is a different failure from a tap that is merely
+# slow, and the timeout message is the only place an operator sees which one
+# happened.
+test_from_tap_wait_reports_unreadable_tap_formula() {
+  local tmp repo bin_dir stderr_file rc
+  tmp="$(mktemp -d)"
+  repo="${tmp}/repo"
+  bin_dir="${tmp}/bin"
+  stderr_file="${tmp}/stderr.log"
+
+  mkdir -p "$repo" "$bin_dir"
+  create_temp_repo "$repo" "v0.6.4"
+  create_mock_semantic_commit "$bin_dir"
+  create_mock_git_scope "$bin_dir"
+  create_mock_gh_tap_state "$bin_dir"
+  create_mock_cargo "$bin_dir"
+
+  git -C "$repo" remote add origin git@github.com:test-org/test-repo.git
+  git -C "$repo" tag -a v0.9.9 -m "v0.9.9"
+
+  set +e
+  (
+    cd "$repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${bin_dir}:$PATH" \
+      MOCK_TAP_RUN_TITLE="Update nils-cli v0.9.9" \
+      MOCK_TAP_FORMULA_VERSION="0.9.9" \
+      MOCK_TAP_FORMULA_UNREADABLE=1 \
+      NILS_CLI_TAP_WAIT_SECONDS=5 \
+      NILS_CLI_TAP_POLL_SECONDS=1 \
+      "$entrypoint" --version 0.9.9 --from-tap --tap-dir "${tmp}/tap" \
+      --skip-tap-tag --skip-dev-clean --skip-local-brew-upgrade \
+      >"${tmp}/stdout.log" 2>"${stderr_file}"
+  )
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 ]]; then
+    fail "expected an unreadable tap formula to fail the release wait"
+  fi
+  assert_contains "$stderr_file" 'still at unknown'
+}
+
 test_formula_inplace_editor_idempotent() {
   local tmp formula_path
   tmp="$(mktemp -d)"
@@ -1183,6 +1295,8 @@ run_all() {
     test_from_tap_upgrades_installed_local_brew_formula
     test_from_tap_wait_accepts_workflow_dispatch_run_title
     test_from_tap_wait_fails_when_tap_formula_stale
+    test_from_tap_wait_rejects_mixed_version_tap_formula
+    test_from_tap_wait_reports_unreadable_tap_formula
     test_formula_inplace_editor_idempotent
     test_pr_mode_default_opens_pr_and_tags_merge_commit
     test_pr_mode_from_linked_worktree_tags_without_checkout_main

@@ -510,7 +510,16 @@ tap_name_from_repo_slug() {
 # produce: it is independent of which event started the tap workflow, of how
 # that run is named, and of whether the dispatch that was supposed to start it
 # did anything at all. Prints the bare version (e.g. 1.26.2); non-zero when the
-# formula cannot be read or carries no recognizable release URL.
+# formula cannot be read, carries no recognizable release URL, or is not
+# coherently at one version.
+#
+# Every platform URL must agree. The formula carries one per target (macOS and
+# Linux, arm64 and x86_64), and reading only the first would let a partially
+# updated formula satisfy the gate while brew on the remaining platforms still
+# resolves the old build. A mixed formula is reported as unpublished rather than
+# as whichever version happens to appear first: this gate exists so the release
+# stops assuming the tap produced a consistent artifact, and picking one of four
+# URLs would reimport a smaller form of that assumption.
 read_tap_formula_version() {
   local tap_repo="$1"
   local tap_formula="$2"
@@ -523,10 +532,12 @@ read_tap_formula_version() {
 import re
 import sys
 
-match = re.search(r"/releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/", sys.argv[1])
-if not match:
+versions = set(
+    re.findall(r"/releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/", sys.argv[1])
+)
+if len(versions) != 1:
     sys.exit(1)
-print(match.group(1))
+print(versions.pop())
 PY
 }
 
