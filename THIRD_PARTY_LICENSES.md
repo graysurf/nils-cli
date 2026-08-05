@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `06275bde19a5db191b52d275330bbf6c62886bdd6239d36595c44a72ccca611d`
+- Cargo.lock SHA256: `81089842ee31bfcde89d05e78392ef4f4e173c12e9c17934fea1d871bed1bf91`
 - Third-party crates (`source != null`): 497
 - Workspace crates (`source == null`, excluded below): 46
 
@@ -528,8 +528,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | wit-component | 0.244.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | wit-parser | 0.244.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | writeable | 0.6.3 | Unicode-3.0 | crates.io |
-| x11rb | 0.13.2 | MIT OR Apache-2.0 | crates.io |
-| x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | crates.io |
+| x11rb | 0.14.0 | MIT OR Apache-2.0 | crates.io |
+| x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | crates.io |
 | xmlwriter | 0.1.0 | MIT | crates.io |
 | yansi | 1.0.1 | MIT OR Apache-2.0 | crates.io |
 | yoke | 0.8.3 | Unicode-3.0 | crates.io |
