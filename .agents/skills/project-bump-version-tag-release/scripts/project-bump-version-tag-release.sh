@@ -505,6 +505,82 @@ tap_name_from_repo_slug() {
   echo "${owner}/${name}"
 }
 
+# Record the review-loop ledger genesis for a release PR, post its delivery
+# outcome, and print the head the observation was bound to.
+#
+# `forge-cli pr merge` fails closed with `review_state_conflict` when the ledger
+# carries no observation for the current head, and the chain refuses an append at
+# a stale head. So this has to run after the PR exists and before the merge --
+# a macro that opens, waits, and merges in one step leaves nowhere to put it,
+# which is why PR-mode releases could not complete on their own.
+#
+# A canonical release PR is a generated version-only diff, so the honest genesis
+# is the empty envelope `review-specialists bundle --mode delivery` produces. The
+# schema rejects a hand-rolled lookalike, which is why this calls the generator
+# instead of writing the payload here.
+record_release_review_genesis() {
+  local pr_number="$1"
+  local review_dir envelope pr_head
+
+  command -v review-specialists >/dev/null 2>&1 ||
+    die "review-specialists is required to record the release review-loop genesis"
+
+  review_dir="$(mktemp -d)"
+  : >"${review_dir}/findings.jsonl"
+  review-specialists bundle \
+    --input "${review_dir}/findings.jsonl" \
+    --out-dir "${review_dir}/bundle" \
+    --mode delivery >/dev/null ||
+    { rm -rf "$review_dir"; die "failed to generate the release review-loop genesis envelope"; }
+
+  envelope="${review_dir}/bundle/findings.merged.json"
+  [[ -s "$envelope" ]] ||
+    { rm -rf "$review_dir"; die "release review-loop genesis envelope was not generated"; }
+
+  pr_head="$(
+    forge-cli --format json pr view "$pr_number" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+data = payload.get("data") if payload.get("ok") is True else None
+head = data.get("head_sha") if isinstance(data, dict) else None
+if not isinstance(head, str) or not head:
+    raise SystemExit("pr view did not report a head sha")
+print(head)
+'
+  )" || { rm -rf "$review_dir"; die "could not read release PR #${pr_number} head"; }
+
+  # Validate before writing: a live observe appends durable, provider-visible
+  # state, so it is not a probe.
+  note "validating release review-loop genesis for #${pr_number} at ${pr_head}"
+  forge-cli --format json pr review-loop observe "$pr_number" \
+    --expected-head "$pr_head" --findings-file "$envelope" --dry-run |
+    python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+data = payload.get("data") if payload.get("ok") is True else None
+if not isinstance(data, dict) or data.get("preflight_ok") is not True:
+    raise SystemExit("release review-loop genesis preflight did not pass")
+' || { rm -rf "$review_dir"; die "release review-loop genesis preflight failed for #${pr_number}"; }
+
+  forge-cli --format json pr review-loop observe "$pr_number" \
+    --expected-head "$pr_head" --findings-file "$envelope" >/dev/null ||
+    { rm -rf "$review_dir"; die "failed to append the release review-loop genesis for #${pr_number}"; }
+  note "recorded release review-loop genesis for #${pr_number}"
+
+  forge-cli --format json pr review "$pr_number" \
+    --decision comments-only --lens quick \
+    --comment="Canonical release PR: a generated version-only change set. The required status checks gated this exact head, and the review-loop genesis records an empty finding set rather than asserting a review that did not happen." \
+    >/dev/null ||
+    { rm -rf "$review_dir"; die "failed to post the release delivery review outcome for #${pr_number}"; }
+
+  rm -rf "$review_dir"
+  printf '%s\n' "$pr_head"
+}
+
 # Read the version currently published in the tap's formula at its default
 # branch. This is the one fact in the release path that only the tap can
 # produce: it is independent of which event started the tap workflow, of how
@@ -1497,15 +1573,48 @@ if [[ "$pr_mode" -eq 1 ]]; then
     printf -- '- Tap stage updates homebrew formula\n'
   } >"$pr_body_file"
 
-  note "opening + waiting + merging release PR via forge-cli pr deliver"
-  forge-cli pr deliver \
-    --kind chore \
-    --title "chore(release): bump cli versions to ${version}" \
-    --body-file "$pr_body_file" \
-    --method squash \
-    --timeout "${NILS_CLI_PR_WAIT:-30m}" \
-    || { rm -f "$pr_body_file"; die "forge-cli pr deliver failed; release branch ${release_branch} left in place for recovery"; }
+  # Deliver up to readiness, then stop: the review-loop genesis has to be recorded
+  # between delivery and merge, so the merge is a separate step below.
+  #
+  # The wait budget must exceed the slowest CI lane this PR can land on, not the
+  # expected one. A release PR uses the reduced release-only lane only when the
+  # exact base `main` SHA already has one trusted successful full CI run; cut soon
+  # after a merge it cannot prove that and falls back to full PR CI, where
+  # `test_macos` has measured 31m45s.
+  note "opening + waiting for release PR via forge-cli pr deliver"
+  local_deliver_json="$(
+    forge-cli --format json pr deliver \
+      --kind chore \
+      --title "chore(release): bump cli versions to ${version}" \
+      --body-file "$pr_body_file" \
+      --method squash \
+      --no-merge \
+      --timeout "${NILS_CLI_PR_WAIT:-60m}"
+  )" || { rm -f "$pr_body_file"; die "forge-cli pr deliver failed; release branch ${release_branch} left in place for recovery"; }
   rm -f "$pr_body_file"
+
+  release_pr_number="$(python3 - "$local_deliver_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+data = payload.get("data") if payload.get("ok") is True else None
+pr = data.get("pr") if isinstance(data, dict) else None
+number = pr.get("number") if isinstance(pr, dict) else None
+if not isinstance(number, int) or number <= 0:
+    raise SystemExit("release delivery did not return one open PR number")
+print(number)
+PY
+  )" || die "release delivery did not return a trusted PR number; branch ${release_branch} left in place for recovery"
+
+  release_pr_head="$(record_release_review_genesis "$release_pr_number")" ||
+    die "could not record the release review-loop genesis; branch ${release_branch} left in place for recovery"
+
+  note "merging release PR #${release_pr_number} at ${release_pr_head}"
+  forge-cli pr merge "$release_pr_number" \
+    --method squash \
+    --expected-head "$release_pr_head" ||
+    die "release PR #${release_pr_number} merge failed; branch ${release_branch} left in place for recovery"
 
   note "resolving merged release bump on origin/main"
   git fetch origin --quiet
