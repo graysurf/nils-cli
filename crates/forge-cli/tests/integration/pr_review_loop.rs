@@ -499,7 +499,7 @@ fn observe_dry_run_renders_the_exact_combined_comment_it_would_post() {
     assert_eq!(planned["includes_outcome_body"], true, "{envelope}");
     assert_eq!(
         planned["visible_metadata"],
-        "forge-cli review ledger · generation 0 · review-loop · head provider-hea"
+        "Review checkpoint — review progress recorded."
     );
     // The reported size is the complete body that would be posted, which is what
     // the provider limit is checked against — so it must equal the byte length of
@@ -773,7 +773,7 @@ fn a_live_combined_observe_reports_appended_and_outcome_posted() {
         "one comment mutation only, log={log}"
     );
     for expected in [
-        "forge-cli review ledger \u{b7} generation 0 \u{b7} review-loop \u{b7} head provider-hea",
+        "Review checkpoint — review progress recorded.",
         "<!-- forge-cli:review-state:v1 ",
         "Approved: bounded review converged.",
     ] {
@@ -819,7 +819,7 @@ fn a_live_observe_without_an_outcome_body_reports_outcome_posted_false() {
     // Even with no outcome, the ledger comment is never a bare marker.
     let log = gh_args_log(&stub);
     assert!(
-        log.contains("forge-cli review ledger \u{b7} generation 0"),
+        log.contains("Review checkpoint — review progress recorded."),
         "{log}"
     );
 }
@@ -871,7 +871,7 @@ fn observe_help_documents_both_findings_file_shapes_and_the_combined_outcome() {
         "disposition",
         "--dry-run",
         "--body-file",
-        "forge-cli review ledger",
+        "Review checkpoint",
         "outcome_posted",
         // The combined form is only correct for a single-shot outcome; a caller
         // must be able to learn that without reading the spec.

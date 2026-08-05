@@ -981,9 +981,9 @@ pub struct PrReviewLoopValidateArgs {
       Check either shape offline, with no pull request and no provider call, \
       using `pr review-loop validate --findings-file <path>`.\n\n\
       COMBINED DELIVERY OUTCOME\n  \
-      Every appended ledger comment leads with a visible \
-      `forge-cli review ledger · generation N · <kind> · head <short-sha>` line \
-      above its machine marker, so it never renders as a blank comment.\n  \
+      Every appended ledger comment leads with the tool-neutral notice \
+      `Review checkpoint — review progress recorded.` above its machine \
+      marker, so it never renders as a blank comment.\n  \
       --body / --body-file additionally posts a human-readable delivery outcome \
       in that SAME comment, after the marker, replacing a separate final outcome \
       comment. An outcome body may not contain an HTML comment, and is checked \
@@ -1002,7 +1002,7 @@ pub struct PrReviewLoopValidateArgs {
       and never revised. A ledger record is immutable and an append is \
       conditional, so a workflow that must post its outcome after repairs and \
       REFRESH it on retry has no append to carry the revision and should keep the \
-      outcome as its own comment — the visible metadata line above already stops \
+      outcome as its own comment — the visible notice above already stops \
       ledger comments from rendering blank.\n\n\
       With --dry-run this runs a faithful non-mutating preflight: it reads and \
       validates the findings payload and any outcome body, resolves the pull \

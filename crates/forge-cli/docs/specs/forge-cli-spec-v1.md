@@ -573,16 +573,17 @@ backend mapping, validation rules, and output schema versions.
   lets a later authorized session resume the same provider-visible chain
   without a machine-local ledger.
 - Record encoding and comment presentation are separate. Every state comment the
-  CLI posts leads with a visible metadata line, followed by the unchanged marker
-  on its own line:
-  `forge-cli review ledger · generation <n> · <payload-kind> · head <short-sha>`.
+  CLI posts leads with the tool-neutral notice
+  `Review checkpoint — review progress recorded.`, followed by the unchanged
+  marker on its own line.
   GitHub hides HTML comments when it renders Markdown, so a marker-only body
   appears in the timeline as a blank comment under the operator's identity; the
-  visible line makes the same append-only record identifiable as machine
-  metadata. A combined delivery outcome is appended *after* both, separated by a
+  visible notice prevents a confusing blank entry without exposing forge-cli's
+  generation, payload-kind, or head bookkeeping to ordinary readers. A combined
+  delivery outcome is appended *after* both, separated by a
   `---` rule. That ordering is load-bearing, not cosmetic: a Markdown HTML block
   opened in caller text runs until a line containing `-->`, so caller text placed
-  above the label could swallow both the label and the marker.
+  above the notice could swallow both the notice and the marker.
 - Presentation text never enters a record digest, the chain order, or the parser,
   so historical bare-marker comments and new rendered comments validate as one
   chain with no migration and no edit or deletion of existing comments. The
@@ -590,10 +591,8 @@ backend mapping, validation rules, and output schema versions.
   sessions that compute the identical transition converge on one record even if
   their comments differ, so a divergent concurrent outcome is possible and is
   detected only for the writing session (see `review_outcome_not_posted` below).
-- The visible line carries only facts already public on the pull request:
-  generation, payload kind, and an abbreviated head. The head is filtered to
-  `[0-9A-Za-z._-]` and truncated to twelve characters so the line can never
-  become more than one line of plain Markdown.
+- The visible notice is constant plain Markdown. Record-specific details stay in
+  the hidden marker and never enter the human-facing timeline label.
 - Receipt fields intentionally exclude authentication tokens, credentials,
   environment-variable values, local paths, and private identity/profile names.
   The durable identity route contains only portable lens names and the semantic
@@ -685,7 +684,7 @@ backend mapping, validation rules, and output schema versions.
   newer one. `agent-runtime-kit`'s delivery skills are in that second category:
   their posting-order contract requires the disposition to post last and to be
   refreshed on merge-convergence retries, so they keep the outcome as its own
-  comment by design. They still benefit from the visible metadata line above,
+  comment by design. They still benefit from the visible notice above,
   which is what stops a ledger comment from rendering blank. Do not adopt the
   combined form in a workflow without first checking that its outcome is
   single-shot.
@@ -755,7 +754,8 @@ backend mapping, validation rules, and output schema versions.
   *without* appending, and the dry run mirrors that: `would_append` is false and
   no comment is planned.
   `data.planned_comment` reports the planned write as
-  `{visible_metadata, includes_outcome_body, bytes}`, where `bytes` is the
+  `{visible_metadata, includes_outcome_body, bytes}`, where the established
+  `visible_metadata` field now carries the tool-neutral notice and `bytes` is the
   complete rendered body the size limit binds. It is present only when a write is
   planned, and the `state_comment_body` verdict is likewise reported only then: an
   already-current chain writes nothing, so there is no body to check and no
