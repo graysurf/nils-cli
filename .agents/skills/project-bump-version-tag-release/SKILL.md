@@ -79,6 +79,7 @@ Inputs:
   - `NILS_CLI_HOMEBREW_TAP_REPO` (env var; tap repo slug)
   - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
   - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap formula update, default 1200)
+  - `NILS_CLI_TAP_POLL_SECONDS` (env var; seconds between tap formula polls, default 15)
 
 Default delivery mode (PR-based):
 
@@ -96,8 +97,12 @@ Default delivery mode (PR-based):
   commit, and pushes the tag to trigger `release.yml`. The tag gate reuses the unique trusted
   merged PR's exact-SHA CI when available and otherwise falls back to polling checks on that SHA.
 - The tap stage waits for the source release workflow to finish, then waits for
-  the dispatched `sympoies/homebrew-tap` formula-update workflow to finish before
-  performing the local Homebrew install / upgrade check.
+  `sympoies/homebrew-tap` to publish the target version before performing the
+  local Homebrew install / upgrade check. The wait clears on the version read
+  from `Formula/<formula>.rb` at the tap's default branch — not on any tap run's
+  own conclusion, which is only evidence that a run happened and exists at all
+  only when the dispatch worked. Tap run telemetry is still polled, but solely
+  to report progress and to fail fast on a red run.
 
 Use `--direct-push` to opt out and reuse the legacy "commit + tag directly on the current
 branch" path. Use `--skip-push` to keep everything local without opening a PR (also implies
