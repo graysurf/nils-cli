@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `81089842ee31bfcde89d05e78392ef4f4e173c12e9c17934fea1d871bed1bf91`
-- Third-party crates (`source != null`): 497
+- Cargo.lock SHA256: `c7d6d40eaed0b2dda48aee2241f4c23d717dfcf15962a5f695ff641dd76fe1ba`
+- Third-party crates (`source != null`): 501
 
 ## Notice Extraction Policy
 
@@ -440,6 +440,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### chacha20 0.10.1
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
 
 ### chrono 0.4.45
 
@@ -2379,7 +2388,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### quinn-proto 0.11.14
+### quinn-proto 0.11.16
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -2420,6 +2429,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
+### rand 0.10.2
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
 ### rand 0.9.4
 
 - License: `MIT OR Apache-2.0`
@@ -2438,6 +2456,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
+### rand_core 0.10.1
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
 ### rand_core 0.6.4
 
 - License: `MIT OR Apache-2.0`
@@ -2448,6 +2475,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
 
 ### rand_core 0.9.5
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
+### rand_pcg 0.10.2
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
