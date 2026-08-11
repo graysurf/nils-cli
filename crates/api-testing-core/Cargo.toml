@@ -12,7 +12,7 @@ name = "api_testing_core"
 path = "src/lib.rs"
 [dependencies]
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 clap = { workspace = true }
 jaq-core = "3.1.0"
 jaq-json = { version = "2.0.1", features = ["serde"] }
