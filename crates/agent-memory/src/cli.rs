@@ -183,7 +183,7 @@ pub struct RecallArgs {
 pub enum RecallCommand {
     /// Print the bounded profiles/startup index.
     Startup(RecallStartupArgs),
-    /// Search curated global notes only.
+    /// Search curated global notes, optionally including one agent scope.
     OnDemand(RecallOnDemandArgs),
     /// List untrusted candidate notes, optionally for one producer.
     Candidates(RecallCandidatesArgs),
@@ -192,7 +192,7 @@ pub enum RecallCommand {
 #[derive(Debug, Args)]
 pub struct RecallStartupArgs {
     /// Maximum allowed startup index size.
-    #[arg(long, value_name = "BYTES", default_value_t = 3072)]
+    #[arg(long, value_name = "BYTES", default_value_t = 768)]
     pub max_bytes: usize,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -207,6 +207,9 @@ pub struct RecallOnDemandArgs {
     /// Term to find in curated global note content.
     #[arg(value_name = "TERM")]
     pub term: String,
+    /// Also search one exact registered non-Claude agent scope.
+    #[arg(long, value_name = "ID")]
+    pub agent: Option<String>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,

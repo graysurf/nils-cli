@@ -800,6 +800,35 @@ fn recall_startup_is_bounded_and_has_json_contract() {
     assert!(too_small.stderr_text().contains("exceeds 8 bytes"));
 }
 
+#[test]
+fn recall_startup_defaults_to_deployed_768_byte_budget() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("profiles/startup/MEMORY.md"),
+        "x".repeat(768),
+    )
+    .expect("boundary startup profile");
+
+    let boundary = run(tmp.path(), &["recall", "startup"]);
+    assert_eq!(boundary.code, 0, "stderr={}", boundary.stderr_text());
+    assert_eq!(boundary.stdout_text().len(), 768);
+
+    fs::write(
+        tmp.path().join("profiles/startup/MEMORY.md"),
+        "x".repeat(769),
+    )
+    .expect("oversized startup profile");
+
+    let out = run(tmp.path(), &["recall", "startup"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.stderr_text().contains("exceeds 768 bytes"),
+        "stderr={}",
+        out.stderr_text()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn recall_startup_rejects_symlink_profile_directory() {
@@ -834,6 +863,300 @@ fn recall_on_demand_searches_curated_global_only() {
     let no_candidate = run(tmp.path(), &["recall", "on-demand", "candidate_only_token"]);
     assert_eq!(no_candidate.code, 1);
     assert!(no_candidate.stdout_text().is_empty());
+
+    let json_hit = run(
+        tmp.path(),
+        &["recall", "on-demand", "route body", "--format", "json"],
+    );
+    assert_eq!(json_hit.code, 0, "stderr={}", json_hit.stderr_text());
+    let hit_doc: serde_json::Value =
+        serde_json::from_str(json_hit.stdout_text().trim()).expect("recall hit json");
+    assert_eq!(
+        hit_doc["schema_version"],
+        "cli.agent-memory.recall-on-demand.v1"
+    );
+    assert!(hit_doc.get("agent").is_none());
+    assert_eq!(hit_doc["count"], 1);
+    assert_eq!(hit_doc["hits"][0]["scope"], "global");
+
+    let json_miss = run(
+        tmp.path(),
+        &["recall", "on-demand", "absent_token", "--format", "json"],
+    );
+    assert_eq!(json_miss.code, 1);
+    let miss_doc: serde_json::Value =
+        serde_json::from_str(json_miss.stdout_text().trim()).expect("recall miss json");
+    assert_eq!(
+        miss_doc["schema_version"],
+        "cli.agent-memory.recall-on-demand.v1"
+    );
+    assert_eq!(miss_doc["ok"], false);
+    assert_eq!(miss_doc["count"], 0);
+    assert_eq!(miss_doc["hits"], serde_json::json!([]));
+    assert!(miss_doc.get("agent").is_none());
+}
+
+#[test]
+fn recall_on_demand_can_include_one_exact_agent_scope() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let codex = tmp.path().join("agents/codex");
+    fs::create_dir_all(&codex).expect("codex agent scope");
+    fs::write(codex.join("MEMORY.md"), "# Codex memory\n").expect("codex index");
+    fs::write(
+        codex.join("routing.md"),
+        note_with(
+            "codex-routing",
+            "reference",
+            "Codex-only routing",
+            "shared_agent_scope_token codex_agent_only_token",
+        ),
+    )
+    .expect("codex note");
+    fs::write(
+        tmp.path().join("global/shared.md"),
+        note_with(
+            "global-shared",
+            "reference",
+            "Global shared routing",
+            "shared_agent_scope_token",
+        ),
+    )
+    .expect("global shared note");
+    let hermes = tmp.path().join("agents/hermes");
+    fs::create_dir_all(&hermes).expect("hermes agent scope");
+    fs::write(hermes.join("MEMORY.md"), "# Hermes memory\n").expect("hermes index");
+    fs::write(
+        hermes.join("routing.md"),
+        note_with(
+            "hermes-routing",
+            "reference",
+            "Hermes-only routing",
+            "shared_agent_scope_token",
+        ),
+    )
+    .expect("hermes note");
+    fs::write(
+        tmp.path().join("candidates/codex/not-curated.md"),
+        "codex_agent_only_token candidate",
+    )
+    .expect("candidate");
+
+    let global_only = run(
+        tmp.path(),
+        &["recall", "on-demand", "codex_agent_only_token"],
+    );
+    assert_eq!(global_only.code, 1);
+
+    let selected = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "codex_agent_only_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(selected.code, 0, "stderr={}", selected.stderr_text());
+    let doc: serde_json::Value =
+        serde_json::from_str(selected.stdout_text().trim()).expect("recall json");
+    assert_eq!(doc["count"], 1);
+    assert_eq!(doc["agent"], "codex");
+    assert_eq!(doc["hits"][0]["scope"], "agents/codex");
+    assert_eq!(doc["hits"][0]["file"], "routing.md");
+    assert!(
+        !selected.stdout_text().contains("not-curated.md"),
+        "{}",
+        selected.stdout_text()
+    );
+
+    let additive = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "shared_agent_scope_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(additive.code, 0, "stderr={}", additive.stderr_text());
+    let doc: serde_json::Value =
+        serde_json::from_str(additive.stdout_text().trim()).expect("additive recall json");
+    assert_eq!(doc["count"], 2);
+    let scopes: Vec<_> = doc["hits"]
+        .as_array()
+        .expect("recall hits")
+        .iter()
+        .map(|hit| hit["scope"].as_str().expect("hit scope"))
+        .collect();
+    assert_eq!(scopes, vec!["global", "agents/codex"]);
+    assert!(!additive.stdout_text().contains("agents/hermes"));
+}
+
+#[test]
+fn recall_on_demand_reports_typed_missing_agent_error() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+
+    let out = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "anything",
+            "--agent",
+            "missing",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
+    assert_eq!(doc["error"]["code"], "agent-scope-not-found");
+    assert_eq!(doc["error"]["details"]["retryable"], false);
+    assert_eq!(
+        doc["error"]["details"]["next_action"],
+        "select an existing agent scope or initialize one"
+    );
+    assert_eq!(
+        doc["error"]["details"]["recovery"]["command"],
+        "agent-memory agents"
+    );
+    assert!(
+        !out.stdout_text()
+            .contains(&tmp.path().display().to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_on_demand_rejects_symlinked_agents_root_without_candidate_content() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/injected.md"),
+        "candidate_injection_token",
+    )
+    .expect("candidate payload");
+    fs::remove_dir_all(tmp.path().join("agents")).expect("remove agents root");
+    std::os::unix::fs::symlink(tmp.path().join("candidates"), tmp.path().join("agents"))
+        .expect("agents symlink");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "candidate_injection_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
+    assert_eq!(doc["error"]["code"], "agent-scope-untrusted");
+    assert!(!out.stdout_text().contains("candidate_injection_token"));
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_on_demand_rejects_symlinked_agent_leaf_without_candidate_content() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/injected.md"),
+        "leaf_candidate_injection_token",
+    )
+    .expect("candidate payload");
+    fs::create_dir_all(tmp.path().join("agents")).expect("agents root");
+    std::os::unix::fs::symlink(
+        tmp.path().join("candidates/codex"),
+        tmp.path().join("agents/codex"),
+    )
+    .expect("agent scope symlink");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "leaf_candidate_injection_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
+    assert_eq!(doc["error"]["code"], "agent-scope-untrusted");
+    assert_eq!(
+        doc["error"]["details"]["recovery"]["command"],
+        "agent-memory doctor"
+    );
+    assert!(!out.stdout_text().contains("leaf_candidate_injection_token"));
+}
+
+#[test]
+fn candidate_list_prefers_frontmatter_description_for_preview() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/claude/frontmatter.md"),
+        "---\nname: frontmatter\ndescription: \"Diagnose shared startup memory\"\nmetadata:\n  type: project\n---\n\nDetailed candidate body.\n",
+    )
+    .expect("frontmatter candidate");
+    fs::write(
+        tmp.path().join("candidates/claude/body-fallback.md"),
+        "---\nname: body-fallback\n---\n\nPreview the first body line.\n",
+    )
+    .expect("body fallback candidate");
+    fs::write(
+        tmp.path().join("candidates/claude/opaque.md"),
+        "---\nThematic separator content.\n---\n",
+    )
+    .expect("opaque candidate");
+    fs::write(
+        tmp.path()
+            .join("candidates/claude/oversized-description.md"),
+        format!(
+            "---\nname: oversized-description\ndescription: \"{}\"\n---\n",
+            "x".repeat(1024 * 1024)
+        ),
+    )
+    .expect("oversized description candidate");
+
+    let out = run(
+        tmp.path(),
+        &["candidate", "list", "claude", "--format", "json"],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("candidate list json");
+    let candidates = doc["candidates"].as_array().expect("candidate rows");
+    let preview = |file: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate["file"] == file)
+            .expect("candidate row")["preview"]
+            .as_str()
+            .expect("preview")
+    };
+    assert_eq!(preview("frontmatter.md"), "Diagnose shared startup memory");
+    assert_eq!(preview("body-fallback.md"), "Preview the first body line.");
+    assert_eq!(preview("opaque.md"), "---");
+    assert_eq!(preview("oversized-description.md").chars().count(), 160);
 }
 
 #[test]

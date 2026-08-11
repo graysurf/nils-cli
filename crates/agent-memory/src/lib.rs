@@ -119,6 +119,15 @@ fn print_help() -> Result<i32, CliError> {
 struct CliError {
     message: String,
     exit_code: i32,
+    code: Option<&'static str>,
+    details: Option<CliErrorDetails>,
+}
+
+#[derive(Debug)]
+struct CliErrorDetails {
+    retryable: bool,
+    next_action: &'static str,
+    recovery_command: &'static str,
 }
 
 impl CliError {
@@ -126,6 +135,27 @@ impl CliError {
         Self {
             message: message.into(),
             exit_code: EXIT_RUNTIME,
+            code: None,
+            details: None,
+        }
+    }
+
+    fn runtime_typed(
+        code: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+        next_action: &'static str,
+        recovery_command: &'static str,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            exit_code: EXIT_RUNTIME,
+            code: Some(code),
+            details: Some(CliErrorDetails {
+                retryable,
+                next_action,
+                recovery_command,
+            }),
         }
     }
 
@@ -133,6 +163,8 @@ impl CliError {
         Self {
             message: message.into(),
             exit_code: EXIT_USAGE,
+            code: None,
+            details: None,
         }
     }
 }
@@ -650,8 +682,9 @@ Claude Code session scoped to "{id}" persona. Loads on top of the base
 
 ## Memory
 
-- Auto-memory store: `./memory/` (this persona's isolated scope, wired via
-  `.claude/settings.local.json`).
+- Auto-memory store: `./memory/` (this persona's isolated scope; its
+  `.claude/settings.local.json` is passed explicitly with `claude --settings`
+  by the persona launcher).
 - Cross-persona facts (shell, git identity, host) belong in global memory,
   not here.
 "#

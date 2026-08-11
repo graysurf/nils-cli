@@ -133,14 +133,14 @@ pub(crate) fn print_list(
             let contents = fs::read_to_string(&path).map_err(|err| {
                 CliError::runtime(format!("failed to read {}: {err}", display_path(&path)))
             })?;
-            let preview = contents
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("")
-                .chars()
-                .take(160)
-                .collect();
+            let preview_source = frontmatter::candidate_preview(&contents).unwrap_or_else(|| {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("")
+            });
+            let preview = preview_source.chars().take(160).collect();
             let mtime = metadata
                 .modified()
                 .ok()
