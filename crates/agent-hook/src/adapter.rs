@@ -223,6 +223,7 @@ fn provider_output_with_aggregate_context(decision: &NormalizedDecision) -> Opti
             }
         }));
     };
+    let has_top_level_context = root.contains_key("additionalContext");
     if let Some(hook_output) = root
         .get_mut("hookSpecificOutput")
         .and_then(Value::as_object_mut)
@@ -231,7 +232,10 @@ fn provider_output_with_aggregate_context(decision: &NormalizedDecision) -> Opti
         hook_output
             .entry("hookEventName".to_string())
             .or_insert_with(|| json!(decision.event));
-    } else if root.contains_key("additionalContext") {
+        if has_top_level_context {
+            root.insert("additionalContext".to_string(), json!(context));
+        }
+    } else if has_top_level_context {
         root.insert("additionalContext".to_string(), json!(context));
     } else {
         return Some(json!({
@@ -932,6 +936,46 @@ mod tests {
                         .expect("provider JSON");
                 assert_eq!(rendered, provider_output);
             }
+        }
+    }
+
+    #[test]
+    fn provider_render_synchronizes_mixed_accepted_context_locations() {
+        for product in [Product::Codex, Product::Claude] {
+            let decision = NormalizedDecision {
+                schema_version: "agent-hook.decision.v1".to_string(),
+                request_id: "request:mixed-context".to_string(),
+                product,
+                event: "UserPromptSubmit".to_string(),
+                action: DecisionAction::Context,
+                reasons: Vec::new(),
+                context: Some("first context\nsecond context".to_string()),
+                replacement: None,
+                shadow: Vec::<ShadowObservation>::new(),
+                config_digest: "sha256:config".to_string(),
+                policy_digest: "sha256:policy".to_string(),
+                recovery_applied: false,
+                provider_output: Some(json!({
+                    "additionalContext": "first context",
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                    },
+                    "suppressOutput": true,
+                })),
+            };
+
+            let rendered: Value =
+                serde_json::from_str(&render_provider(&decision).expect("provider output"))
+                    .expect("provider JSON");
+            assert_eq!(
+                rendered["hookSpecificOutput"]["additionalContext"],
+                "first context\nsecond context"
+            );
+            assert_eq!(
+                rendered["additionalContext"],
+                "first context\nsecond context"
+            );
+            assert_eq!(rendered["suppressOutput"], true);
         }
     }
 }
