@@ -1068,6 +1068,42 @@ fn recall_on_demand_rejects_symlinked_agents_root_without_candidate_content() {
     assert!(!out.stdout_text().contains("candidate_injection_token"));
 }
 
+#[cfg(unix)]
+#[test]
+fn recall_on_demand_rejects_symlinked_agent_leaf_without_candidate_content() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/injected.md"),
+        "leaf_candidate_injection_token",
+    )
+    .expect("candidate payload");
+    fs::create_dir_all(tmp.path().join("agents")).expect("agents root");
+    std::os::unix::fs::symlink(
+        tmp.path().join("candidates/codex"),
+        tmp.path().join("agents/codex"),
+    )
+    .expect("agent scope symlink");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "leaf_candidate_injection_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
+    assert_eq!(doc["error"]["code"], "agent-scope-not-found");
+    assert!(!out.stdout_text().contains("leaf_candidate_injection_token"));
+}
+
 #[test]
 fn candidate_list_prefers_frontmatter_description_for_preview() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

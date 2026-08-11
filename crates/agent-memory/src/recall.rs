@@ -158,7 +158,7 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
                 CliError::runtime(format!("failed to read {}: {err}", display_path(&file)))
             })?;
             for (index, line) in contents.lines().enumerate() {
-                if contains_case_insensitive(line, &args.term, &needle) {
+                if contains_case_insensitive(line, &needle) {
                     hit_count += 1;
                     if json_output {
                         hits.push(RecallHit {
@@ -201,13 +201,11 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
     })
 }
 
-fn contains_case_insensitive(haystack: &str, needle: &str, lowercase_needle: &str) -> bool {
-    if haystack.is_ascii() && needle.is_ascii() {
-        return haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()));
-    }
+fn contains_case_insensitive(haystack: &str, lowercase_needle: &str) -> bool {
+    // `str::contains` keeps the substring search algorithm out of the
+    // quadratic `windows(...).eq_ignore_ascii_case(...)` worst case. Recall
+    // processes one line at a time, so the temporary lowercase buffer stays
+    // bounded by the current line rather than the complete result set.
     haystack.to_lowercase().contains(lowercase_needle)
 }
 
