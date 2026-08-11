@@ -186,6 +186,13 @@ fn init_persona_renders_tilde_settings_when_store_lives_under_home() {
         settings.contains("\"~/.config/agent-memory/personas/work/memory\""),
         "settings should use a HOME-relative path; got: {settings}"
     );
+
+    let instructions =
+        fs::read_to_string(amh.join("personas/work/CLAUDE.md")).expect("persona instructions");
+    assert!(
+        instructions.contains("passed explicitly with `claude --settings`"),
+        "persona scaffold must explain the explicit settings contract; got: {instructions}"
+    );
 }
 
 #[test]

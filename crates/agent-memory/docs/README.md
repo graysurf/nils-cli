@@ -37,15 +37,16 @@ Beyond the original shell contract, the Rust CLI adds:
   the default text output is unchanged.
 - `search <term> [SCOPE] [--all]` — case-insensitive substring search over note
   frontmatter and bodies, returning `scope/file:line: text`.
-- `recall startup|on-demand|candidates` — exposes bounded startup routing,
-  curated term recall, and explicitly untrusted proposal listing as separate
-  profiles.
+- `recall startup|on-demand|candidates` — exposes 768-byte bounded startup
+  routing, curated global term recall with an optional exact `--agent` scope,
+  and explicitly untrusted proposal listing as separate profiles.
 - `candidate add|list|promote` — isolates proposal writers by producer and
   provides an explicit dry-run/apply promotion transaction into curated
   `global/` memory. Promotion requires explicit session provenance, preserves
   supported global-directory symlinks, removes exact native-index filename
   references, and reports incomplete rollback without deleting recovery
-  backups.
+  backups. Listing prefers an optional frontmatter description or body preview
+  while retaining opaque fallback behavior.
 - `archive list|search` — explicitly queries historical superseded notes that
   are structurally excluded from active recall, search, checks, and completion.
 - `archive retire <slug> ... [--apply]` — dry-run-first, rollback-safe movement

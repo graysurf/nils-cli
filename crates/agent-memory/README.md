@@ -43,7 +43,7 @@ agent-memory add [SCOPE] --name <slug> --type <t> --description <text> \
 agent-memory list [SCOPE] [--type <t>] [--format text|json]
 agent-memory search <term> [SCOPE] [--all] [--format text|json]
 agent-memory recall startup [--max-bytes <bytes>] [--format text|json]
-agent-memory recall on-demand <term> [--format text|json]
+agent-memory recall on-demand <term> [--agent <id>] [--format text|json]
 agent-memory recall candidates [producer] [--format text|json]
 agent-memory candidate add <producer> --name <slug> \
   [--title <text>] [--hook <text>] [--body <text>|-] \
@@ -110,14 +110,17 @@ matches and `1` when there are none.
 ## Recall profiles
 
 `recall startup` reads only `profiles/startup/MEMORY.md`, treats the payload as
-untrusted memory data, and fails closed when the file exceeds 3,072 bytes by
-default. `--max-bytes` can set a stricter or explicitly configured boundary.
+untrusted memory data, and rejects a file that exceeds the deployed 768-byte
+transport budget by default. `--max-bytes` can set an explicitly configured
+boundary.
 It never falls back to `global/MEMORY.md`.
 
-`recall on-demand <term>` searches curated `global/*.md` notes only and does
-not emit the full global index. `recall candidates [producer]` lists opaque
-proposal files under producer-isolated candidate roots and labels the result
-untrusted.
+`recall on-demand <term>` searches curated `global/*.md` notes and does not emit
+the full global index. `--agent <id>` additionally includes only the exact
+registered `agents/<id>/*.md` scope; candidate, archive, profile, and persona
+content remain excluded. Omitting `--agent` preserves the global-only contract.
+`recall candidates [producer]` lists opaque proposal files under
+producer-isolated candidate roots and labels the result untrusted.
 
 ## Candidate lifecycle
 
@@ -125,6 +128,14 @@ untrusted.
 proposal file, and updates its candidate index. Candidate bodies do not need
 canonical frontmatter because provider-native memory may use its own format.
 Candidate roots, indexes, source files, and body-file inputs reject symlinks.
+Candidate listing uses an optional recognizable frontmatter description, then
+the first body line, for its bounded preview; otherwise it preserves the opaque
+first-non-empty-line fallback.
+
+`init-persona` writes the isolated auto-memory path to
+`personas/<id>/.claude/settings.local.json`. Persona launchers must pass that
+file explicitly with `claude --settings`; the filename alone is not a promise
+that Claude will honor user-scope-only settings keys.
 
 `candidate promote` is non-mutating unless `--apply` is present. The preview
 validates the producer, source, destination, canonical type, and both indexes,

@@ -38,6 +38,28 @@ pub(crate) fn body_after_frontmatter(contents: &str) -> &str {
     strip_optional_separator(&contents[end..])
 }
 
+/// Return a useful preview for a candidate with recognizable optional
+/// frontmatter.
+///
+/// Candidate files remain opaque input: a leading thematic `---` block is not
+/// treated as metadata unless it carries `name` or `description`. When a
+/// description is present it is the best bounded summary; otherwise the first
+/// non-empty body line is used.
+pub(crate) fn candidate_preview(contents: &str) -> Option<String> {
+    let (frontmatter, end) = parse_leading_block(contents)?;
+    if frontmatter.name.is_none() && frontmatter.description.is_none() {
+        return None;
+    }
+    if let Some(description) = frontmatter.description {
+        return Some(description);
+    }
+    strip_optional_separator(&contents[end..])
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Report whether a note starts with two consecutive recognizable blocks.
 pub(crate) fn has_duplicate_frontmatter(contents: &str) -> bool {
     let Some((_, end)) = parse_leading_block(contents) else {

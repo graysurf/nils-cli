@@ -10,7 +10,7 @@ use nils_common::fs::display_path;
 use crate::cli::{
     RecallArgs, RecallCandidatesArgs, RecallCommand, RecallOnDemandArgs, RecallStartupArgs,
 };
-use crate::{CliError, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, Layout, markdown_files};
+use crate::{CliError, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, Layout, markdown_files, validate_id};
 
 pub(crate) fn run(layout: &Layout, args: &RecallArgs) -> Result<i32, CliError> {
     let (json, schema_command) = match &args.command {
@@ -94,6 +94,7 @@ fn startup(layout: &Layout, args: &RecallStartupArgs) -> Result<i32, CliError> {
 }
 
 struct RecallHit {
+    scope: String,
     file: String,
     line: usize,
     text: String,
@@ -110,28 +111,49 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
             display_path(&global)
         )));
     }
+    let mut scopes = vec![("global".to_string(), global)];
+    if let Some(agent) = args.agent.as_deref() {
+        validate_id(agent)?;
+        let agent_dir = layout.agents_dir().join(agent);
+        let available = fs::symlink_metadata(&agent_dir)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
+        if !available {
+            return Err(CliError::runtime_typed(
+                "agent-scope-not-found",
+                format!("agent scope is not available: {agent}"),
+                false,
+                "select an existing agent scope or initialize one",
+                "agent-memory agents",
+            ));
+        }
+        scopes.push((format!("agents/{agent}"), agent_dir));
+    }
+
     let needle = args.term.to_lowercase();
     let mut hits = Vec::new();
-    for file in markdown_files(&global)? {
-        let Some(name) = file
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        if name == "MEMORY.md" {
-            continue;
-        }
-        let contents = fs::read_to_string(&file).map_err(|err| {
-            CliError::runtime(format!("failed to read {}: {err}", display_path(&file)))
-        })?;
-        for (index, line) in contents.lines().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                hits.push(RecallHit {
-                    file: name.clone(),
-                    line: index + 1,
-                    text: line.trim().to_string(),
-                });
+    for (scope, directory) in scopes {
+        for file in markdown_files(&directory)? {
+            let Some(name) = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            if name == "MEMORY.md" {
+                continue;
+            }
+            let contents = fs::read_to_string(&file).map_err(|err| {
+                CliError::runtime(format!("failed to read {}: {err}", display_path(&file)))
+            })?;
+            for (index, line) in contents.lines().enumerate() {
+                if line.to_lowercase().contains(&needle) {
+                    hits.push(RecallHit {
+                        scope: scope.clone(),
+                        file: name.clone(),
+                        line: index + 1,
+                        text: line.trim().to_string(),
+                    });
+                }
             }
         }
     }
@@ -142,14 +164,14 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
             .iter()
             .map(|hit| {
                 json!({
-                    "scope": "global",
+                    "scope": hit.scope,
                     "file": hit.file,
                     "line": hit.line,
                     "text": hit.text,
                 })
             })
             .collect();
-        let doc = json!({
+        let mut doc = json!({
             "schema_version": schema_version_for("agent-memory", "recall-on-demand", 1),
             "ok": !hits.is_empty(),
             "profile": "on-demand",
@@ -159,13 +181,16 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
             "count": hits.len(),
             "hits": records,
         });
+        if let Some(agent) = args.agent.as_deref() {
+            doc["agent"] = json!(agent);
+        }
         println!(
             "{}",
             serde_json::to_string(&doc).expect("on-demand recall should serialize")
         );
     } else {
         for hit in &hits {
-            println!("global/{}:{}: {}", hit.file, hit.line, hit.text);
+            println!("{}/{}:{}: {}", hit.scope, hit.file, hit.line, hit.text);
         }
     }
     Ok(if hits.is_empty() {
@@ -189,18 +214,28 @@ fn output_format(format: OutputFormat, json: bool) -> OutputFormat {
 }
 
 fn print_json_error(schema_command: &str, err: &CliError) {
-    let code = if err.exit_code == EXIT_USAGE {
+    let default_code = if err.exit_code == EXIT_USAGE {
         "usage-error"
     } else {
         "runtime-error"
     };
+    let mut error = json!({
+        "code": err.code.unwrap_or(default_code),
+        "message": err.message,
+    });
+    if let Some(details) = &err.details {
+        error["details"] = json!({
+            "retryable": details.retryable,
+            "next_action": details.next_action,
+            "recovery": {
+                "command": details.recovery_command,
+            },
+        });
+    }
     let doc = json!({
         "schema_version": schema_version_for("agent-memory", schema_command, 1),
         "ok": false,
-        "error": {
-            "code": code,
-            "message": err.message,
-        },
+        "error": error,
     });
     println!(
         "{}",
