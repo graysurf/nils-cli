@@ -1100,7 +1100,11 @@ fn recall_on_demand_rejects_symlinked_agent_leaf_without_candidate_content() {
     assert_eq!(out.code, 1);
     let doc: serde_json::Value =
         serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
-    assert_eq!(doc["error"]["code"], "agent-scope-not-found");
+    assert_eq!(doc["error"]["code"], "agent-scope-untrusted");
+    assert_eq!(
+        doc["error"]["details"]["recovery"]["command"],
+        "agent-memory doctor"
+    );
     assert!(!out.stdout_text().contains("leaf_candidate_injection_token"));
 }
 

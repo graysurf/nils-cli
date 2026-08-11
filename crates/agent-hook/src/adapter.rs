@@ -205,13 +205,15 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
 
 fn provider_output_with_aggregate_context(decision: &NormalizedDecision) -> Option<Value> {
     let mut output = decision.provider_output.clone()?;
-    let context = decision.context.as_deref()?;
     if !matches!(
         decision.action,
         DecisionAction::Context | DecisionAction::Warn
     ) {
         return Some(output);
     }
+    let Some(context) = decision.context.as_deref() else {
+        return Some(output);
+    };
 
     let Some(root) = output.as_object_mut() else {
         return Some(json!({
@@ -892,6 +894,44 @@ mod tests {
                 "first context\nsecond context"
             );
             assert_eq!(rendered["suppressOutput"], true);
+        }
+    }
+
+    #[test]
+    fn provider_render_preserves_native_envelopes_without_aggregate_context() {
+        for product in [Product::Codex, Product::Claude] {
+            for action in [
+                DecisionAction::Allow,
+                DecisionAction::Block,
+                DecisionAction::Transform,
+            ] {
+                let provider_output = json!({
+                    "decision": "provider-native",
+                    "reason": "preserve me",
+                    "suppressOutput": true,
+                    "providerExtension": {"product": product.as_str()},
+                });
+                let decision = NormalizedDecision {
+                    schema_version: "agent-hook.decision.v1".to_string(),
+                    request_id: "request:provider-preservation".to_string(),
+                    product,
+                    event: "PreToolUse".to_string(),
+                    action,
+                    reasons: Vec::new(),
+                    context: None,
+                    replacement: None,
+                    shadow: Vec::<ShadowObservation>::new(),
+                    config_digest: "sha256:config".to_string(),
+                    policy_digest: "sha256:policy".to_string(),
+                    recovery_applied: false,
+                    provider_output: Some(provider_output.clone()),
+                };
+
+                let rendered: Value =
+                    serde_json::from_str(&render_provider(&decision).expect("provider output"))
+                        .expect("provider JSON");
+                assert_eq!(rendered, provider_output);
+            }
         }
     }
 }

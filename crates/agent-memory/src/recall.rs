@@ -235,6 +235,15 @@ fn validate_agent_scope_metadata(
 ) -> Result<(), CliError> {
     match metadata {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CliError::runtime_typed(
+                "agent-scope-untrusted",
+                format!("agent scope must be a non-symlink directory: {agent}"),
+                false,
+                "repair the agent memory layout before agent-scoped recall",
+                "agent-memory doctor",
+            ));
+        }
         Ok(_) => {
             return Err(agent_scope_not_found(agent));
         }
