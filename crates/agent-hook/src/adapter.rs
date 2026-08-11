@@ -157,8 +157,8 @@ pub fn normalize(
 }
 
 pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookError> {
-    if let Some(output) = decision.provider_output.as_ref() {
-        return serde_json::to_string(output).map_err(|_| {
+    if let Some(output) = provider_output_with_aggregate_context(decision) {
+        return serde_json::to_string(&output).map_err(|_| {
             HookError::runtime(
                 "provider-output-render-failed",
                 "provider output could not be rendered",
@@ -201,6 +201,45 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
             "provider output could not be rendered",
         )
     })
+}
+
+fn provider_output_with_aggregate_context(decision: &NormalizedDecision) -> Option<Value> {
+    let mut output = decision.provider_output.clone()?;
+    let context = decision.context.as_deref()?;
+    if !matches!(
+        decision.action,
+        DecisionAction::Context | DecisionAction::Warn
+    ) {
+        return Some(output);
+    }
+
+    let Some(root) = output.as_object_mut() else {
+        return Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": decision.event,
+                "additionalContext": context,
+            }
+        }));
+    };
+    if let Some(hook_output) = root
+        .get_mut("hookSpecificOutput")
+        .and_then(Value::as_object_mut)
+    {
+        hook_output.insert("additionalContext".to_string(), json!(context));
+        hook_output
+            .entry("hookEventName".to_string())
+            .or_insert_with(|| json!(decision.event));
+    } else if root.contains_key("additionalContext") {
+        root.insert("additionalContext".to_string(), json!(context));
+    } else {
+        return Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": decision.event,
+                "additionalContext": context,
+            }
+        }));
+    }
+    Some(output)
 }
 
 pub fn render_provider_error(
@@ -809,4 +848,50 @@ fn parse_provider_json(input: &[u8]) -> Result<Value, HookError> {
             )
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DecisionReason, ShadowObservation};
+
+    #[test]
+    fn provider_render_uses_the_full_aggregated_context() {
+        for product in [Product::Codex, Product::Claude] {
+            let decision = NormalizedDecision {
+                schema_version: "agent-hook.decision.v1".to_string(),
+                request_id: "request:test".to_string(),
+                product,
+                event: "UserPromptSubmit".to_string(),
+                action: DecisionAction::Context,
+                reasons: vec![DecisionReason {
+                    rule_id: "fixture.context".to_string(),
+                    code: "fixture-context".to_string(),
+                    disposition: "context".to_string(),
+                }],
+                context: Some("first context\nsecond context".to_string()),
+                replacement: None,
+                shadow: Vec::<ShadowObservation>::new(),
+                config_digest: "sha256:config".to_string(),
+                policy_digest: "sha256:policy".to_string(),
+                recovery_applied: false,
+                provider_output: Some(json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": "first context",
+                    },
+                    "suppressOutput": true,
+                })),
+            };
+
+            let rendered: Value =
+                serde_json::from_str(&render_provider(&decision).expect("provider output"))
+                    .expect("provider JSON");
+            assert_eq!(
+                rendered["hookSpecificOutput"]["additionalContext"],
+                "first context\nsecond context"
+            );
+            assert_eq!(rendered["suppressOutput"], true);
+        }
+    }
 }

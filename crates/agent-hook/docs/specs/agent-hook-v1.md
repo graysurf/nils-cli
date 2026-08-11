@@ -323,7 +323,9 @@ rule_id asc)`. A duplicate rule ID is invalid. Decision precedence is
 `block > transform-conflict > transform > warn/context > allow`.
 
 Multiple context values concatenate in rule order with a 16 KiB aggregate
-limit. Identical replacements coalesce. Different replacements are an explicit
+limit. Provider-native rendering uses that complete aggregate even when the
+first context rule supplied an otherwise reusable native envelope. Identical
+replacements coalesce. Different replacements are an explicit
 `transform-conflict` block; transforms never compose implicitly. Failure
 posture is typed per rule (`open`, `warn`, or `closed`), while locked privacy,
 writer, transaction, and recovery rules must be `closed`.
