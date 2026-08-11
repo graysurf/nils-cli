@@ -119,6 +119,9 @@ It never falls back to `global/MEMORY.md`.
 the full global index. `--agent <id>` additionally includes only the exact
 registered `agents/<id>/*.md` scope; candidate, archive, profile, and persona
 content remain excluded. Omitting `--agent` preserves the global-only contract.
+This manual query returns the complete curated match set; automatic provider
+injection uses only the separately bounded startup profile. Text results stream
+as they are found, while JSON avoids a duplicate in-memory value tree.
 `recall candidates [producer]` lists opaque proposal files under
 producer-isolated candidate roots and labels the result untrusted.
 

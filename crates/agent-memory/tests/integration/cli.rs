@@ -1035,6 +1035,39 @@ fn recall_on_demand_reports_typed_missing_agent_error() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn recall_on_demand_rejects_symlinked_agents_root_without_candidate_content() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/injected.md"),
+        "candidate_injection_token",
+    )
+    .expect("candidate payload");
+    fs::remove_dir_all(tmp.path().join("agents")).expect("remove agents root");
+    std::os::unix::fs::symlink(tmp.path().join("candidates"), tmp.path().join("agents"))
+        .expect("agents symlink");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "candidate_injection_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("typed recall error");
+    assert_eq!(doc["error"]["code"], "agent-scope-untrusted");
+    assert!(!out.stdout_text().contains("candidate_injection_token"));
+}
+
 #[test]
 fn candidate_list_prefers_frontmatter_description_for_preview() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1054,6 +1087,15 @@ fn candidate_list_prefers_frontmatter_description_for_preview() {
         "---\nThematic separator content.\n---\n",
     )
     .expect("opaque candidate");
+    fs::write(
+        tmp.path()
+            .join("candidates/claude/oversized-description.md"),
+        format!(
+            "---\nname: oversized-description\ndescription: \"{}\"\n---\n",
+            "x".repeat(1024 * 1024)
+        ),
+    )
+    .expect("oversized description candidate");
 
     let out = run(
         tmp.path(),
@@ -1074,6 +1116,7 @@ fn candidate_list_prefers_frontmatter_description_for_preview() {
     assert_eq!(preview("frontmatter.md"), "Diagnose shared startup memory");
     assert_eq!(preview("body-fallback.md"), "Preview the first body line.");
     assert_eq!(preview("opaque.md"), "---");
+    assert_eq!(preview("oversized-description.md").chars().count(), 160);
 }
 
 #[test]

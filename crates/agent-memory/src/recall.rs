@@ -1,7 +1,9 @@
 //! Bounded startup, curated on-demand, and untrusted candidate recall.
 
 use std::fs;
+use std::io::{self, Write};
 
+use serde::Serialize;
 use serde_json::json;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
@@ -93,11 +95,26 @@ fn startup(layout: &Layout, args: &RecallStartupArgs) -> Result<i32, CliError> {
     Ok(EXIT_OK)
 }
 
+#[derive(Serialize)]
 struct RecallHit {
     scope: String,
     file: String,
     line: usize,
     text: String,
+}
+
+#[derive(Serialize)]
+struct RecallOnDemandResponse<'a> {
+    schema_version: String,
+    ok: bool,
+    profile: &'static str,
+    trust: &'static str,
+    curation: &'static str,
+    term: &'a str,
+    count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    hits: &'a [RecallHit],
 }
 
 fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError> {
@@ -114,13 +131,18 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
     let mut scopes = vec![("global".to_string(), global)];
     if let Some(agent) = args.agent.as_deref() {
         validate_id(agent)?;
-        let agent_dir = layout.agents_dir().join(agent);
+        let agents_dir = layout.agents_dir();
+        validate_agents_root_metadata(agent, fs::symlink_metadata(&agents_dir))?;
+        let agent_dir = agents_dir.join(agent);
         validate_agent_scope_metadata(agent, fs::symlink_metadata(&agent_dir))?;
         scopes.push((format!("agents/{agent}"), agent_dir));
     }
 
+    let format = output_format(args.format, args.json);
+    let json_output = format.is_json();
     let needle = args.term.to_lowercase();
     let mut hits = Vec::new();
+    let mut hit_count = 0;
     for (scope, directory) in scopes {
         for file in markdown_files(&directory)? {
             let Some(name) = file
@@ -136,58 +158,77 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
                 CliError::runtime(format!("failed to read {}: {err}", display_path(&file)))
             })?;
             for (index, line) in contents.lines().enumerate() {
-                if line.to_lowercase().contains(&needle) {
-                    hits.push(RecallHit {
-                        scope: scope.clone(),
-                        file: name.clone(),
-                        line: index + 1,
-                        text: line.trim().to_string(),
-                    });
+                if contains_case_insensitive(line, &args.term, &needle) {
+                    hit_count += 1;
+                    if json_output {
+                        hits.push(RecallHit {
+                            scope: scope.clone(),
+                            file: name.clone(),
+                            line: index + 1,
+                            text: line.trim().to_string(),
+                        });
+                    } else {
+                        println!("{scope}/{name}:{}: {}", index + 1, line.trim());
+                    }
                 }
             }
         }
     }
 
-    let format = output_format(args.format, args.json);
-    if format.is_json() {
-        let records: Vec<_> = hits
-            .iter()
-            .map(|hit| {
-                json!({
-                    "scope": hit.scope,
-                    "file": hit.file,
-                    "line": hit.line,
-                    "text": hit.text,
-                })
-            })
-            .collect();
-        let mut doc = json!({
-            "schema_version": schema_version_for("agent-memory", "recall-on-demand", 1),
-            "ok": !hits.is_empty(),
-            "profile": "on-demand",
-            "trust": "untrusted-memory-data",
-            "curation": "curated",
-            "term": args.term,
-            "count": hits.len(),
-            "hits": records,
-        });
-        if let Some(agent) = args.agent.as_deref() {
-            doc["agent"] = json!(agent);
-        }
-        println!(
-            "{}",
-            serde_json::to_string(&doc).expect("on-demand recall should serialize")
-        );
-    } else {
-        for hit in &hits {
-            println!("{}/{}:{}: {}", hit.scope, hit.file, hit.line, hit.text);
-        }
+    if json_output {
+        let doc = RecallOnDemandResponse {
+            schema_version: schema_version_for("agent-memory", "recall-on-demand", 1),
+            ok: hit_count != 0,
+            profile: "on-demand",
+            trust: "untrusted-memory-data",
+            curation: "curated",
+            term: args.term.as_str(),
+            count: hit_count,
+            agent: args.agent.as_deref(),
+            hits: &hits,
+        };
+        let mut output = io::stdout().lock();
+        serde_json::to_writer(&mut output, &doc)
+            .map_err(|err| CliError::runtime(format!("failed to write recall JSON: {err}")))?;
+        output
+            .write_all(b"\n")
+            .map_err(|err| CliError::runtime(format!("failed to write recall JSON: {err}")))?;
     }
-    Ok(if hits.is_empty() {
+    Ok(if hit_count == 0 {
         EXIT_RUNTIME
     } else {
         EXIT_OK
     })
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str, lowercase_needle: &str) -> bool {
+    if haystack.is_ascii() && needle.is_ascii() {
+        return haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()));
+    }
+    haystack.to_lowercase().contains(lowercase_needle)
+}
+
+fn validate_agents_root_metadata(
+    agent: &str,
+    metadata: std::io::Result<fs::Metadata>,
+) -> Result<(), CliError> {
+    match metadata {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => Ok(()),
+        Ok(_) => Err(CliError::runtime_typed(
+            "agent-scope-untrusted",
+            "agent scope root must be a non-symlink directory",
+            false,
+            "repair the agent memory layout before agent-scoped recall",
+            "agent-memory doctor",
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(agent_scope_not_found(agent)),
+        Err(err) => Err(CliError::runtime(format!(
+            "failed to inspect agent scope root: {err}"
+        ))),
+    }
 }
 
 fn validate_agent_scope_metadata(
@@ -197,22 +238,10 @@ fn validate_agent_scope_metadata(
     match metadata {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
         Ok(_) => {
-            return Err(CliError::runtime_typed(
-                "agent-scope-not-found",
-                format!("agent scope is not available: {agent}"),
-                false,
-                "select an existing agent scope or initialize one",
-                "agent-memory agents",
-            ));
+            return Err(agent_scope_not_found(agent));
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CliError::runtime_typed(
-                "agent-scope-not-found",
-                format!("agent scope is not available: {agent}"),
-                false,
-                "select an existing agent scope or initialize one",
-                "agent-memory agents",
-            ));
+            return Err(agent_scope_not_found(agent));
         }
         Err(err) => {
             return Err(CliError::runtime(format!(
@@ -221,6 +250,16 @@ fn validate_agent_scope_metadata(
         }
     }
     Ok(())
+}
+
+fn agent_scope_not_found(agent: &str) -> CliError {
+    CliError::runtime_typed(
+        "agent-scope-not-found",
+        format!("agent scope is not available: {agent}"),
+        false,
+        "select an existing agent scope or initialize one",
+        "agent-memory agents",
+    )
 }
 
 fn candidates(layout: &Layout, args: &RecallCandidatesArgs) -> Result<i32, CliError> {

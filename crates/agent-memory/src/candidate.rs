@@ -139,7 +139,6 @@ pub(crate) fn print_list(
                     .map(str::trim)
                     .find(|line| !line.is_empty())
                     .unwrap_or("")
-                    .to_string()
             });
             let preview = preview_source.chars().take(160).collect();
             let mtime = metadata
