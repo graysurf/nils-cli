@@ -115,17 +115,7 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
     if let Some(agent) = args.agent.as_deref() {
         validate_id(agent)?;
         let agent_dir = layout.agents_dir().join(agent);
-        let available = fs::symlink_metadata(&agent_dir)
-            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
-        if !available {
-            return Err(CliError::runtime_typed(
-                "agent-scope-not-found",
-                format!("agent scope is not available: {agent}"),
-                false,
-                "select an existing agent scope or initialize one",
-                "agent-memory agents",
-            ));
-        }
+        validate_agent_scope_metadata(agent, fs::symlink_metadata(&agent_dir))?;
         scopes.push((format!("agents/{agent}"), agent_dir));
     }
 
@@ -200,6 +190,39 @@ fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError
     })
 }
 
+fn validate_agent_scope_metadata(
+    agent: &str,
+    metadata: std::io::Result<fs::Metadata>,
+) -> Result<(), CliError> {
+    match metadata {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CliError::runtime_typed(
+                "agent-scope-not-found",
+                format!("agent scope is not available: {agent}"),
+                false,
+                "select an existing agent scope or initialize one",
+                "agent-memory agents",
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CliError::runtime_typed(
+                "agent-scope-not-found",
+                format!("agent scope is not available: {agent}"),
+                false,
+                "select an existing agent scope or initialize one",
+                "agent-memory agents",
+            ));
+        }
+        Err(err) => {
+            return Err(CliError::runtime(format!(
+                "failed to inspect agent scope {agent}: {err}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn candidates(layout: &Layout, args: &RecallCandidatesArgs) -> Result<i32, CliError> {
     crate::candidate::print_list(
         layout,
@@ -241,4 +264,33 @@ fn print_json_error(schema_command: &str, err: &CliError) {
         "{}",
         serde_json::to_string(&doc).expect("recall error should serialize")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_scope_not_found_remains_typed_and_non_retryable() {
+        let err = validate_agent_scope_metadata(
+            "codex",
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .expect_err("missing agent scope");
+
+        assert_eq!(err.code, Some("agent-scope-not-found"));
+        assert!(!err.details.expect("typed details").retryable);
+    }
+
+    #[test]
+    fn agent_scope_operational_error_is_not_misreported_as_missing() {
+        let err = validate_agent_scope_metadata(
+            "codex",
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("agent scope inspection failure");
+
+        assert_eq!(err.code, None);
+        assert!(err.message.contains("failed to inspect agent scope codex"));
+    }
 }

@@ -806,6 +806,16 @@ fn recall_startup_defaults_to_deployed_768_byte_budget() {
     seed_recall_layout(tmp.path());
     fs::write(
         tmp.path().join("profiles/startup/MEMORY.md"),
+        "x".repeat(768),
+    )
+    .expect("boundary startup profile");
+
+    let boundary = run(tmp.path(), &["recall", "startup"]);
+    assert_eq!(boundary.code, 0, "stderr={}", boundary.stderr_text());
+    assert_eq!(boundary.stdout_text().len(), 768);
+
+    fs::write(
+        tmp.path().join("profiles/startup/MEMORY.md"),
         "x".repeat(769),
     )
     .expect("oversized startup profile");
@@ -853,6 +863,37 @@ fn recall_on_demand_searches_curated_global_only() {
     let no_candidate = run(tmp.path(), &["recall", "on-demand", "candidate_only_token"]);
     assert_eq!(no_candidate.code, 1);
     assert!(no_candidate.stdout_text().is_empty());
+
+    let json_hit = run(
+        tmp.path(),
+        &["recall", "on-demand", "route body", "--format", "json"],
+    );
+    assert_eq!(json_hit.code, 0, "stderr={}", json_hit.stderr_text());
+    let hit_doc: serde_json::Value =
+        serde_json::from_str(json_hit.stdout_text().trim()).expect("recall hit json");
+    assert_eq!(
+        hit_doc["schema_version"],
+        "cli.agent-memory.recall-on-demand.v1"
+    );
+    assert!(hit_doc.get("agent").is_none());
+    assert_eq!(hit_doc["count"], 1);
+    assert_eq!(hit_doc["hits"][0]["scope"], "global");
+
+    let json_miss = run(
+        tmp.path(),
+        &["recall", "on-demand", "absent_token", "--format", "json"],
+    );
+    assert_eq!(json_miss.code, 1);
+    let miss_doc: serde_json::Value =
+        serde_json::from_str(json_miss.stdout_text().trim()).expect("recall miss json");
+    assert_eq!(
+        miss_doc["schema_version"],
+        "cli.agent-memory.recall-on-demand.v1"
+    );
+    assert_eq!(miss_doc["ok"], false);
+    assert_eq!(miss_doc["count"], 0);
+    assert_eq!(miss_doc["hits"], serde_json::json!([]));
+    assert!(miss_doc.get("agent").is_none());
 }
 
 #[test]
@@ -868,10 +909,33 @@ fn recall_on_demand_can_include_one_exact_agent_scope() {
             "codex-routing",
             "reference",
             "Codex-only routing",
-            "codex_agent_only_token",
+            "shared_agent_scope_token codex_agent_only_token",
         ),
     )
     .expect("codex note");
+    fs::write(
+        tmp.path().join("global/shared.md"),
+        note_with(
+            "global-shared",
+            "reference",
+            "Global shared routing",
+            "shared_agent_scope_token",
+        ),
+    )
+    .expect("global shared note");
+    let hermes = tmp.path().join("agents/hermes");
+    fs::create_dir_all(&hermes).expect("hermes agent scope");
+    fs::write(hermes.join("MEMORY.md"), "# Hermes memory\n").expect("hermes index");
+    fs::write(
+        hermes.join("routing.md"),
+        note_with(
+            "hermes-routing",
+            "reference",
+            "Hermes-only routing",
+            "shared_agent_scope_token",
+        ),
+    )
+    .expect("hermes note");
     fs::write(
         tmp.path().join("candidates/codex/not-curated.md"),
         "codex_agent_only_token candidate",
@@ -908,6 +972,31 @@ fn recall_on_demand_can_include_one_exact_agent_scope() {
         "{}",
         selected.stdout_text()
     );
+
+    let additive = run(
+        tmp.path(),
+        &[
+            "recall",
+            "on-demand",
+            "shared_agent_scope_token",
+            "--agent",
+            "codex",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(additive.code, 0, "stderr={}", additive.stderr_text());
+    let doc: serde_json::Value =
+        serde_json::from_str(additive.stdout_text().trim()).expect("additive recall json");
+    assert_eq!(doc["count"], 2);
+    let scopes: Vec<_> = doc["hits"]
+        .as_array()
+        .expect("recall hits")
+        .iter()
+        .map(|hit| hit["scope"].as_str().expect("hit scope"))
+        .collect();
+    assert_eq!(scopes, vec!["global", "agents/codex"]);
+    assert!(!additive.stdout_text().contains("agents/hermes"));
 }
 
 #[test]
