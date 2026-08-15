@@ -1,4 +1,4 @@
-_fzf-cli() {
+_fzf__cli() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -371,7 +371,7 @@ _fzf-cli() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _fzf-cli -o nosort -o bashdefault -o default fzf-cli
+    complete -F _fzf__cli -o nosort -o bashdefault -o default fzf-cli
 else
-    complete -F _fzf-cli -o bashdefault -o default fzf-cli
+    complete -F _fzf__cli -o bashdefault -o default fzf-cli
 fi

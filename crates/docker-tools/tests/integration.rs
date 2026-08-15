@@ -74,8 +74,8 @@ fn completion_exports_bash_and_zsh_scripts() {
     let bash = run(&["completion", "bash"], &options_in(tmp.path()));
     assert_exit(&bash, 0);
     let bash_text = bash.stdout_text();
-    assert!(bash_text.contains("_docker-tools()"));
-    assert!(bash_text.contains("complete -F _docker-tools"));
+    assert!(bash_text.contains("_docker__tools()"));
+    assert!(bash_text.contains("complete -F _docker__tools"));
 }
 
 #[test]

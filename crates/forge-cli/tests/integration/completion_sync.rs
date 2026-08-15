@@ -48,8 +48,8 @@ fn completion_bash_emits_non_empty_script_with_forge_cli_marker() {
         "bash completion script must be non-empty"
     );
     assert!(
-        stdout.contains("_forge-cli"),
-        "bash completion must define _forge-cli, got first 200 bytes: {}",
+        stdout.contains("_forge__cli"),
+        "bash completion must define _forge__cli, got first 200 bytes: {}",
         &stdout[..stdout.len().min(200)]
     );
 }

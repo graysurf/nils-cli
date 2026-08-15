@@ -22,7 +22,10 @@ fn md_cell(value: Value) -> Result<Value, Error> {
                 "md_cell(): undefined value",
             ));
         }
-        ValueKind::Bool | ValueKind::Number => canonicalize_table_cell(&value.to_string()),
+        // MiniJinja renders booleans with Python spelling (`True` / `False`).
+        // Preserve this filter's JSON-oriented canonicalization contract.
+        ValueKind::Bool => value.is_true().to_string(),
+        ValueKind::Number => canonicalize_table_cell(&value.to_string()),
         _ => {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -98,6 +101,9 @@ mod tests {
     fn bool_and_number_are_canonicalized() {
         let true_out = render("{{ value | md_cell }}", serde_json::json!({"value": true}));
         assert_eq!(true_out, "true");
+
+        let false_out = render("{{ value | md_cell }}", serde_json::json!({"value": false}));
+        assert_eq!(false_out, "false");
 
         let num_out = render("{{ value | md_cell }}", serde_json::json!({"value": 42}));
         assert_eq!(num_out, "42");

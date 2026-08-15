@@ -1,4 +1,4 @@
-_agent-run() {
+_agent__run() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -194,7 +194,7 @@ _agent-run() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _agent-run -o nosort -o bashdefault -o default agent-run
+    complete -o nospace -F _agent__run -o nosort -o bashdefault -o default agent-run
 else
-    complete -o nospace -F _agent-run -o bashdefault -o default agent-run
+    complete -o nospace -F _agent__run -o bashdefault -o default agent-run
 fi

@@ -1,4 +1,4 @@
-_agent-out() {
+_agent__out() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -264,7 +264,7 @@ _agent-out() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _agent-out -o nosort -o bashdefault -o default agent-out
+    complete -F _agent__out -o nosort -o bashdefault -o default agent-out
 else
-    complete -F _agent-out -o bashdefault -o default agent-out
+    complete -F _agent__out -o bashdefault -o default agent-out
 fi

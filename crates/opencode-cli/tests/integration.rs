@@ -237,8 +237,8 @@ fn main_help_unknown_and_completion_paths_are_stable() {
 
     let bash = run(&["completion", "bash"], &clean_options());
     assert_exit(&bash, 0);
-    assert!(bash.stdout_text().contains("_opencode-cli()"));
-    assert!(bash.stdout_text().contains("complete -F _opencode-cli"));
+    assert!(bash.stdout_text().contains("_opencode__cli()"));
+    assert!(bash.stdout_text().contains("complete -F _opencode__cli"));
 }
 
 #[test]

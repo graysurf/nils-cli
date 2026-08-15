@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `0b3d746e901b26a1e28459b357fb13fa2609b544c5226434fc184a498ca3bfb8`
-- Third-party crates (`source != null`): 487
+- Cargo.lock SHA256: `efcda47accdccf65f39980ce06ab29ab96509c4897aa618d547eabaf0f03da9a`
+- Third-party crates (`source != null`): 488
 
 ## Notice Extraction Policy
 
@@ -485,7 +485,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### clap 4.6.5
+### clap 4.6.6
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -494,7 +494,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### clap_builder 4.6.5
+### clap_builder 4.6.6
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -503,7 +503,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### clap_complete 4.6.8
+### clap_complete 4.6.9
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -1498,7 +1498,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jaq-json 2.0.1
+### jaq-json 2.0.2
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1677,7 +1677,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE.txt`
 
-### libsqlite3-sys 0.38.1
+### libsqlite3-sys 0.38.2
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1800,7 +1800,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### minijinja 2.21.0
+### minijinja 2.24.0
 
 - License: `Apache-2.0`
 - Source: `crates.io`
@@ -2634,7 +2634,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### rusqlite 0.40.1
+### rusqlite 0.40.2
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3134,7 +3134,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### thiserror 2.0.19
+### thiserror 2.0.20
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -3143,7 +3143,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### thiserror-impl 2.0.19
+### thiserror-impl 2.0.20
 
 - License: `MIT OR Apache-2.0`
 - Source: `crates.io`
@@ -4076,7 +4076,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zbus 5.18.0
+### zbus 5.19.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -4084,7 +4084,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zbus_macros 5.18.0
+### zbus_macros 5.19.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -4093,6 +4093,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE`
 
 ### zbus_names 4.3.4
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### zcheapstr 1.1.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -4206,7 +4214,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-MIT`
   - `LICENSE-ZLIB`
 
-### zvariant 5.13.1
+### zvariant 5.14.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -4214,7 +4222,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zvariant_derive 5.13.1
+### zvariant_derive 5.14.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -4222,7 +4230,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### zvariant_utils 3.5.0
+### zvariant_utils 4.0.0
 
 - License: `MIT`
 - Source: `crates.io`

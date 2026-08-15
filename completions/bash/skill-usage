@@ -1,4 +1,4 @@
-_skill-usage() {
+_skill__usage() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -380,7 +380,7 @@ _skill-usage() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _skill-usage -o nosort -o bashdefault -o default skill-usage
+    complete -o nospace -F _skill__usage -o nosort -o bashdefault -o default skill-usage
 else
-    complete -o nospace -F _skill-usage -o bashdefault -o default skill-usage
+    complete -o nospace -F _skill__usage -o bashdefault -o default skill-usage
 fi

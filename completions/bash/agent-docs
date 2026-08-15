@@ -1,4 +1,4 @@
-_agent-docs() {
+_agent__docs() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -949,7 +949,7 @@ _agent-docs() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _agent-docs -o nosort -o bashdefault -o default agent-docs
+    complete -F _agent__docs -o nosort -o bashdefault -o default agent-docs
 else
-    complete -F _agent-docs -o bashdefault -o default agent-docs
+    complete -F _agent__docs -o bashdefault -o default agent-docs
 fi

@@ -1,4 +1,4 @@
-_github-app-cli() {
+_github__app__cli() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -135,7 +135,7 @@ _github-app-cli() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _github-app-cli -o nosort -o bashdefault -o default github-app-cli
+    complete -F _github__app__cli -o nosort -o bashdefault -o default github-app-cli
 else
-    complete -F _github-app-cli -o bashdefault -o default github-app-cli
+    complete -F _github__app__cli -o bashdefault -o default github-app-cli
 fi
