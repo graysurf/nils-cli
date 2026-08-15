@@ -8,7 +8,7 @@ repository = "https://github.com/sympoies/nils-cli"
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 clap = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }

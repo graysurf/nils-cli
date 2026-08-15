@@ -2230,7 +2230,7 @@ dependencies = [
 name = "nils-api-grpc"
 version = "1.26.4"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "clap_complete",
  "nils-api-testing-core",
@@ -2246,7 +2246,7 @@ dependencies = [
 name = "nils-api-rest"
 version = "1.26.4"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "clap_complete",
  "nils-api-testing-core",
@@ -2279,7 +2279,7 @@ name = "nils-api-testing-core"
 version = "1.26.4"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "jaq-core",
  "jaq-json",
@@ -2386,7 +2386,7 @@ name = "nils-common"
 version = "1.26.4"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "jiff",
  "libc",
@@ -2604,7 +2604,7 @@ dependencies = [
 name = "nils-macos-agent"
 version = "1.26.4"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "clap_complete",
  "jiff",
