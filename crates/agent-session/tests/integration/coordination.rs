@@ -819,12 +819,8 @@ fn assignment_request_digest(value: &serde_json::Value) -> String {
 }
 
 fn write_private_json(path: &Path, value: &serde_json::Value) {
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(value).expect("private json"),
-    )
-    .expect("write private json");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
+    let bytes = serde_json::to_vec_pretty(value).expect("private json");
+    nils_common::fs::write_atomic(path, &bytes, 0o600).expect("write private json atomically");
 }
 
 fn session_authority_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
