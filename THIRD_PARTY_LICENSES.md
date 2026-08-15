@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `30040e1a877114c8988f92db9e2496c9f7d7a35815d969c472fcaf76d124fd4c`
-- Third-party crates (`source != null`): 488
+- Cargo.lock SHA256: `9f4466d08a989823e11a67421195ee26ed0ea57e60d8aa2c4aa222618ba90e65`
+- Third-party crates (`source != null`): 493
 - Workspace crates (`source == null`, excluded below): 46
 
 ## Notes
@@ -18,7 +18,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | License Expression | Crate Count |
 | --- | ---: |
 | MIT OR Apache-2.0 | 236 |
-| MIT | 98 |
+| MIT | 103 |
 | Apache-2.0 OR MIT | 40 |
 | Zlib OR Apache-2.0 OR MIT | 20 |
 | Unicode-3.0 | 18 |
@@ -154,7 +154,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | event-listener-strategy | 0.5.4 | Apache-2.0 OR MIT | crates.io |
 | fallible-iterator | 0.3.0 | MIT/Apache-2.0 | crates.io |
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 | crates.io |
-| fancy-regex | 0.17.0 | MIT | crates.io |
+| fancy-regex | 0.19.0 | MIT | crates.io |
 | fastrand | 2.4.1 | Apache-2.0 OR MIT | crates.io |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | crates.io |
 | find-msvc-tools | 0.1.9 | MIT OR Apache-2.0 | crates.io |
@@ -238,7 +238,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 | crates.io |
 | jobserver | 0.1.34 | MIT OR Apache-2.0 | crates.io |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 | crates.io |
-| jsonschema | 0.40.2 | MIT | crates.io |
+| jsonschema | 0.49.9 | MIT | crates.io |
+| jsonschema-regex | 0.49.9 | MIT | crates.io |
+| jsonschema-value | 0.49.9 | MIT | crates.io |
 | jsonwebtoken | 11.0.0 | MIT | crates.io |
 | kqueue | 1.2.0 | MIT | crates.io |
 | kqueue-sys | 1.1.2 | MIT | crates.io |
@@ -258,6 +260,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 | crates.io |
 | memo-map | 0.3.3 | Apache-2.0 | crates.io |
 | memoffset | 0.9.1 | MIT | crates.io |
+| micromap | 0.3.0 | MIT | crates.io |
 | mime | 0.3.17 | MIT OR Apache-2.0 | crates.io |
 | mime_guess | 2.0.5 | MIT | crates.io |
 | minijinja | 2.24.0 | Apache-2.0 | crates.io |
@@ -347,7 +350,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | redox_syscall | 0.5.18 | MIT | crates.io |
 | ref-cast | 1.0.26 | MIT OR Apache-2.0 | crates.io |
 | ref-cast-impl | 1.0.26 | MIT OR Apache-2.0 | crates.io |
-| referencing | 0.40.2 | MIT | crates.io |
+| referencing | 0.49.9 | MIT | crates.io |
 | regex | 1.13.1 | MIT OR Apache-2.0 | crates.io |
 | regex-automata | 0.4.16 | MIT OR Apache-2.0 | crates.io |
 | regex-bites | 0.1.6 | MIT OR Apache-2.0 | crates.io |
@@ -409,6 +412,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | crates.io |
 | strict-num | 0.1.1 | MIT | crates.io |
 | strsim | 0.11.1 | MIT | crates.io |
+| strum | 0.28.0 | MIT | crates.io |
+| strum_macros | 0.28.0 | MIT | crates.io |
 | subtle | 2.6.1 | BSD-3-Clause | crates.io |
 | svgtypes | 0.16.1 | Apache-2.0 OR MIT | crates.io |
 | syn | 2.0.117 | MIT OR Apache-2.0 | crates.io |

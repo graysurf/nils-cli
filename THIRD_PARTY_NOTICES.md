@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `30040e1a877114c8988f92db9e2496c9f7d7a35815d969c472fcaf76d124fd4c`
-- Third-party crates (`source != null`): 488
+- Cargo.lock SHA256: `9f4466d08a989823e11a67421195ee26ed0ea57e60d8aa2c4aa222618ba90e65`
+- Third-party crates (`source != null`): 493
 
 ## Notice Extraction Policy
 
@@ -888,7 +888,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### fancy-regex 0.17.0
+### fancy-regex 0.19.0
 
 - License: `MIT`
 - Source: `crates.io`
@@ -1610,13 +1610,27 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### jsonschema 0.40.2
+### jsonschema 0.49.9
 
 - License: `MIT`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### jsonschema-regex 0.49.9
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file reference: none declared
+
+### jsonschema-value 0.49.9
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file reference: none declared
 
 ### jsonwebtoken 11.0.0
 
@@ -1782,6 +1796,14 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### micromap 0.3.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE.txt`
 
 ### mime 0.3.17
 
@@ -2529,7 +2551,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### referencing 0.40.2
+### referencing 0.49.9
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3067,6 +3089,22 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE`
 
 ### strsim 0.11.1
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### strum 0.28.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### strum_macros 0.28.0
 
 - License: `MIT`
 - Source: `crates.io`
