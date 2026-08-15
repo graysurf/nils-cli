@@ -43,6 +43,9 @@ skip = [
     # hashbrown / foldhash generation overlap.
     { crate = "hashbrown@0.16.1", reason = "hashbrown 0.16/0.17 transition" },
     { crate = "foldhash@0.1.5", reason = "foldhash 0.1/0.2 via hashbrown" },
+    # resvg/usvg 0.48 requires base64 0.23 while the workspace and web stack
+    # remain on base64 0.22.
+    { crate = "base64@0.23.1", reason = "resvg 0.48 -> usvg 0.48 requires base64 0.23; workspace/web stack remains on 0.22" },
     # SVG stack: usvg/resvg pulls roxmltree 0.20; the workspace uses 0.21.
     { crate = "roxmltree@0.20.0", reason = "usvg pulls 0.20; workspace on 0.21" },
     # TLS stack pulls an older untrusted on one webpki path.
