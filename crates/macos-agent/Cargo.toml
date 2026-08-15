@@ -15,7 +15,7 @@ path = "src/lib.rs"
 name = "macos-agent"
 path = "src/main.rs"
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 nils-build-info = { version = "1.26.4", path = "../nils-build-info" }
