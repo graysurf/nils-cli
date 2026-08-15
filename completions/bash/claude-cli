@@ -1,4 +1,4 @@
-_claude-cli() {
+_claude__cli() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -1160,7 +1160,7 @@ _claude-cli() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _claude-cli -o nosort -o bashdefault -o default claude-cli
+    complete -F _claude__cli -o nosort -o bashdefault -o default claude-cli
 else
-    complete -F _claude-cli -o bashdefault -o default claude-cli
+    complete -F _claude__cli -o bashdefault -o default claude-cli
 fi

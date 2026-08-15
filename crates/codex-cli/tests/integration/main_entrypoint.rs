@@ -163,8 +163,8 @@ fn main_completion_exports_bash_and_zsh_scripts() {
     let bash = run(&["completion", "bash"]);
     assert_exit(&bash, 0);
     let bash_text = stdout(&bash);
-    assert!(bash_text.contains("_codex-cli()"));
-    assert!(bash_text.contains("complete -F _codex-cli"));
+    assert!(bash_text.contains("_codex__cli()"));
+    assert!(bash_text.contains("complete -F _codex__cli"));
     assert!(bash_text.contains("opts=\"-h --help bash zsh\""));
 }
 

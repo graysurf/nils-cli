@@ -1,4 +1,4 @@
-_docs-impact() {
+_docs__impact() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -199,7 +199,7 @@ _docs-impact() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _docs-impact -o nosort -o bashdefault -o default docs-impact
+    complete -o nospace -F _docs__impact -o nosort -o bashdefault -o default docs-impact
 else
-    complete -o nospace -F _docs-impact -o bashdefault -o default docs-impact
+    complete -o nospace -F _docs__impact -o bashdefault -o default docs-impact
 fi

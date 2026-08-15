@@ -1,4 +1,4 @@
-_canary-check() {
+_canary__check() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -157,7 +157,7 @@ _canary-check() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _canary-check -o nosort -o bashdefault -o default canary-check
+    complete -o nospace -F _canary__check -o nosort -o bashdefault -o default canary-check
 else
-    complete -o nospace -F _canary-check -o bashdefault -o default canary-check
+    complete -o nospace -F _canary__check -o bashdefault -o default canary-check
 fi

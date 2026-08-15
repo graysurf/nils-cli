@@ -31,7 +31,7 @@ fn completion_bash_export_is_normalized() {
     assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
     let stdout = out.stdout_text();
     assert!(
-        stdout.contains("_screen-record()"),
+        stdout.contains("_screen__record()"),
         "missing bash completion entry point: {stdout}"
     );
     // clap_complete emits `__subcmd__` separators in its generated command

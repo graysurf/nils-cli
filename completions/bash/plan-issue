@@ -1,4 +1,4 @@
-_plan-issue() {
+_plan__issue() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -1730,7 +1730,7 @@ _plan-issue() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _plan-issue -o nosort -o bashdefault -o default plan-issue
+    complete -F _plan__issue -o nosort -o bashdefault -o default plan-issue
 else
-    complete -F _plan-issue -o bashdefault -o default plan-issue
+    complete -F _plan__issue -o bashdefault -o default plan-issue
 fi

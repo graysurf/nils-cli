@@ -1,4 +1,4 @@
-_review-evidence() {
+_review__evidence() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -241,7 +241,7 @@ _review-evidence() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _review-evidence -o nosort -o bashdefault -o default review-evidence
+    complete -o nospace -F _review__evidence -o nosort -o bashdefault -o default review-evidence
 else
-    complete -o nospace -F _review-evidence -o bashdefault -o default review-evidence
+    complete -o nospace -F _review__evidence -o bashdefault -o default review-evidence
 fi

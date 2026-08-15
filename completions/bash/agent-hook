@@ -1,4 +1,4 @@
-_agent-hook() {
+_agent__hook() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -924,7 +924,7 @@ _agent-hook() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _agent-hook -o nosort -o bashdefault -o default agent-hook
+    complete -F _agent__hook -o nosort -o bashdefault -o default agent-hook
 else
-    complete -F _agent-hook -o bashdefault -o default agent-hook
+    complete -F _agent__hook -o bashdefault -o default agent-hook
 fi

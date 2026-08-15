@@ -1,4 +1,4 @@
-_plan-archive() {
+_plan__archive() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -586,7 +586,7 @@ _plan-archive() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _plan-archive -o nosort -o bashdefault -o default plan-archive
+    complete -F _plan__archive -o nosort -o bashdefault -o default plan-archive
 else
-    complete -F _plan-archive -o bashdefault -o default plan-archive
+    complete -F _plan__archive -o bashdefault -o default plan-archive
 fi

@@ -1,4 +1,4 @@
-_heuristic-inbox() {
+_heuristic__inbox() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -407,7 +407,7 @@ _heuristic-inbox() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -o nospace -F _heuristic-inbox -o nosort -o bashdefault -o default heuristic-inbox
+    complete -o nospace -F _heuristic__inbox -o nosort -o bashdefault -o default heuristic-inbox
 else
-    complete -o nospace -F _heuristic-inbox -o bashdefault -o default heuristic-inbox
+    complete -o nospace -F _heuristic__inbox -o bashdefault -o default heuristic-inbox
 fi

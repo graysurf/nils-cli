@@ -43,7 +43,7 @@ fn completion_bash_export_is_normalized() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("_image-processing()"),
+        stdout.contains("_image__processing()"),
         "missing bash completion entry point: {stdout}"
     );
     // clap_complete emits `__subcmd__` separators in its generated command

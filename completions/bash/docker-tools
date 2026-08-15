@@ -1,4 +1,4 @@
-_docker-tools() {
+_docker__tools() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -607,7 +607,7 @@ _docker-tools() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _docker-tools -o nosort -o bashdefault -o default docker-tools
+    complete -F _docker__tools -o nosort -o bashdefault -o default docker-tools
 else
-    complete -F _docker-tools -o bashdefault -o default docker-tools
+    complete -F _docker__tools -o bashdefault -o default docker-tools
 fi

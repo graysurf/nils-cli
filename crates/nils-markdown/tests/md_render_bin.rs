@@ -133,7 +133,7 @@ fn md_render_completion_exports_bash_and_zsh_scripts() {
     let bash = run_md_render(&["completion", "bash"]);
     assert_eq!(bash.code, 0, "bash completion failed");
     let bash_stdout = bash.stdout_text();
-    assert!(bash_stdout.contains("complete -o nospace -F _md-render"));
+    assert!(bash_stdout.contains("complete -o nospace -F _md__render"));
     assert!(bash_stdout.contains("md-render"));
     assert!(bash_stdout.contains("render"));
 
