@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `326b46f6cb6dff6fea7662f1b436e194cd72271099ecfc5bcd1cf4beab40978f`
+- Cargo.lock SHA256: `50fcbec4daad3cc09121299d31e1aff3d2303959c67a0773e1d8a8c026b9561f`
 - Third-party crates (`source != null`): 487
 - Workspace crates (`source == null`, excluded below): 46
 
@@ -236,7 +236,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | jobserver | 0.1.34 | MIT OR Apache-2.0 | crates.io |
 | js-sys | 0.3.102 | MIT OR Apache-2.0 | crates.io |
 | jsonschema | 0.40.2 | MIT | crates.io |
-| jsonwebtoken | 10.4.0 | MIT | crates.io |
+| jsonwebtoken | 11.0.0 | MIT | crates.io |
 | kqueue | 1.2.0 | MIT | crates.io |
 | kqueue-sys | 1.1.2 | MIT | crates.io |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | crates.io |
