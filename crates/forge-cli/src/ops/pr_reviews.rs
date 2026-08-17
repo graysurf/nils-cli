@@ -26,7 +26,7 @@ pub(crate) const MAX_PENDING_REVIEW_BODY_BYTES: usize = 64 * 1024;
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body viewerDidAuthor } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEW_TARGET_QUERY: &str = "query($review: ID!) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 1) { totalCount } pullRequest { number url headRefOid } } } }";
-const GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY: &str = "query($review: ID!, $after: String) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 100, after: $after) { totalCount nodes { id url author { login } body createdAt path line originalLine diffSide startLine originalStartLine startDiffSide subjectType } pageInfo { hasNextPage endCursor } } pullRequest { number url headRefOid } } } }";
+const GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY: &str = "query($review: ID!, $after: String) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 100, after: $after) { totalCount nodes { id url author { login } body createdAt path diffHunk line originalLine startLine originalStartLine subjectType } pageInfo { hasNextPage endCursor } } pullRequest { number url headRefOid } } } }";
 
 struct ReviewPage {
     viewer_login: String,
@@ -955,6 +955,25 @@ fn parse_github_pending_review_snapshot_page(
             let semantic_body = review_state::strip_owned_markers(&body);
             let body_digest = review_state::sha256_digest(semantic_body.as_bytes());
             let line = optional_u32(comment, "/line");
+            let original_line = optional_u32(comment, "/originalLine");
+            let start_line = optional_u32(comment, "/startLine");
+            let original_start_line = optional_u32(comment, "/originalStartLine");
+            let subject_type = optional_string(comment, "/subjectType")
+                .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string());
+            let diff_side = normalized_comment_side(
+                comment,
+                "/diffSide",
+                line.or(original_line),
+                &subject_type,
+                None,
+            )?;
+            let start_diff_side = normalized_comment_side(
+                comment,
+                "/startDiffSide",
+                start_line.or(original_start_line),
+                &subject_type,
+                diff_side.as_deref(),
+            )?;
             Ok(PendingReviewInlineComment {
                 id: required_string(comment, "/id", "review.comment.id")?,
                 url: required_string(comment, "/url", "review.comment.url")?,
@@ -966,13 +985,12 @@ fn parse_github_pending_review_snapshot_page(
                 created_at: required_string(comment, "/createdAt", "review.comment.createdAt")?,
                 path: optional_string(comment, "/path").unwrap_or_default(),
                 line,
-                original_line: optional_u32(comment, "/originalLine"),
-                diff_side: optional_string(comment, "/diffSide"),
-                start_line: optional_u32(comment, "/startLine"),
-                original_start_line: optional_u32(comment, "/originalStartLine"),
-                start_diff_side: optional_string(comment, "/startDiffSide"),
-                subject_type: optional_string(comment, "/subjectType")
-                    .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string()),
+                original_line,
+                diff_side,
+                start_line,
+                original_start_line,
+                start_diff_side,
+                subject_type,
                 body_digest,
             })
         })
@@ -1021,6 +1039,104 @@ fn parse_github_pending_review_snapshot_page(
             snapshot_digest: String::new(),
         },
     }))
+}
+
+fn normalized_comment_side(
+    comment: &serde_json::Value,
+    direct_pointer: &str,
+    anchor_line: Option<u32>,
+    subject_type: &str,
+    preferred_side: Option<&str>,
+) -> Result<Option<String>, ForgeError> {
+    if let Some(side) = optional_string(comment, direct_pointer) {
+        return Ok(Some(side));
+    }
+    if subject_type == "FILE" || anchor_line.is_none() {
+        return Ok(None);
+    }
+    let diff_hunk = required_string(comment, "/diffHunk", "review.comment.diffHunk")?;
+    let side = infer_side_from_diff_hunk(
+        &diff_hunk,
+        anchor_line.expect("checked above"),
+        preferred_side,
+    )
+    .ok_or_else(|| {
+        snapshot_incomplete(
+            "pending review comment diff side cannot be derived from its diff hunk",
+            optional_string(comment, "/id").map(|id| {
+                format!(
+                    "comment_id={id}; anchor_line={}",
+                    anchor_line.expect("checked above")
+                )
+            }),
+        )
+    })?;
+    Ok(Some(side.to_string()))
+}
+
+fn infer_side_from_diff_hunk(
+    diff_hunk: &str,
+    anchor_line: u32,
+    preferred_side: Option<&str>,
+) -> Option<&'static str> {
+    let mut old_line = None;
+    let mut new_line = None;
+    let mut candidates = Vec::new();
+
+    for row in diff_hunk.lines() {
+        if row.starts_with("@@") {
+            let (old_start, new_start) = parse_diff_hunk_starts(row)?;
+            old_line = Some(old_start);
+            new_line = Some(new_start);
+            continue;
+        }
+        let (Some(old), Some(new)) = (old_line.as_mut(), new_line.as_mut()) else {
+            continue;
+        };
+        match row.as_bytes().first().copied() {
+            Some(b'+') => {
+                if *new == anchor_line {
+                    candidates.push("RIGHT");
+                }
+                *new = new.saturating_add(1);
+            }
+            Some(b'-') => {
+                if *old == anchor_line {
+                    candidates.push("LEFT");
+                }
+                *old = old.saturating_add(1);
+            }
+            Some(b' ') => {
+                if *new == anchor_line {
+                    // GitHub normalizes unchanged context anchors to RIGHT.
+                    candidates.push("RIGHT");
+                }
+                *old = old.saturating_add(1);
+                *new = new.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    preferred_side
+        .and_then(|preferred| {
+            candidates
+                .iter()
+                .rev()
+                .find(|side| **side == preferred)
+                .copied()
+        })
+        .or_else(|| candidates.last().copied())
+}
+
+fn parse_diff_hunk_starts(header: &str) -> Option<(u32, u32)> {
+    let body = header.strip_prefix("@@ -")?;
+    let (old_span, rest) = body.split_once(" +")?;
+    let (new_span, _) = rest.split_once(" @@")?;
+    Some((
+        old_span.split(',').next()?.parse().ok()?,
+        new_span.split(',').next()?.parse().ok()?,
+    ))
 }
 
 fn validate_snapshot_page_identity(
@@ -1456,8 +1572,75 @@ mod tests {
             build_github_pending_review_target_page_call(&github_ctx(), "PRR_pending", None)
                 .plan_argv()
                 .join(" ");
-        assert!(pending.contains("diffSide"), "{pending}");
-        assert!(pending.contains("startDiffSide"), "{pending}");
+        assert!(pending.contains("diffHunk"), "{pending}");
+        assert!(!pending.contains(" diffSide"), "{pending}");
+        assert!(!pending.contains(" startDiffSide"), "{pending}");
+    }
+
+    #[test]
+    fn pending_snapshot_derives_normalized_sides_from_supported_comment_fields() {
+        let snapshot_without_side_fields = |spec: PendingSnapshotPageSpec<'_>, diff_hunk: &str| {
+            let mut output = pending_snapshot_page(spec);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            let comment = value
+                .pointer_mut("/data/node/comments/nodes/0")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("comment object");
+            comment.remove("diffSide");
+            comment.remove("startDiffSide");
+            comment.insert("diffHunk".into(), diff_hunk.into());
+            output.stdout = value.to_string();
+            output
+        };
+
+        let right_range = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_right",
+                path: "src/new.rs",
+                line: 8,
+                diff_side: "RIGHT",
+                start_line: Some(7),
+                start_diff_side: Some("RIGHT"),
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -7,2 +7,2 @@\n context\n-old value\n+new value",
+        );
+        let page = parse_github_pending_review_snapshot_page(&right_range, "PENDING")
+            .expect("supported GraphQL fields parse")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert_eq!(
+            page.snapshot.inline_comments[0].start_diff_side.as_deref(),
+            Some("RIGHT")
+        );
+
+        let left_line = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_left",
+                path: "src/old.rs",
+                line: 8,
+                diff_side: "LEFT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -8,1 +8,0 @@\n-old value",
+        );
+        let page = parse_github_pending_review_snapshot_page(&left_line, "PENDING")
+            .expect("supported GraphQL fields parse")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("LEFT")
+        );
     }
 
     #[test]
