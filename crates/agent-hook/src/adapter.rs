@@ -3,7 +3,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +16,7 @@ use crate::path_binding::{TargetBinding, resolve_target_bindings};
 use crate::strict_json;
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
+const DSH_INGRESS_VERSION: &str = "agent-hook.dsh-ingress.v1";
 const MAX_PROVIDER_ID_CHARS: usize = 256;
 const MAX_MUTATION_TARGETS: usize = 256;
 const MAX_MUTATION_TARGET_BYTES: usize = 4096;
@@ -39,6 +40,23 @@ struct ActivityEvent {
     attention_kind: Option<&'static str>,
     confidence: &'static str,
     source_kind: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshIngress {
+    schema_version: String,
+    event: String,
+    call_id: String,
+    cwd: PathBuf,
+    tool: DshToolCall,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshToolCall {
+    name: String,
+    arguments: Value,
 }
 
 pub fn read_stdin() -> Result<Vec<u8>, HookError> {
@@ -70,6 +88,9 @@ pub fn normalize(
         ));
     }
     let raw = parse_provider_json(input)?;
+    if product == Product::Dsh {
+        return normalize_dsh(event_arg, input, raw);
+    }
     let object = raw.as_object().ok_or_else(|| {
         HookError::data(
             "provider-input-invalid",
@@ -150,6 +171,116 @@ pub fn normalize(
         // dispatcher replaces this with a #676 registry-derived projection.
         semantic_conflict: None,
         stop_reentry: stop_reentry(object),
+        target_paths,
+        execution_path,
+        binding_roots,
+    })
+}
+
+fn normalize_dsh(
+    event_arg: Option<&str>,
+    input: &[u8],
+    raw: Value,
+) -> Result<NormalizedRequest, HookError> {
+    let ingress: DshIngress = serde_json::from_value(raw).map_err(|_| {
+        HookError::data(
+            "dsh-ingress-invalid",
+            "DSH ingress must match the strict agent-hook.dsh-ingress.v1 object",
+        )
+    })?;
+    if ingress.schema_version != DSH_INGRESS_VERSION {
+        return Err(HookError::data(
+            "dsh-ingress-version-invalid",
+            "DSH ingress schema_version is unsupported",
+        ));
+    }
+    if let Some(argument) = event_arg
+        && argument != ingress.event
+    {
+        return Err(HookError::data(
+            "provider-event-mismatch",
+            "--event does not match the DSH ingress event",
+        ));
+    }
+    let event = match ingress.event.as_str() {
+        "tools/pre-execute" => "PreToolUse",
+        _ => {
+            return Err(HookError::data(
+                "provider-event-unsupported",
+                "DSH ingress event is not supported by agent-hook v1",
+            ));
+        }
+    };
+    if ingress.call_id.is_empty()
+        || ingress.call_id.chars().count() > MAX_PROVIDER_ID_CHARS
+        || ingress.tool.name.is_empty()
+        || ingress.tool.name.chars().count() > MAX_PROVIDER_ID_CHARS
+        || !ingress.cwd.is_absolute()
+        || !ingress.tool.arguments.is_object()
+    {
+        return Err(HookError::data(
+            "dsh-ingress-invalid",
+            "DSH ingress requires bounded call/tool identifiers, an absolute cwd, and object arguments",
+        ));
+    }
+
+    let mut canonical = Map::new();
+    canonical.insert(
+        "cwd".to_string(),
+        Value::String(ingress.cwd.to_string_lossy().into_owned()),
+    );
+    canonical.insert(
+        "tool_name".to_string(),
+        Value::String(ingress.tool.name.clone()),
+    );
+    canonical.insert("tool_input".to_string(), ingress.tool.arguments);
+
+    let matcher = Some(ingress.tool.name);
+    let (target_paths, execution_path) =
+        target_paths(Product::Dsh, &canonical, matcher.as_deref())?;
+    let target_count = target_paths.len();
+    let mut binding_paths = target_paths;
+    if let Some(execution_path) = execution_path.as_ref() {
+        binding_paths.push(execution_path.clone());
+    }
+    let mut resolved_bindings = resolve_target_bindings(&binding_paths)?;
+    let execution_binding = execution_path
+        .as_ref()
+        .and_then(|_| resolved_bindings.pop());
+    debug_assert_eq!(resolved_bindings.len(), target_count);
+    let mut target_bindings = resolved_bindings;
+    deduplicate_target_bindings(&mut target_bindings);
+    let target_material = target_set_binding_material(&target_bindings)?;
+    let mut binding_roots = target_bindings
+        .iter()
+        .map(|binding| binding.binding_root.clone())
+        .collect::<Vec<_>>();
+    if let Some(binding) = execution_binding {
+        binding_roots.push(binding.binding_root);
+    }
+    deduplicate_paths(&mut binding_roots);
+    let target_paths = target_bindings
+        .into_iter()
+        .map(|binding| binding.effective_path)
+        .collect();
+    let command_material = command_text(&canonical)
+        .unwrap_or("command-unavailable")
+        .as_bytes();
+    let snapshot_digest = digest(input);
+    let request_id = format!("request:{}", &snapshot_digest[7..39]);
+
+    Ok(NormalizedRequest {
+        schema_version: REQUEST_VERSION.to_string(),
+        request_id,
+        product: Product::Dsh,
+        event: event.to_string(),
+        matcher,
+        target_digest: digest(&target_material),
+        command_digest: digest(command_material),
+        snapshot_digest,
+        worktree_fingerprint: None,
+        semantic_conflict: None,
+        stop_reentry: None,
         target_paths,
         execution_path,
         binding_roots,

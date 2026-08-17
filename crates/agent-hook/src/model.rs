@@ -15,6 +15,7 @@ pub const DECISION_VERSION: &str = "agent-hook.normalized-decision.v1";
 pub enum Product {
     Codex,
     Claude,
+    Dsh,
     Hermes,
 }
 
@@ -23,6 +24,7 @@ impl Product {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Dsh => "dsh",
             Self::Hermes => "hermes",
         }
     }

@@ -33,7 +33,7 @@ _agent-hook() {
         case $line[1] in
             (dispatch)
 _arguments "${_arguments_options[@]}" : \
-'--product=[Provider whose bounded JSON request is read from stdin]:PRODUCT:(codex claude hermes)' \
+'--product=[Provider whose bounded JSON request is read from stdin]:PRODUCT:(codex claude dsh hermes)' \
 '--event=[Provider event when the request does not carry one]:EVENT:_default' \
 '--capability-file=[Private exact recovery capability file]:PATH:_files' \
 '--format=[Output contract. Provider is the hook-ingress default]:FORMAT:((provider\:"Provider-native output for hook ingress"
@@ -72,7 +72,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (doctor)
 _arguments "${_arguments_options[@]}" : \
-'(--all)--product=[Limit provider diagnostics]:PRODUCT:(codex claude hermes)' \
+'(--all)--product=[Limit provider diagnostics]:PRODUCT:(codex claude dsh hermes)' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -85,7 +85,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (setup)
 _arguments "${_arguments_options[@]}" : \
-'--product=[Provider whose exact owned ingress is managed]:PRODUCT:(codex claude hermes)' \
+'--product=[Provider whose exact owned ingress is managed]:PRODUCT:(codex claude dsh hermes)' \
 '--expected-plan-digest=[Digest from the reviewed preview; required for drift, compatibility, or dual state]:SHA256:_default' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -119,7 +119,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (challenge)
 _arguments "${_arguments_options[@]}" : \
-'--product=[]:PRODUCT:(codex claude hermes)' \
+'--product=[]:PRODUCT:(codex claude dsh hermes)' \
 '--event=[]:EVENT:_default' \
 '--target-digest=[]:TARGET_DIGEST:_default' \
 '--command-digest=[]:COMMAND_DIGEST:_default' \
@@ -154,7 +154,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (consume)
 _arguments "${_arguments_options[@]}" : \
 '--capability-file=[Private authorized capability file to validate and consume]:PATH:_files' \
-'--product=[]:PRODUCT:(codex claude hermes)' \
+'--product=[]:PRODUCT:(codex claude dsh hermes)' \
 '--event=[]:EVENT:_default' \
 '--target-digest=[]:TARGET_DIGEST:_default' \
 '--command-digest=[]:COMMAND_DIGEST:_default' \

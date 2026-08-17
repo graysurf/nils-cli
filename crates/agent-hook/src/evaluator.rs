@@ -1450,6 +1450,7 @@ fn runtime_hook_root(product: Product) -> Result<PathBuf, HookError> {
             .unwrap_or_else(|| home.join(".codex"))
             .join("hooks"),
         Product::Claude => home.join(".claude/hooks"),
+        Product::Dsh => home.join(".dsh/hooks"),
         Product::Hermes => home.join(".hermes/hooks"),
     })
 }

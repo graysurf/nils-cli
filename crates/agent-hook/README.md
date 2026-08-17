@@ -1,9 +1,10 @@
 # agent-hook
 
 `agent-hook` is the shared policy control plane for Codex and Claude native
-hooks. Provider configuration contains only one dispatcher command per required
-event/matcher group; versioned policy, deterministic aggregation, diagnostics,
-and governed recovery live behind that ingress.
+hooks and the out-of-tree DeepSeek Harness (DSH) runtime bundle. Provider
+configuration contains only one dispatcher command per required event/matcher
+group; versioned policy, deterministic aggregation, diagnostics, and governed
+recovery live behind that ingress.
 
 ## Package and binary
 
@@ -42,6 +43,7 @@ agent-hook setup --product claude --remove --dry-run --format json
 agent-hook setup --product claude --remove \
   --expected-plan-digest sha256:<digest> --format json
 printf '%s' "$PROVIDER_HOOK_JSON" | agent-hook dispatch --product codex
+printf '%s' "$DSH_INGRESS_JSON" | agent-hook dispatch --product dsh --format json
 agent-hook completion zsh
 ```
 
@@ -50,9 +52,22 @@ is present. Setup preserves unrelated hooks and provider metadata, migrates
 recognized pre-dispatch `agent-session`/runtime-kit handlers, and removes only exact
 owned dispatcher entries. `--remove --dry-run` returns the
 `remove-dry-run` action without writes; its digest binds the remove operation
-and each provider file's exact before/after content or absence. Hermes policy
-can be validated and inspected, but native setup truthfully reports
-`unsupported` until Hermes exposes a compatible runner.
+and each provider file's exact before/after content or absence. DSH policy
+dispatch is enforceable, but setup truthfully reports `unsupported` because the
+external `dsh-runtime-kit` bundle owns the Cordis registration. Hermes policy
+can be validated and inspected, but native setup also reports `unsupported`
+until Hermes exposes a compatible runner.
+
+DSH doctor output names `dsh-runtime-kit` as `registration_owner` and reports
+`dispatch_supported: true` even though file-based setup remains unsupported.
+
+DSH sends strict `agent-hook.dsh-ingress.v1` JSON. The first supported native
+event is `tools/pre-execute`, normalized to canonical `PreToolUse`; the service
+JSON decision is mapped back to DSH's `tools/pre-execute` waterfall by the
+runtime bundle. DSH rules cannot select retired `runtime-kit.handler.v1` file
+handlers.
+DSH v1 policies accept only `decision.allow.v1` and `decision.block.v1` until
+native path binding and context-bearing decision semantics are implemented.
 
 Before `doctor` reports an enforceable provider as `converged`, it resolves
 every script-backed handler selected by that product's policy and applies the
