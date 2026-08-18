@@ -162,6 +162,7 @@ fn pending_recovery_snapshot(marked: bool, inline_count: usize, viewer_owned: bo
     };
     let comments = (0..inline_count)
         .map(|index| {
+            let line = index + 1;
             let semantic = if marked {
                 "first".to_string()
             } else {
@@ -181,12 +182,11 @@ fn pending_recovery_snapshot(marked: bool, inline_count: usize, viewer_owned: bo
                 "body": body,
                 "createdAt": format!("2026-07-20T12:00:{index:02}Z"),
                 "path": format!("src/file-{index}.rs"),
-                "line": index + 1,
-                "originalLine": index + 1,
-                "diffSide": "RIGHT",
+                "diffHunk": format!("@@ -{line},0 +{line},1 @@\n+added line"),
+                "line": line,
+                "originalLine": line,
                 "startLine": null,
                 "originalStartLine": null,
-                "startDiffSide": null,
                 "subjectType": "LINE"
             })
         })
@@ -395,7 +395,7 @@ case "$1 $2" in
     printf '%s\n' '{{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}}'
     ;;
   "api graphql")
-    printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Summary\n<!-- forge-cli:review-run:v1 run=run-123 -->","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":1,"nodes":[{{"id":"PRRC_1","url":"https://github.com/acme/widgets/pull/42#discussion_r1","author":{{"login":"review-bot"}},"body":"first\n<!-- forge-cli:review-finding:v1 run=run-123 digest=sha256:a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e -->","createdAt":"2026-07-20T12:00:00Z","path":"src/lib.rs","diffHunk":"@@ -10,1 +10,1 @@\n-old\n+new","line":10,"originalLine":10,"startLine":null,"originalStartLine":null,"subjectType":"LINE"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+    printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Summary\n<!-- forge-cli:review-run:v1 run=run-123 -->","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":1,"nodes":[{{"id":"PRRC_1","url":"https://github.com/acme/widgets/pull/42#discussion_r1","author":{{"login":"review-bot"}},"body":"first\n<!-- forge-cli:review-finding:v1 run=run-123 digest=sha256:a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e -->","createdAt":"2026-07-20T12:00:00Z","path":"src/lib.rs","diffHunk":"@@ -10,0 +10,1 @@\n+new","line":10,"originalLine":10,"startLine":null,"originalStartLine":null,"subjectType":"LINE"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
     ;;
   *)
     echo "unexpected gh args: $*" >&2

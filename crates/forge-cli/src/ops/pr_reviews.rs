@@ -965,14 +965,12 @@ fn parse_github_pending_review_snapshot_page(
                 "/diffSide",
                 line.or(original_line),
                 &subject_type,
-                None,
             )?;
             let start_diff_side = normalized_comment_side(
                 comment,
                 "/startDiffSide",
                 start_line.or(original_start_line),
                 &subject_type,
-                diff_side.as_deref(),
             )?;
             Ok(PendingReviewInlineComment {
                 id: required_string(comment, "/id", "review.comment.id")?,
@@ -1046,7 +1044,6 @@ fn normalized_comment_side(
     direct_pointer: &str,
     anchor_line: Option<u32>,
     subject_type: &str,
-    preferred_side: Option<&str>,
 ) -> Result<Option<String>, ForgeError> {
     if let Some(side) = optional_string(comment, direct_pointer) {
         return Ok(Some(side));
@@ -1055,30 +1052,22 @@ fn normalized_comment_side(
         return Ok(None);
     }
     let diff_hunk = required_string(comment, "/diffHunk", "review.comment.diffHunk")?;
-    let side = infer_side_from_diff_hunk(
-        &diff_hunk,
-        anchor_line.expect("checked above"),
-        preferred_side,
-    )
-    .ok_or_else(|| {
-        snapshot_incomplete(
-            "pending review comment diff side cannot be derived from its diff hunk",
-            optional_string(comment, "/id").map(|id| {
-                format!(
-                    "comment_id={id}; anchor_line={}",
-                    anchor_line.expect("checked above")
-                )
-            }),
-        )
-    })?;
+    let side = infer_side_from_diff_hunk(&diff_hunk, anchor_line.expect("checked above"))
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review comment diff side cannot be derived from its diff hunk",
+                optional_string(comment, "/id").map(|id| {
+                    format!(
+                        "comment_id={id}; anchor_line={}",
+                        anchor_line.expect("checked above")
+                    )
+                }),
+            )
+        })?;
     Ok(Some(side.to_string()))
 }
 
-fn infer_side_from_diff_hunk(
-    diff_hunk: &str,
-    anchor_line: u32,
-    preferred_side: Option<&str>,
-) -> Option<&'static str> {
+fn infer_side_from_diff_hunk(diff_hunk: &str, anchor_line: u32) -> Option<&'static str> {
     let mut old_line = None;
     let mut new_line = None;
     let mut candidates = Vec::new();
@@ -1118,15 +1107,11 @@ fn infer_side_from_diff_hunk(
         }
     }
 
-    preferred_side
-        .and_then(|preferred| {
-            candidates
-                .iter()
-                .rev()
-                .find(|side| **side == preferred)
-                .copied()
-        })
-        .or_else(|| candidates.last().copied())
+    let side = candidates.first().copied()?;
+    candidates
+        .iter()
+        .all(|candidate| *candidate == side)
+        .then_some(side)
 }
 
 fn parse_diff_hunk_starts(header: &str) -> Option<(u32, u32)> {
@@ -1599,14 +1584,14 @@ mod tests {
                 head: "head-7",
                 id: "PRRC_right",
                 path: "src/new.rs",
-                line: 8,
+                line: 9,
                 diff_side: "RIGHT",
                 start_line: Some(7),
                 start_diff_side: Some("RIGHT"),
                 has_next_page: false,
                 end_cursor: None,
             },
-            "@@ -7,2 +7,2 @@\n context\n-old value\n+new value",
+            "@@ -7,0 +7,3 @@\n+first\n+middle\n+last",
         );
         let page = parse_github_pending_review_snapshot_page(&right_range, "PENDING")
             .expect("supported GraphQL fields parse")
@@ -1641,6 +1626,50 @@ mod tests {
             page.snapshot.inline_comments[0].diff_side.as_deref(),
             Some("LEFT")
         );
+
+        let mut direct_side = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_direct",
+            path: "src/replaced.rs",
+            line: 8,
+            diff_side: "LEFT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&direct_side.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["nodes"][0]["diffHunk"] =
+            "@@ -8,1 +8,1 @@\n-old value\n+new value".into();
+        direct_side.stdout = value.to_string();
+        let page = parse_github_pending_review_snapshot_page(&direct_side, "PENDING")
+            .expect("direct provider discriminator parses")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("LEFT")
+        );
+
+        let ambiguous = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_ambiguous",
+                path: "src/replaced.rs",
+                line: 8,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -8,1 +8,1 @@\n-old value\n+new value",
+        );
+        let error = match parse_github_pending_review_snapshot_page(&ambiguous, "PENDING") {
+            Err(error) => error,
+            Ok(_) => panic!("same-number replacement without a side discriminator is ambiguous"),
+        };
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
     }
 
     #[test]
