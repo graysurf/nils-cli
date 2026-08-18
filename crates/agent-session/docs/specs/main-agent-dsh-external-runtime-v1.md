@@ -13,7 +13,7 @@ that issue.
 ## Division of responsibility
 
 | Concern | Owner |
-|---|---|
+| --- | --- |
 | Run/assignment/checkpoint records, revision fencing, idempotency | `main-agent` (this crate, unchanged) |
 | Worker session record + capability/checkpoint file minting | `main-agent worker start` (dsh arm) |
 | Spawning the worker agent, delivering the bootstrap prompt | dsh-runtime-kit plugin |
