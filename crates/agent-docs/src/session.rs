@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use nils_common::cli_contract::{Envelope, EnvelopeError};
 
 use crate::cli::{
-    SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionVerifyArgs,
+    SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionContextArgs,
+    SessionVerifyArgs,
 };
 use crate::config::load_catalog_from_roots;
 use crate::env::{PathOverrides, ResolvedRoots, resolve_roots};
@@ -36,6 +37,10 @@ const MAX_AVAILABLE_INTENTS: usize = 32;
 const MAX_RECOVERY_INTENTS: usize = 16;
 const MAX_RECOVERY_IDENTIFIER_BYTES: usize = 128;
 const BOUNDED_RETRY_ATTEMPTS: u8 = 3;
+const MAX_CONTEXT_REQUEST_ID_BYTES: usize = 128;
+const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+const CONTEXT_DECISION_SCHEMA: &str = "decision.context.v1";
+const CONTEXT_FINGERPRINT_PREFIX: &str = "dsh-context-v1:";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
@@ -82,6 +87,33 @@ struct SessionData {
     /// Stable reason code for a `prepare` result (`prepared` / `already-current`).
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextData {
+    decision: ContextDecision,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextDecision {
+    schema_version: &'static str,
+    request_id: String,
+    product: Product,
+    intent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    reason: &'static str,
+    verified: bool,
+    documents: Vec<ContextDocument>,
+    document_count: usize,
+    total_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextDocument {
+    source: &'static str,
+    scope: &'static str,
+    content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -316,6 +348,13 @@ pub fn run(
             use_user_config,
             expected_integration_fingerprint.as_deref(),
         ),
+        SessionCommand::Context(args) => context(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
         SessionCommand::Status(args) => status(
             args,
             overrides,
@@ -331,6 +370,159 @@ pub fn run(
             expected_integration_fingerprint.as_deref(),
         ),
     }
+}
+
+/// Resolve one DSH intent, validate the complete response budget, and only
+/// then persist its activation while the same per-scope record lock is held.
+/// The success DTO deliberately excludes catalog metadata, filesystem paths,
+/// validation commands, session state paths, and the raw session identifier.
+fn context(
+    args: SessionContextArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
+    let common = SessionCommonArgs {
+        session_id: args.session_id.clone(),
+        product: args.product.as_product(),
+        state_home: args.state_home.clone(),
+        format: args.format,
+    };
+    let common = &common;
+    let result = (|| -> Result<ContextData, SessionFailure> {
+        validate_common(common)?;
+        validate_context_args(&args)?;
+        let phase = parse_phase_arg(args.phase.as_deref())?;
+        let roots = resolve_session_roots(&overrides)?;
+        let path = record_path(common, &roots.project_path)?;
+        let _lock = RecordLock::acquire(&path)?;
+        let existing = if path.exists() {
+            match decode_record(&path)? {
+                DecodedRecord::Current(record) => {
+                    validate_record_context(common, &roots.project_path, &record)?;
+                    Some(*record)
+                }
+                DecodedRecord::LegacyV1 => None,
+            }
+        } else {
+            None
+        };
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        let intent = Context::parse(&args.intent).map_err(|err| {
+            SessionFailure::data("invalid-intent", err).with_available_intents(&available)
+        })?;
+        if !available.iter().any(|item| item == intent.as_str()) {
+            return Err(SessionFailure::data(
+                "undeclared-intent",
+                format!("intent `{intent}` is not declared"),
+            )
+            .with_available_intents(&available));
+        }
+        let report = resolver::resolve_context_with_effective_catalog_for_scope(
+            &intent,
+            &roots,
+            common.product,
+            phase.clone(),
+            true,
+            fallback,
+            args.max_bytes,
+            &catalog,
+        )
+        .map_err(context_resolve_failure)?;
+        if report.has_unsatisfied_required() {
+            return Err(SessionFailure::data(
+                unsatisfied_code(phase.as_ref()),
+                format!("strict preflight failed for `{intent}`"),
+            )
+            .with_preflight_context(&intent, phase.as_ref(), &report));
+        }
+
+        let mut total_bytes = 0usize;
+        let mut documents = Vec::with_capacity(report.summary.satisfied_required);
+        for document in report
+            .documents
+            .iter()
+            .filter(|document| document.required && document.satisfied())
+        {
+            let content = document.content.clone().ok_or_else(|| {
+                SessionFailure::runtime(
+                    "context-content-missing",
+                    "a satisfied required document omitted its content",
+                )
+            })?;
+            total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+                SessionFailure::data(
+                    "context-budget-exceeded",
+                    "required policy content exceeds the requested response budget",
+                )
+            })?;
+            if total_bytes > args.max_bytes {
+                return Err(SessionFailure::data(
+                    "context-budget-exceeded",
+                    "required policy content exceeds the requested response budget",
+                ));
+            }
+            documents.push(ContextDocument {
+                source: document.source.as_str(),
+                scope: document.scope.as_str(),
+                content,
+            });
+        }
+
+        let had_existing = existing.is_some();
+        let mut record = existing.unwrap_or_else(|| {
+            new_record(common, &roots.project_path, integration_fingerprint.clone())
+        });
+        let mut changed = !had_existing;
+        if record.integration_fingerprint != integration_fingerprint {
+            record.active_intents.clear();
+            record.active_phase_intents.clear();
+            record.integration_fingerprint = integration_fingerprint.clone();
+            changed = true;
+        }
+        changed |= store_activation(
+            &mut record,
+            &intent,
+            phase.as_ref(),
+            context_fingerprint(
+                &report,
+                &catalog,
+                fallback,
+                integration_fingerprint.as_deref(),
+            )?,
+        );
+        let reason = if changed {
+            record.activated_at = jiff::Timestamp::now().to_string();
+            write_record(&path, &record)?;
+            "prepared"
+        } else {
+            "already-current"
+        };
+        let document_count = documents.len();
+        Ok(ContextData {
+            decision: ContextDecision {
+                schema_version: CONTEXT_DECISION_SCHEMA,
+                request_id: args.request_id.clone(),
+                product: common.product,
+                intent: intent.to_string(),
+                phase: phase.as_ref().map(ToString::to_string),
+                reason,
+                verified: true,
+                documents,
+                document_count,
+                total_bytes,
+            },
+        })
+    })();
+    render_context(common.format, result)
 }
 
 fn activate(
@@ -799,6 +991,25 @@ fn activation_matches(
     catalog: &integration::EffectiveCatalog,
     integration_fingerprint: Option<&str>,
 ) -> Result<bool, SessionFailure> {
+    if stored.starts_with(CONTEXT_FINGERPRINT_PREFIX) {
+        if product != Product::Dsh {
+            return Ok(false);
+        }
+        let report = resolver::resolve_context_with_effective_catalog_for_scope(
+            intent,
+            roots,
+            product,
+            phase.cloned(),
+            true,
+            fallback,
+            MAX_CONTEXT_BYTES,
+            catalog,
+        )
+        .map_err(verification_context_failure)?;
+        return Ok(!report.has_unsatisfied_required()
+            && stored
+                == context_fingerprint(&report, catalog, fallback, integration_fingerprint)?);
+    }
     let report = resolver::resolve_intent_with_effective_catalog_for_scope(
         intent,
         roots,
@@ -811,6 +1022,17 @@ fn activation_matches(
     );
     Ok(!report.has_unsatisfied_required()
         && stored == fingerprint(&report, catalog, fallback, integration_fingerprint)?)
+}
+
+fn context_resolve_failure(error: resolver::ContextResolveError) -> SessionFailure {
+    SessionFailure::data(error.code(), error.message())
+}
+
+fn verification_context_failure(_error: resolver::ContextResolveError) -> SessionFailure {
+    SessionFailure::data(
+        "context-policy-invalid",
+        "the prepared DSH context can no longer be resolved within its safety limits",
+    )
 }
 
 fn parse_phase_arg(raw: Option<&str>) -> Result<Option<Phase>, SessionFailure> {
@@ -885,6 +1107,29 @@ fn validate_common(common: &SessionCommonArgs) -> Result<(), SessionFailure> {
         return Err(SessionFailure::data(
             "invalid-state-home",
             "--state-home must be absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_args(args: &SessionContextArgs) -> Result<(), SessionFailure> {
+    let request_id = args.request_id.as_bytes();
+    let valid_request_id = !request_id.is_empty()
+        && request_id.len() <= MAX_CONTEXT_REQUEST_ID_BYTES
+        && request_id[0].is_ascii_alphanumeric()
+        && request_id
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if !valid_request_id {
+        return Err(SessionFailure::data(
+            "invalid-request-id",
+            "--request-id must be a bounded argv-safe identifier",
+        ));
+    }
+    if args.max_bytes == 0 || args.max_bytes > MAX_CONTEXT_BYTES {
+        return Err(SessionFailure::data(
+            "invalid-max-bytes",
+            "--max-bytes must be between 1 and 65536",
         ));
     }
     Ok(())
@@ -1035,6 +1280,18 @@ fn fingerprint(
     let bytes = serde_json::to_vec(&input)
         .map_err(|err| SessionFailure::runtime("fingerprint-failed", err.to_string()))?;
     Ok(digest(&bytes))
+}
+
+fn context_fingerprint(
+    report: &PreflightReport,
+    catalog: &integration::EffectiveCatalog,
+    fallback: FallbackMode,
+    integration_fingerprint: Option<&str>,
+) -> Result<String, SessionFailure> {
+    Ok(format!(
+        "{CONTEXT_FINGERPRINT_PREFIX}{}",
+        fingerprint(report, catalog, fallback, integration_fingerprint)?
+    ))
 }
 
 fn product_names(products: &[Product]) -> Vec<&'static str> {
@@ -1192,6 +1449,58 @@ fn render(format: OutputFormat, command: &str, result: Result<SessionData, Sessi
     }
 }
 
+fn render_context(format: OutputFormat, result: Result<ContextData, SessionFailure>) -> i32 {
+    const SCHEMA: &str = "cli.agent-docs.session.context.v1";
+    match result {
+        Ok(data) => {
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": SCHEMA,
+                        "ok": true,
+                        "data": data,
+                    }))
+                    .expect("session context output serializes")
+                );
+            } else {
+                println!(
+                    "agent-docs session context: product={} intent={} documents={} bytes={} verified={}",
+                    data.decision.product,
+                    data.decision.intent,
+                    data.decision.document_count,
+                    data.decision.total_bytes,
+                    data.decision.verified
+                );
+            }
+            EXIT_OK
+        }
+        Err(failure) => {
+            if format == OutputFormat::Json {
+                let details = serde_json::to_value(&failure.details)
+                    .expect("session failure details serialize");
+                let mut error =
+                    EnvelopeError::new(failure.code, &failure.message).with_details(details);
+                if let Some(hint) = &failure.hint {
+                    error = error.with_hint(hint);
+                }
+                let envelope: Envelope<ContextData> = Envelope::failure(SCHEMA, error);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&envelope).expect("session error serializes")
+                );
+            } else {
+                eprintln!(
+                    "agent-docs session context: {}; next action: {}",
+                    failure.message,
+                    failure.details.next_action.as_str()
+                );
+            }
+            failure.exit_code
+        }
+    }
+}
+
 struct SessionFailure {
     code: &'static str,
     message: String,
@@ -1284,6 +1593,10 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
         | "invalid-state-home"
         | "invalid-intent"
         | "invalid-phase"
+        | "invalid-product"
+        | "invalid-request-id"
+        | "invalid-max-bytes"
+        | "context-budget-exceeded"
         | "root-resolution-failed" => (
             false,
             NextAction::FixArguments,
@@ -1331,7 +1644,8 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
         ),
         "catalog-load-failed"
         | "integration-catalog-not-selected"
-        | "integration-resolution-failed" => (
+        | "integration-resolution-failed"
+        | "context-policy-invalid" => (
             false,
             NextAction::RepairCatalog,
             recovery_command(RecoveryCommand::Audit, catalog_reuse_scope()),
@@ -1346,6 +1660,7 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
         ),
         "fingerprint-producer-missing"
         | "fingerprint-failed"
+        | "context-content-missing"
         | "record-render-failed"
         | "record-path-not-portable"
         | "lock-owner-render-failed"
@@ -1381,6 +1696,14 @@ fn failure_message(code: &str) -> &'static str {
         "invalid-state-home" => "the session state location is invalid",
         "invalid-intent" => "the intent identifier is invalid",
         "invalid-phase" => "the phase identifier is invalid",
+        "invalid-product" => "the selected product is not supported for session context",
+        "invalid-request-id" => "the context request identifier is invalid",
+        "invalid-max-bytes" => "the context response budget is invalid",
+        "context-budget-exceeded" => "required policy content exceeds the response budget",
+        "context-policy-invalid" => {
+            "the prepared DSH context no longer satisfies the bounded policy contract"
+        }
+        "context-content-missing" => "required policy content was unavailable after validation",
         "undeclared-intent" => "the requested intent is not declared for this project",
         "preflight-unsatisfied" => "required policy documents are not satisfied",
         "phase-unsatisfied" => "required policy documents are not satisfied for this phase",

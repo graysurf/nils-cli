@@ -97,7 +97,7 @@ fn private_config_surface_is_structured() {
         (["integration", "--help"].as_slice(), ["resolve"].as_slice()),
         (
             ["integration", "resolve", "--help"].as_slice(),
-            ["--product", "codex", "claude", "hermes", "--format"].as_slice(),
+            ["--product", "codex", "claude", "hermes", "dsh", "--format"].as_slice(),
         ),
     ] {
         let out = run_cli(args, &options);

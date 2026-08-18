@@ -83,6 +83,38 @@ fn session_prepare_is_never_described_as_read_only() {
 }
 
 #[test]
+fn session_context_is_never_described_as_read_only() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let output = run_cli(
+        &[
+            "operation-effect",
+            "--format",
+            "json",
+            "--",
+            "session",
+            "context",
+            "--session-id",
+            "session-1",
+            "--product",
+            "dsh",
+            "--state-home",
+            temp.path().to_str().expect("temp UTF-8"),
+            "--intent",
+            "project-dev",
+            "--request-id",
+            "request-1",
+            "--format",
+            "json",
+        ],
+        &cmd::CmdOptions::default().with_cwd(temp.path()),
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr);
+    assert_eq!(output.json()["data"]["operation"], "session.context");
+    assert_ne!(output.json()["data"]["effect"], "read_only");
+}
+
+#[test]
 fn unknown_inner_flags_produce_no_descriptor() {
     let output = run_cli(
         &[

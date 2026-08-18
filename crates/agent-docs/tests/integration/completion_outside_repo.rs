@@ -13,7 +13,11 @@ fn completion_export_succeeds_outside_git_repo() {
         "missing zsh completion header: {stdout}"
     );
     assert!(
-        stdout.contains("--product") && stdout.contains("codex claude"),
+        stdout.contains("--product")
+            && stdout.contains("codex claude hermes dsh")
+            && stdout.contains("context")
+            && stdout.contains("--request-id")
+            && stdout.contains("--max-bytes"),
         "missing product completion choices: {stdout}"
     );
 }
@@ -27,7 +31,11 @@ fn bash_completion_exports_product_choices_outside_git_repo() {
     assert_eq!(output.code, 0, "expected exit code 0, got: {output:?}");
     let stdout = output.stdout_text();
     assert!(
-        stdout.contains("--product") && stdout.contains("codex claude"),
+        stdout.contains("--product")
+            && stdout.contains("codex claude hermes dsh")
+            && stdout.contains("context")
+            && stdout.contains("--request-id")
+            && stdout.contains("--max-bytes"),
         "missing product completion choices: {stdout}"
     );
 }

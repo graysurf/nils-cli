@@ -83,6 +83,54 @@ struct PrivateReadBudget {
     remaining_bytes: usize,
 }
 
+pub(crate) const MAX_CONTEXT_DOCUMENTS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextResolveError {
+    BudgetExceeded,
+    UnsafeDocument,
+}
+
+impl ContextResolveError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::BudgetExceeded => "context-budget-exceeded",
+            Self::UnsafeDocument => "context-document-unsafe",
+        }
+    }
+
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::BudgetExceeded => "required policy content exceeds the bounded context limits",
+            Self::UnsafeDocument => {
+                "a required policy document is outside its trusted scope or is not a regular file"
+            }
+        }
+    }
+}
+
+struct ContextReadBudget {
+    remaining_documents: usize,
+    remaining_bytes: usize,
+}
+
+impl ContextReadBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining_documents: MAX_CONTEXT_DOCUMENTS,
+            remaining_bytes: max_bytes,
+        }
+    }
+
+    fn claim_document(&mut self) -> Result<(), ContextResolveError> {
+        if self.remaining_documents == 0 {
+            return Err(ContextResolveError::BudgetExceeded);
+        }
+        self.remaining_documents -= 1;
+        Ok(())
+    }
+}
+
 impl PrivateReadBudget {
     fn new() -> Self {
         Self {
@@ -189,6 +237,51 @@ pub(crate) fn resolve_intent_with_effective_catalog_for_scope(
             private_allowed_roots: &effective.private_allowed_roots,
         },
     )
+}
+
+/// Resolve the content-bearing DSH context surface.
+///
+/// Unlike the general diagnostic resolver, this path never opens optional
+/// documents. Required documents are confined to their declared scope and are
+/// read through one aggregate byte/count budget before any activation can be
+/// persisted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_context_with_effective_catalog_for_scope(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Product,
+    phase: Option<Phase>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    max_bytes: usize,
+    effective: &EffectiveCatalog,
+) -> Result<PreflightReport, ContextResolveError> {
+    let documents = resolve_context_documents(
+        roots,
+        product,
+        phase.as_ref(),
+        fallback_mode,
+        max_bytes,
+        &effective.catalog,
+        &mut |entry| entry.context == *intent,
+    )?;
+    let validation =
+        resolve_validation_contract_for_product(intent, roots, Some(product), &effective.catalog);
+    let summary = ResolveSummary::from_documents(&documents);
+
+    Ok(PreflightReport {
+        schema_version: PreflightReport::SCHEMA_VERSION,
+        intent: intent.clone(),
+        product: Some(product),
+        phase,
+        strict,
+        docs_home: roots.docs_home.clone(),
+        project_path: roots.project_path.clone(),
+        is_linked_worktree: roots.is_linked_worktree,
+        documents,
+        validation,
+        summary,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -363,6 +456,224 @@ fn resolve_documents(
     }
 
     documents
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_context_documents(
+    roots: &ResolvedRoots,
+    product: Product,
+    phase: Option<&Phase>,
+    fallback_mode: FallbackMode,
+    max_bytes: usize,
+    catalog: &LoadedCatalog,
+    accept: &mut dyn FnMut(&DocumentEntry) -> bool,
+) -> Result<Vec<ResolvedDocument>, ContextResolveError> {
+    let mut reader = read_context_document;
+    resolve_context_documents_with_reader(
+        roots,
+        product,
+        phase,
+        fallback_mode,
+        max_bytes,
+        catalog,
+        accept,
+        &mut reader,
+    )
+}
+
+type ContextDocumentReader<'a> = dyn FnMut(
+        &Path,
+        &Path,
+        Scope,
+        &ResolvedRoots,
+        FallbackMode,
+        &mut ContextReadBudget,
+    ) -> Result<Option<String>, ContextResolveError>
+    + 'a;
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_context_documents_with_reader(
+    roots: &ResolvedRoots,
+    product: Product,
+    phase: Option<&Phase>,
+    fallback_mode: FallbackMode,
+    max_bytes: usize,
+    catalog: &LoadedCatalog,
+    accept: &mut dyn FnMut(&DocumentEntry) -> bool,
+    reader: &mut ContextDocumentReader<'_>,
+) -> Result<Vec<ResolvedDocument>, ContextResolveError> {
+    let mut effective_entries = Vec::new();
+    let mut index_by_path: HashMap<PathBuf, usize> = HashMap::new();
+    let home_project_scope_applies = home_project_scope_applies(roots);
+
+    for scope_catalog in catalog.in_load_order() {
+        for entry in &scope_catalog.documents {
+            if !accept(entry)
+                || !matches_product(&entry.products, Some(product))
+                || !matches_phase(&entry.phases, phase)
+            {
+                continue;
+            }
+            if scope_catalog.source_scope == Scope::Home
+                && entry.scope == Scope::Project
+                && !home_project_scope_applies
+            {
+                continue;
+            }
+
+            let path = resolve_entry_path(entry, roots, fallback_mode);
+            let candidate = (scope_catalog, entry, path.clone());
+            if let Some(existing) = index_by_path.get(&path).copied() {
+                effective_entries[existing] = candidate;
+            } else {
+                index_by_path.insert(path, effective_entries.len());
+                effective_entries.push(candidate);
+            }
+        }
+    }
+
+    let mut documents = Vec::with_capacity(effective_entries.len());
+    let mut budget = ContextReadBudget::new(max_bytes);
+    for (scope_catalog, entry, path) in effective_entries {
+        let when_satisfied = predicate::evaluate(&entry.when, &roots.project_path);
+        let required = entry.required && when_satisfied;
+        let raw = if required {
+            budget.claim_document()?;
+            reader(
+                &entry.path,
+                &path,
+                entry.scope,
+                roots,
+                fallback_mode,
+                &mut budget,
+            )?
+        } else {
+            None
+        };
+        let status = if raw.is_some() {
+            DocumentStatus::Present
+        } else {
+            DocumentStatus::Missing
+        };
+        let validation = raw
+            .as_deref()
+            .map(|raw| content::validate_content(raw, entry))
+            .unwrap_or_else(DocumentValidation::missing);
+        let resolved = ResolvedDocument {
+            context: entry.context.clone(),
+            scope: entry.scope,
+            path,
+            products: entry.products.clone(),
+            phases: entry.phases.clone(),
+            declared_required: entry.required,
+            required,
+            when: entry.when_raw.clone(),
+            when_satisfied,
+            status,
+            validation,
+            source: DocumentSource::from_scope(scope_catalog.source_scope),
+            why: describe_why(entry, scope_catalog, when_satisfied, false),
+            content: raw,
+        };
+        documents.push(resolved);
+    }
+
+    Ok(documents)
+}
+
+fn read_context_document(
+    declared_path: &Path,
+    resolved_path: &Path,
+    scope: Scope,
+    roots: &ResolvedRoots,
+    fallback_mode: FallbackMode,
+    budget: &mut ContextReadBudget,
+) -> Result<Option<String>, ContextResolveError> {
+    if declared_path.is_absolute()
+        || declared_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ContextResolveError::UnsafeDocument);
+    }
+
+    let metadata = match fs::symlink_metadata(resolved_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ContextResolveError::UnsafeDocument),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ContextResolveError::UnsafeDocument);
+    }
+    if metadata.len() > budget.remaining_bytes as u64 {
+        return Err(ContextResolveError::BudgetExceeded);
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(resolved_path)
+        .map_err(|_| ContextResolveError::UnsafeDocument)?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| ContextResolveError::UnsafeDocument)?;
+    if !opened_metadata.is_file() {
+        return Err(ContextResolveError::UnsafeDocument);
+    }
+
+    let canonical_path =
+        fs::canonicalize(resolved_path).map_err(|_| ContextResolveError::UnsafeDocument)?;
+    let mut allowed_roots = vec![root_for_scope(scope, roots).to_path_buf()];
+    if scope == Scope::Project
+        && fallback_mode == FallbackMode::Auto
+        && let Some(primary) = roots.primary_worktree_fallback()
+    {
+        allowed_roots.push(primary.path.clone());
+    }
+    let contained = allowed_roots.iter().any(|root| {
+        fs::canonicalize(root)
+            .ok()
+            .is_some_and(|root| canonical_path.starts_with(root))
+    });
+    if !contained {
+        return Err(ContextResolveError::UnsafeDocument);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canonical_metadata =
+            fs::metadata(&canonical_path).map_err(|_| ContextResolveError::UnsafeDocument)?;
+        if opened_metadata.dev() != canonical_metadata.dev()
+            || opened_metadata.ino() != canonical_metadata.ino()
+        {
+            return Err(ContextResolveError::UnsafeDocument);
+        }
+    }
+
+    let read_limit = budget.remaining_bytes;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take((read_limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ContextResolveError::UnsafeDocument)?;
+    if bytes.len() > read_limit {
+        return Err(ContextResolveError::BudgetExceeded);
+    }
+    budget.remaining_bytes -= bytes.len();
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| ContextResolveError::UnsafeDocument)
 }
 
 fn resolve_entry(
@@ -953,6 +1264,139 @@ commands = ["cargo test"]
             .expect("optional document");
         assert_eq!(optional.status, DocumentStatus::Missing);
         assert_eq!(optional.content, None);
+    }
+
+    #[test]
+    fn context_resolution_never_opens_optional_documents() {
+        let catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "REQUIRED.md"
+product = "dsh"
+required = true
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "OPTIONAL.md"
+product = "dsh"
+required = false
+"#;
+        let fixture = fixture("", catalog);
+        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let mut opened = Vec::new();
+        let documents = resolve_context_documents_with_reader(
+            &fixture.roots,
+            Product::Dsh,
+            None,
+            FallbackMode::Auto,
+            1024,
+            &loaded,
+            &mut |entry| entry.context == intent("project-dev"),
+            &mut |declared_path, _, _, _, _, budget| {
+                opened.push(declared_path.to_path_buf());
+                let content = "required policy\n".to_string();
+                budget.remaining_bytes -= content.len();
+                Ok(Some(content))
+            },
+        )
+        .expect("context resolution");
+
+        assert_eq!(opened, vec![PathBuf::from("REQUIRED.md")]);
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].content.as_deref(), Some("required policy\n"));
+        assert_eq!(documents[1].content, None);
+    }
+
+    #[test]
+    fn context_resolution_budgets_only_the_winning_duplicate_entry() {
+        let home_catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "home"
+path = "SHARED.md"
+product = "dsh"
+required = true
+"#;
+        let project_catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "home"
+path = "SHARED.md"
+product = "dsh"
+required = true
+"#;
+        let fixture = fixture(home_catalog, project_catalog);
+        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let mut opened = Vec::new();
+        let documents = resolve_context_documents_with_reader(
+            &fixture.roots,
+            Product::Dsh,
+            None,
+            FallbackMode::Auto,
+            8,
+            &loaded,
+            &mut |entry| entry.context == intent("project-dev"),
+            &mut |declared_path, _, _, _, _, budget| {
+                opened.push(declared_path.to_path_buf());
+                let content = "12345678".to_string();
+                if content.len() > budget.remaining_bytes {
+                    return Err(ContextResolveError::BudgetExceeded);
+                }
+                budget.remaining_bytes -= content.len();
+                Ok(Some(content))
+            },
+        )
+        .expect("only the effective entry consumes the byte budget");
+
+        assert_eq!(opened, vec![PathBuf::from("SHARED.md")]);
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].source, DocumentSource::Project);
+        assert_eq!(documents[0].content.as_deref(), Some("12345678"));
+    }
+
+    #[test]
+    fn optional_project_override_prevents_opening_superseded_required_entry() {
+        let home_catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "home"
+path = "SHARED.md"
+product = "dsh"
+required = true
+"#;
+        let project_catalog = r#"
+[[document]]
+context = "project-dev"
+scope = "home"
+path = "SHARED.md"
+product = "dsh"
+required = false
+"#;
+        let fixture = fixture(home_catalog, project_catalog);
+        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let mut opened = Vec::new();
+        let documents = resolve_context_documents_with_reader(
+            &fixture.roots,
+            Product::Dsh,
+            None,
+            FallbackMode::Auto,
+            8,
+            &loaded,
+            &mut |entry| entry.context == intent("project-dev"),
+            &mut |declared_path, _, _, _, _, _| {
+                opened.push(declared_path.to_path_buf());
+                Ok(Some("unexpected".to_string()))
+            },
+        )
+        .expect("optional override");
+
+        assert!(opened.is_empty());
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].source, DocumentSource::Project);
+        assert!(!documents[0].required);
+        assert_eq!(documents[0].content, None);
     }
 
     #[test]

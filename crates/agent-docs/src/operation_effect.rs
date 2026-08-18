@@ -102,6 +102,12 @@ fn classify(command: &Command) -> (&'static str, Effect, ProviderEffect, Vec<&'s
                 ProviderEffect::None,
                 Vec::new(),
             ),
+            SessionCommand::Context(_) => (
+                "session.context",
+                mutation,
+                ProviderEffect::None,
+                Vec::new(),
+            ),
         },
         Command::Config(args) => match args.command {
             ConfigCommand::Show(_) => ("config.show", read, local, vec!["user_config"]),

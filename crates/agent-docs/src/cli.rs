@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::model::{AuditTarget, FallbackMode, OutputFormat, Product, Scope};
 
@@ -386,6 +386,9 @@ pub enum SessionCommand {
     /// Atomically prepare one or more declared intents (activate + strict
     /// preflight) and report a stable JSON result usable by a runtime hook.
     Prepare(SessionActivateArgs),
+    /// Resolve and prepare exactly one DSH intent, returning only its bounded
+    /// satisfied required document content as a replay-bound decision.
+    Context(SessionContextArgs),
     /// Show active intents for the current session/project/product scope.
     Status(SessionCommonArgs),
     /// Re-resolve the catalog and verify required intents are active and fresh.
@@ -416,6 +419,53 @@ pub struct SessionActivateArgs {
         help = "Scope preparation to a workflow phase (no-phase docs always apply)"
     )]
     pub phase: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionContextArgs {
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: String,
+    #[arg(long, value_enum)]
+    pub product: ContextProduct,
+    #[arg(long = "state-home", value_name = "DIR")]
+    pub state_home: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    #[arg(long, value_name = "INTENT", required = true)]
+    pub intent: String,
+    #[arg(
+        long,
+        value_name = "PHASE",
+        help = "Scope preparation to a workflow phase (no-phase docs always apply)"
+    )]
+    pub phase: Option<String>,
+    #[arg(
+        long = "request-id",
+        value_name = "ID",
+        help = "Bounded caller correlation id echoed by the context decision"
+    )]
+    pub request_id: String,
+    #[arg(
+        long = "max-bytes",
+        value_name = "BYTES",
+        default_value_t = 20 * 1024,
+        help = "Maximum aggregate UTF-8 bytes of returned policy content (hard cap: 65536)"
+    )]
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ContextProduct {
+    Dsh,
+}
+
+impl ContextProduct {
+    pub const fn as_product(self) -> Product {
+        match self {
+            Self::Dsh => Product::Dsh,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

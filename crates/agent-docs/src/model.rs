@@ -125,6 +125,7 @@ pub enum Product {
     Codex,
     Claude,
     Hermes,
+    Dsh,
 }
 
 impl Product {
@@ -133,11 +134,12 @@ impl Product {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Hermes => "hermes",
+            Self::Dsh => "dsh",
         }
     }
 
     pub const fn supported_values() -> &'static [&'static str] {
-        &["codex", "claude", "hermes"]
+        &["codex", "claude", "hermes", "dsh"]
     }
 
     pub fn from_config_value(value: &str) -> Option<Self> {
@@ -145,6 +147,7 @@ impl Product {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
             "hermes" => Some(Self::Hermes),
+            "dsh" => Some(Self::Dsh),
             _ => None,
         }
     }
