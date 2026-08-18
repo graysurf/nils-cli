@@ -555,7 +555,7 @@ operations:
     notes: "The read is complete and fail-closed: every inline-comment page repeats the same review, PR, head, commit, author, body, viewer-capability identity, and stable totalCount. totalCount above 1,000 is rejected before another page, and the decoded retained snapshot is capped at 4 MiB. The snapshot and digest preserve diff_side and start_diff_side as well as line/range anchors. Owned versioned markers are removed only from semantic_body; raw provider content remains visible in the snapshot. provenance is receipt-bound or unmarked, while mixed or digest-mismatched markers return pending_review_manifest_mismatch."
 
   - id: pr.pending-review.resume-submit
-    schema_version: cli.forge-cli.pr.pending-review.resume-submit.v1
+    schema_version: cli.forge-cli.pr.pending-review.resume-submit.v2
     summary: Submit one exact receipt-bound pending review after final compare-and-swap validation.
     inputs:
       - { name: <id>, type: integer, required: true }
@@ -585,7 +585,7 @@ operations:
       local: unsupported
     output:
       data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest?,snapshot_provenance,review_run_id,submitted}>
-    notes: "The exact receipt-bound pending snapshot is submitted once under a private provider/host/repository/PR/viewer cross-process lease, then its complete submitted manifest is immediately reconciled. FILE receipt anchors accept provider-null side/range fields; LINE and range anchors remain exact. A live reconciled submit reports snapshot_provenance=pending-cas+submitted-reconciled. If submission already completed, a complete submitted-review read-back authored by the authenticated viewer with the same review_run_id, review id, current head, commit, decision state, and complete receipt-bound thread manifest returns idempotent success without another mutation, with snapshot_digest=null and snapshot_provenance=pending-snapshot-unverified because the former pending digest cannot be proven. GitHub provides no submission CAS, so the lease excludes cooperating forge-cli processes but cannot exclude a same-identity non-cooperating provider client between final read and mutation."
+    notes: "Version 2 makes snapshot_digest nullable and adds snapshot_provenance so idempotent recovery never misrepresents an unprovable former pending digest. The exact receipt-bound pending snapshot is submitted once under a private provider/host/repository/PR/viewer cross-process lease, then its complete submitted manifest is immediately reconciled. FILE receipt anchors accept provider-null side/range fields; LINE and range anchors remain exact. A live reconciled submit reports snapshot_provenance=pending-cas+submitted-reconciled. If submission already completed, a complete submitted-review read-back authored by the authenticated viewer with the same review_run_id, review id, current head, commit, decision state, and complete receipt-bound thread manifest returns idempotent success without another mutation, with snapshot_digest=null and snapshot_provenance=pending-snapshot-unverified because the former pending digest cannot be proven. GitHub provides no submission CAS, so the lease excludes cooperating forge-cli processes but cannot exclude a same-identity non-cooperating provider client between final read and mutation."
 
   - id: pr.pending-review.submit
     schema_version: cli.forge-cli.pr.pending-review.submit.v1
@@ -616,8 +616,8 @@ operations:
       gitlab: unsupported
       local: unsupported
     output:
-      data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest?,snapshot_provenance,review_run_id?,submitted}>
-    notes: "Only provenance=unmarked is eligible. The exact snapshot digest, head, commit, viewer identity, body, and every inline comment are re-read under the cross-process lease before submission; inline content is preserved, and the complete submitted manifest is reconciled before success."
+      data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest,snapshot_provenance,review_run_id?,submitted}>
+    notes: "The released v1 snapshot_digest remains a required string. Only provenance=unmarked is eligible. The exact snapshot digest, head, commit, viewer identity, body, and every inline comment are re-read under the cross-process lease before submission; inline content is preserved, and the complete submitted manifest is reconciled before success."
 
   - id: pr.pending-review.discard
     schema_version: cli.forge-cli.pr.pending-review.discard.v1

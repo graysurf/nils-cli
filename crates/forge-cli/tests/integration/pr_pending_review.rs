@@ -1,7 +1,8 @@
 //! Recovery tests for an authenticated actor's provider-valid pending review.
 
 use std::fs;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
 
@@ -17,6 +18,42 @@ use super::support::{
 
 const INCOMPLETE_RECEIPT_RUN_ID: &str =
     "sha256:3de5f335496edb76e29ba96b787fbc9dc18d081f45a285b0e2ae877443f49405";
+
+struct LeaseTestChild {
+    child: Option<Child>,
+    release: PathBuf,
+}
+
+impl LeaseTestChild {
+    fn new(child: Child, release: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            release,
+        }
+    }
+
+    fn release_and_wait(mut self) -> ExitStatus {
+        fs::write(&self.release, "release\n").expect("release first submit");
+        let status = self
+            .child
+            .as_mut()
+            .expect("lease child")
+            .wait()
+            .expect("wait for first submit");
+        self.child.take();
+        status
+    }
+}
+
+impl Drop for LeaseTestChild {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "release\n");
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn incomplete_receipt_marker() -> String {
     let receipt = ReviewRunReceipt {
@@ -111,6 +148,28 @@ fn pr_pending_review_catalog_uses_provider_native_viewer_guards() {
     }
     assert!(catalog.contains("schema: forge-cli.review-loop.v1"));
     assert!(catalog.contains("privacy_forbidden:"));
+    let resume_submit = catalog
+        .split_once("  - id: pr.pending-review.resume-submit\n")
+        .expect("resume-submit operation")
+        .1
+        .split_once("  - id: pr.pending-review.submit\n")
+        .expect("submit follows resume-submit")
+        .0;
+    assert!(
+        resume_submit.contains("schema_version: cli.forge-cli.pr.pending-review.resume-submit.v2")
+    );
+    assert!(resume_submit.contains("snapshot_digest?"));
+    assert!(resume_submit.contains("snapshot_provenance"));
+    let direct_submit = catalog
+        .split_once("  - id: pr.pending-review.submit\n")
+        .expect("direct-submit operation")
+        .1
+        .split_once("  - id: pr.pending-review.discard\n")
+        .expect("discard follows direct-submit")
+        .0;
+    assert!(direct_submit.contains("schema_version: cli.forge-cli.pr.pending-review.submit.v1"));
+    assert!(direct_submit.contains("commit_sha,snapshot_digest,snapshot_provenance"));
+    assert!(!direct_submit.contains("snapshot_digest?"));
     let operation = catalog
         .split_once("  - id: pr.pending-review.delete\n")
         .expect("pending-review operation")
@@ -627,6 +686,10 @@ fn pr_pending_review_resume_submit_accepts_an_exact_receipt_manifest() {
 
     assert_eq!(output.code, 0, "{}", output.stdout);
     let envelope = parse_envelope(&output.stdout);
+    assert_eq!(
+        envelope["schema_version"],
+        "cli.forge-cli.pr.pending-review.resume-submit.v2"
+    );
     assert_eq!(envelope["data"]["submitted"], true);
     assert_eq!(envelope["data"]["review_run_id"], review_run_id);
     assert_eq!(
@@ -636,6 +699,84 @@ fn pr_pending_review_resume_submit_accepts_an_exact_receipt_manifest() {
     let calls = fs::read_to_string(capture).expect("read calls");
     assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
     assert!(!calls.contains("deletePullRequestReview(input:"), "{calls}");
+}
+
+#[test]
+fn pr_pending_review_direct_submit_v1_remains_deserializable_with_a_required_digest() {
+    #[derive(serde::Deserialize)]
+    struct PriorV1Envelope {
+        schema_version: String,
+        data: PriorV1SubmitPayload,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PriorV1SubmitPayload {
+        snapshot_digest: String,
+    }
+
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("direct-submit-v1-calls.log");
+    let snapshot = pending_recovery_snapshot(false, 1, true);
+    let script = pending_recovery_script(&capture.to_string_lossy(), &snapshot, "unused");
+    let stub = stub.gh_stub(&script);
+    let inspect = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+    assert_eq!(inspect.code, 0, "{}", inspect.stdout);
+    let digest = parse_envelope(&inspect.stdout)["data"]["snapshot"]["snapshot_digest"]
+        .as_str()
+        .expect("snapshot digest")
+        .to_string();
+
+    let output = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "submit",
+            "42",
+            "--review",
+            "PRR_pending",
+            "--expected-head",
+            "head-new",
+            "--expected-commit",
+            "head-new",
+            "--expected-snapshot",
+            &digest,
+            "--decision",
+            "comments-only",
+            "--confirm-unmarked-submit",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "{}", output.stdout);
+    let prior: PriorV1Envelope =
+        serde_json::from_str(&output.stdout).expect("prior v1 consumer shape");
+    assert_eq!(
+        prior.schema_version,
+        "cli.forge-cli.pr.pending-review.submit.v1"
+    );
+    assert_eq!(prior.data.snapshot_digest, digest);
 }
 
 #[test]
@@ -804,7 +945,7 @@ fn pr_pending_review_cross_process_lease_excludes_a_second_mutation() {
     for (key, value) in &stub.envs {
         first.env(key, value);
     }
-    let first = first.spawn().expect("spawn first submit");
+    let first = LeaseTestChild::new(first.spawn().expect("spawn first submit"), release.clone());
     for _ in 0..500 {
         if started.exists() {
             break;
@@ -822,14 +963,8 @@ fn pr_pending_review_cross_process_lease_excludes_a_second_mutation() {
     let calls = fs::read_to_string(&capture).expect("read calls");
     assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
 
-    fs::write(&release, "release\n").expect("release first submit");
-    let output = first.wait_with_output().expect("wait for first submit");
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let status = first.release_and_wait();
+    assert!(status.success(), "first submit exited with {status}");
 }
 
 #[test]
@@ -1151,7 +1286,7 @@ esac
     let envelope = parse_envelope(&output.stdout);
     assert_eq!(
         envelope["schema_version"],
-        "cli.forge-cli.pr.pending-review.resume-submit.v1"
+        "cli.forge-cli.pr.pending-review.resume-submit.v2"
     );
     assert_eq!(envelope["data"]["review_id"], "PRR_pending");
     assert_eq!(envelope["data"]["review_run_id"], review_run_id);

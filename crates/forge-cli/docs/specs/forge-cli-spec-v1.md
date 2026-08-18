@@ -612,7 +612,9 @@ backend mapping, validation rules, and output schema versions.
 - `pr pending-review resume-submit <id> --review <PRR_...> --review-run-id
   <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot
   <digest> --decision <decision>` emits
-  `cli.forge-cli.pr.pending-review.resume-submit.v1`. It submits only an exact
+  `cli.forge-cli.pr.pending-review.resume-submit.v2`. Version 2 makes
+  `snapshot_digest` nullable and adds `snapshot_provenance` so idempotent
+  recovery never claims a pending snapshot it cannot prove. It submits only an exact
   viewer-owned receipt-bound snapshot after recomputing the run id and matching
   the summary plus every immutable inline-manifest field. If that review was
   already submitted, the command reads submitted reviews and threads, verifies
@@ -628,8 +630,9 @@ backend mapping, validation rules, and output schema versions.
 - `pr pending-review submit <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> --expected-snapshot <digest> --decision <decision>
   --confirm-unmarked-submit` emits `cli.forge-cli.pr.pending-review.submit.v1`.
-  It accepts only `unmarked` provenance and preserves the exact body and
-  all inline comments while submitting. It never auto-adopts a unmarked draft.
+  Its released v1 `snapshot_digest` remains a required string. It accepts only
+  `unmarked` provenance and preserves the exact body and all inline comments
+  while submitting. It never auto-adopts a unmarked draft.
 - `pr pending-review discard <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> --expected-snapshot <digest> --confirm-discard`
   emits `cli.forge-cli.pr.pending-review.discard.v1`. It is destructive and

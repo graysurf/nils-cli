@@ -1821,6 +1821,95 @@ mod tests {
     }
 
     #[test]
+    fn pending_snapshot_rejects_cross_page_total_count_drift() {
+        let first = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_1",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: true,
+            end_cursor: Some("cursor-1"),
+        });
+        let mut second = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_2",
+            path: "src/two.rs",
+            line: 2,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&second.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["totalCount"] = 3.into();
+        second.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![first, second]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("totalCount drift across pages must fail closed");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_more_than_one_thousand_accumulated_nodes() {
+        let page = |id: &'static str, node_count: usize, has_next_page, end_cursor| {
+            let mut output = pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id,
+                path: "src/many.rs",
+                line: 1,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page,
+                end_cursor,
+            });
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            let node = value["data"]["node"]["comments"]["nodes"][0].clone();
+            value["data"]["node"]["comments"]["totalCount"] = MAX_PENDING_REVIEW_COMMENTS.into();
+            value["data"]["node"]["comments"]["nodes"] = vec![node; node_count].into();
+            output.stdout = value.to_string();
+            output
+        };
+        let runner = ScriptedRunner::new(vec![
+            page("PRRC_1", 501, true, Some("cursor-1")),
+            page("PRRC_2", 500, false, None),
+        ]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("accumulated nodes above the safety limit must fail closed");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_terminal_actual_count_mismatch() {
+        let runner = ScriptedRunner::new(vec![pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_only",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        })]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("terminal observed node count must match totalCount");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
     fn pending_snapshot_rejects_multi_page_retained_byte_exhaustion() {
         let oversized_body = "x".repeat(MAX_PENDING_REVIEW_SNAPSHOT_BYTES / 3 + 1);
         let page = |id: &'static str, has_next_page, end_cursor| {

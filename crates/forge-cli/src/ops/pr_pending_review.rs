@@ -44,10 +44,31 @@ pub struct PrPendingReviewSubmitPayload {
     pub review_url: String,
     pub head_sha: String,
     pub commit_sha: String,
-    pub snapshot_digest: Option<String>,
+    pub snapshot_digest: String,
     pub snapshot_provenance: &'static str,
     pub review_run_id: Option<String>,
     pub submitted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrPendingReviewResumeSubmitPayload {
+    pub provider: &'static str,
+    pub number: u64,
+    pub url: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub head_sha: String,
+    pub commit_sha: String,
+    pub snapshot_digest: Option<String>,
+    pub snapshot_provenance: &'static str,
+    pub review_run_id: String,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitContract {
+    DirectV1,
+    ResumeV2,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -202,7 +223,7 @@ pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view,
         snapshot,
         args.decision,
-        "pr.pending-review.resume-submit",
+        SubmitContract::ResumeV2,
         format,
     )
 }
@@ -248,7 +269,7 @@ pub fn run_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view,
         snapshot,
         args.decision,
-        "pr.pending-review.submit",
+        SubmitContract::DirectV1,
         format,
     )
 }
@@ -650,7 +671,7 @@ fn emit_already_submitted<R: BackendRunner>(
         ));
     }
     validate_snapshot_against_receipt(&submitted_snapshot, &receipt)?;
-    let payload = PrPendingReviewSubmitPayload {
+    let payload = PrPendingReviewResumeSubmitPayload {
         provider: ctx.provider.as_str(),
         number: view.number,
         url: view.url,
@@ -660,11 +681,11 @@ fn emit_already_submitted<R: BackendRunner>(
         commit_sha: submitted.commit_sha.clone(),
         snapshot_digest: None,
         snapshot_provenance: "pending-snapshot-unverified",
-        review_run_id: Some(review_run_id.to_string()),
+        review_run_id: review_run_id.to_string(),
         submitted: true,
     };
     Ok(emit_success(
-        schema_version_for(BINARY, "pr.pending-review.resume-submit", 1),
+        schema_version_for(BINARY, "pr.pending-review.resume-submit", 2),
         payload,
         format,
         |payload| {
@@ -857,7 +878,7 @@ fn submit_snapshot<R: BackendRunner>(
     view: pr_view::PrViewPayload,
     snapshot: pr_reviews::PendingReviewSnapshot,
     decision: PrReviewDecision,
-    schema: &str,
+    contract: SubmitContract,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     if !snapshot.viewer_did_author {
@@ -907,31 +928,66 @@ fn submit_snapshot<R: BackendRunner>(
         ));
     }
     let commit_sha = snapshot.commit_sha.clone().expect("CAS checked commit");
-    Ok(emit_success(
-        schema_version_for(BINARY, schema, 1),
-        PrPendingReviewSubmitPayload {
-            provider: ctx.provider.as_str(),
-            number: view.number,
-            url: view.url,
-            review_id: snapshot.review_id,
-            review_url: submitted.review_url,
-            head_sha: snapshot.head_sha,
-            commit_sha,
-            snapshot_digest: Some(snapshot.snapshot_digest),
-            snapshot_provenance: "pending-cas+submitted-reconciled",
-            review_run_id: snapshot.review_run_id,
-            submitted: true,
-        },
-        format,
-        |payload| {
-            println!(
-                "submitted pending review {review} on #{number}\n  {url}",
-                review = payload.review_id,
-                number = payload.number,
-                url = payload.review_url
-            );
-        },
-    ))
+    let provider = ctx.provider.as_str();
+    let number = view.number;
+    let url = view.url;
+    let review_id = snapshot.review_id;
+    let review_url = submitted.review_url;
+    let head_sha = snapshot.head_sha;
+    let snapshot_digest = snapshot.snapshot_digest;
+    let review_run_id = snapshot.review_run_id;
+    Ok(match contract {
+        SubmitContract::DirectV1 => emit_success(
+            schema_version_for(BINARY, "pr.pending-review.submit", 1),
+            PrPendingReviewSubmitPayload {
+                provider,
+                number,
+                url,
+                review_id,
+                review_url,
+                head_sha,
+                commit_sha,
+                snapshot_digest,
+                snapshot_provenance: "pending-cas+submitted-reconciled",
+                review_run_id,
+                submitted: true,
+            },
+            format,
+            |payload| {
+                println!(
+                    "submitted pending review {review} on #{number}\n  {url}",
+                    review = payload.review_id,
+                    number = payload.number,
+                    url = payload.review_url
+                );
+            },
+        ),
+        SubmitContract::ResumeV2 => emit_success(
+            schema_version_for(BINARY, "pr.pending-review.resume-submit", 2),
+            PrPendingReviewResumeSubmitPayload {
+                provider,
+                number,
+                url,
+                review_id,
+                review_url,
+                head_sha,
+                commit_sha,
+                snapshot_digest: Some(snapshot_digest),
+                snapshot_provenance: "pending-cas+submitted-reconciled",
+                review_run_id: review_run_id.expect("receipt-bound recovery checked review run"),
+                submitted: true,
+            },
+            format,
+            |payload| {
+                println!(
+                    "submitted pending review {review} on #{number}\n  {url}",
+                    review = payload.review_id,
+                    number = payload.number,
+                    url = payload.review_url
+                );
+            },
+        ),
+    })
 }
 
 fn ensure_pending_author(snapshot: &pr_reviews::PendingReviewSnapshot) -> Result<(), ForgeError> {
