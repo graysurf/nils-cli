@@ -5412,6 +5412,7 @@ fn terminal_notification_waiting(
                 && turn.current_turn.is_none()
         }),
         AgentKind::Hermes => false,
+        AgentKind::Dsh => false,
     }
 }
 
@@ -7969,7 +7970,7 @@ fn provider_prompt_new_runtime_source_authorized(record: &crate::SessionRecord) 
         Some(AgentKind::Claude) => {
             resume.provider == "claude" && resume.capture_method == "claude-explicit-session-id"
         }
-        Some(AgentKind::Hermes) | None => false,
+        Some(AgentKind::Hermes) | Some(AgentKind::Dsh) | None => false,
     }
 }
 
@@ -7988,7 +7989,7 @@ fn provider_prompt_pending_fresh_runtime(record: &crate::SessionRecord) -> bool 
                 && resume.capture_method == "claude-explicit-session-id"
                 && !resume.session_id.trim().is_empty()
         }),
-        Some(AgentKind::Hermes) | None => false,
+        Some(AgentKind::Hermes) | Some(AgentKind::Dsh) | None => false,
     }
 }
 

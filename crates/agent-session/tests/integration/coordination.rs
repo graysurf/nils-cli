@@ -38344,3 +38344,294 @@ fn main_agent_quick_no_longer_requires_an_idempotency_key() {
         "must no longer require --idempotency-key: {error}"
     );
 }
+
+#[test]
+fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let worktree = tmp.path().join("lane-worktree");
+    fs::create_dir(&worktree).expect("lane worktree");
+    let assignment_path = tmp.path().join("assignment-dsh.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-dsh",
+            "task_summary": "Exercise the dsh external-runtime launch contract",
+            "task": {},
+            "launch": {
+                "agent": "dsh",
+                "cwd": worktree,
+                "title": null,
+                "session_id": "worker-dsh",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worktree,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let envs: &[(&str, &str)] = &[
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+
+    // A non-zero --await-ready refuses before any durable side effect: the
+    // external runtime cannot deliver the prompt while this command blocks.
+    let refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "5m",
+            "--idempotency-key",
+            "worker-start-dsh-await-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(refused.code, 64, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "dsh-await-ready-unsupported"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-dsh")
+            .is_none(),
+        "await-ready refusal must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-dsh").exists(),
+        "await-ready refusal must not create a worker session"
+    );
+
+    // Launch-only start performs the store bookkeeping and returns the
+    // external launch contract instead of pasting a prompt into tmux.
+    let start_args = [
+        "--state-dir",
+        &state_arg,
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-dsh-0001",
+        "--format",
+        "json",
+    ];
+    let started = run_main_agent(&checkout, &start_args, envs);
+    assert_eq!(started.code, 0, "outcome={}", started.stdout_text());
+    let envelope = started.stdout_json();
+    let outcome = envelope["data"].clone();
+    assert_eq!(
+        outcome["schema_version"],
+        "main-agent.worker-start-result.v1"
+    );
+    assert_eq!(outcome["delivery"]["state"], "external-launch-pending");
+    assert_eq!(outcome["delivery"]["proof"], "external-runtime-transfer");
+    assert_eq!(outcome["worker"]["session_id"], "worker-dsh");
+    assert_eq!(outcome["worker"]["status"], "external");
+    let external_launch = &outcome["external_launch"];
+    assert_eq!(
+        external_launch["schema_version"],
+        "main-agent.external-launch.v1"
+    );
+    let launch_id = external_launch["launch_id"].as_str().expect("launch id");
+    assert!(!launch_id.is_empty(), "launch id is minted");
+    assert_eq!(
+        outcome["worker"]["session_incarnation"].as_str(),
+        Some(launch_id),
+        "the incarnation is the minted launch id"
+    );
+    let prompt = external_launch["prompt"].as_str().expect("prompt");
+    assert!(
+        prompt.contains("bootstrap --idempotency-key bootstrap-"),
+        "prompt drives the worker bootstrap: {prompt}"
+    );
+    assert!(
+        !prompt.contains("AGENT_SESSION_"),
+        "the prompt is environment-free; env delivery is plugin-owned: {prompt}"
+    );
+    let worker_env = &external_launch["worker_env"];
+    assert_eq!(worker_env["AGENT_SESSION_ID"], "worker-dsh");
+    assert_eq!(
+        worker_env["AGENT_SESSION_RUNTIME_ID"].as_str(),
+        Some(launch_id)
+    );
+    let capability_env = worker_env["AGENT_SESSION_CAPABILITY_FILE"]
+        .as_str()
+        .expect("capability env");
+    assert!(
+        capability_env.contains("sessions/worker-dsh/coordination/capability-"),
+        "capability path is session-scoped: {capability_env}"
+    );
+    let checkpoint_env = worker_env["AGENT_SESSION_CHECKPOINT_FILE"]
+        .as_str()
+        .expect("checkpoint env");
+    assert!(
+        checkpoint_env.contains("sessions/worker-dsh/coordination/main-agent-checkpoint-"),
+        "checkpoint path is session-scoped: {checkpoint_env}"
+    );
+    let heartbeat_argv = external_launch["broker_heartbeat_argv"]
+        .as_array()
+        .expect("heartbeat argv");
+    assert!(
+        heartbeat_argv[0]
+            .as_str()
+            .is_some_and(|bin| bin.ends_with("agent-session")),
+        "heartbeat runs the sibling agent-session binary"
+    );
+    assert!(
+        heartbeat_argv
+            .iter()
+            .any(|value| value.as_str() == Some(launch_id)),
+        "heartbeat argv binds the minted incarnation"
+    );
+    let liveness_file = external_launch["liveness_file"]
+        .as_str()
+        .expect("liveness file");
+    assert!(
+        liveness_file.ends_with("sessions/worker-dsh/dsh-runtime-liveness.json"),
+        "liveness sidecar lives in the session state dir: {liveness_file}"
+    );
+    assert_eq!(
+        external_launch["liveness_schema"],
+        "main-agent.dsh-runtime-liveness.v1"
+    );
+    let registry = orchestration_registry(&state_dir);
+    let assignment = &registry["assignments"]["assignment-dsh"];
+    assert_eq!(assignment["state"], "starting");
+    assert_eq!(assignment["revision"], 2);
+    assert_eq!(assignment["worker"]["session_id"], "worker-dsh");
+    assert_eq!(
+        assignment["worker"]["session_incarnation"].as_str(),
+        Some(launch_id)
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions/worker-dsh/session.json"))
+            .expect("worker record"),
+    )
+    .expect("worker record json");
+    assert_eq!(record["agent"], "dsh");
+    assert_eq!(record["mode"], "external");
+    assert_eq!(record["runtime"]["kind"], "dsh_external");
+    assert_eq!(record["runtime"]["launch_id"].as_str(), Some(launch_id));
+    assert_eq!(record["dsh_liveness_file"].as_str(), Some(liveness_file));
+    let stored_prompt =
+        fs::read_to_string(state_dir.join("sessions/worker-dsh/prompt.md")).expect("stored prompt");
+    assert_eq!(
+        stored_prompt, prompt,
+        "the stored prompt is the replay contract"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "a dsh worker start must never touch tmux"
+    );
+
+    // The recorded receipt makes the start idempotent.
+    let replayed = run_main_agent(&checkout, &start_args, envs);
+    assert_eq!(replayed.code, 0, "outcome={}", replayed.stdout_text());
+    assert_eq!(
+        replayed.stdout_json()["data"],
+        outcome,
+        "replay returns the receipt"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "replay must not touch tmux either"
+    );
+
+    // A live open lane refuses record deletion; a terminated lane deletes.
+    let live_sidecar = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": { "pid": std::process::id() },
+        "lane": { "state": "open" }
+    });
+    fs::write(liveness_file, live_sidecar.to_string()).expect("live sidecar");
+    let delete_options = CmdOptions::new().with_cwd(&checkout).with_envs(&[
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ]);
+    let refused_delete = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_delete.code,
+        0,
+        "a live open lane must refuse deletion: {}",
+        refused_delete.stdout_text()
+    );
+    assert!(
+        state_dir.join("sessions/worker-dsh").exists(),
+        "refused deletion preserves the record"
+    );
+    let terminated_sidecar = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": { "pid": std::process::id() },
+        "lane": { "state": "terminated" }
+    });
+    fs::write(liveness_file, terminated_sidecar.to_string()).expect("terminated sidecar");
+    let deleted = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_eq!(deleted.code, 0, "outcome={}", deleted.stdout_text());
+    assert!(
+        !state_dir.join("sessions/worker-dsh").exists(),
+        "terminated lane deletion removes the record"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "dsh record deletion must never touch tmux"
+    );
+}

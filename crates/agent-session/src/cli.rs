@@ -1064,6 +1064,9 @@ pub enum AgentKind {
     Codex,
     Claude,
     Hermes,
+    /// DeepSeek Harness workers managed by an external runtime (the
+    /// dsh-runtime-kit bundle); never tmux-launched by this crate.
+    Dsh,
 }
 
 impl AgentKind {
@@ -1072,6 +1075,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Hermes => "hermes",
+            Self::Dsh => "dsh",
         }
     }
 
@@ -1082,6 +1086,7 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
             "hermes" => Some(Self::Hermes),
+            "dsh" => Some(Self::Dsh),
             _ => None,
         }
     }

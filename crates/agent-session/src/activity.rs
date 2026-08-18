@@ -3383,18 +3383,20 @@ pub(crate) fn doctor(
                     reported_config_path,
                 )
             }
-            AgentKind::Claude | AgentKind::Hermes => match provider_configured(agent, &path) {
-                Ok(configured) => (configured, None, None, None, None, None, path.clone()),
-                Err(error) => (
-                    false,
-                    Some(error.code().to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    path.clone(),
-                ),
-            },
+            AgentKind::Claude | AgentKind::Hermes | AgentKind::Dsh => {
+                match provider_configured(agent, &path) {
+                    Ok(configured) => (configured, None, None, None, None, None, path.clone()),
+                    Err(error) => (
+                        false,
+                        Some(error.code().to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        path.clone(),
+                    ),
+                }
+            }
         };
         let activity_summary = activity_by_provider
             .get(agent.as_str())
@@ -3430,6 +3432,13 @@ pub(crate) fn doctor(
                     "Hermes 0.18.2 shell approval hooks use projected non-empty tool_call_id for exact correlation; missing/empty-id tuple fallback retains conservative multiplicity until completion, a new turn, or a runtime boundary",
                     "Hermes shell hooks require first-use consent unless explicitly accepted",
                     "Run activity setup --agent hermes --dry-run, apply it, then approve and verify with hermes hooks doctor",
+                ),
+                AgentKind::Dsh => (
+                    "unverified",
+                    "dsh lifecycle state is owned by the external dsh-runtime-kit runtime; no provider hook completion signal exists",
+                    "no provider attention correlation exists; the external runtime's liveness sidecar is the only runtime evidence",
+                    "the external dsh-runtime-kit bundle owns Cordis registration; no files are managed here",
+                    "Use main-agent capabilities --provider dsh for the external-runtime readiness contract",
                 ),
             };
         let audited = version
@@ -3468,6 +3477,7 @@ pub(crate) fn doctor(
                 "hook",
             ),
             AgentKind::Hermes => (if audited { "supported" } else { "unverified" }, "hook"),
+            AgentKind::Dsh => ("unverified", "external-runtime"),
         };
         let mut guidance = if matches!(classification, "unavailable" | "unverified") {
             format!(
@@ -3744,6 +3754,9 @@ fn audited_floor(agent: AgentKind) -> (u64, u64, u64) {
         AgentKind::Codex => (0, 144, 1),
         AgentKind::Claude => (2, 1, 206),
         AgentKind::Hermes => (0, 18, 2),
+        // No provider activity pipeline exists for dsh; the config-path gate
+        // refuses `--agent dsh` before any floor comparison can run.
+        AgentKind::Dsh => (u64::MAX, 0, 0),
     }
 }
 
@@ -3775,6 +3788,13 @@ fn provider_config_path(agent: AgentKind) -> Result<std::path::PathBuf, CliError
         AgentKind::Codex => home.join(".codex/hooks.json"),
         AgentKind::Claude => home.join(".claude/settings.json"),
         AgentKind::Hermes => home.join(".hermes/config.yaml"),
+        AgentKind::Dsh => {
+            return Err(CliError::usage(
+                "unsupported-activity-agent",
+                "dsh lifecycle state is owned by the external dsh-runtime-kit runtime; there is no provider activity configuration to manage",
+                Some(json!({ "agent": agent.as_str() })),
+            ));
+        }
     })
 }
 
@@ -3911,6 +3931,9 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
                 matcher: None,
             },
         ],
+        // No provider activity hooks exist for dsh; lifecycle evidence is
+        // owned by the external dsh-runtime-kit runtime.
+        AgentKind::Dsh => Vec::new(),
     }
 }
 
@@ -3926,7 +3949,7 @@ fn retired_provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
                 matcher: None,
             },
         ],
-        AgentKind::Codex | AgentKind::Hermes => Vec::new(),
+        AgentKind::Codex | AgentKind::Hermes | AgentKind::Dsh => Vec::new(),
     }
 }
 
@@ -3955,6 +3978,8 @@ fn provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> 
         }
         AgentKind::Claude => json_provider_configured(agent, path),
         AgentKind::Hermes => hermes_configured(path),
+        // Unreachable in practice: provider_config_path refuses dsh first.
+        AgentKind::Dsh => Ok(false),
     }
 }
 

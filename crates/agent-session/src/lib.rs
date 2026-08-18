@@ -6,6 +6,7 @@ mod codex_app_server;
 pub mod completion;
 mod coordination;
 mod diagnose;
+mod dsh_external;
 mod main_agent;
 mod maintenance;
 mod orchestration;
@@ -1850,6 +1851,15 @@ fn start_session_with_create_guard(
     create_guard: Option<&mut dyn FnMut() -> Result<(), CliError>>,
     mut lifecycle_guards: StartLifecycleGuards<'_>,
 ) -> Result<StartView, CliError> {
+    if args.agent == AgentKind::Dsh {
+        // Refused before any durable side effect: dsh session records are
+        // created only by `main-agent worker start`'s external-runtime arm.
+        return Err(CliError::usage(
+            "unsupported-start-agent",
+            "dsh sessions are launched by the external dsh-runtime-kit runtime; use main-agent worker start with launch.agent \"dsh\"",
+            None,
+        ));
+    }
     validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
@@ -2773,7 +2783,11 @@ fn create_record_with_guard(
         updated_at: iso.clone(),
         provider_resume: request.provider_resume,
         runtime: Some(RuntimeInfo {
-            kind: "tmux".to_string(),
+            kind: if request.agent == AgentKind::Dsh {
+                dsh_external::DSH_RUNTIME_KIND.to_string()
+            } else {
+                "tmux".to_string()
+            },
             tmux_session: tmux_session.clone(),
             generation: 1,
             started_at: now.timestamp().to_string(),
@@ -2927,6 +2941,7 @@ fn initial_provider_resume_plan(agent: AgentKind, _cwd: &Path) -> InitialProvide
         }
         AgentKind::Codex => InitialProviderPlan::default(),
         AgentKind::Hermes => InitialProviderPlan::default(),
+        AgentKind::Dsh => InitialProviderPlan::default(),
     }
 }
 
@@ -3037,6 +3052,13 @@ fn resolve_provider_resume_source(
             return Err(CliError::usage(
                 "unsupported-provider-resume-agent",
                 "hermes sessions cannot be imported by provider resume id",
+                Some(json!({ "agent": agent.as_str() })),
+            ));
+        }
+        AgentKind::Dsh => {
+            return Err(CliError::usage(
+                "unsupported-provider-resume-agent",
+                "dsh sessions are owned by the external dsh-runtime-kit runtime and cannot be imported by provider resume id",
                 Some(json!({ "agent": agent.as_str() })),
             ));
         }
@@ -3162,6 +3184,7 @@ pub(crate) fn resolve_provider_transcript_path_from_roots(
             budget.truncated
         }
         AgentKind::Hermes => return None,
+        AgentKind::Dsh => return None,
     };
     if truncated || matches.len() != 1 {
         return None;
@@ -7953,6 +7976,13 @@ fn start_interactive_tmux(
         AgentKind::Hermes => {
             command.arg("chat");
         }
+        AgentKind::Dsh => {
+            return Err(CliError::usage(
+                "unsupported-start-agent",
+                "dsh sessions are launched by the external dsh-runtime-kit runtime, never by tmux",
+                None,
+            ));
+        }
     }
     command.args(agent_args);
     run_tmux_new_session(command, tmux_bin, record)
@@ -7991,6 +8021,13 @@ fn start_run_tmux(
             return Err(CliError::usage(
                 "unsupported-run-agent",
                 "hermes does not support one-shot run mode; use start --agent hermes",
+                None,
+            ));
+        }
+        AgentKind::Dsh => {
+            return Err(CliError::usage(
+                "unsupported-run-agent",
+                "dsh sessions are launched by the external dsh-runtime-kit runtime, never by tmux",
                 None,
             ));
         }
@@ -8252,7 +8289,7 @@ fn capture_provider_resume_after_launch(
 ) -> Option<ProviderResume> {
     match agent {
         AgentKind::Codex => capture_codex_resume(record, launch_started_at),
-        AgentKind::Claude | AgentKind::Hermes => None,
+        AgentKind::Claude | AgentKind::Hermes | AgentKind::Dsh => None,
     }
 }
 
@@ -10152,6 +10189,7 @@ fn add_runtime_tmux_environment(
             AgentKind::Codex => Some("CODEX_HOME"),
             AgentKind::Claude => Some("CLAUDE_CONFIG_DIR"),
             AgentKind::Hermes => None,
+            AgentKind::Dsh => None,
         };
         if let Some(env_key) = env_key {
             let mut assignment = OsString::from(format!("{env_key}="));
@@ -12091,6 +12129,21 @@ fn delete_session_locked_with_timeouts(
     kill_timeout: Duration,
     verify_timeout: Duration,
 ) -> Result<DeleteResult, CliError> {
+    if dsh_external::is_external_record(&record) {
+        // There is no tmux runtime to terminate. Deleting the durable record
+        // is admitted only once nothing proves the lane may still be running:
+        // a terminated or proven-stopped lane deletes; a live lane must be
+        // interrupted by the plugin first.
+        if dsh_external::external_session_status(&record) == "running" {
+            return Err(session_termination_error(
+                &record,
+                SessionTerminationFailure::StillRunning,
+                SessionTerminationOperation::Delete,
+            ));
+        }
+        let registry_fence = SessionRegistryFence::from_record(&record);
+        return finish_session_delete(context, record, session_dir, registry_fence);
+    }
     let registry_fence = SessionRegistryFence::from_record(&record);
     terminate_tmux_session_with_timeouts(
         context,
@@ -12286,6 +12339,13 @@ pub(crate) fn stop_session_runtime_locked(
     record: &mut SessionRecord,
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
+    if dsh_external::is_external_record(record) {
+        return Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            "dsh worker runtimes are owned by the external dsh-runtime-kit plugin; interrupt the lane there, then reconcile once the liveness sidecar proves the lane stopped",
+            Some(json!({ "id": record.id.clone() })),
+        ));
+    }
     terminate_tmux_session_with_timeouts(
         context,
         record,
@@ -13730,6 +13790,9 @@ pub(crate) struct CoordinationRuntimeEvidence {
 pub(crate) fn coordination_runtime_evidence(
     record: &SessionRecord,
 ) -> Result<CoordinationRuntimeEvidence, CliError> {
+    if dsh_external::is_external_record(record) {
+        return dsh_external::external_runtime_evidence(record);
+    }
     let identity = persisted_tmux_runtime_identity(record)
         .map_err(|_| {
             CliError::runtime(
@@ -15715,6 +15778,9 @@ fn managed_tmux_pane_target(tmux_session: &str) -> String {
 }
 
 fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
+    if dsh_external::is_external_record(record) {
+        return dsh_external::external_session_status(record);
+    }
     live_status(tmux_bin, &record.tmux_session)
 }
 
@@ -15811,6 +15877,7 @@ pub(crate) fn canonical_provider_resume_args(
         ]),
         AgentKind::Claude => Some(vec!["--resume".to_string(), session_id.to_string()]),
         AgentKind::Hermes => None,
+        AgentKind::Dsh => None,
     }
 }
 
@@ -15825,6 +15892,7 @@ fn validate_stored_agent_args(record: &SessionRecord, agent: AgentKind) -> Resul
             .iter()
             .find_map(|arg| reserved_claude_resume_arg(arg)),
         AgentKind::Hermes => None,
+        AgentKind::Dsh => None,
     };
     if let Some(flag) = flag {
         return Err(CliError::data(
@@ -16280,6 +16348,9 @@ fn resolve_agent_bin(agent: AgentKind, explicit: Option<&Path>) -> PathBuf {
         AgentKind::Codex => "AGENT_SESSION_CODEX_BIN",
         AgentKind::Claude => "AGENT_SESSION_CLAUDE_BIN",
         AgentKind::Hermes => "AGENT_SESSION_HERMES_BIN",
+        // Never launched by this crate; the resolved name is only ever used
+        // in typed-refusal diagnostics.
+        AgentKind::Dsh => "AGENT_SESSION_DSH_BIN",
     };
     non_empty_env(env_key)
         .map(PathBuf::from)

@@ -32,7 +32,7 @@ _main-agent() {
         case $line[1] in
             (capabilities)
 _arguments "${_arguments_options[@]}" : \
-'--provider=[Provider runtime whose deployed hook surface must admit checkpoint writes]:PROVIDER:(codex claude)' \
+'--provider=[Provider runtime whose deployed hook surface must admit checkpoint writes]:PROVIDER:(codex claude dsh)' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \

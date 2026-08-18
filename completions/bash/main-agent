@@ -314,7 +314,7 @@ _main__agent() {
             fi
             case "${prev}" in
                 --provider)
-                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh" -- "${cur}"))
                     return 0
                     ;;
                 --format)

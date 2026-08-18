@@ -34,6 +34,10 @@ or integrating a specific subsystem.
 - [Main Agent orchestration v1](specs/main-agent-orchestration-v1.md): durable
   run/assignment schemas, authenticated facade, rehydration, and relationship
   lifecycle.
+- [Main Agent DSH external runtime v1](specs/main-agent-dsh-external-runtime-v1.md):
+  the `launch.agent = "dsh"` worker transport owned by the external
+  dsh-runtime-kit plugin — capabilities probe, external launch contract, and
+  the liveness sidecar.
 
 ## Evidence and migration reports
 

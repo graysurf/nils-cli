@@ -511,6 +511,21 @@ healthy installation to the other provider. Either mixed-deployment direction
 therefore fails before worker launch. The `1.25.11` registry floor alone does
 not prove this additive paired API.
 
+`main-agent capabilities --provider dsh --format json` reports the
+external-runtime contract instead: `capabilities.runtime_hook_checkpoint_write`
+is always `null` (DSH policy v1 admits only native allow/block decisions and
+the store fences every checkpoint), `capabilities.external_runtime` is
+`main-agent.external-runtime.v1` when the sibling `agent-hook` doctor reports
+`dispatch_supported:true` with `registration_owner:"dsh-runtime-kit"`, and
+`compatible` follows that probe. DSH workers are never tmux-launched:
+`worker start` with `launch.agent:"dsh"` requires `--await-ready 0s`, performs
+the identical store bookkeeping, and returns a
+`main-agent.external-launch.v1` payload (byte-stable environment-free prompt,
+exact worker environment, broker heartbeat/stop argv, and the liveness sidecar
+path) that the external dsh-runtime-kit plugin executes. See
+`main-agent-dsh-external-runtime-v1.md` for the full external-runtime
+contract.
+
 The current controller incarnation MUST also pass `main-agent self readiness
 --format json` before `init` or mutation. This authenticates the session and
 requires its exact runtime-derived `AGENT_SESSION_CHECKPOINT_FILE` path to
