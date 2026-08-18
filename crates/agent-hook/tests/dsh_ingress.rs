@@ -1,5 +1,7 @@
 mod support;
 
+use std::fs;
+
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -162,11 +164,92 @@ fn dsh_ingress_enforces_field_boundaries_and_event_identity() {
         Some(&boundary.to_string()),
     );
     assert_eq!(accepted.code, 0, "stderr={}", accepted.stderr_text());
+    let envelope = accepted.stdout_json();
+    let request_id = envelope["data"]["request_id"].clone();
+    let config_digest = envelope["data"]["config_digest"].clone();
+    let policy_digest = envelope["data"]["policy_digest"].clone();
+    assert_eq!(
+        envelope,
+        json!({
+            "schema_version": "cli.agent-hook.dispatch.v1",
+            "ok": true,
+            "data": {
+                "schema_version": "agent-hook.normalized-decision.v1",
+                "request_id": request_id,
+                "product": "dsh",
+                "event": "PreToolUse",
+                "action": "allow",
+                "reasons": [],
+                "config_digest": config_digest,
+                "policy_digest": policy_digest,
+                "recovery_applied": false
+            }
+        })
+    );
+    assert!(
+        envelope["data"]["request_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("request:"))
+    );
+    for field in ["config_digest", "policy_digest"] {
+        assert!(
+            envelope["data"][field]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:")),
+            "field={field}"
+        );
+    }
 }
 
 #[test]
-fn dsh_registration_is_bundle_owned_and_legacy_file_handlers_are_rejected() {
+fn dsh_tool_name_collisions_keep_dsh_cwd_only_target_semantics() {
     let fixture = Fixture::new(POLICY);
+
+    for tool_name in ["Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"] {
+        let mut collision: serde_json::Value =
+            serde_json::from_str(&request(&fixture)).expect("request JSON");
+        collision["tool"]["name"] = json!(tool_name);
+        collision["tool"]["arguments"] = json!({});
+        let output = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&collision.to_string()),
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "tool={tool_name} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "allow");
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn dsh_registration_is_bundle_owned_and_legacy_file_handlers_are_rejected() { // stale-audit: keep-contract
+    let fixture = Fixture::new(POLICY);
+    let dsh_config = fixture.home.join(".dsh/cordis.patch.yml");
+    for action in ["--apply", "--repair", "--remove"] {
+        let output = fixture.run(&["setup", "--product", "dsh", action, "--format", "json"], None);
+        assert_eq!(output.code, 0, "action={action} stderr={}", output.stderr_text());
+        assert_eq!(output.stdout_json()["data"]["status"], "unsupported", "action={action}");
+        assert_eq!(output.stdout_json()["data"]["changed"], false, "action={action}");
+        assert!(!dsh_config.exists(), "action={action} created an absent DSH config");
+    }
+
+    fs::create_dir_all(dsh_config.parent().expect("DSH config parent")).expect("DSH config dir");
+    let sentinel = b"foreign: cordis-registration\n";
+    fs::write(&dsh_config, sentinel).expect("DSH config sentinel");
+    Fixture::set_private(&dsh_config);
+    for action in ["--apply", "--repair", "--remove"] {
+        let output = fixture.run(&["setup", "--product", "dsh", action, "--format", "json"], None);
+        assert_eq!(output.code, 0, "action={action} stderr={}", output.stderr_text());
+        assert_eq!(output.stdout_json()["data"]["status"], "unsupported", "action={action}");
+        assert_eq!(output.stdout_json()["data"]["changed"], false, "action={action}");
+        assert_eq!(fs::read(&dsh_config).expect("DSH config sentinel retained"), sentinel, "action={action}");
+    }
+
     let setup = fixture.run(
         &["setup", "--product", "dsh", "--dry-run", "--format", "json"],
         None,
@@ -237,7 +320,7 @@ fn dsh_v1_rejects_capabilities_without_native_decision_or_target_semantics() {
                 r#"capability = { id = "decision.context.v1", reason_code = "context", text = "context" }"#
             }
             "agent-session.owner-liveness.v1" => {
-                r#"capability = { id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 60 }"#
+                r#"capability = { id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 60 }"# // stale-audit: keep-contract
             }
             "agent-session.activity.v1" => {
                 r#"capability = { id = "agent-session.activity.v1", reason_code = "activity" }"#

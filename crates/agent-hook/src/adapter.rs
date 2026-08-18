@@ -126,55 +126,7 @@ pub fn normalize(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
-    let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
-    let target_count = target_paths.len();
-    let mut binding_paths = target_paths;
-    if let Some(execution_path) = execution_path.as_ref() {
-        binding_paths.push(execution_path.clone());
-    }
-    let mut resolved_bindings = resolve_target_bindings(&binding_paths)?;
-    let execution_binding = execution_path
-        .as_ref()
-        .and_then(|_| resolved_bindings.pop());
-    debug_assert_eq!(resolved_bindings.len(), target_count);
-    let mut target_bindings = resolved_bindings;
-    deduplicate_target_bindings(&mut target_bindings);
-    let target_material = target_set_binding_material(&target_bindings)?;
-    let mut binding_roots = target_bindings
-        .iter()
-        .map(|binding| binding.binding_root.clone())
-        .collect::<Vec<_>>();
-    if let Some(binding) = execution_binding {
-        binding_roots.push(binding.binding_root);
-    }
-    deduplicate_paths(&mut binding_roots);
-    let target_paths = target_bindings
-        .into_iter()
-        .map(|binding| binding.effective_path)
-        .collect();
-    let command_material = command_text(object)
-        .unwrap_or("command-unavailable")
-        .as_bytes();
-    let snapshot_digest = digest(input);
-    let request_id = format!("request:{}", &snapshot_digest[7..39]);
-    Ok(NormalizedRequest {
-        schema_version: REQUEST_VERSION.to_string(),
-        request_id,
-        product,
-        event,
-        matcher,
-        target_digest: digest(&target_material),
-        command_digest: digest(command_material),
-        snapshot_digest,
-        worktree_fingerprint: None,
-        // Provider payload fields are untrusted and deliberately ignored. The
-        // dispatcher replaces this with a #676 registry-derived projection.
-        semantic_conflict: None,
-        stop_reentry: stop_reentry(object),
-        target_paths,
-        execution_path,
-        binding_roots,
-    })
+    finalize_normalized_request(product, event, matcher, input, object, stop_reentry(object))
 }
 
 fn normalize_dsh(
@@ -236,8 +188,25 @@ fn normalize_dsh(
     canonical.insert("tool_input".to_string(), ingress.tool.arguments);
 
     let matcher = Some(ingress.tool.name);
-    let (target_paths, execution_path) =
-        target_paths(Product::Dsh, &canonical, matcher.as_deref())?;
+    finalize_normalized_request(
+        Product::Dsh,
+        event.to_string(),
+        matcher,
+        input,
+        &canonical,
+        None,
+    )
+}
+
+fn finalize_normalized_request(
+    product: Product,
+    event: String,
+    matcher: Option<String>,
+    input: &[u8],
+    object: &Map<String, Value>,
+    stop_reentry: Option<bool>,
+) -> Result<NormalizedRequest, HookError> {
+    let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
     let target_count = target_paths.len();
     let mut binding_paths = target_paths;
     if let Some(execution_path) = execution_path.as_ref() {
@@ -263,7 +232,7 @@ fn normalize_dsh(
         .into_iter()
         .map(|binding| binding.effective_path)
         .collect();
-    let command_material = command_text(&canonical)
+    let command_material = command_text(object)
         .unwrap_or("command-unavailable")
         .as_bytes();
     let snapshot_digest = digest(input);
@@ -272,15 +241,18 @@ fn normalize_dsh(
     Ok(NormalizedRequest {
         schema_version: REQUEST_VERSION.to_string(),
         request_id,
-        product: Product::Dsh,
-        event: event.to_string(),
+        product,
+        event,
         matcher,
         target_digest: digest(&target_material),
         command_digest: digest(command_material),
         snapshot_digest,
         worktree_fingerprint: None,
         semantic_conflict: None,
-        stop_reentry: None,
+        // Provider payload fields are untrusted and deliberately ignored. The
+        // dispatcher replaces semantic conflict state with a registry-derived
+        // projection. Only the separately validated Stop re-entry fact remains.
+        stop_reentry,
         target_paths,
         execution_path,
         binding_roots,
@@ -658,35 +630,39 @@ fn target_paths(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
     let nested = object.get("tool_input").and_then(Value::as_object);
-    let mut targets = match matcher {
-        Some("Write" | "Edit" | "MultiEdit") => {
-            let input = mutation_input(nested)?;
-            let path = exactly_one_path(input, &["path", "file_path"])?;
-            vec![resolve_mutation_target(path, execution.as_deref())?]
+    let mut targets = if product == Product::Dsh {
+        execution.iter().cloned().collect()
+    } else {
+        match matcher {
+            Some("Write" | "Edit" | "MultiEdit") => {
+                let input = mutation_input(nested)?;
+                let path = exactly_one_path(input, &["path", "file_path"])?;
+                vec![resolve_mutation_target(path, execution.as_deref())?]
+            }
+            Some("NotebookEdit") => {
+                let input = mutation_input(nested)?;
+                let path = required_string(input.get("notebook_path"))?;
+                vec![resolve_mutation_target(path, execution.as_deref())?]
+            }
+            Some("apply_patch") if product == Product::Codex => {
+                let input = mutation_input(nested)?;
+                let patch = match input.get("command") {
+                    Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
+                    _ => {
+                        return Err(untrusted_target(
+                            "Codex apply_patch mutation must contain a non-empty command string",
+                        ));
+                    }
+                };
+                parse_apply_patch_targets(patch, execution.as_deref())?
+            }
+            Some("apply_patch") => {
+                return Err(untrusted_target(
+                    "apply_patch mutation has no documented native mapping for this provider",
+                ));
+            }
+            _ => execution.iter().cloned().collect(),
         }
-        Some("NotebookEdit") => {
-            let input = mutation_input(nested)?;
-            let path = required_string(input.get("notebook_path"))?;
-            vec![resolve_mutation_target(path, execution.as_deref())?]
-        }
-        Some("apply_patch") if product == Product::Codex => {
-            let input = mutation_input(nested)?;
-            let patch = match input.get("command") {
-                Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
-                _ => {
-                    return Err(untrusted_target(
-                        "Codex apply_patch mutation must contain a non-empty command string",
-                    ));
-                }
-            };
-            parse_apply_patch_targets(patch, execution.as_deref())?
-        }
-        Some("apply_patch") => {
-            return Err(untrusted_target(
-                "apply_patch mutation has no documented native mapping for this provider",
-            ));
-        }
-        _ => execution.iter().cloned().collect(),
     };
     deduplicate_targets(&mut targets);
     Ok((targets, execution))
