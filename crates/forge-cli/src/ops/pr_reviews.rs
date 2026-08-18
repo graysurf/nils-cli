@@ -22,11 +22,13 @@ pub const SCHEMA_VERSION: u32 = 1;
 const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
 pub(crate) const MAX_PENDING_REVIEW_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PENDING_REVIEW_COMMENTS: u64 = 1_000;
+pub(crate) const MAX_PENDING_REVIEW_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body viewerDidAuthor } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEW_TARGET_QUERY: &str = "query($review: ID!) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 1) { totalCount } pullRequest { number url headRefOid } } } }";
-const GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY: &str = "query($review: ID!, $after: String) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 100, after: $after) { totalCount nodes { id url author { login } body createdAt path line originalLine diffSide startLine originalStartLine startDiffSide subjectType } pageInfo { hasNextPage endCursor } } pullRequest { number url headRefOid } } } }";
+const GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY: &str = "query($review: ID!, $after: String) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 100, after: $after) { totalCount nodes { id url author { login } body createdAt path diffHunk line originalLine startLine originalStartLine subjectType } pageInfo { hasNextPage endCursor } } pullRequest { number url headRefOid } } } }";
 
 struct ReviewPage {
     viewer_login: String,
@@ -395,6 +397,26 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
                 ))
             };
         };
+        if page.total_count > MAX_PENDING_REVIEW_COMMENTS {
+            return Err(snapshot_incomplete(
+                "pending review inline-comment count exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; total_count={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
+                    page.total_count
+                )),
+            ));
+        }
+        if let Some(total) = expected_total
+            && page.total_count != total
+        {
+            return Err(snapshot_incomplete(
+                "pending review inline-comment count changed while paginating",
+                Some(format!(
+                    "review_id={review_id}; expected_total={total}; observed_total={}",
+                    page.total_count
+                )),
+            ));
+        }
         if let Some(existing) = snapshot.as_mut() {
             validate_snapshot_page_identity(existing, &page.snapshot)?;
             existing
@@ -403,6 +425,33 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
         } else {
             expected_total = Some(page.total_count);
             snapshot = Some(page.snapshot);
+        }
+        let retained = snapshot.as_ref().expect("page created a snapshot");
+        if retained.inline_comments.len() as u64 > MAX_PENDING_REVIEW_COMMENTS {
+            return Err(snapshot_incomplete(
+                "pending review retained inline-comment count exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; observed_comments={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
+                    retained.inline_comments.len()
+                )),
+            ));
+        }
+        let retained_bytes = serde_json::to_vec(retained)
+            .map_err(|error| {
+                ForgeError::software(
+                    schema_err(),
+                    "failed to size pending-review snapshot",
+                    Some(error.to_string()),
+                )
+            })?
+            .len();
+        if retained_bytes > MAX_PENDING_REVIEW_SNAPSHOT_BYTES {
+            return Err(snapshot_incomplete(
+                "pending review decoded snapshot exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; retained_bytes={retained_bytes}; max_bytes={MAX_PENDING_REVIEW_SNAPSHOT_BYTES}"
+                )),
+            ));
         }
         if !page.has_next_page {
             let mut snapshot = snapshot.expect("page created a snapshot");
@@ -955,6 +1004,23 @@ fn parse_github_pending_review_snapshot_page(
             let semantic_body = review_state::strip_owned_markers(&body);
             let body_digest = review_state::sha256_digest(semantic_body.as_bytes());
             let line = optional_u32(comment, "/line");
+            let original_line = optional_u32(comment, "/originalLine");
+            let start_line = optional_u32(comment, "/startLine");
+            let original_start_line = optional_u32(comment, "/originalStartLine");
+            let subject_type = optional_string(comment, "/subjectType")
+                .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string());
+            let diff_side = normalized_comment_side(
+                comment,
+                "/diffSide",
+                line.or(original_line),
+                &subject_type,
+            )?;
+            let start_diff_side = normalized_comment_side(
+                comment,
+                "/startDiffSide",
+                start_line.or(original_start_line),
+                &subject_type,
+            )?;
             Ok(PendingReviewInlineComment {
                 id: required_string(comment, "/id", "review.comment.id")?,
                 url: required_string(comment, "/url", "review.comment.url")?,
@@ -966,13 +1032,12 @@ fn parse_github_pending_review_snapshot_page(
                 created_at: required_string(comment, "/createdAt", "review.comment.createdAt")?,
                 path: optional_string(comment, "/path").unwrap_or_default(),
                 line,
-                original_line: optional_u32(comment, "/originalLine"),
-                diff_side: optional_string(comment, "/diffSide"),
-                start_line: optional_u32(comment, "/startLine"),
-                original_start_line: optional_u32(comment, "/originalStartLine"),
-                start_diff_side: optional_string(comment, "/startDiffSide"),
-                subject_type: optional_string(comment, "/subjectType")
-                    .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string()),
+                original_line,
+                diff_side,
+                start_line,
+                original_start_line,
+                start_diff_side,
+                subject_type,
                 body_digest,
             })
         })
@@ -1021,6 +1086,91 @@ fn parse_github_pending_review_snapshot_page(
             snapshot_digest: String::new(),
         },
     }))
+}
+
+fn normalized_comment_side(
+    comment: &serde_json::Value,
+    direct_pointer: &str,
+    anchor_line: Option<u32>,
+    subject_type: &str,
+) -> Result<Option<String>, ForgeError> {
+    if let Some(side) = optional_string(comment, direct_pointer) {
+        return Ok(Some(side));
+    }
+    if subject_type == "FILE" || anchor_line.is_none() {
+        return Ok(None);
+    }
+    let diff_hunk = required_string(comment, "/diffHunk", "review.comment.diffHunk")?;
+    let side = infer_side_from_diff_hunk(&diff_hunk, anchor_line.expect("checked above"))
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review comment diff side cannot be derived from its diff hunk",
+                optional_string(comment, "/id").map(|id| {
+                    format!(
+                        "comment_id={id}; anchor_line={}",
+                        anchor_line.expect("checked above")
+                    )
+                }),
+            )
+        })?;
+    Ok(Some(side.to_string()))
+}
+
+fn infer_side_from_diff_hunk(diff_hunk: &str, anchor_line: u32) -> Option<&'static str> {
+    let mut old_line = None;
+    let mut new_line = None;
+    let mut candidates = Vec::new();
+
+    for row in diff_hunk.lines() {
+        if row.starts_with("@@") {
+            let (old_start, new_start) = parse_diff_hunk_starts(row)?;
+            old_line = Some(old_start);
+            new_line = Some(new_start);
+            continue;
+        }
+        let (Some(old), Some(new)) = (old_line.as_mut(), new_line.as_mut()) else {
+            continue;
+        };
+        match row.as_bytes().first().copied() {
+            Some(b'+') => {
+                if *new == anchor_line {
+                    candidates.push("RIGHT");
+                }
+                *new = new.saturating_add(1);
+            }
+            Some(b'-') => {
+                if *old == anchor_line {
+                    candidates.push("LEFT");
+                }
+                *old = old.saturating_add(1);
+            }
+            Some(b' ') => {
+                if *new == anchor_line {
+                    // GitHub normalizes unchanged context anchors to RIGHT.
+                    candidates.push("RIGHT");
+                }
+                *old = old.saturating_add(1);
+                *new = new.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    let side = candidates.first().copied()?;
+    candidates
+        .iter()
+        .all(|candidate| *candidate == side)
+        .then_some(side)
+}
+
+fn parse_diff_hunk_starts(header: &str) -> Option<(u32, u32)> {
+    let body = header.strip_prefix("@@ -")?;
+    let (old_span, rest) = body.split_once(" +")?;
+    let (new_span, _) = rest.split_once(" @@")?;
+    Some((
+        old_span.split(',').next()?.parse().ok()?,
+        new_span.split(',').next()?.parse().ok()?,
+    ))
 }
 
 fn validate_snapshot_page_identity(
@@ -1456,8 +1606,119 @@ mod tests {
             build_github_pending_review_target_page_call(&github_ctx(), "PRR_pending", None)
                 .plan_argv()
                 .join(" ");
-        assert!(pending.contains("diffSide"), "{pending}");
-        assert!(pending.contains("startDiffSide"), "{pending}");
+        assert!(pending.contains("diffHunk"), "{pending}");
+        assert!(!pending.contains(" diffSide"), "{pending}");
+        assert!(!pending.contains(" startDiffSide"), "{pending}");
+    }
+
+    #[test]
+    fn pending_snapshot_derives_normalized_sides_from_supported_comment_fields() {
+        let snapshot_without_side_fields = |spec: PendingSnapshotPageSpec<'_>, diff_hunk: &str| {
+            let mut output = pending_snapshot_page(spec);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            let comment = value
+                .pointer_mut("/data/node/comments/nodes/0")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("comment object");
+            comment.remove("diffSide");
+            comment.remove("startDiffSide");
+            comment.insert("diffHunk".into(), diff_hunk.into());
+            output.stdout = value.to_string();
+            output
+        };
+
+        let right_range = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_right",
+                path: "src/new.rs",
+                line: 9,
+                diff_side: "RIGHT",
+                start_line: Some(7),
+                start_diff_side: Some("RIGHT"),
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -7,0 +7,3 @@\n+first\n+middle\n+last",
+        );
+        let page = parse_github_pending_review_snapshot_page(&right_range, "PENDING")
+            .expect("supported GraphQL fields parse")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert_eq!(
+            page.snapshot.inline_comments[0].start_diff_side.as_deref(),
+            Some("RIGHT")
+        );
+
+        let left_line = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_left",
+                path: "src/old.rs",
+                line: 8,
+                diff_side: "LEFT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -8,1 +8,0 @@\n-old value",
+        );
+        let page = parse_github_pending_review_snapshot_page(&left_line, "PENDING")
+            .expect("supported GraphQL fields parse")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("LEFT")
+        );
+
+        let mut direct_side = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_direct",
+            path: "src/replaced.rs",
+            line: 8,
+            diff_side: "LEFT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&direct_side.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["nodes"][0]["diffHunk"] =
+            "@@ -8,1 +8,1 @@\n-old value\n+new value".into();
+        direct_side.stdout = value.to_string();
+        let page = parse_github_pending_review_snapshot_page(&direct_side, "PENDING")
+            .expect("direct provider discriminator parses")
+            .expect("pending snapshot");
+        assert_eq!(
+            page.snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("LEFT")
+        );
+
+        let ambiguous = snapshot_without_side_fields(
+            PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_ambiguous",
+                path: "src/replaced.rs",
+                line: 8,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            },
+            "@@ -8,1 +8,1 @@\n-old value\n+new value",
+        );
+        let error = match parse_github_pending_review_snapshot_page(&ambiguous, "PENDING") {
+            Err(error) => error,
+            Ok(_) => panic!("same-number replacement without a side discriminator is ambiguous"),
+        };
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
     }
 
     #[test]
@@ -1532,6 +1793,152 @@ mod tests {
         let error = compute_pending_snapshot(&drifted, &github_ctx(), "PRR_pending")
             .expect_err("metadata drift between pages must fail closed");
         assert_eq!(error.kind(), "review_snapshot_incomplete");
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_excessive_total_count_before_following_pages() {
+        let mut first = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_1",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: true,
+            end_cursor: Some("cursor-1"),
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&first.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["totalCount"] = (MAX_PENDING_REVIEW_COMMENTS + 1).into();
+        first.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![first]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("oversized aggregate count must fail before another page");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_cross_page_total_count_drift() {
+        let first = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_1",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: true,
+            end_cursor: Some("cursor-1"),
+        });
+        let mut second = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_2",
+            path: "src/two.rs",
+            line: 2,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&second.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["totalCount"] = 3.into();
+        second.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![first, second]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("totalCount drift across pages must fail closed");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_more_than_one_thousand_accumulated_nodes() {
+        let page = |id: &'static str, node_count: usize, has_next_page, end_cursor| {
+            let mut output = pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id,
+                path: "src/many.rs",
+                line: 1,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page,
+                end_cursor,
+            });
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            let node = value["data"]["node"]["comments"]["nodes"][0].clone();
+            value["data"]["node"]["comments"]["totalCount"] = MAX_PENDING_REVIEW_COMMENTS.into();
+            value["data"]["node"]["comments"]["nodes"] = vec![node; node_count].into();
+            output.stdout = value.to_string();
+            output
+        };
+        let runner = ScriptedRunner::new(vec![
+            page("PRRC_1", 501, true, Some("cursor-1")),
+            page("PRRC_2", 500, false, None),
+        ]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("accumulated nodes above the safety limit must fail closed");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_terminal_actual_count_mismatch() {
+        let runner = ScriptedRunner::new(vec![pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_only",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        })]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("terminal observed node count must match totalCount");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_multi_page_retained_byte_exhaustion() {
+        let oversized_body = "x".repeat(MAX_PENDING_REVIEW_SNAPSHOT_BYTES / 3 + 1);
+        let page = |id: &'static str, has_next_page, end_cursor| {
+            let mut output = pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id,
+                path: "src/large.rs",
+                line: 1,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page,
+                end_cursor,
+            });
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            value["data"]["node"]["comments"]["nodes"][0]["body"] = oversized_body.clone().into();
+            output.stdout = value.to_string();
+            output
+        };
+        let runner = ScriptedRunner::new(vec![
+            page("PRRC_1", true, Some("cursor-1")),
+            page("PRRC_2", false, None),
+        ]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("decoded retained aggregate bytes must be bounded");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
     }
 
     #[test]

@@ -390,6 +390,23 @@ fn validate_capability_binding(
     event: &str,
     capability: &Capability,
 ) -> Result<(), HookError> {
+    if product == Product::Dsh && matches!(capability, Capability::RuntimeKitHandler { .. }) {
+        return Err(HookError::data(
+            "policy-capability-event-unsupported",
+            "DSH policy cannot invoke retired runtime-kit file handlers",
+        ));
+    }
+    if product == Product::Dsh
+        && !matches!(
+            capability,
+            Capability::Allow { .. } | Capability::Block { .. }
+        )
+    {
+        return Err(HookError::data(
+            "policy-capability-event-unsupported",
+            "DSH policy v1 supports only native allow and block decisions",
+        ));
+    }
     if matches!(capability, Capability::SessionCoordination { .. }) && !product.enforceable() {
         return Err(HookError::data(
             "policy-capability-event-unsupported",
@@ -447,6 +464,7 @@ fn supports_context(product: Product, event: &str) -> bool {
                 | "SubagentStop"
                 | "Stop"
         ),
+        Product::Dsh => false,
         Product::Hermes => false,
     }
 }
@@ -479,6 +497,7 @@ fn supports_block(product: Product, event: &str) -> bool {
                 | "Elicitation"
                 | "ElicitationResult"
         ),
+        Product::Dsh => event == "PreToolUse",
         Product::Hermes => false,
     }
 }
@@ -487,6 +506,7 @@ fn supports_transform(product: Product, event: &str) -> bool {
     match product {
         Product::Codex => event == "PreToolUse",
         Product::Claude => matches!(event, "PreToolUse" | "PermissionRequest" | "PostToolUse"),
+        Product::Dsh => false,
         Product::Hermes => false,
     }
 }
@@ -629,6 +649,7 @@ pub fn supported_event(product: Product, event: &str) -> bool {
                 | "Elicitation"
                 | "ElicitationResult"
         ),
+        Product::Dsh => event == "PreToolUse",
         Product::Hermes => matches!(
             event,
             "pre_llm_call" | "post_llm_call" | "pre_approval_request" | "post_approval_response"
@@ -640,7 +661,7 @@ pub fn matcher_input_field(product: Product, event: &str) -> Option<&'static str
     match (product, event) {
         (Product::Codex | Product::Claude, "SessionStart") => Some("source"),
         (
-            Product::Codex | Product::Claude,
+            Product::Codex | Product::Claude | Product::Dsh,
             "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure",
         ) => Some("tool_name"),
         (Product::Codex | Product::Claude, "PreCompact") | (Product::Codex, "PostCompact") => {

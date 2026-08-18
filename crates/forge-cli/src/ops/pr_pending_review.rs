@@ -1,10 +1,16 @@
 //! Authenticated recovery for provider-valid pending GitHub reviews.
 
-use std::fs;
+use std::env;
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendRunner, BackendSuccess};
 use crate::cli::{
@@ -39,8 +45,30 @@ pub struct PrPendingReviewSubmitPayload {
     pub head_sha: String,
     pub commit_sha: String,
     pub snapshot_digest: String,
+    pub snapshot_provenance: &'static str,
     pub review_run_id: Option<String>,
     pub submitted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrPendingReviewResumeSubmitPayload {
+    pub provider: &'static str,
+    pub number: u64,
+    pub url: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub head_sha: String,
+    pub commit_sha: String,
+    pub snapshot_digest: Option<String>,
+    pub snapshot_provenance: &'static str,
+    pub review_run_id: String,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitContract {
+    DirectV1,
+    ResumeV2,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -157,6 +185,9 @@ pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             format,
         );
     };
+    ensure_pending_author(&snapshot)?;
+    let _lease = acquire_pending_review_lease(&ctx, &view, &snapshot.author)?;
+    let snapshot = reload_pending_snapshot(runner, &ctx, &view, &args.review)?;
     validate_snapshot_cas(
         &snapshot,
         &args.expected_head,
@@ -192,7 +223,7 @@ pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view,
         snapshot,
         args.decision,
-        "pr.pending-review.resume-submit",
+        SubmitContract::ResumeV2,
         format,
     )
 }
@@ -215,6 +246,9 @@ pub fn run_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 ) -> Result<i32, ForgeError> {
     let (ctx, view, snapshot) =
         load_pending_snapshot(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    ensure_pending_author(&snapshot)?;
+    let _lease = acquire_pending_review_lease(&ctx, &view, &snapshot.author)?;
+    let snapshot = reload_pending_snapshot(runner, &ctx, &view, &args.review)?;
     validate_snapshot_cas(
         &snapshot,
         &args.expected_head,
@@ -235,7 +269,7 @@ pub fn run_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         view,
         snapshot,
         args.decision,
-        "pr.pending-review.submit",
+        SubmitContract::DirectV1,
         format,
     )
 }
@@ -258,6 +292,9 @@ pub fn run_discard_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 ) -> Result<i32, ForgeError> {
     let (ctx, view, snapshot) =
         load_pending_snapshot(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    ensure_pending_author(&snapshot)?;
+    let _lease = acquire_pending_review_lease(&ctx, &view, &snapshot.author)?;
+    let snapshot = reload_pending_snapshot(runner, &ctx, &view, &args.review)?;
     validate_snapshot_cas(
         &snapshot,
         &args.expected_head,
@@ -284,21 +321,11 @@ pub fn run_discard_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             )),
         ));
     }
-    let output = runner.run(&pr_review::build_github_delete_pending_review_call(
+    let mutation = runner.run(&pr_review::build_github_delete_pending_review_call(
         &ctx,
         &snapshot.review_id,
-    ))?;
-    let (deleted_id, deleted_url) = parse_deleted_review(&output)?;
-    if deleted_id != snapshot.review_id {
-        return Err(ForgeError::software(
-            schema_err(),
-            "GitHub returned a different review after pending-review discard",
-            Some(format!(
-                "expected_review_id={}; provider_review_id={deleted_id}",
-                snapshot.review_id
-            )),
-        ));
-    }
+    ));
+    let deleted_url = reconcile_deleted_snapshot(runner, &ctx, &snapshot, mutation)?;
     let commit_sha = snapshot.commit_sha.clone().expect("CAS checked commit");
     let inline_comment_count = snapshot.inline_comments.len();
     Ok(emit_success(
@@ -403,22 +430,40 @@ pub fn run_delete_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let pending = &target.review;
-    let deleted_output = runner.run(&pr_review::build_github_delete_pending_review_call(
-        &ctx,
-        &pending.id,
-    ))?;
-    let (deleted_id, deleted_url) = parse_deleted_review(&deleted_output)?;
-    if deleted_id != pending.id {
-        return Err(ForgeError::software(
+    let _lease = acquire_pending_review_lease(&ctx, &view, &target.review.author)?;
+    let target = pr_reviews::compute_pending_target(runner, &ctx, &args.review)?
+        .ok_or_else(|| pending_not_found(args.id, &args.review))?;
+    if target.number != view.number || target.pr_url != view.url || target.review.id != args.review
+    {
+        return Err(ForgeError::validation(
             schema_err(),
-            "GitHub returned a different review after pending-review deletion",
+            "pending_review_pr_mismatch",
+            "the pending review target no longer belongs to the named pull request",
             Some(format!(
-                "expected_review_id={}; provider_review_id={deleted_id}",
-                pending.id
+                "expected_pr={}; provider_pr={}; review_id={}",
+                view.number, target.number, args.review
             )),
         ));
     }
+    validate_pending_guard(&target.review, &target.head_sha, &args, &expected_body)?;
+    if target.inline_comment_count != 0 {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_inline_comments_present",
+            "pending reviews with inline draft comments require manual recovery",
+            Some(format!(
+                "review_id={}; inline_comment_count={}",
+                target.review.id, target.inline_comment_count
+            )),
+        ));
+    }
+
+    let pending = &target.review;
+    let mutation = runner.run(&pr_review::build_github_delete_pending_review_call(
+        &ctx,
+        &pending.id,
+    ));
+    let deleted_url = reconcile_deleted_target(runner, &ctx, &target, mutation)?;
 
     let payload = PrPendingReviewDeletePayload {
         provider: ctx.provider.as_str(),
@@ -516,10 +561,27 @@ fn emit_already_submitted<R: BackendRunner>(
     review_run_id: &str,
     expected_head: &str,
     expected_commit: &str,
-    expected_snapshot: &str,
+    _expected_snapshot: &str,
     decision: PrReviewDecision,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    let initial_reviews = pr_reviews::compute_for_pr(runner, ctx, view.number, &view.url)?;
+    if initial_reviews.viewer_login.is_empty() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_identity_mismatch",
+            "the authenticated GitHub viewer identity is unavailable",
+            Some(format!("review_id={review_id}")),
+        ));
+    }
+    let _lease = acquire_pending_review_lease(ctx, &view, &initial_reviews.viewer_login)?;
+    if pr_reviews::compute_pending_snapshot(runner, ctx, review_id)?.is_some() {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the pending review changed while entering submitted-review recovery",
+            format!("review_id={review_id}"),
+        ));
+    }
     let reviews = pr_reviews::compute_for_pr(runner, ctx, view.number, &view.url)?;
     if reviews.head_sha != expected_head {
         return Err(expected_mismatch(
@@ -609,7 +671,7 @@ fn emit_already_submitted<R: BackendRunner>(
         ));
     }
     validate_snapshot_against_receipt(&submitted_snapshot, &receipt)?;
-    let payload = PrPendingReviewSubmitPayload {
+    let payload = PrPendingReviewResumeSubmitPayload {
         provider: ctx.provider.as_str(),
         number: view.number,
         url: view.url,
@@ -617,12 +679,13 @@ fn emit_already_submitted<R: BackendRunner>(
         review_url: submitted.url.clone(),
         head_sha: reviews.head_sha,
         commit_sha: submitted.commit_sha.clone(),
-        snapshot_digest: expected_snapshot.to_string(),
-        review_run_id: Some(review_run_id.to_string()),
+        snapshot_digest: None,
+        snapshot_provenance: "pending-snapshot-unverified",
+        review_run_id: review_run_id.to_string(),
         submitted: true,
     };
     Ok(emit_success(
-        schema_version_for(BINARY, "pr.pending-review.resume-submit", 1),
+        schema_version_for(BINARY, "pr.pending-review.resume-submit", 2),
         payload,
         format,
         |payload| {
@@ -738,14 +801,23 @@ fn validate_snapshot_against_receipt(
         .zip(&receipt.inline_manifest)
         .enumerate()
     {
-        let matches = expected.index == index
-            && comment.review_run_id.as_deref() == Some(receipt.review_run_id.as_str())
-            && comment.path == expected.path
+        let file_anchor_matches = comment.subject_type == "FILE"
+            && expected.subject_type == "FILE"
+            && comment.line.is_none()
+            && comment.diff_side.is_none()
+            && comment.start_line.is_none()
+            && comment.start_diff_side.is_none();
+        let line_anchor_matches = comment.subject_type != "FILE"
+            && expected.subject_type != "FILE"
             && comment.line == expected.line
             && comment.diff_side.as_deref() == Some(expected.side.as_str())
             && comment.start_line == expected.start_line
-            && comment.start_diff_side == expected.start_side
+            && comment.start_diff_side == expected.start_side;
+        let matches = expected.index == index
+            && comment.review_run_id.as_deref() == Some(receipt.review_run_id.as_str())
+            && comment.path == expected.path
             && comment.subject_type == expected.subject_type
+            && (file_anchor_matches || line_anchor_matches)
             && comment.body_digest == expected.body_digest;
         if !matches {
             return Err(expected_mismatch(
@@ -806,7 +878,7 @@ fn submit_snapshot<R: BackendRunner>(
     view: pr_view::PrViewPayload,
     snapshot: pr_reviews::PendingReviewSnapshot,
     decision: PrReviewDecision,
-    schema: &str,
+    contract: SubmitContract,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     if !snapshot.viewer_did_author {
@@ -820,39 +892,372 @@ fn submit_snapshot<R: BackendRunner>(
             )),
         ));
     }
-    let output = runner.run(&pr_review::build_github_submit_review_call(
+    let mutation = runner.run(&pr_review::build_github_submit_review_call(
         ctx,
         &snapshot.review_id,
         decision.to_github_event(),
         Some(snapshot.body.as_str()),
-    ))?;
-    let review_url = pr_review::parse_submitted_review_url(&output)
-        .unwrap_or_else(|| snapshot.review_url.clone());
+    ));
+    let expected_state = match decision {
+        PrReviewDecision::CommentsOnly => "COMMENTED",
+        PrReviewDecision::Approve => "APPROVED",
+        PrReviewDecision::RequestChanges => "CHANGES_REQUESTED",
+    };
+    let submitted = pr_reviews::compute_submitted_review_snapshot(
+        runner,
+        ctx,
+        &snapshot.review_id,
+        expected_state,
+    )?
+    .ok_or_else(|| reconciliation_failed(&snapshot.review_id, mutation.as_ref().err()))?;
+    validate_submitted_reconciliation(&snapshot, &submitted)?;
+    if let Ok(output) = mutation.as_ref()
+        && let Some(returned_url) = pr_review::parse_submitted_review_url(output)
+        && returned_url != submitted.review_url
+    {
+        return Err(reconciliation_failed(
+            &snapshot.review_id,
+            Some(&ForgeError::software(
+                schema_err(),
+                "GitHub returned a different submitted review URL",
+                Some(format!(
+                    "mutation_url={returned_url}; reconciled_url={}",
+                    submitted.review_url
+                )),
+            )),
+        ));
+    }
     let commit_sha = snapshot.commit_sha.clone().expect("CAS checked commit");
-    Ok(emit_success(
-        schema_version_for(BINARY, schema, 1),
-        PrPendingReviewSubmitPayload {
-            provider: ctx.provider.as_str(),
-            number: view.number,
-            url: view.url,
-            review_id: snapshot.review_id,
-            review_url,
-            head_sha: snapshot.head_sha,
-            commit_sha,
-            snapshot_digest: snapshot.snapshot_digest,
-            review_run_id: snapshot.review_run_id,
-            submitted: true,
-        },
-        format,
-        |payload| {
-            println!(
-                "submitted pending review {review} on #{number}\n  {url}",
-                review = payload.review_id,
-                number = payload.number,
-                url = payload.review_url
-            );
-        },
+    let provider = ctx.provider.as_str();
+    let number = view.number;
+    let url = view.url;
+    let review_id = snapshot.review_id;
+    let review_url = submitted.review_url;
+    let head_sha = snapshot.head_sha;
+    let snapshot_digest = snapshot.snapshot_digest;
+    let review_run_id = snapshot.review_run_id;
+    Ok(match contract {
+        SubmitContract::DirectV1 => emit_success(
+            schema_version_for(BINARY, "pr.pending-review.submit", 1),
+            PrPendingReviewSubmitPayload {
+                provider,
+                number,
+                url,
+                review_id,
+                review_url,
+                head_sha,
+                commit_sha,
+                snapshot_digest,
+                snapshot_provenance: "pending-cas+submitted-reconciled",
+                review_run_id,
+                submitted: true,
+            },
+            format,
+            |payload| {
+                println!(
+                    "submitted pending review {review} on #{number}\n  {url}",
+                    review = payload.review_id,
+                    number = payload.number,
+                    url = payload.review_url
+                );
+            },
+        ),
+        SubmitContract::ResumeV2 => emit_success(
+            schema_version_for(BINARY, "pr.pending-review.resume-submit", 2),
+            PrPendingReviewResumeSubmitPayload {
+                provider,
+                number,
+                url,
+                review_id,
+                review_url,
+                head_sha,
+                commit_sha,
+                snapshot_digest: Some(snapshot_digest),
+                snapshot_provenance: "pending-cas+submitted-reconciled",
+                review_run_id: review_run_id.expect("receipt-bound recovery checked review run"),
+                submitted: true,
+            },
+            format,
+            |payload| {
+                println!(
+                    "submitted pending review {review} on #{number}\n  {url}",
+                    review = payload.review_id,
+                    number = payload.number,
+                    url = payload.review_url
+                );
+            },
+        ),
+    })
+}
+
+fn ensure_pending_author(snapshot: &pr_reviews::PendingReviewSnapshot) -> Result<(), ForgeError> {
+    if snapshot.viewer_did_author {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "pending_review_identity_mismatch",
+        "the invoking GitHub identity is not the pending review author",
+        Some(format!(
+            "review_id={}; review_author={}",
+            snapshot.review_id, snapshot.author
+        )),
     ))
+}
+
+fn reload_pending_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    view: &pr_view::PrViewPayload,
+    review_id: &str,
+) -> Result<pr_reviews::PendingReviewSnapshot, ForgeError> {
+    let snapshot = pr_reviews::compute_pending_snapshot(runner, ctx, review_id)?
+        .ok_or_else(|| pending_not_found(view.number, review_id))?;
+    if snapshot.number != view.number
+        || snapshot.pr_url != view.url
+        || snapshot.review_id != review_id
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_pr_mismatch",
+            "the pending review target does not belong to the named pull request",
+            Some(format!(
+                "expected_pr={}; provider_pr={}; review_id={review_id}",
+                view.number, snapshot.number
+            )),
+        ));
+    }
+    ensure_pending_author(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_submitted_reconciliation(
+    pending: &pr_reviews::PendingReviewSnapshot,
+    submitted: &pr_reviews::PendingReviewSnapshot,
+) -> Result<(), ForgeError> {
+    let matches = submitted.number == pending.number
+        && submitted.pr_url == pending.pr_url
+        && submitted.head_sha == pending.head_sha
+        && submitted.review_id == pending.review_id
+        && submitted.review_url == pending.review_url
+        && submitted.author == pending.author
+        && submitted.commit_sha == pending.commit_sha
+        && submitted.body == pending.body
+        && submitted.semantic_body == pending.semantic_body
+        && submitted.viewer_did_author
+        && submitted.review_run_id == pending.review_run_id
+        && submitted.provenance == pending.provenance
+        && submitted.inline_comments == pending.inline_comments;
+    if matches {
+        return Ok(());
+    }
+    Err(reconciliation_failed(&pending.review_id, None))
+}
+
+fn reconciliation_failed(review_id: &str, mutation_error: Option<&ForgeError>) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "pending_review_reconciliation_failed",
+        "the pending-review mutation could not be reconciled to the exact provider state",
+        Some(match mutation_error {
+            Some(error) => format!("review_id={review_id}; mutation_error={error}"),
+            None => format!("review_id={review_id}"),
+        }),
+    )
+}
+
+fn reconcile_deleted_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    snapshot: &pr_reviews::PendingReviewSnapshot,
+    mutation: Result<BackendSuccess, ForgeError>,
+) -> Result<String, ForgeError> {
+    let remaining = pr_reviews::compute_pending_snapshot(runner, ctx, &snapshot.review_id)?;
+    let deleted_url = reconciled_deleted_url(mutation, &snapshot.review_id, &snapshot.review_url)?;
+    if remaining.is_some() {
+        return Err(reconciliation_failed(&snapshot.review_id, None));
+    }
+    Ok(deleted_url)
+}
+
+fn reconcile_deleted_target<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    target: &pr_reviews::PendingReviewTarget,
+    mutation: Result<BackendSuccess, ForgeError>,
+) -> Result<String, ForgeError> {
+    let remaining = pr_reviews::compute_pending_target(runner, ctx, &target.review.id)?;
+    let deleted_url = reconciled_deleted_url(mutation, &target.review.id, &target.review.url)?;
+    if remaining.is_some() {
+        return Err(reconciliation_failed(&target.review.id, None));
+    }
+    Ok(deleted_url)
+}
+
+fn reconciled_deleted_url(
+    mutation: Result<BackendSuccess, ForgeError>,
+    expected_id: &str,
+    fallback_url: &str,
+) -> Result<String, ForgeError> {
+    let Ok(output) = mutation else {
+        return Ok(fallback_url.to_string());
+    };
+    let (deleted_id, deleted_url) = parse_deleted_review(&output)?;
+    if deleted_id != expected_id {
+        return Err(ForgeError::software(
+            schema_err(),
+            "GitHub returned a different review after pending-review deletion",
+            Some(format!(
+                "expected_review_id={expected_id}; provider_review_id={deleted_id}"
+            )),
+        ));
+    }
+    Ok(deleted_url)
+}
+
+pub(crate) struct PendingReviewLease(File);
+
+impl Drop for PendingReviewLease {
+    fn drop(&mut self) {
+        unlock_file(self.0.as_raw_fd());
+    }
+}
+
+fn acquire_pending_review_lease(
+    ctx: &ProviderContext,
+    view: &pr_view::PrViewPayload,
+    viewer: &str,
+) -> Result<PendingReviewLease, ForgeError> {
+    acquire_pending_review_lease_for(ctx, &view.url, view.number, viewer)
+}
+
+pub(crate) fn acquire_pending_review_lease_for(
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+    viewer: &str,
+) -> Result<PendingReviewLease, ForgeError> {
+    if viewer.is_empty() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_identity_mismatch",
+            "the authenticated GitHub viewer identity is unavailable",
+            Some(format!("pr={number}")),
+        ));
+    }
+    let repository = crate::ops::pr_comments::github_repo_slug_from_url(pr_url)
+        .or_else(|| ctx.repo.clone())
+        .ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "repo_required",
+                "pending-review recovery requires a repository slug",
+                None,
+            )
+        })?;
+    let state_root = pending_review_state_root()?;
+    let lease_dir = state_root.join("forge-cli").join("pending-review-leases");
+    let key = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        ctx.provider.as_str(),
+        ctx.host.to_ascii_lowercase(),
+        repository.to_ascii_lowercase(),
+        number,
+        viewer.to_ascii_lowercase()
+    );
+    acquire_pending_review_lease_at(&lease_dir, &key)
+}
+
+fn pending_review_state_root() -> Result<PathBuf, ForgeError> {
+    let path = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| lease_unsafe("neither XDG_STATE_HOME nor HOME is available"))?;
+    if !path.is_absolute() {
+        return Err(lease_unsafe("pending-review state root is not absolute"));
+    }
+    Ok(path)
+}
+
+fn acquire_pending_review_lease_at(
+    lease_dir: &Path,
+    key: &str,
+) -> Result<PendingReviewLease, ForgeError> {
+    if !lease_dir.exists() {
+        fs::create_dir_all(lease_dir)
+            .map_err(|error| lease_unsafe(&format!("failed to create lease directory: {error}")))?;
+        fs::set_permissions(lease_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| lease_unsafe(&format!("failed to secure lease directory: {error}")))?;
+    }
+    let directory = fs::symlink_metadata(lease_dir)
+        .map_err(|error| lease_unsafe(&format!("failed to inspect lease directory: {error}")))?;
+    if !directory.file_type().is_dir()
+        || directory.uid() != effective_uid()
+        || directory.mode() & 0o077 != 0
+    {
+        return Err(lease_unsafe(
+            "pending-review lease directory is not a private viewer-owned directory",
+        ));
+    }
+
+    let digest = Sha256::digest(key.as_bytes());
+    let mut digest_hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut digest_hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    let lock_path = lease_dir.join(format!("{digest_hex}.lock"));
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| lease_unsafe(&format!("failed to open lease file: {error}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| lease_unsafe(&format!("failed to inspect lease file: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(lease_unsafe(
+            "pending-review lease file is not a private viewer-owned regular file",
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        let raw = error.raw_os_error();
+        if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+            return Err(ForgeError::unavailable(
+                schema_err(),
+                "pending_review_lease_busy",
+                "another trusted forge-cli process is mutating this viewer's pending review",
+                None,
+            ));
+        }
+        return Err(lease_unsafe(&format!("failed to acquire lease: {error}")));
+    }
+    Ok(PendingReviewLease(file))
+}
+
+fn lease_unsafe(detail: &str) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "pending_review_lease_unsafe",
+        "the pending-review mutation lease cannot be used safely",
+        Some(detail.to_string()),
+    )
+}
+
+fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn unlock_file(fd: RawFd) {
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
 }
 
 fn validate_pending_guard(
@@ -1128,4 +1533,45 @@ fn render_text(payload: &PrPendingReviewDeletePayload) {
         number = payload.number,
         url = payload.review_url,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn pending_review_lease_excludes_a_concurrent_holder() {
+        let temp = TempDir::new().expect("tempdir");
+        let lease_dir = temp.path().join("leases");
+        let first = acquire_pending_review_lease_at(&lease_dir, "github/repo/7/viewer")
+            .expect("first lease");
+        let error = match acquire_pending_review_lease_at(&lease_dir, "github/repo/7/viewer") {
+            Err(error) => error,
+            Ok(_) => panic!("concurrent holder must be rejected"),
+        };
+        assert_eq!(error.kind(), "pending_review_lease_busy");
+        drop(first);
+        acquire_pending_review_lease_at(&lease_dir, "github/repo/7/viewer")
+            .expect("lease is available after release");
+    }
+
+    #[test]
+    fn pending_review_lease_rejects_a_symlinked_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("target dir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("private target");
+        let lease_dir = temp.path().join("leases");
+        symlink(&target, &lease_dir).expect("symlink lease dir");
+
+        let error = match acquire_pending_review_lease_at(&lease_dir, "github/repo/7/viewer") {
+            Err(error) => error,
+            Ok(_) => panic!("symlinked lease directory must be rejected"),
+        };
+        assert_eq!(error.kind(), "pending_review_lease_unsafe");
+    }
 }

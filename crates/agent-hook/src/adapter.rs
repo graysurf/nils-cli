@@ -3,7 +3,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +16,7 @@ use crate::path_binding::{TargetBinding, resolve_target_bindings};
 use crate::strict_json;
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
+const DSH_INGRESS_VERSION: &str = "agent-hook.dsh-ingress.v1";
 const MAX_PROVIDER_ID_CHARS: usize = 256;
 const MAX_MUTATION_TARGETS: usize = 256;
 const MAX_MUTATION_TARGET_BYTES: usize = 4096;
@@ -39,6 +40,23 @@ struct ActivityEvent {
     attention_kind: Option<&'static str>,
     confidence: &'static str,
     source_kind: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshIngress {
+    schema_version: String,
+    event: String,
+    call_id: String,
+    cwd: PathBuf,
+    tool: DshToolCall,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshToolCall {
+    name: String,
+    arguments: Value,
 }
 
 pub fn read_stdin() -> Result<Vec<u8>, HookError> {
@@ -70,6 +88,9 @@ pub fn normalize(
         ));
     }
     let raw = parse_provider_json(input)?;
+    if product == Product::Dsh {
+        return normalize_dsh(event_arg, input, raw);
+    }
     let object = raw.as_object().ok_or_else(|| {
         HookError::data(
             "provider-input-invalid",
@@ -105,6 +126,86 @@ pub fn normalize(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
+    finalize_normalized_request(product, event, matcher, input, object, stop_reentry(object))
+}
+
+fn normalize_dsh(
+    event_arg: Option<&str>,
+    input: &[u8],
+    raw: Value,
+) -> Result<NormalizedRequest, HookError> {
+    let ingress: DshIngress = serde_json::from_value(raw).map_err(|_| {
+        HookError::data(
+            "dsh-ingress-invalid",
+            "DSH ingress must match the strict agent-hook.dsh-ingress.v1 object",
+        )
+    })?;
+    if ingress.schema_version != DSH_INGRESS_VERSION {
+        return Err(HookError::data(
+            "dsh-ingress-version-invalid",
+            "DSH ingress schema_version is unsupported",
+        ));
+    }
+    if let Some(argument) = event_arg
+        && argument != ingress.event
+    {
+        return Err(HookError::data(
+            "provider-event-mismatch",
+            "--event does not match the DSH ingress event",
+        ));
+    }
+    let event = match ingress.event.as_str() {
+        "tools/pre-execute" => "PreToolUse",
+        _ => {
+            return Err(HookError::data(
+                "provider-event-unsupported",
+                "DSH ingress event is not supported by agent-hook v1",
+            ));
+        }
+    };
+    if ingress.call_id.is_empty()
+        || ingress.call_id.chars().count() > MAX_PROVIDER_ID_CHARS
+        || ingress.tool.name.is_empty()
+        || ingress.tool.name.chars().count() > MAX_PROVIDER_ID_CHARS
+        || !ingress.cwd.is_absolute()
+        || !ingress.tool.arguments.is_object()
+    {
+        return Err(HookError::data(
+            "dsh-ingress-invalid",
+            "DSH ingress requires bounded call/tool identifiers, an absolute cwd, and object arguments",
+        ));
+    }
+
+    let mut canonical = Map::new();
+    canonical.insert(
+        "cwd".to_string(),
+        Value::String(ingress.cwd.to_string_lossy().into_owned()),
+    );
+    canonical.insert(
+        "tool_name".to_string(),
+        Value::String(ingress.tool.name.clone()),
+    );
+    canonical.insert("tool_input".to_string(), ingress.tool.arguments);
+
+    let matcher = Some(ingress.tool.name);
+    finalize_normalized_request(
+        Product::Dsh,
+        event.to_string(),
+        matcher,
+        input,
+        &canonical,
+        None,
+    )
+}
+
+fn finalize_normalized_request(
+    product: Product,
+    event: String,
+    matcher: Option<String>,
+    input: &[u8],
+    object: &Map<String, Value>,
+    stop_reentry: Option<bool>,
+) -> Result<NormalizedRequest, HookError> {
     let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
     let target_count = target_paths.len();
     let mut binding_paths = target_paths;
@@ -136,6 +237,7 @@ pub fn normalize(
         .as_bytes();
     let snapshot_digest = digest(input);
     let request_id = format!("request:{}", &snapshot_digest[7..39]);
+
     Ok(NormalizedRequest {
         schema_version: REQUEST_VERSION.to_string(),
         request_id,
@@ -146,10 +248,11 @@ pub fn normalize(
         command_digest: digest(command_material),
         snapshot_digest,
         worktree_fingerprint: None,
-        // Provider payload fields are untrusted and deliberately ignored. The
-        // dispatcher replaces this with a #676 registry-derived projection.
         semantic_conflict: None,
-        stop_reentry: stop_reentry(object),
+        // Provider payload fields are untrusted and deliberately ignored. The
+        // dispatcher replaces semantic conflict state with a registry-derived
+        // projection. Only the separately validated Stop re-entry fact remains.
+        stop_reentry,
         target_paths,
         execution_path,
         binding_roots,
@@ -527,35 +630,39 @@ fn target_paths(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
     let nested = object.get("tool_input").and_then(Value::as_object);
-    let mut targets = match matcher {
-        Some("Write" | "Edit" | "MultiEdit") => {
-            let input = mutation_input(nested)?;
-            let path = exactly_one_path(input, &["path", "file_path"])?;
-            vec![resolve_mutation_target(path, execution.as_deref())?]
+    let mut targets = if product == Product::Dsh {
+        execution.iter().cloned().collect()
+    } else {
+        match matcher {
+            Some("Write" | "Edit" | "MultiEdit") => {
+                let input = mutation_input(nested)?;
+                let path = exactly_one_path(input, &["path", "file_path"])?;
+                vec![resolve_mutation_target(path, execution.as_deref())?]
+            }
+            Some("NotebookEdit") => {
+                let input = mutation_input(nested)?;
+                let path = required_string(input.get("notebook_path"))?;
+                vec![resolve_mutation_target(path, execution.as_deref())?]
+            }
+            Some("apply_patch") if product == Product::Codex => {
+                let input = mutation_input(nested)?;
+                let patch = match input.get("command") {
+                    Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
+                    _ => {
+                        return Err(untrusted_target(
+                            "Codex apply_patch mutation must contain a non-empty command string",
+                        ));
+                    }
+                };
+                parse_apply_patch_targets(patch, execution.as_deref())?
+            }
+            Some("apply_patch") => {
+                return Err(untrusted_target(
+                    "apply_patch mutation has no documented native mapping for this provider",
+                ));
+            }
+            _ => execution.iter().cloned().collect(),
         }
-        Some("NotebookEdit") => {
-            let input = mutation_input(nested)?;
-            let path = required_string(input.get("notebook_path"))?;
-            vec![resolve_mutation_target(path, execution.as_deref())?]
-        }
-        Some("apply_patch") if product == Product::Codex => {
-            let input = mutation_input(nested)?;
-            let patch = match input.get("command") {
-                Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
-                _ => {
-                    return Err(untrusted_target(
-                        "Codex apply_patch mutation must contain a non-empty command string",
-                    ));
-                }
-            };
-            parse_apply_patch_targets(patch, execution.as_deref())?
-        }
-        Some("apply_patch") => {
-            return Err(untrusted_target(
-                "apply_patch mutation has no documented native mapping for this provider",
-            ));
-        }
-        _ => execution.iter().cloned().collect(),
     };
     deduplicate_targets(&mut targets);
     Ok((targets, execution))

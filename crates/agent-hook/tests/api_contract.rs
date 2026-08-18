@@ -830,6 +830,7 @@ fn provider_event_capability_matrix_rejects_unenforceable_actions() {
                 "ElicitationResult",
             ][..],
         ),
+        ("dsh", &["PreToolUse"][..]),
     ];
     let capabilities = [
         (
@@ -915,6 +916,9 @@ capability = {capability_toml}
 }
 
 fn capability_is_compatible(product: &str, event: &str, capability: &str) -> bool {
+    if product == "dsh" {
+        return event == "PreToolUse" && matches!(capability, "allow" | "block");
+    }
     if matches!(capability, "allow" | "activity" | "runtime-handler") {
         return true;
     }

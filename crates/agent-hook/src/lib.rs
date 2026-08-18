@@ -226,7 +226,12 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
             let products = if let Some(product) = args.product {
                 vec![product]
             } else if args.all {
-                vec![Product::Codex, Product::Claude, Product::Hermes]
+                vec![
+                    Product::Codex,
+                    Product::Claude,
+                    Product::Dsh,
+                    Product::Hermes,
+                ]
             } else {
                 vec![Product::Codex, Product::Claude]
             };

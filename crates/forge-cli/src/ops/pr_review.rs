@@ -1452,6 +1452,12 @@ fn submit_github_review_with_threads<R: BackendRunner>(
             skipped,
         });
     }
+    let _pending_review_lease = super::pr_pending_review::acquire_pending_review_lease_for(
+        ctx,
+        &target.url,
+        number,
+        &state.viewer_login,
+    )?;
 
     let marked_body = marked_review_body(&summary, &review_run_id);
     let marked_specs = to_post
@@ -1610,34 +1616,70 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         ));
     }
 
-    let submit_output = match runner.run(&build_github_submit_review_call(
+    let submit_result = runner.run(&build_github_submit_review_call(
         ctx,
         &pending.review_id,
         decision.to_github_event(),
         Some(&marked_body),
-    )) {
-        Ok(output) => output,
-        Err(err) => {
-            let err = map_github_native_review_submit_error(decision, err);
-            if let Some(review_url) =
-                find_submitted_review_run(runner, ctx, number, &target.url, &receipt)?
-            {
-                return Ok(GithubReviewSubmission {
-                    review_url: Some(review_url),
-                    submitted: true,
-                    created: review_threads,
-                    skipped,
-                });
-            }
-            return Err(pending_transaction_incomplete(
-                &review_run_id,
-                Some(&pending.review_id),
-                "pending review submit result is unknown; content was preserved",
-                Some(err),
-            ));
-        }
+    ));
+    let expected_state = match decision {
+        PrReviewDecision::CommentsOnly => "COMMENTED",
+        PrReviewDecision::Approve => "APPROVED",
+        PrReviewDecision::RequestChanges => "CHANGES_REQUESTED",
     };
-    let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
+    let submitted_snapshot = pr_reviews::compute_submitted_review_snapshot(
+        runner,
+        ctx,
+        &pending.review_id,
+        expected_state,
+    )
+    .map_err(|error| {
+        pending_transaction_incomplete(
+            &review_run_id,
+            Some(&pending.review_id),
+            "submitted review read-back failed",
+            Some(error),
+        )
+    })?;
+    let Some(submitted_snapshot) = submitted_snapshot else {
+        let cause = submit_result
+            .err()
+            .map(|error| map_github_native_review_submit_error(decision, error));
+        return Err(pending_transaction_incomplete(
+            &review_run_id,
+            Some(&pending.review_id),
+            "pending review submission could not be reconciled",
+            cause,
+        ));
+    };
+    validate_receipt_bound_snapshot(
+        &submitted_snapshot,
+        number,
+        expected_head,
+        &summary,
+        &review_run_id,
+        &manifest,
+    )?;
+    if submitted_snapshot.inline_comments.len() != manifest.len() {
+        return Err(pending_transaction_incomplete(
+            &review_run_id,
+            Some(&pending.review_id),
+            "submitted review manifest is not complete",
+            None,
+        ));
+    }
+    if let Ok(output) = submit_result.as_ref()
+        && let Some(review_url) = parse_submitted_review_url(output)
+        && review_url != submitted_snapshot.review_url
+    {
+        return Err(pending_transaction_incomplete(
+            &review_run_id,
+            Some(&pending.review_id),
+            "submitted review URL differs from the reconciled provider node",
+            None,
+        ));
+    }
+    let review_url = submitted_snapshot.review_url;
     Ok(GithubReviewSubmission {
         review_url: Some(review_url),
         submitted: true,
@@ -1749,13 +1791,22 @@ fn validate_receipt_bound_snapshot(
         ));
     }
     for (comment, expected) in snapshot.inline_comments.iter().zip(manifest) {
+        let file_anchor_matches = comment.subject_type == "FILE"
+            && expected.subject_type == "FILE"
+            && comment.line.is_none()
+            && comment.diff_side.is_none()
+            && comment.start_line.is_none()
+            && comment.start_diff_side.is_none();
+        let line_anchor_matches = comment.subject_type != "FILE"
+            && expected.subject_type != "FILE"
+            && comment.line == expected.line
+            && comment.diff_side.as_deref() == Some(expected.side.as_str())
+            && comment.start_line == expected.start_line
+            && comment.start_diff_side == expected.start_side;
         if comment.review_run_id.as_deref() != Some(review_run_id)
             || comment.path != expected.path
-            || comment.line != expected.line
-            || comment.diff_side.as_deref() != Some(expected.side.as_str())
-            || comment.start_line != expected.start_line
-            || comment.start_diff_side != expected.start_side
             || comment.subject_type != expected.subject_type
+            || !(file_anchor_matches || line_anchor_matches)
             || comment.body_digest != expected.body_digest
         {
             return Err(ForgeError::validation(

@@ -110,6 +110,10 @@ pub struct DoctorResult {
     pub config_digest: String,
     pub policy_digest: String,
     pub recovery: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_supported: Option<bool>,
 }
 
 struct Plan {
@@ -141,8 +145,19 @@ pub fn run(
     action: SetupAction,
     expected_plan_digest: Option<&str>,
 ) -> Result<SetupResult, HookError> {
-    if !product.enforceable() {
+    if matches!(product, Product::Dsh | Product::Hermes) {
         let groups = policy_groups(loaded, product);
+        let (compatibility_owner, trust) = if product == Product::Dsh {
+            (
+                "dsh-runtime-kit",
+                "external dsh-runtime-kit bundle owns Cordis registration; no files changed",
+            )
+        } else {
+            (
+                "agent-hook",
+                "provider has no compatible native hook runner; no files changed",
+            )
+        };
         return Ok(SetupResult {
             schema_version: "agent-hook.setup-result.v1".to_string(),
             product: product.as_str().to_string(),
@@ -161,8 +176,8 @@ pub fn run(
             owned_groups: groups,
             legacy_residue_count: 0,
             unrelated_count: 0,
-            compatibility_owner: "agent-hook".to_string(),
-            trust: "provider has no compatible native hook runner; no files changed".to_string(),
+            compatibility_owner: compatibility_owner.to_string(),
+            trust: trust.to_string(),
         });
     }
     let plan = build_plan(loaded, product, action)?;
@@ -240,7 +255,8 @@ pub fn run(
 }
 
 pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, HookError> {
-    if !product.enforceable() {
+    if matches!(product, Product::Dsh | Product::Hermes) {
+        let dsh = product == Product::Dsh;
         return Ok(DoctorResult {
             schema_version: "agent-hook.doctor.v1".to_string(),
             product: product.as_str().to_string(),
@@ -252,7 +268,14 @@ pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, H
             unrelated_count: 0,
             config_digest: loaded.config_digest.clone(),
             policy_digest: loaded.policy_digest.clone(),
-            recovery: "available-for-shared-policy-only".to_string(),
+            recovery: if dsh {
+                "dispatch-supported-registration-owned-by-dsh-runtime-kit"
+            } else {
+                "available-for-shared-policy-only"
+            }
+            .to_string(),
+            registration_owner: dsh.then(|| "dsh-runtime-kit".to_string()),
+            dispatch_supported: dsh.then_some(true),
         });
     }
     let plan = build_plan(loaded, product, SetupAction::DryRun)?;
@@ -278,6 +301,8 @@ pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, H
         config_digest: loaded.config_digest.clone(),
         policy_digest: loaded.policy_digest.clone(),
         recovery: "challenge-authorize-consume".to_string(),
+        registration_owner: None,
+        dispatch_supported: None,
     })
 }
 
@@ -312,7 +337,7 @@ fn build_plan(
     match product {
         Product::Codex => build_codex_plan(loaded, product, action, path, original, groups),
         Product::Claude => build_json_plan(product, action, path, original, groups, loaded),
-        Product::Hermes => unreachable!("unsupported returned before plan"),
+        Product::Dsh | Product::Hermes => unreachable!("unsupported returned before plan"),
     }
 }
 
@@ -1734,7 +1759,7 @@ fn exact_runtime_handler_command(command: &str, product: Product, filename: &str
                 || command
                     == format!("AGENT_RUNTIME_PRODUCT=claude \"$HOME/.claude/hooks/{filename}\"")
         }
-        Product::Hermes => false,
+        Product::Dsh | Product::Hermes => false,
     }
 }
 
@@ -1750,6 +1775,7 @@ fn provider_path(product: Product) -> Result<PathBuf, HookError> {
             .unwrap_or_else(|| home.join(".codex"))
             .join("config.toml"),
         Product::Claude => home.join(".claude/settings.json"),
+        Product::Dsh => home.join(".dsh/cordis.patch.yml"),
         Product::Hermes => home.join(".hermes/config.yaml"),
     })
 }

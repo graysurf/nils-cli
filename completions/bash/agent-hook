@@ -168,7 +168,7 @@ _agent__hook() {
             fi
             case "${prev}" in
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh hermes" -- "${cur}"))
                     return 0
                     ;;
                 --event)
@@ -246,7 +246,7 @@ _agent__hook() {
             fi
             case "${prev}" in
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh hermes" -- "${cur}"))
                     return 0
                     ;;
                 --format)
@@ -500,7 +500,7 @@ _agent__hook() {
             fi
             case "${prev}" in
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh hermes" -- "${cur}"))
                     return 0
                     ;;
                 --event)
@@ -617,7 +617,7 @@ _agent__hook() {
                     return 0
                     ;;
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh hermes" -- "${cur}"))
                     return 0
                     ;;
                 --event)
@@ -810,7 +810,7 @@ _agent__hook() {
             fi
             case "${prev}" in
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude dsh hermes" -- "${cur}"))
                     return 0
                     ;;
                 --expected-plan-digest)

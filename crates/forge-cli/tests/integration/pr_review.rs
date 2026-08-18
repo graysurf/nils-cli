@@ -963,9 +963,15 @@ case "$*" in
     fi
     ;;
   *"query(\$review: ID!"*)
-    if [ ! -f "$pending_body" ] || [ -f "$submitted" ]; then
+    if [ ! -f "$pending_body" ]; then
       printf '%s\n' '{"data":{"node":null}}'
       exit 0
+    fi
+    state=PENDING
+    can_delete=true
+    if [ -f "$submitted" ]; then
+      state=COMMENTED
+      can_delete=false
     fi
     body=$(json_escape "$pending_body")
     comments=''
@@ -991,7 +997,7 @@ case "$*" in
       fi
       total=2
     fi
-    printf '{"data":{"node":{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"PENDING","commit":{"oid":"head-44"},"body":"%s","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{"totalCount":%s,"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}},"pullRequest":{"number":44,"url":"https://github.com/acme/widgets/pull/44","headRefOid":"head-44"}}}}\n' "$body" "$total" "$comments"
+    printf '{"data":{"node":{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"%s","commit":{"oid":"head-44"},"body":"%s","viewerDidAuthor":true,"viewerCanDelete":%s,"comments":{"totalCount":%s,"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}},"pullRequest":{"number":44,"url":"https://github.com/acme/widgets/pull/44","headRefOid":"head-44"}}}}\n' "$state" "$body" "$can_delete" "$total" "$comments"
     ;;
   *"query(\$owner: String!, \$name: String!, \$number: Int!"*)
     printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}'
@@ -1473,8 +1479,8 @@ fn pr_review_transaction_recovers_a_lost_submit_response() {
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
     assert!(
-        calls.matches("reviews(first: 100").count() >= 2,
-        "the lost response must be reconciled through submitted-review read-back: {calls}"
+        calls.matches("query($review: ID!").count() >= 2,
+        "the lost response must be reconciled through exact submitted-node read-back: {calls}"
     );
 }
 

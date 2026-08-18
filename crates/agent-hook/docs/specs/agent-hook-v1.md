@@ -8,11 +8,13 @@ Ownership: crate-local canonical specification for `nils-agent-hook` and the
 ## Purpose and boundary
 
 `agent-hook` is the sole owner of nils-cli-managed Codex and Claude hook
-registrations. Provider-native hooks remain lifecycle ingress, but their owned
-commands contain only `agent-hook dispatch --product <provider>`; policy rules
-never live in provider configuration. The CLI does not manage unrelated hooks,
-execute config-defined programs, weaken lower-level transaction/privacy rules,
-or claim native enforcement for providers without a compatible runner.
+registrations and the policy engine behind the external DSH runtime bundle.
+Provider-native hooks remain lifecycle ingress, but their owned commands
+contain only `agent-hook dispatch --product <provider>`; policy rules never
+live in provider configuration. DSH is registered by `dsh-runtime-kit`, not by
+`agent-hook setup`. The CLI does not manage unrelated hooks, execute
+config-defined programs, weaken lower-level transaction/privacy rules, or claim
+native setup ownership for providers without a compatible runner.
 
 ## Files and limits
 
@@ -56,6 +58,10 @@ above.
   one public boolean fact. It is trusted in exactly one direction: `true` may end
   a turn that is already looping, and it can never grant authority, release a
   claim, or downgrade a proven owner.
+- `agent-hook.dsh-ingress.v1`: strict DSH-to-policy transport for one native
+  extension event. Version 1 carries exactly `event`, bounded `call_id`, an
+  absolute `cwd`, and a `tool` object with bounded `name` and object-valued
+  `arguments`. Unknown fields are rejected at the root and nested tool object.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, and config /
   policy digests.
@@ -67,7 +73,8 @@ above.
   permitted. Provider hook argv content is omitted.
 - `agent-hook.doctor.v1`: product status (missing, compatibility-only, `dual`,
   `drifted`, `converged`, `unsupported`, or `unrelated`), owned counts,
-  compatibility residue count, digests, policy availability, and recovery health.
+  compatibility residue count, digests, policy availability, recovery health,
+  registration owner, and whether direct dispatch is supported.
 - `agent-hook.inventory.v1`: ordered public rule metadata and effective mode;
   capability parameters and private paths are omitted.
 - `agent-hook.recovery-challenge.v1`: random challenge ID, exact product/event,
@@ -98,9 +105,10 @@ whose default is provider output so the documented ingress command is usable.
 
 ## Provider normalization and rendering
 
-Products are `codex`, `claude`, and `hermes`. Codex and Claude are enforceable;
-Hermes validates and evaluates shared policy but reports `unsupported` for
-native setup until a compatible runner exists.
+Products are `codex`, `claude`, `dsh`, and `hermes`. Codex, Claude, and DSH are
+enforceable. DSH setup reports `unsupported` because the out-of-tree runtime
+bundle owns registration. Hermes validates and evaluates shared policy but
+reports `unsupported` for native setup until a compatible runner exists.
 
 Supported canonical events are:
 
@@ -111,15 +119,20 @@ Supported canonical events are:
   `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
   `Notification`, `SubagentStart`, `SubagentStop`, `Elicitation`, and
   `ElicitationResult`.
+- DSH: `PreToolUse`, normalized only from native `tools/pre-execute` ingress in
+  this version.
 
-The adapter accepts the event from `--event` or the provider's documented
-`hook_event_name`/`event` field and rejects a mismatch. Matcher values are
-normalized only from documented provider fields:
+The Codex/Claude/Hermes adapter accepts the event from `--event` or the
+provider's documented `hook_event_name`/`event` field and rejects a mismatch.
+The DSH adapter requires `agent-hook.dsh-ingress.v1`; an optional `--event`
+must equal its native event string before that string is mapped to the canonical
+policy event. Matcher values are normalized only from documented fields:
 
 | Provider events | Matcher input field |
 | --- | --- |
 | Codex/Claude `SessionStart` | `source` |
 | Codex/Claude `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | `tool_name` |
+| DSH `PreToolUse` | `tool.name` |
 | Codex/Claude `PreCompact`; Codex `PostCompact` | `trigger` |
 | Codex/Claude `SubagentStart`, `SubagentStop` | `agent_type` |
 | Claude `Notification` | `notification_type` |
@@ -155,6 +168,16 @@ normalized request, decision, trace, or recovery artifact.
 Owner-liveness evaluates every distinct target checkout plus the execution
 checkout and returns the strongest result; an active foreign owner therefore
 cannot be masked by a self-owned or unclaimed target.
+
+DSH v1 preserves the complete object-valued tool arguments for policy
+normalization, but it does not yet declare tool-specific mutation path mappings.
+Until those mappings are added, DSH `PreToolUse` binds target/effect context to
+the absolute session `cwd`; tool-name policy can still allow or block, but
+target-granular owner-liveness is not claimed. Policy validation therefore
+accepts only `decision.allow.v1` and `decision.block.v1` for DSH v1; context,
+warning, activity, coordination, read-only, owner-liveness, semantic-conflict,
+transform, and retired handler capabilities are rejected until their native
+semantics exist.
 
 Built-in semantic-conflict and owner-liveness admission applies only to a
 managed process. When `AGENT_SESSION_ID`, `AGENT_SESSION_RUNTIME_ID`,
@@ -193,19 +216,25 @@ safely produce no stdout, a concise stderr diagnostic, and exit `2` so the
 provider applies its native blocking fallback. Runtime or service-format
 failures use exit `1`; successful provider-native decisions use exit `0`.
 `dispatch --format json` returns the normalized decision envelope and does not
-return raw provider content.
+return raw provider content. DSH ingress requires this service JSON form; the
+runtime bundle maps `block` to a `tools/pre-execute` denial, delegates `allow`,
+and fails closed on every malformed, truncated, signaled, exit-mismatched,
+replayed, timed-out, oversized, or unsupported response.
 
 Policy validation also checks the complete provider/event/capability binding,
 not only each component in isolation. `decision.warn.v1` and
 `decision.context.v1` require an event with native model-context semantics;
 `decision.block.v1` requires native block, continuation, feedback, or decline
 semantics; and `decision.transform.v1` is limited to Codex `PreToolUse` plus
-Claude `PreToolUse`, `PermissionRequest`, and `PostToolUse`.
+Claude `PreToolUse`, `PermissionRequest`, and `PostToolUse`. DSH v1 does not
+transform arguments and accepts only native allow/block capabilities.
 `agent-session.owner-liveness.v1` and
 `agent-session.semantic-conflict.v1` require both context and block semantics
 because their result is data-dependent. Neutral `decision.allow.v1`, metadata
 side effects through `agent-session.activity.v1`, and trusted provider-native
-`runtime-kit.handler.v1` remain valid for every supported event. This preserves
+`runtime-kit.handler.v1` remain valid for supported Codex/Claude events. DSH
+rules reject retired file handlers so policy cannot fall back to the archived
+runtime-kit implementation. This preserves
 notification and failure logging without pretending that events such as
 Claude `Notification` or `StopFailure` can enforce a decision.
 `agent-session.coordination.v1` is limited to enforceable

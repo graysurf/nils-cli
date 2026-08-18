@@ -141,6 +141,7 @@ pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> Cm
     // tests and flip outcomes. Point it at an empty per-run dir; individual
     // stubs may still override it via `.env("XDG_CONFIG_HOME", …)`.
     cmd.env("XDG_CONFIG_HOME", stub.tempdir.path().join("xdg-config"));
+    cmd.env("XDG_STATE_HOME", stub.tempdir.path().join("xdg-state"));
     // Disable the GraphQL rate-limit gate by default so existing stubs, which
     // branch on an exact `gh` argv sequence, do not see the extra
     // `gh api rate_limit` preflight probe the gate inserts. Gate-specific tests
@@ -167,6 +168,7 @@ pub fn run_forge_cli_with_stdin(stub: &StubEnv, args: &[&str], stdin: &str) -> C
         cmd.env_remove(key);
     }
     cmd.env("XDG_CONFIG_HOME", stub.tempdir.path().join("xdg-config"));
+    cmd.env("XDG_STATE_HOME", stub.tempdir.path().join("xdg-state"));
     // See `run_forge_cli_in`: keep the rate-limit gate off by default here too.
     cmd.env("FORGE_CLI_RATE_LIMIT_GATE", "off");
     for (k, v) in &stub.envs {
