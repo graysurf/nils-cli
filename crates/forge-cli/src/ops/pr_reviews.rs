@@ -22,6 +22,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
 pub(crate) const MAX_PENDING_REVIEW_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PENDING_REVIEW_COMMENTS: u64 = 1_000;
+pub(crate) const MAX_PENDING_REVIEW_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body viewerDidAuthor } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
@@ -395,6 +397,26 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
                 ))
             };
         };
+        if page.total_count > MAX_PENDING_REVIEW_COMMENTS {
+            return Err(snapshot_incomplete(
+                "pending review inline-comment count exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; total_count={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
+                    page.total_count
+                )),
+            ));
+        }
+        if let Some(total) = expected_total
+            && page.total_count != total
+        {
+            return Err(snapshot_incomplete(
+                "pending review inline-comment count changed while paginating",
+                Some(format!(
+                    "review_id={review_id}; expected_total={total}; observed_total={}",
+                    page.total_count
+                )),
+            ));
+        }
         if let Some(existing) = snapshot.as_mut() {
             validate_snapshot_page_identity(existing, &page.snapshot)?;
             existing
@@ -403,6 +425,33 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
         } else {
             expected_total = Some(page.total_count);
             snapshot = Some(page.snapshot);
+        }
+        let retained = snapshot.as_ref().expect("page created a snapshot");
+        if retained.inline_comments.len() as u64 > MAX_PENDING_REVIEW_COMMENTS {
+            return Err(snapshot_incomplete(
+                "pending review retained inline-comment count exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; observed_comments={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
+                    retained.inline_comments.len()
+                )),
+            ));
+        }
+        let retained_bytes = serde_json::to_vec(retained)
+            .map_err(|error| {
+                ForgeError::software(
+                    schema_err(),
+                    "failed to size pending-review snapshot",
+                    Some(error.to_string()),
+                )
+            })?
+            .len();
+        if retained_bytes > MAX_PENDING_REVIEW_SNAPSHOT_BYTES {
+            return Err(snapshot_incomplete(
+                "pending review decoded snapshot exceeds the recovery safety limit",
+                Some(format!(
+                    "review_id={review_id}; retained_bytes={retained_bytes}; max_bytes={MAX_PENDING_REVIEW_SNAPSHOT_BYTES}"
+                )),
+            ));
         }
         if !page.has_next_page {
             let mut snapshot = snapshot.expect("page created a snapshot");
@@ -1744,6 +1793,63 @@ mod tests {
         let error = compute_pending_snapshot(&drifted, &github_ctx(), "PRR_pending")
             .expect_err("metadata drift between pages must fail closed");
         assert_eq!(error.kind(), "review_snapshot_incomplete");
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_excessive_total_count_before_following_pages() {
+        let mut first = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_1",
+            path: "src/one.rs",
+            line: 1,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: true,
+            end_cursor: Some("cursor-1"),
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&first.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["totalCount"] = (MAX_PENDING_REVIEW_COMMENTS + 1).into();
+        first.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![first]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("oversized aggregate count must fail before another page");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn pending_snapshot_rejects_multi_page_retained_byte_exhaustion() {
+        let oversized_body = "x".repeat(MAX_PENDING_REVIEW_SNAPSHOT_BYTES / 3 + 1);
+        let page = |id: &'static str, has_next_page, end_cursor| {
+            let mut output = pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id,
+                path: "src/large.rs",
+                line: 1,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page,
+                end_cursor,
+            });
+            let mut value: serde_json::Value =
+                serde_json::from_str(&output.stdout).expect("snapshot fixture");
+            value["data"]["node"]["comments"]["nodes"][0]["body"] = oversized_body.clone().into();
+            output.stdout = value.to_string();
+            output
+        };
+        let runner = ScriptedRunner::new(vec![
+            page("PRRC_1", true, Some("cursor-1")),
+            page("PRRC_2", false, None),
+        ]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("decoded retained aggregate bytes must be bounded");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert_eq!(runner.calls.borrow().len(), 2);
     }
 
     #[test]

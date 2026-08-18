@@ -1,6 +1,9 @@
 //! Recovery tests for an authenticated actor's provider-valid pending review.
 
 use std::fs;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use forge_cli::ops::review_state::{
     ReviewCommentManifestItem, ReviewRunReceipt, ReviewStatePayload, ReviewStateRecord,
@@ -8,7 +11,9 @@ use forge_cli::ops::review_state::{
 };
 use pretty_assertions::assert_eq;
 
-use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli, run_forge_cli_with_stdin};
+use super::support::{
+    CmdOutput, StubEnv, forge_cli_bin, parse_envelope, run_forge_cli, run_forge_cli_with_stdin,
+};
 
 const INCOMPLETE_RECEIPT_RUN_ID: &str =
     "sha256:3de5f335496edb76e29ba96b787fbc9dc18d081f45a285b0e2ae877443f49405";
@@ -220,6 +225,13 @@ fn pending_recovery_snapshot(marked: bool, inline_count: usize, viewer_owned: bo
 
 fn pending_recovery_script(capture: &str, snapshot: &str, marker: &str) -> String {
     let state_marker = serde_json::to_string(marker).expect("serialize review-state marker");
+    let mut submitted: serde_json::Value =
+        serde_json::from_str(snapshot).expect("pending snapshot fixture");
+    submitted["data"]["node"]["state"] = "COMMENTED".into();
+    submitted["data"]["node"]["viewerCanDelete"] = false.into();
+    let submitted = submitted.to_string();
+    let submitted_flag = format!("{capture}.submitted");
+    let deleted_flag = format!("{capture}.deleted");
     r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "@CAPTURE@"
@@ -233,13 +245,21 @@ case "$1 $2" in
         printf '%s\n' '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"comments":{"nodes":[{"author":{"login":"review-bot"},"body":@STATE_MARKER@}],"pageInfo":{"hasNextPage":false,"endCursor":"state-tip"}}}}}}'
         ;;
       *"submitPullRequestReview(input:"*)
+        : > "@SUBMITTED_FLAG@"
         printf '%s\n' '{"data":{"submitPullRequestReview":{"pullRequestReview":{"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102"}}}}'
         ;;
       *"deletePullRequestReview(input:"*)
+        : > "@DELETED_FLAG@"
         printf '%s\n' '{"data":{"deletePullRequestReview":{"pullRequestReview":{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102"}}}}'
         ;;
       *"comments(first: 100"*)
-        printf '%s\n' '@SNAPSHOT@'
+        if [ -e "@DELETED_FLAG@" ]; then
+          printf '%s\n' '{"data":{"node":null}}'
+        elif [ -e "@SUBMITTED_FLAG@" ]; then
+          printf '%s\n' '@SUBMITTED_SNAPSHOT@'
+        else
+          printf '%s\n' '@SNAPSHOT@'
+        fi
         ;;
       *)
         echo "unexpected graphql args: $*" >&2
@@ -255,6 +275,9 @@ esac
 "#
     .replace("@CAPTURE@", capture)
     .replace("@SNAPSHOT@", snapshot)
+    .replace("@SUBMITTED_SNAPSHOT@", &submitted)
+    .replace("@SUBMITTED_FLAG@", &submitted_flag)
+    .replace("@DELETED_FLAG@", &deleted_flag)
     .replace("@STATE_MARKER@", &state_marker)
 }
 
@@ -606,9 +629,337 @@ fn pr_pending_review_resume_submit_accepts_an_exact_receipt_manifest() {
     let envelope = parse_envelope(&output.stdout);
     assert_eq!(envelope["data"]["submitted"], true);
     assert_eq!(envelope["data"]["review_run_id"], review_run_id);
+    assert_eq!(
+        envelope["data"]["snapshot_provenance"],
+        "pending-cas+submitted-reconciled"
+    );
     let calls = fs::read_to_string(capture).expect("read calls");
     assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
     assert!(!calls.contains("deletePullRequestReview(input:"), "{calls}");
+}
+
+#[test]
+fn pr_pending_review_submit_fails_when_provider_state_cannot_be_reconciled() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("unreconciled-submit-calls.log");
+    let manifest = vec![ReviewCommentManifestItem {
+        index: 0,
+        path: "src/file-0.rs".to_string(),
+        line: Some(1),
+        side: "RIGHT".to_string(),
+        start_line: None,
+        start_side: None,
+        subject_type: "LINE".to_string(),
+        body_digest: sha256_digest(b"first"),
+    }];
+    let (review_run_id, marker) = receipt_marker("Summary", manifest);
+    let snapshot =
+        pending_recovery_snapshot(true, 1, true).replace(INCOMPLETE_RECEIPT_RUN_ID, &review_run_id);
+    let script = pending_recovery_script(&capture.to_string_lossy(), &snapshot, &marker).replace(
+        &format!(": > \"{}.submitted\"", capture.to_string_lossy()),
+        ":",
+    );
+    let stub = stub.gh_stub(&script);
+    let inspect = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+    let digest = parse_envelope(&inspect.stdout)["data"]["snapshot"]["snapshot_digest"]
+        .as_str()
+        .expect("snapshot digest")
+        .to_string();
+
+    let output = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "resume-submit",
+            "42",
+            "--review",
+            "PRR_pending",
+            "--review-run-id",
+            &review_run_id,
+            "--expected-head",
+            "head-new",
+            "--expected-commit",
+            "head-new",
+            "--expected-snapshot",
+            &digest,
+            "--decision",
+            "comments-only",
+        ],
+    );
+
+    assert_eq!(
+        output.code, 65,
+        "stdout={}\nstderr={}",
+        output.stdout, output.stderr
+    );
+    assert_eq!(
+        parse_envelope(&output.stdout)["error"]["code"],
+        "pending_review_reconciliation_failed"
+    );
+    let calls = fs::read_to_string(capture).expect("read calls");
+    assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
+}
+
+#[test]
+fn pr_pending_review_cross_process_lease_excludes_a_second_mutation() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("concurrent-submit-calls.log");
+    let started = stub.tempdir.path().join("submit-started.flag");
+    let release = stub.tempdir.path().join("submit-release.flag");
+    let manifest = vec![ReviewCommentManifestItem {
+        index: 0,
+        path: "src/file-0.rs".to_string(),
+        line: Some(1),
+        side: "RIGHT".to_string(),
+        start_line: None,
+        start_side: None,
+        subject_type: "LINE".to_string(),
+        body_digest: sha256_digest(b"first"),
+    }];
+    let (review_run_id, marker) = receipt_marker("Summary", manifest);
+    let snapshot =
+        pending_recovery_snapshot(true, 1, true).replace(INCOMPLETE_RECEIPT_RUN_ID, &review_run_id);
+    let submitted_flag = format!("{}.submitted", capture.to_string_lossy());
+    let transition = format!(
+        ": > {started:?}\n        while [ ! -e {release:?} ]; do sleep 0.01; done\n        : > \"{submitted_flag}\""
+    );
+    let script = pending_recovery_script(&capture.to_string_lossy(), &snapshot, &marker)
+        .replace(&format!(": > \"{submitted_flag}\""), &transition);
+    let stub = stub.gh_stub(&script);
+    let inspect = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+    let digest = parse_envelope(&inspect.stdout)["data"]["snapshot"]["snapshot_digest"]
+        .as_str()
+        .expect("snapshot digest")
+        .to_string();
+    let args = [
+        "--provider",
+        "github",
+        "--repo",
+        "acme/widgets",
+        "--format",
+        "json",
+        "pr",
+        "pending-review",
+        "resume-submit",
+        "42",
+        "--review",
+        "PRR_pending",
+        "--review-run-id",
+        &review_run_id,
+        "--expected-head",
+        "head-new",
+        "--expected-commit",
+        "head-new",
+        "--expected-snapshot",
+        &digest,
+        "--decision",
+        "comments-only",
+    ];
+    let mut first = Command::new(forge_cli_bin());
+    first
+        .args(args)
+        .env("XDG_CONFIG_HOME", stub.tempdir.path().join("xdg-config"))
+        .env("XDG_STATE_HOME", stub.tempdir.path().join("xdg-state"))
+        .env("FORGE_CLI_RATE_LIMIT_GATE", "off")
+        .current_dir(stub.tempdir.path());
+    for (key, value) in &stub.envs {
+        first.env(key, value);
+    }
+    let first = first.spawn().expect("spawn first submit");
+    for _ in 0..500 {
+        if started.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.exists(), "first submit did not reach the mutation");
+
+    let second = run_forge_cli(&stub, &args);
+    assert_eq!(second.code, 69, "{}", second.stdout);
+    assert_eq!(
+        parse_envelope(&second.stdout)["error"]["code"],
+        "pending_review_lease_busy"
+    );
+    let calls = fs::read_to_string(&capture).expect("read calls");
+    assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
+
+    fs::write(&release, "release\n").expect("release first submit");
+    let output = first.wait_with_output().expect("wait for first submit");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn pr_pending_review_resume_submit_accepts_provider_null_file_anchors() {
+    let stub = StubEnv::new();
+    let capture = stub
+        .tempdir
+        .path()
+        .join("file-anchor-resume-submit-calls.log");
+    let bodies = [
+        "first file finding",
+        "second file finding",
+        "third file finding",
+    ];
+    let manifest = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| ReviewCommentManifestItem {
+            index,
+            path: format!("src/file-{index}.rs"),
+            line: None,
+            side: "RIGHT".to_string(),
+            start_line: None,
+            start_side: None,
+            subject_type: "FILE".to_string(),
+            body_digest: sha256_digest(body.as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    let (review_run_id, marker) = receipt_marker("Summary", manifest);
+    let comments = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| serde_json::json!({
+            "id": format!("PRRC_{index}"),
+            "url": format!("https://github.com/acme/widgets/pull/42#discussion_file_{index}"),
+            "author": {"login": "review-bot"},
+            "body": format!("{body}\n<!-- forge-cli:review-finding:v1 run={review_run_id} digest={} -->", sha256_digest(body.as_bytes())),
+            "createdAt": format!("2026-07-20T12:00:{index:02}Z"),
+            "path": format!("src/file-{index}.rs"),
+            "diffHunk": "",
+            "line": null,
+            "originalLine": null,
+            "startLine": null,
+            "originalStartLine": null,
+            "subjectType": "FILE"
+        }))
+        .collect::<Vec<_>>();
+    let snapshot = serde_json::json!({
+        "data": {"node": {
+            "id": "PRR_pending",
+            "url": "https://github.com/acme/widgets/pull/42#pullrequestreview-102",
+            "author": {"login": "review-bot"},
+            "state": "PENDING",
+            "commit": {"oid": "head-new"},
+            "body": format!("Summary\n<!-- forge-cli:review-run:v1 run={review_run_id} -->"),
+            "viewerDidAuthor": true,
+            "viewerCanDelete": true,
+            "comments": {
+                "totalCount": 3,
+                "nodes": comments,
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            },
+            "pullRequest": {
+                "number": 42,
+                "url": "https://github.com/acme/widgets/pull/42",
+                "headRefOid": "head-new"
+            }
+        }}
+    })
+    .to_string();
+    let script = pending_recovery_script(&capture.to_string_lossy(), &snapshot, &marker);
+    let stub = stub.gh_stub(&script);
+
+    let inspect = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+    assert_eq!(inspect.code, 0, "{}", inspect.stdout);
+    let digest = parse_envelope(&inspect.stdout)["data"]["snapshot"]["snapshot_digest"]
+        .as_str()
+        .expect("snapshot digest")
+        .to_string();
+    let output = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "resume-submit",
+            "42",
+            "--review",
+            "PRR_pending",
+            "--review-run-id",
+            &review_run_id,
+            "--expected-head",
+            "head-new",
+            "--expected-commit",
+            "head-new",
+            "--expected-snapshot",
+            &digest,
+            "--decision",
+            "comments-only",
+        ],
+    );
+
+    assert_eq!(
+        output.code, 0,
+        "stdout={}\nstderr={}",
+        output.stdout, output.stderr
+    );
+    let calls = fs::read_to_string(capture).expect("read calls");
+    assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
 }
 
 #[test]
@@ -804,6 +1155,11 @@ esac
     );
     assert_eq!(envelope["data"]["review_id"], "PRR_pending");
     assert_eq!(envelope["data"]["review_run_id"], review_run_id);
+    assert_eq!(envelope["data"]["snapshot_digest"], serde_json::Value::Null);
+    assert_eq!(
+        envelope["data"]["snapshot_provenance"],
+        "pending-snapshot-unverified"
+    );
     assert_eq!(envelope["data"]["submitted"], true);
     let calls = fs::read_to_string(capture).expect("read calls");
     assert!(!calls.contains("submitPullRequestReview(input:"), "{calls}");
@@ -1176,6 +1532,7 @@ fn pr_pending_review_discard_requires_distinct_inline_content_approval() {
 fn pr_pending_review_delete_verifies_and_deletes_the_exact_pending_node() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-calls.log");
+    let deleted = stub.tempdir.path().join("deleted.flag");
     let script = format!(
         r#"#!/bin/sh
 set -eu
@@ -1187,10 +1544,15 @@ case "$1 $2" in
   "api graphql")
     case "$*" in
       *"deletePullRequestReview(input:"*)
+        : > {deleted:?}
         printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102"}}}}}}}}'
         ;;
       *"comments(first: 1)"*)
-        printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Pending review summary","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":0}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+        if [ -e {deleted:?} ]; then
+          printf '%s\n' '{{"data":{{"node":null}}}}'
+        else
+          printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Pending review summary","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":0}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+        fi
         ;;
       *)
         printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-new","reviews":{{"nodes":[{{"id":"PRR_pending","databaseId":102,"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"viewerDidAuthor":true,"viewerCanDelete":true,"body":"Pending review summary"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
@@ -2091,6 +2453,7 @@ esac
 fn pr_pending_review_delete_finds_the_exact_node_on_a_later_page() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-calls.log");
+    let deleted = stub.tempdir.path().join("deleted.flag");
     let script = format!(
         r#"#!/bin/sh
 set -eu
@@ -2102,10 +2465,15 @@ case "$1 $2" in
   "api graphql")
     case "$*" in
       *"deletePullRequestReview(input:"*)
+        : > {deleted:?}
         printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_page_2","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-202"}}}}}}}}'
         ;;
       *"comments(first: 1)"*)
-        printf '%s\n' '{{"data":{{"node":{{"id":"PRR_page_2","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-202","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"target","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":0}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+        if [ -e {deleted:?} ]; then
+          printf '%s\n' '{{"data":{{"node":null}}}}'
+        else
+          printf '%s\n' '{{"data":{{"node":{{"id":"PRR_page_2","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-202","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"target","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":0}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+        fi
         ;;
       *"after=cursor-1"*)
         printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-new","reviews":{{"nodes":[{{"id":"PRR_page_2","databaseId":202,"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-202","author":{{"login":"example-review-bot[bot]"}},"state":"PENDING","commit":{{"oid":"head-new"}},"viewerDidAuthor":true,"viewerCanDelete":true,"body":"target"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'

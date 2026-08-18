@@ -602,10 +602,12 @@ backend mapping, validation rules, and output schema versions.
   PR/head/review identity, author, commit, raw and semantic body,
   `viewerDidAuthor`, `viewerCanDelete`, provenance, every inline comment with
   normalized body digest plus `diffSide`/`startDiffSide` and line/range anchors,
-  and `snapshot_digest`. Every page must
-  repeat identical review metadata; partial data, cursor loops, count mismatch,
-  or head drift returns `review_snapshot_incomplete` instead of a partial
-  snapshot. Provenance is `receipt-bound` or `unmarked`; mixed, missing,
+  and `snapshot_digest`. Every page must repeat identical review metadata and a
+  stable `totalCount`; partial data, cursor loops, count mismatch, head drift,
+  an aggregate above 1,000 comments, or a decoded retained snapshot above 4 MiB
+  returns `review_snapshot_incomplete` instead of a partial snapshot. An
+  excessive `totalCount` is rejected before another page. Provenance is
+  `receipt-bound` or `unmarked`; mixed, missing,
   or digest-mismatched owned markers return `pending_review_manifest_mismatch`.
 - `pr pending-review resume-submit <id> --review <PRR_...> --review-run-id
   <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot
@@ -616,7 +618,13 @@ backend mapping, validation rules, and output schema versions.
   already submitted, the command reads submitted reviews and threads, verifies
   the authenticated author, same run id, review id, head, commit, decision
   state, and complete receipt-bound manifest, and returns the same successful
-  envelope without another mutation.
+  envelope without another mutation. Because a submitted review cannot prove
+  the caller's former pending-snapshot digest, that idempotent envelope reports
+  `snapshot_digest: null` with `snapshot_provenance:
+  pending-snapshot-unverified`; a live submit reports its guarded digest with
+  `snapshot_provenance: pending-cas+submitted-reconciled`. Provider-null
+  side/range values on a `FILE` comment are normalized away when matching a
+  receipt; `LINE` and range anchors remain exact.
 - `pr pending-review submit <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> --expected-snapshot <digest> --decision <decision>
   --confirm-unmarked-submit` emits `cli.forge-cli.pr.pending-review.submit.v1`.
@@ -630,8 +638,16 @@ backend mapping, validation rules, and output schema versions.
   invokes discard or delete.
 - Live inspect data is required for these four commands, so their current v1
   dry-run form fails with `pending_review_snapshot_required`. All mutating forms
-  perform the exact head/commit/snapshot and viewer-identity checks before the
-  mutation. Mismatches return `pending_review_head_changed`,
+  perform the exact head/commit/snapshot and viewer-identity checks under a
+  private cross-process forge-cli lease keyed by provider, host, repository,
+  PR, and authenticated viewer. Submission and deletion are immediately read
+  back and succeed only when the exact submitted manifest or absence is
+  reconciled; otherwise they return `pending_review_reconciliation_failed`.
+  A busy or unsafe lease returns `pending_review_lease_busy` or
+  `pending_review_lease_unsafe`. GitHub exposes no compare-and-swap token on
+  review submission, so the lease closes races among cooperating forge-cli
+  processes but cannot exclude a same-identity non-cooperating API client in
+  the irreducible interval between the final read and mutation. Mismatches return `pending_review_head_changed`,
   `pending_review_commit_mismatch`, `pending_review_manifest_mismatch`,
   `pending_review_identity_mismatch`, `pending_review_pr_mismatch`, or
   `pending_review_not_found` with no mutation.
@@ -783,19 +799,22 @@ backend mapping, validation rules, and output schema versions.
   `pending_review_not_deletable`; content drift returns the corresponding
   `pending_review_*_mismatch`. Submitted-review parsing is independent and
   cannot block this recovery path.
-- After the membership checks, the command reads the exact review node again
-  immediately before deletion. It revalidates PR membership, head, commit,
+- After the membership checks, the command takes the private cross-process
+  viewer/repository/PR lease and reads the exact review node again immediately
+  before deletion. It revalidates PR membership, head, commit,
   body, ownership, and delete capability. `pending_review_pr_mismatch` rejects
   a moved or inconsistent target. Reviews with inline draft comments return
   `pending_review_inline_comments_present` and require manual provider recovery;
   this primitive deletes only confirmed abandoned body-only drafts.
-- Only the revalidated node id is passed to `deletePullRequestReview`, and the
-  returned id must match. The success payload is
+- Only the revalidated node id is passed to `deletePullRequestReview`, the
+  returned id must match, and an exact-node read must reconcile provider absence
+  before success. The success payload is
   `data = { provider, number, url, head_sha, commit_sha, review_id, review_url,
   author, deleted }`. GitHub does not expose content compare-and-swap on this
-  deletion mutation, so a small residual race remains between the exact final
-  read and delete; explicit abandonment confirmation, immutable content guards,
-  and the inline-comment refusal bound that risk, but cannot remove it.
+  deletion mutation. The lease excludes cooperating forge-cli processes, while
+  explicit abandonment confirmation, immutable content guards, reconciliation,
+  and the inline-comment refusal bound the irreducible same-identity
+  non-cooperating-client window between the exact final read and delete.
 - `--dry-run` is offline. It validates a named `--expected-body-file`, renders
   the PR guard, complete snapshot, exact-target read, and delete plans, and
   never emits the expected body or its file path.
@@ -864,12 +883,15 @@ backend mapping, validation rules, and output schema versions.
   whose semantic `(path, body)` already has a live non-resolved/non-outdated
   thread, computes a deterministic `review_run_id`, and appends an immutable
   `forge-cli.review-loop.v1` receipt before native-review mutation. It then
-  selects only an exact viewer-owned receipt-bound pending review, or creates a
+  takes the same private provider/host/repository/PR/viewer cross-process lease
+  used by pending-review recovery and selects only an exact viewer-owned
+  receipt-bound pending review, or creates a
   new review bound to `--expected-head` through `commitOID`. The review body and
   every finding carry owned run/digest markers. An exact pending manifest must
   be an ordered prefix of the receipt manifest; the command adds only the
   missing suffix and performs a final complete snapshot before
-  `submitPullRequestReview`.
+  `submitPullRequestReview`. Success requires an immediate exact-node read-back
+  whose submitted state and complete receipt-bound manifest reconcile.
 
   Every interrupted stage is resumable: a lost create response, any lost inline
   comment response, a pre-submit failure, and a lost submit response preserve
@@ -1345,69 +1367,72 @@ backend implementations cannot diverge.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
-| `error.kind`                               | Triggered by rule    |
-| ------------------------------------------ | -------------------- |
-| `branch_name_invalid`                      | 1                    |
-| `branch_kind_mismatch`                     | 1                    |
-| `body_missing_summary`                     | 2                    |
-| `body_missing_test_plan`                   | 2                    |
-| `title_too_long`                           | 3                    |
-| `dirty_worktree`                           | 4                    |
-| `head_not_pushed`                          | 5                    |
-| `default_branch_protected`                 | 6                    |
-| `push_destination_missing`                 | 6                    |
-| `push_destination_ambiguous`               | 6                    |
-| `push_destination_credentials_unsupported` | 6                    |
-| `push_destination_rewrite_ambiguous`       | 6                    |
-| `provider_mismatch`                        | 6                    |
-| `provider_unsupported`                     | 6 (`USAGE 64`)       |
-| `repository_mismatch`                      | 6                    |
-| `detached_head`                            | 6                    |
-| `default_branch_checkout`                  | 6                    |
-| `head_not_checked_out`                     | 6                    |
-| `expected_base_mismatch`                   | 6                    |
-| `expected_base_missing`                    | 6                    |
-| `expected_base_not_ancestor`               | 6                    |
-| `direct_commit_count_invalid`              | 6                    |
-| `commit_signature_unverified`              | 6                    |
-| `reason_file_unreadable`                   | 6                    |
-| `reason_invalid`                           | 6                    |
-| `object_id_invalid`                        | 6                    |
-| `remote_default_lookup_failed`             | 6 (`UNAVAILABLE 69`) |
-| `remote_default_branch_missing`            | 6                    |
-| `git_timeout`                              | 6 (`UNAVAILABLE 69`) |
-| `git_output_limit`                         | 6 (`UNAVAILABLE 69`) |
-| `backend_timeout`                          | 6 (`UNAVAILABLE 69`) |
-| `backend_output_limit`                     | 6 (`UNAVAILABLE 69`) |
-| `default_push_rejected`                    | 6 (`RUNTIME 1`)      |
-| `default_push_verification_failed`         | 6 (`RUNTIME 1`)      |
-| `software_error`                           | 6 (`SOFTWARE 70`)    |
-| `draft_merge_refused`                      | 7                    |
-| `checks_pending`                           | 8                    |
-| `checks_failed`                            | 8 (`RUNTIME 1`)      |
-| `checks_not_registered`                    | 8                    |
-| `merge_method_unsupported`                 | 9                    |
-| `keep_branch_conflict`                     | 10                   |
-| `local_path_present`                       | 11                   |
-| `agent_attribution_present`                | 17                   |
-| `review_changes_requested`                 | 12                   |
-| `review_convergence_head_missing`          | 12                   |
-| `review_convergence_head_changed`          | 12                   |
-| `review_convergence_activity_changed`      | 12                   |
-| `review_snapshot_incomplete`               | 12, 16               |
-| `invalid_review_convergence_config`        | 12                   |
-| `unresolved_review_threads`                | 13                   |
-| `unchecked_task_items`                     | 14                   |
-| `review_thread_pr_mismatch`                | 15                   |
-| `pending_review_not_found`                 | 16                   |
-| `pending_review_author_mismatch`           | 16                   |
-| `pending_review_not_deletable`             | 16                   |
-| `pending_review_head_mismatch`             | 16                   |
-| `pending_review_commit_mismatch`           | 16                   |
-| `pending_review_body_mismatch`             | 16                   |
-| `pending_review_body_too_large`            | 16                   |
-| `pending_review_pr_mismatch`               | 16                   |
-| `pending_review_inline_comments_present`   | 16                   |
+| `error.kind`                               | Triggered by rule     |
+| ------------------------------------------ | --------------------- |
+| `branch_name_invalid`                      | 1                     |
+| `branch_kind_mismatch`                     | 1                     |
+| `body_missing_summary`                     | 2                     |
+| `body_missing_test_plan`                   | 2                     |
+| `title_too_long`                           | 3                     |
+| `dirty_worktree`                           | 4                     |
+| `head_not_pushed`                          | 5                     |
+| `default_branch_protected`                 | 6                     |
+| `push_destination_missing`                 | 6                     |
+| `push_destination_ambiguous`               | 6                     |
+| `push_destination_credentials_unsupported` | 6                     |
+| `push_destination_rewrite_ambiguous`       | 6                     |
+| `provider_mismatch`                        | 6                     |
+| `provider_unsupported`                     | 6 (`USAGE 64`)        |
+| `repository_mismatch`                      | 6                     |
+| `detached_head`                            | 6                     |
+| `default_branch_checkout`                  | 6                     |
+| `head_not_checked_out`                     | 6                     |
+| `expected_base_mismatch`                   | 6                     |
+| `expected_base_missing`                    | 6                     |
+| `expected_base_not_ancestor`               | 6                     |
+| `direct_commit_count_invalid`              | 6                     |
+| `commit_signature_unverified`              | 6                     |
+| `reason_file_unreadable`                   | 6                     |
+| `reason_invalid`                           | 6                     |
+| `object_id_invalid`                        | 6                     |
+| `remote_default_lookup_failed`             | 6 (`UNAVAILABLE 69`)  |
+| `remote_default_branch_missing`            | 6                     |
+| `git_timeout`                              | 6 (`UNAVAILABLE 69`)  |
+| `git_output_limit`                         | 6 (`UNAVAILABLE 69`)  |
+| `backend_timeout`                          | 6 (`UNAVAILABLE 69`)  |
+| `backend_output_limit`                     | 6 (`UNAVAILABLE 69`)  |
+| `default_push_rejected`                    | 6 (`RUNTIME 1`)       |
+| `default_push_verification_failed`         | 6 (`RUNTIME 1`)       |
+| `software_error`                           | 6 (`SOFTWARE 70`)     |
+| `draft_merge_refused`                      | 7                     |
+| `checks_pending`                           | 8                     |
+| `checks_failed`                            | 8 (`RUNTIME 1`)       |
+| `checks_not_registered`                    | 8                     |
+| `merge_method_unsupported`                 | 9                     |
+| `keep_branch_conflict`                     | 10                    |
+| `local_path_present`                       | 11                    |
+| `agent_attribution_present`                | 17                    |
+| `review_changes_requested`                 | 12                    |
+| `review_convergence_head_missing`          | 12                    |
+| `review_convergence_head_changed`          | 12                    |
+| `review_convergence_activity_changed`      | 12                    |
+| `review_snapshot_incomplete`               | 12, 16                |
+| `invalid_review_convergence_config`        | 12                    |
+| `unresolved_review_threads`                | 13                    |
+| `unchecked_task_items`                     | 14                    |
+| `review_thread_pr_mismatch`                | 15                    |
+| `pending_review_not_found`                 | 16                    |
+| `pending_review_author_mismatch`           | 16                    |
+| `pending_review_not_deletable`             | 16                    |
+| `pending_review_head_mismatch`             | 16                    |
+| `pending_review_commit_mismatch`           | 16                    |
+| `pending_review_body_mismatch`             | 16                    |
+| `pending_review_body_too_large`            | 16                    |
+| `pending_review_pr_mismatch`               | 16                    |
+| `pending_review_inline_comments_present`   | 16                    |
+| `pending_review_lease_busy`                | 16 (`UNAVAILABLE 69`) |
+| `pending_review_lease_unsafe`              | 16                    |
+| `pending_review_reconciliation_failed`     | 16                    |
 
 ## Activity output contract
 
