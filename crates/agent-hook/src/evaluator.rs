@@ -212,7 +212,7 @@ pub fn prepare<'a>(
                 rule,
                 mode,
                 recovery: recovery_rules.contains(&rule.id)
-                    && !matches!(rule.capability, Capability::SessionCoordination { .. }),
+                    && !coordination_capability(&rule.capability),
             })
         })
         .collect::<Vec<_>>();
@@ -224,6 +224,9 @@ pub fn prepare<'a>(
             matches!(
                 prepared.rule.capability,
                 Capability::SessionCoordination { .. }
+                    | Capability::DshPolicy {
+                        group: crate::policy_parity::DshCapabilityGroup::OperationLifecycle
+                    }
             )
         })
         .map(|prepared| prepared.rule);
@@ -238,12 +241,14 @@ pub fn prepare<'a>(
     let executable_count = rules
         .iter()
         .filter(|prepared| !prepared.recovery)
+        .filter(|prepared| !coordination_capability(&prepared.rule.capability))
         .filter(|prepared| match prepared.mode {
             RuleMode::Enforce => matches!(
                 prepared.rule.capability,
                 Capability::SessionActivity { .. }
                     | Capability::ExecutionReadOnly { .. }
                     | Capability::RuntimeKitHandler { .. }
+                    | Capability::DshPolicy { .. }
             ),
             RuleMode::Shadow => {
                 matches!(
@@ -280,6 +285,11 @@ pub fn prepare<'a>(
                 Capability::SemanticConflict { .. }
                     | Capability::OwnerLiveness { .. }
                     | Capability::SessionCoordination { .. }
+                    | Capability::DshPolicy {
+                        group: crate::policy_parity::DshCapabilityGroup::OwnerUnclaimed
+                            | crate::policy_parity::DshCapabilityGroup::SemanticConflict
+                            | crate::policy_parity::DshCapabilityGroup::OperationLifecycle
+                    }
             )
     });
 
@@ -288,6 +298,16 @@ pub fn prepare<'a>(
         needs_coordination,
         session_coordination: session_coordination_rule,
     })
+}
+
+fn coordination_capability(capability: &Capability) -> bool {
+    matches!(
+        capability,
+        Capability::SessionCoordination { .. }
+            | Capability::DshPolicy {
+                group: crate::policy_parity::DshCapabilityGroup::OperationLifecycle
+            }
+    )
 }
 
 pub fn evaluate(
@@ -324,20 +344,39 @@ fn evaluate_with_io(
     // Terminal correlation is evidence maintenance, not an admission gate.
     let _ = crate::degraded::complete_terminal(raw, request);
     let liveness = prepared.needs_coordination.then(|| {
-        liveness::DispatchProjection::new(
-            coordination.snapshot,
-            coordination.mode_override,
-            coordination.unmanaged,
-            liveness_io,
-        )
+        if request.product == Product::Dsh {
+            liveness::DispatchProjection::new_dsh(
+                coordination.snapshot,
+                request
+                    .dsh_subject
+                    .as_ref()
+                    .map(|subject| subject.session_id.as_str()),
+                coordination.mode_override,
+                liveness_io,
+            )
+        } else {
+            liveness::DispatchProjection::new(
+                coordination.snapshot,
+                coordination.mode_override,
+                coordination.unmanaged,
+                liveness_io,
+            )
+        }
     });
     request.semantic_conflict = coordination.snapshot.map(|_| {
-        liveness::derive_semantic_conflict(
-            request,
-            liveness
-                .as_ref()
-                .expect("coordination snapshot requires liveness projection"),
-        )
+        let projection = liveness
+            .as_ref()
+            .expect("coordination snapshot requires liveness projection");
+        if request.product == Product::Dsh {
+            request.dsh_subject.as_ref().map_or(
+                crate::model::SemanticConflict::Unknown,
+                |subject| {
+                    liveness::derive_dsh_semantic_conflict(request, projection, &subject.session_id)
+                },
+            )
+        } else {
+            liveness::derive_semantic_conflict(request, projection)
+        }
     });
 
     let mut enforced = Vec::new();
@@ -346,7 +385,14 @@ fn evaluate_with_io(
     let mut execution_budgets = ExecutionBudgets::new();
     let operation_effect = if prepared.rules.iter().any(|prepared_rule| {
         prepared_rule.mode == RuleMode::Enforce
-            && prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
+            && (prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
+                || matches!(
+                    prepared_rule.rule.capability,
+                    Capability::DshPolicy {
+                        group: crate::policy_parity::DshCapabilityGroup::PreEditIntentGate
+                            | crate::policy_parity::DshCapabilityGroup::CheckoutLeaseGuard
+                    }
+                ))
     }) {
         crate::effect::classify(raw, request)
     } else {
@@ -383,7 +429,7 @@ fn evaluate_with_io(
             ));
             continue;
         }
-        if matches!(rule.capability, Capability::SessionCoordination { .. }) {
+        if coordination_capability(&rule.capability) {
             continue;
         }
         if let Capability::ExecutionReadOnly {
@@ -513,7 +559,8 @@ fn evaluate_shadow(
         }
         Capability::SessionActivity { .. }
         | Capability::SessionCoordination { .. }
-        | Capability::RuntimeKitHandler { .. } => {
+        | Capability::RuntimeKitHandler { .. }
+        | Capability::DshPolicy { .. } => {
             simple(DecisionAction::Allow, "shadow-side-effect-skipped")
         }
     }
@@ -628,6 +675,71 @@ fn evaluate_capability(
         Capability::RuntimeKitHandler { handler_id } => {
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?
         }
+        Capability::DshPolicy { group } => match group {
+            crate::policy_parity::DshCapabilityGroup::AgentActivity => {
+                match run_session_activity(request, raw, execution_budget) {
+                    Ok(()) => simple(DecisionAction::Allow, group.as_str()),
+                    Err(_) => simple(DecisionAction::Block, group.as_str()),
+                }
+            }
+            crate::policy_parity::DshCapabilityGroup::SemanticConflict => {
+                if request.dsh_subject.is_none() {
+                    return Ok(simple(DecisionAction::Block, group.as_str()));
+                }
+                if liveness.is_some_and(liveness::DispatchProjection::is_unmanaged) {
+                    simple(DecisionAction::Allow, "coordination-unmanaged")
+                } else {
+                    let action = liveness::semantic_conflict_action(
+                        request.semantic_conflict,
+                        liveness.and_then(liveness::DispatchProjection::mode),
+                    );
+                    simple(
+                        if action == DecisionAction::Allow {
+                            DecisionAction::Allow
+                        } else {
+                            DecisionAction::Block
+                        },
+                        group.as_str(),
+                    )
+                }
+            }
+            crate::policy_parity::DshCapabilityGroup::OwnerUnclaimed => {
+                if request.dsh_subject.is_none() {
+                    return Ok(simple(DecisionAction::Block, group.as_str()));
+                }
+                let projection = liveness.ok_or_else(|| {
+                    HookError::runtime(
+                        "coordination-unavailable",
+                        "owner liveness projection is unavailable",
+                    )
+                })?;
+                let outcome = liveness::classify(request, 300, projection);
+                simple(
+                    if outcome.action == DecisionAction::Allow {
+                        DecisionAction::Allow
+                    } else {
+                        DecisionAction::Block
+                    },
+                    group.as_str(),
+                )
+            }
+            _ => {
+                let outcome = crate::dsh_policy::evaluate(
+                    *group,
+                    request,
+                    raw,
+                    crate::effect::classify(raw, request),
+                    &mut |command| run_with_budget(command, &[], execution_budget),
+                )?;
+                RuleOutcome {
+                    action: outcome.action,
+                    code: outcome.code,
+                    context: outcome.context,
+                    replacement: None,
+                    provider_output: None,
+                }
+            }
+        },
     })
 }
 
@@ -692,7 +804,13 @@ pub fn apply_session_coordination(
             StopCoordinationOutcome::NotRun,
         ));
     };
-    if execution.unmanaged {
+    let native_dsh_operation = matches!(
+        rule.capability,
+        Capability::DshPolicy {
+            group: crate::policy_parity::DshCapabilityGroup::OperationLifecycle
+        }
+    );
+    if execution.unmanaged && !native_dsh_operation {
         return Ok(crate::degradation::apply_stop_reentry(
             request,
             raw,
@@ -717,13 +835,57 @@ pub fn apply_session_coordination(
             StopCoordinationOutcome::NotRun,
         ));
     }
-    let Capability::SessionCoordination { reason_code } = &rule.capability else {
-        unreachable!("prepared coordination rule has the typed capability")
+    let reason_code = match &rule.capability {
+        Capability::SessionCoordination { reason_code } => reason_code.as_str(),
+        Capability::DshPolicy {
+            group: crate::policy_parity::DshCapabilityGroup::OperationLifecycle,
+        } => crate::policy_parity::DshCapabilityGroup::OperationLifecycle.as_str(),
+        _ => unreachable!("prepared coordination rule has the typed capability"),
     };
-    let (outcome, coordination_outcome) = match run_session_coordination(request.product, raw) {
+    let run_result = if native_dsh_operation {
+        crate::dsh_coordination::run(request, raw, execution.operation_effect, &mut |command| {
+            run_bounded(
+                command,
+                &[],
+                SESSION_COORDINATION_TIMEOUT,
+                MAX_HANDLER_OUTPUT,
+                false,
+            )
+        })
+        .map(|native| {
+            let (action, status) = match native.status {
+                crate::dsh_coordination::Status::NotRun => {
+                    (DecisionAction::Allow, CoordinationHandlerStatus::NotRun)
+                }
+                crate::dsh_coordination::Status::Clean => {
+                    (DecisionAction::Allow, CoordinationHandlerStatus::Clean)
+                }
+                crate::dsh_coordination::Status::Pending => {
+                    (DecisionAction::Block, CoordinationHandlerStatus::Pending)
+                }
+                crate::dsh_coordination::Status::Unavailable => (
+                    DecisionAction::Block,
+                    CoordinationHandlerStatus::Unavailable,
+                ),
+            };
+            CoordinationHandlerOutcome {
+                outcome: RuleOutcome {
+                    action,
+                    code: reason_code.to_string(),
+                    context: native.message,
+                    replacement: None,
+                    provider_output: None,
+                },
+                status,
+            }
+        })
+    } else {
+        run_session_coordination(request.product, raw)
+    };
+    let (outcome, coordination_outcome) = match run_result {
         Ok(mut handler) => {
             if handler.outcome.code == SESSION_COORDINATION_HANDLER {
-                handler.outcome.code.clone_from(reason_code);
+                handler.outcome.code = reason_code.to_string();
             }
             let status = match handler.status {
                 CoordinationHandlerStatus::NotRun => StopCoordinationOutcome::NotRun,
@@ -1141,16 +1303,19 @@ fn run_session_activity(
     raw: &[u8],
     execution_budget: &mut ExecutionBudget,
 ) -> Result<(), HookError> {
-    let Some(session_id) = std::env::var("AGENT_SESSION_ID")
+    let session_id = std::env::var("AGENT_SESSION_ID")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(());
-    };
-    let Some(runtime_id) = std::env::var("AGENT_SESSION_RUNTIME_ID")
+        .filter(|value| !value.trim().is_empty());
+    let runtime_id = std::env::var("AGENT_SESSION_RUNTIME_ID")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
+        .filter(|value| !value.trim().is_empty());
+    if request.product == Product::Dsh && session_id.is_some() != runtime_id.is_some() {
+        return Err(HookError::data(
+            "session-activity-identity-incomplete",
+            "managed DSH activity requires both session and runtime identity",
+        ));
+    }
+    let (Some(session_id), Some(runtime_id)) = (session_id, runtime_id) else {
         return Ok(());
     };
     let Some(event) = crate::adapter::normalize_activity_event(request, raw, &runtime_id)? else {
@@ -1921,6 +2086,7 @@ mod tests {
             target_paths: vec![root.join("target.txt")],
             execution_path: Some(root.to_path_buf()),
             binding_roots: vec![root.to_path_buf()],
+            dsh_subject: None,
         }
     }
 

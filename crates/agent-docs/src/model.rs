@@ -125,7 +125,6 @@ pub enum Product {
     Codex,
     Claude,
     Hermes,
-    Dsh,
 }
 
 impl Product {
@@ -134,12 +133,11 @@ impl Product {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Hermes => "hermes",
-            Self::Dsh => "dsh",
         }
     }
 
     pub const fn supported_values() -> &'static [&'static str] {
-        &["codex", "claude", "hermes", "dsh"]
+        &["codex", "claude", "hermes"]
     }
 
     pub fn from_config_value(value: &str) -> Option<Self> {
@@ -147,7 +145,6 @@ impl Product {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
             "hermes" => Some(Self::Hermes),
-            "dsh" => Some(Self::Dsh),
             _ => None,
         }
     }
@@ -856,6 +853,26 @@ impl RemoveOutcome {
 impl fmt::Display for RemoveOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::Product;
+
+    #[test]
+    fn public_product_boundary_remains_the_stable_three_variant_contract() {
+        fn exhaustive_name(product: Product) -> &'static str {
+            match product {
+                Product::Codex => "codex",
+                Product::Claude => "claude",
+                Product::Hermes => "hermes",
+            }
+        }
+
+        assert_eq!(Product::supported_values(), &["codex", "claude", "hermes"]);
+        assert_eq!(Product::from_config_value("dsh"), None);
+        assert_eq!(exhaustive_name(Product::Hermes), "hermes");
     }
 }
 

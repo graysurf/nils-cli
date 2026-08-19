@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use pretty_assertions::assert_eq;
 
@@ -22,6 +23,36 @@ fn context_args<'a>(state: &'a str, request_id: &'a str) -> Vec<&'a str> {
         "--format",
         "json",
     ]
+}
+
+fn session_records(state_home: &Path) -> Vec<PathBuf> {
+    let sessions = state_home.join("agent-docs/sessions");
+    if !sessions.exists() {
+        return Vec::new();
+    }
+    let mut pending = vec![sessions];
+    let mut records = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).expect("session state directory") {
+            let path = entry.expect("session state entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                records.push(path);
+            }
+        }
+    }
+    records.sort();
+    records
+}
+
+fn only_session_record(state_home: &Path) -> PathBuf {
+    let records = session_records(state_home);
+    assert_eq!(records.len(), 1, "expected one DSH session record");
+    records.into_iter().next().unwrap()
 }
 
 #[test]
@@ -198,51 +229,11 @@ required = true
     assert_eq!(output.json()["error"]["code"], "context-budget-exceeded");
     assert!(!output.stdout.contains("POLICY_CONTENT_MUST_NOT_BE_PARTIAL"));
 
-    let verify = env.run(&[
-        "session",
-        "verify",
-        "--session-id",
-        "dsh-session-private-sentinel",
-        "--product",
-        "dsh",
-        "--state-home",
-        state,
-        "--require-intent",
-        "project-dev",
-        "--format",
-        "json",
-    ]);
-    assert_eq!(verify.code, 65, "stderr={}", verify.stderr);
-    assert_eq!(verify.json()["error"]["code"], "missing-activation");
-    assert_eq!(
-        verify.json()["error"]["details"]["next_action"],
-        "prepare-intent"
-    );
-    assert_eq!(
-        verify.json()["error"]["details"]["recovery"]["command"],
-        "session.prepare"
-    );
+    assert!(session_records(&state_home).is_empty());
 
     let prepared = env.run(&context_args(state, "request-prepared"));
     assert_eq!(prepared.code, 0, "stderr={}", prepared.stderr);
-    let status = env.run(&[
-        "session",
-        "status",
-        "--session-id",
-        "dsh-session-private-sentinel",
-        "--product",
-        "dsh",
-        "--state-home",
-        state,
-        "--format",
-        "json",
-    ]);
-    assert_eq!(status.code, 0, "stderr={}", status.stderr);
-    let record_file = status.json()["data"]["record_file"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let record_path = state_home.join(record_file);
+    let record_path = only_session_record(&state_home);
     let before = fs::read(&record_path).unwrap();
 
     let mut failed_refresh = context_args(state, "request-budget-existing");
@@ -258,26 +249,12 @@ required = true
     );
     assert_eq!(fs::read(&record_path).unwrap(), before);
 
-    let verify_preserved = env.run(&[
-        "session",
-        "verify",
-        "--session-id",
-        "dsh-session-private-sentinel",
-        "--product",
-        "dsh",
-        "--state-home",
-        state,
-        "--require-intent",
-        "project-dev",
-        "--format",
-        "json",
-    ]);
+    let preserved = env.run(&context_args(state, "request-preserved"));
+    assert_eq!(preserved.code, 0, "stderr={}", preserved.stderr);
     assert_eq!(
-        verify_preserved.code, 0,
-        "stderr={}",
-        verify_preserved.stderr
+        preserved.json()["data"]["decision"]["reason"],
+        "already-current"
     );
-    assert_eq!(verify_preserved.json()["data"]["verified"], true);
 }
 
 #[test]
@@ -394,71 +371,63 @@ required = true
     assert_eq!(decision["document_count"], 2);
     assert!(!output.stdout.contains("DELIVERY.md"));
 
-    let same_phase = env.run(&[
+    let mut same_phase_args = context_args(state, "request-same-phase");
+    same_phase_args.splice(
+        same_phase_args.len() - 2..same_phase_args.len() - 2,
+        ["--phase", "edit"],
+    );
+    let same_phase = env.run(&same_phase_args);
+    assert_eq!(same_phase.code, 0, "stderr={}", same_phase.stderr);
+    assert_eq!(
+        same_phase.json()["data"]["decision"]["reason"],
+        "already-current"
+    );
+
+    let mut other_phase_args = context_args(state, "request-other-phase");
+    other_phase_args.splice(
+        other_phase_args.len() - 2..other_phase_args.len() - 2,
+        ["--phase", "delivery"],
+    );
+    let other_phase = env.run(&other_phase_args);
+    assert_eq!(other_phase.code, 65, "stdout={}", other_phase.stdout);
+    assert_eq!(other_phase.json()["error"]["code"], "phase-unsatisfied");
+    assert_eq!(
+        other_phase.json()["error"]["details"]["next_action"],
+        "repair-catalog"
+    );
+    assert_eq!(
+        other_phase.json()["error"]["details"]["recovery"]["action"],
+        "repair-catalog"
+    );
+    assert!(
+        other_phase.json()["error"]["details"]["recovery"]
+            .get("command")
+            .is_none()
+    );
+
+    let other_session = env.run(&[
         "session",
-        "verify",
+        "context",
         "--session-id",
-        "dsh-session-private-sentinel",
+        "other-session",
         "--product",
         "dsh",
         "--state-home",
         state,
-        "--require-intent",
+        "--intent",
         "project-dev",
         "--phase",
         "edit",
+        "--request-id",
+        "request-other-session",
         "--format",
         "json",
     ]);
-    assert_eq!(same_phase.code, 0, "stderr={}", same_phase.stderr);
-    assert_eq!(same_phase.json()["data"]["verified"], true);
-
-    let other_phase = env.run(&[
-        "session",
-        "verify",
-        "--session-id",
-        "dsh-session-private-sentinel",
-        "--product",
-        "dsh",
-        "--state-home",
-        state,
-        "--require-intent",
-        "project-dev",
-        "--phase",
-        "delivery",
-        "--format",
-        "json",
-    ]);
-    assert_eq!(other_phase.code, 65, "stdout={}", other_phase.stdout);
-    assert_eq!(other_phase.json()["error"]["code"], "missing-intent");
-
-    for (session, intent, expected_code) in [
-        ("other-session", "project-dev", "missing-activation"),
-        (
-            "dsh-session-private-sentinel",
-            "task-tools",
-            "missing-intent",
-        ),
-    ] {
-        let verify = env.run(&[
-            "session",
-            "verify",
-            "--session-id",
-            session,
-            "--product",
-            "dsh",
-            "--state-home",
-            state,
-            "--require-intent",
-            intent,
-            "--phase",
-            "edit",
-            "--format",
-            "json",
-        ]);
-        assert_eq!(verify.code, 65, "stdout={}", verify.stdout);
-        assert_eq!(verify.json()["error"]["code"], expected_code);
-    }
+    assert_eq!(other_session.code, 0, "stdout={}", other_session.stdout);
+    assert_eq!(
+        other_session.json()["data"]["decision"]["reason"],
+        "prepared"
+    );
 }
 
 #[test]
@@ -668,7 +637,7 @@ required = true
 }
 
 #[test]
-fn dsh_verify_reports_policy_repair_when_context_exceeds_the_hard_limit() {
+fn dsh_context_fails_closed_when_policy_exceeds_the_hard_limit() {
     let env = TestEnv::new();
     env.write_project_catalog(
         r#"
@@ -686,31 +655,20 @@ required = true
 
     let prepared = env.run(&context_args(state, "request-before-growth"));
     assert_eq!(prepared.code, 0, "stderr={}", prepared.stderr);
+    let record_path = only_session_record(&state_home);
+    let before = fs::read(&record_path).expect("prepared record");
 
     env.write_project_doc("POLICY.md", &"x".repeat(64 * 1024 + 1));
-    let verify = env.run(&[
-        "session",
-        "verify",
-        "--session-id",
-        "dsh-session-private-sentinel",
-        "--product",
-        "dsh",
-        "--state-home",
-        state,
-        "--require-intent",
-        "project-dev",
-        "--format",
-        "json",
-    ]);
-    assert_eq!(verify.code, 65, "stdout={}", verify.stdout);
-    let error = &verify.json()["error"];
-    assert_eq!(error["code"], "context-policy-invalid");
-    assert_eq!(error["details"]["next_action"], "repair-catalog");
-    assert_eq!(error["details"]["recovery"]["command"], "audit");
+    let mut args = context_args(state, "request-after-growth");
+    args.splice(args.len() - 2..args.len() - 2, ["--max-bytes", "65536"]);
+    let output = env.run(&args);
+    assert_eq!(output.code, 65, "stdout={}", output.stdout);
+    assert_eq!(output.json()["error"]["code"], "context-budget-exceeded");
+    assert_eq!(fs::read(record_path).expect("record after failure"), before);
 }
 
 #[test]
-fn standard_session_prepare_and_verify_accept_the_dsh_product() {
+fn generic_session_surfaces_do_not_expand_the_stable_product_contract() {
     let env = TestEnv::new();
     env.write_project_catalog(
         r#"
@@ -739,8 +697,8 @@ required = true
         "--format",
         "json",
     ]);
-    assert_eq!(prepare.code, 0, "stderr={}", prepare.stderr);
-    assert_eq!(prepare.json()["data"]["product"], "dsh");
+    assert_eq!(prepare.code, 64, "stderr={}", prepare.stderr);
+    assert_eq!(prepare.json()["error"]["code"], "parse-error");
 
     let verify = env.run(&[
         "session",
@@ -756,12 +714,12 @@ required = true
         "--format",
         "json",
     ]);
-    assert_eq!(verify.code, 0, "stderr={}", verify.stderr);
-    assert_eq!(verify.json()["data"]["verified"], true);
+    assert_eq!(verify.code, 64, "stderr={}", verify.stderr);
+    assert_eq!(verify.json()["error"]["code"], "parse-error");
 }
 
 #[test]
-fn dsh_catalog_filter_and_integration_resolve_are_supported() {
+fn standard_catalog_filter_and_dsh_integration_resolve_are_isolated() {
     let env = TestEnv::new();
     env.write_project_catalog(
         r#"
@@ -783,10 +741,10 @@ required = true
     .write_project_doc("DSH.md", "dsh policy\n")
     .write_project_doc("CODEX.md", "codex policy\n");
 
-    let list = env.run(&["list", "--product", "dsh", "--format", "json"]);
+    let list = env.run(&["list", "--product", "codex", "--format", "json"]);
     assert_eq!(list.code, 0, "stderr={}", list.stderr);
     assert_eq!(list.json()["documents"].as_array().unwrap().len(), 1);
-    assert_eq!(list.json()["documents"][0]["products"][0], "dsh");
+    assert_eq!(list.json()["documents"][0]["products"][0], "codex");
 
     let integration = env.run(&[
         "integration",

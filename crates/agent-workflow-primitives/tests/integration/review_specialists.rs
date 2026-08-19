@@ -47,6 +47,30 @@ fn review_specialists_validate_normalizes_findings() {
 }
 
 #[test]
+fn review_specialists_validate_accepts_the_dsh_quick_specialist() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("quick.jsonl");
+    fs::write(
+        &input,
+        r#"{"severity":"medium","confidence":0.85,"path":"src/review.js","line":7,"category":"correctness","summary":"Quick review found a material issue.","evidence":"The changed branch violates its invariant.","recommendation":"Restore the invariant.","specialist":"quick","fingerprint":"correctness:reviewer:documented-invariant"}"#,
+    )
+    .expect("write quick finding");
+    let input = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &["validate", "--input", &input, "--format", "json"],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["data"]["findings"][0]["specialist"],
+        "quick"
+    );
+}
+
+#[test]
 fn review_specialists_validate_rejects_bad_rows_with_data_exit() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let input = path_arg(&fixture("findings.invalid.jsonl"));

@@ -387,6 +387,7 @@ pub(crate) fn broker_status(context: &CliContext, id: &str) -> Result<Value, Cli
         cli::BrokerStatusArgs {
             session: id.to_string(),
             capability_file: None,
+            authenticated: false,
             format: nils_common::cli_contract::OutputFormat::Json,
         },
     )

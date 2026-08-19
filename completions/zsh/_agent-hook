@@ -196,6 +196,82 @@ json\:"Single-record JSON envelope (snake_case)"))' \
     ;;
 esac
 ;;
+(finish-line)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-hook__subcmd__finish-line_commands" \
+"*::: :->finish-line" \
+&& ret=0
+
+    case $state in
+    (finish-line)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-finish-line-command-$line[1]:"
+        case $line[1] in
+            (open)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(begin)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(run)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -220,6 +296,7 @@ _agent-hook_commands() {
 'doctor:Inspect policy, provider registrations, compatibility residue, and recovery state' \
 'setup:Preview, apply, repair, or remove exact owned provider ingress' \
 'recovery:Create, authorize, inspect, consume, or revoke governed recovery' \
+'finish-line:Persist edit generations, execute declared validations, and enforce the DSH stop boundary' \
 'completion:Print a shell completion script' \
     )
     _describe -t commands 'agent-hook commands' commands "$@"
@@ -238,6 +315,42 @@ _agent-hook__subcmd__dispatch_commands() {
 _agent-hook__subcmd__doctor_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook doctor commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line_commands] )) ||
+_agent-hook__subcmd__finish-line_commands() {
+    local commands; commands=(
+'open:Mint one private DSH runner capability for this repository session' \
+'begin:Durably advance the edit generation before an authoritative mutation' \
+'run:Probe or supervise one foreground DSH Bash command and classify exact validation targets' \
+'stop:Decide whether every current validation target is satisfied' \
+'status:Inspect bounded redacted finish-line state' \
+    )
+    _describe -t commands 'agent-hook finish-line commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__begin_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__begin_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line begin commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__open_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__open_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line open commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__run_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line run commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__status_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line status commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__stop_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line stop commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__inventory_commands] )) ||
 _agent-hook__subcmd__inventory_commands() {

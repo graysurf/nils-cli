@@ -591,6 +591,7 @@ fn capability_identity(capability: &Capability) -> (&'static str, Option<&str>) 
         Capability::ExecutionReadOnly { .. } => ("execution.read-only.v1", None),
         Capability::SessionActivity { .. } => ("agent-session.activity.v1", None),
         Capability::SessionCoordination { .. } => ("agent-session.coordination.v1", None),
+        Capability::DshPolicy { group } => ("dsh.policy.v1", Some(group.as_str())),
         _ => ("decision.builtin.v1", None),
     }
 }
@@ -678,6 +679,7 @@ mod tests {
             target_paths: Vec::new(),
             execution_path: None,
             binding_roots: Vec::new(),
+            dsh_subject: None,
         };
         let barrier = Arc::new(Barrier::new(WRITERS));
         let handles = (0..WRITERS)

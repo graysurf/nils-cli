@@ -362,7 +362,7 @@ pub struct IntegrationResolveArgs {
         value_enum,
         help = "Product whose automatic integration decision is being resolved"
     )]
-    pub product: Product,
+    pub product: IntegrationProduct,
     #[arg(
         long,
         value_enum,
@@ -370,6 +370,26 @@ pub struct IntegrationResolveArgs {
         help = "Output format"
     )]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum IntegrationProduct {
+    Codex,
+    Claude,
+    Hermes,
+    Dsh,
+}
+
+impl IntegrationProduct {
+    pub const fn as_stable_product(self) -> Option<Product> {
+        match self {
+            Self::Codex => Some(Product::Codex),
+            Self::Claude => Some(Product::Claude),
+            Self::Hermes => Some(Product::Hermes),
+            Self::Dsh => None,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -461,9 +481,9 @@ pub enum ContextProduct {
 }
 
 impl ContextProduct {
-    pub const fn as_product(self) -> Product {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Dsh => Product::Dsh,
+            Self::Dsh => "dsh",
         }
     }
 }

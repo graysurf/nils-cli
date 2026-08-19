@@ -246,10 +246,9 @@ pub(crate) fn resolve_intent_with_effective_catalog_for_scope(
 /// read through one aggregate byte/count budget before any activation can be
 /// persisted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_context_with_effective_catalog_for_scope(
+pub(crate) fn resolve_dsh_context_with_effective_catalog_for_scope(
     intent: &Context,
     roots: &ResolvedRoots,
-    product: Product,
     phase: Option<Phase>,
     strict: bool,
     fallback_mode: FallbackMode,
@@ -258,7 +257,6 @@ pub(crate) fn resolve_context_with_effective_catalog_for_scope(
 ) -> Result<PreflightReport, ContextResolveError> {
     let documents = resolve_context_documents(
         roots,
-        product,
         phase.as_ref(),
         fallback_mode,
         max_bytes,
@@ -266,13 +264,13 @@ pub(crate) fn resolve_context_with_effective_catalog_for_scope(
         &mut |entry| entry.context == *intent,
     )?;
     let validation =
-        resolve_validation_contract_for_product(intent, roots, Some(product), &effective.catalog);
+        resolve_validation_contract_for_product(intent, roots, None, &effective.catalog);
     let summary = ResolveSummary::from_documents(&documents);
 
     Ok(PreflightReport {
         schema_version: PreflightReport::SCHEMA_VERSION,
         intent: intent.clone(),
-        product: Some(product),
+        product: None,
         phase,
         strict,
         docs_home: roots.docs_home.clone(),
@@ -461,7 +459,6 @@ fn resolve_documents(
 #[allow(clippy::too_many_arguments)]
 fn resolve_context_documents(
     roots: &ResolvedRoots,
-    product: Product,
     phase: Option<&Phase>,
     fallback_mode: FallbackMode,
     max_bytes: usize,
@@ -471,7 +468,6 @@ fn resolve_context_documents(
     let mut reader = read_context_document;
     resolve_context_documents_with_reader(
         roots,
-        product,
         phase,
         fallback_mode,
         max_bytes,
@@ -494,7 +490,6 @@ type ContextDocumentReader<'a> = dyn FnMut(
 #[allow(clippy::too_many_arguments)]
 fn resolve_context_documents_with_reader(
     roots: &ResolvedRoots,
-    product: Product,
     phase: Option<&Phase>,
     fallback_mode: FallbackMode,
     max_bytes: usize,
@@ -508,10 +503,7 @@ fn resolve_context_documents_with_reader(
 
     for scope_catalog in catalog.in_load_order() {
         for entry in &scope_catalog.documents {
-            if !accept(entry)
-                || !matches_product(&entry.products, Some(product))
-                || !matches_phase(&entry.phases, phase)
-            {
+            if !accept(entry) || !matches_phase(&entry.phases, phase) {
                 continue;
             }
             if scope_catalog.source_scope == Scope::Home
@@ -1133,6 +1125,7 @@ fn push_unique_intent(intents: &mut Vec<String>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::load_dsh_catalog_from_roots;
 
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -1284,11 +1277,12 @@ product = "dsh"
 required = false
 "#;
         let fixture = fixture("", catalog);
-        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let loaded = load_dsh_catalog_from_roots(&fixture.roots)
+            .expect("catalog")
+            .into_loaded();
         let mut opened = Vec::new();
         let documents = resolve_context_documents_with_reader(
             &fixture.roots,
-            Product::Dsh,
             None,
             FallbackMode::Auto,
             1024,
@@ -1328,11 +1322,12 @@ product = "dsh"
 required = true
 "#;
         let fixture = fixture(home_catalog, project_catalog);
-        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let loaded = load_dsh_catalog_from_roots(&fixture.roots)
+            .expect("catalog")
+            .into_loaded();
         let mut opened = Vec::new();
         let documents = resolve_context_documents_with_reader(
             &fixture.roots,
-            Product::Dsh,
             None,
             FallbackMode::Auto,
             8,
@@ -1375,11 +1370,12 @@ product = "dsh"
 required = false
 "#;
         let fixture = fixture(home_catalog, project_catalog);
-        let loaded = load_catalog_from_roots(&fixture.roots).expect("catalog");
+        let loaded = load_dsh_catalog_from_roots(&fixture.roots)
+            .expect("catalog")
+            .into_loaded();
         let mut opened = Vec::new();
         let documents = resolve_context_documents_with_reader(
             &fixture.roots,
-            Product::Dsh,
             None,
             FallbackMode::Auto,
             8,

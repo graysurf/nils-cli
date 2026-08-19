@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -391,16 +392,39 @@ fn git_repo_root() -> Result<PathBuf, CliError> {
 }
 
 fn git_stdout(args: &[&str]) -> Result<String, CliError> {
-    let output = ProcessCommand::new("git")
-        .args(args)
-        .output()
-        .map_err(|err| {
-            CliError::runtime(
-                "git-spawn-failed",
-                format!("failed to run git: {err}"),
-                None,
-            )
-        })?;
+    let executable = trusted_git_executable()?;
+    let mut command = ProcessCommand::new(executable);
+    command
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.pager=cat",
+        ]);
+    if args.first() == Some(&"diff") {
+        command.arg("diff").args(["--no-ext-diff", "--no-textconv"]);
+        command.args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    let output = command.output().map_err(|err| {
+        CliError::runtime(
+            "git-spawn-failed",
+            format!("failed to run git: {err}"),
+            None,
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -416,6 +440,30 @@ fn git_stdout(args: &[&str]) -> Result<String, CliError> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn trusted_git_executable() -> Result<PathBuf, CliError> {
+    for directory in ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        let candidate = Path::new(directory).join("git");
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&canonical) else {
+            continue;
+        };
+        if metadata.is_file()
+            && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            && metadata.permissions().mode() & 0o022 == 0
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return Ok(canonical);
+        }
+    }
+    Err(CliError::runtime(
+        "git-spawn-failed",
+        "a trusted system Git executable is unavailable",
+        None,
+    ))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {

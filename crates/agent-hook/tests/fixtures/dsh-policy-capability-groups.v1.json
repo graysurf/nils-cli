@@ -1,0 +1,28 @@
+{
+  "schema_version": "agent-hook.dsh-policy-capability-groups.v1",
+  "capabilities": [
+    { "id": "agent-activity", "migration_task": "3.4" },
+    { "id": "owner-unclaimed", "migration_task": "3.2" },
+    { "id": "semantic-conflict", "migration_task": "3.2" },
+    { "id": "operation-lifecycle", "migration_task": "3.4" },
+    { "id": "agent-scope-lock-guard", "migration_task": "3.2" },
+    { "id": "block-direct-git-commit", "migration_task": "3.2" },
+    { "id": "block-direct-git-worktree", "migration_task": "3.2" },
+    { "id": "block-direct-pr-create", "migration_task": "3.2" },
+    { "id": "block-direct-python", "migration_task": "3.2" },
+    { "id": "block-project-memory-write", "migration_task": "3.3" },
+    { "id": "block-unsafe-default-delivery", "migration_task": "3.2" },
+    { "id": "checkout-lease-guard", "migration_task": "3.2" },
+    { "id": "finish-line-record", "migration_task": "2.3" },
+    { "id": "forge-label-reminder", "migration_task": "3.3" },
+    { "id": "mcp-secret-scan", "migration_task": "3.3" },
+    { "id": "memory-write-principle-reminder", "migration_task": "3.3" },
+    { "id": "portable-paths-scan", "migration_task": "3.3" },
+    { "id": "pre-edit-intent-gate", "migration_task": "3.2" },
+    { "id": "semantic-commit-body-gate", "migration_task": "3.2" },
+    { "id": "session-start-healthcheck", "migration_task": "3.3" },
+    { "id": "skill-usage-reminder", "migration_task": "3.3" },
+    { "id": "stop-pre-pr-reminder", "migration_task": "3.3" },
+    { "id": "user-prompt-agent-memory", "migration_task": "3.3" }
+  ]
+}

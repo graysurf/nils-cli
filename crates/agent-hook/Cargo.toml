@@ -20,8 +20,10 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
+nils-agent-docs = { version = "1.26.4", path = "../agent-docs" }
 nils-build-info = { version = "1.26.4", path = "../nils-build-info" }
 nils-common = { version = "1.26.4", path = "../nils-common", package = "nils-common" }
+regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

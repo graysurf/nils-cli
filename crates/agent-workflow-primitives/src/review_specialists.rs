@@ -115,6 +115,7 @@ const SPECIALISTS: &[&str] = &[
     "data-migration",
     "maintainability",
     "performance",
+    "quick",
     "red-team",
     "security",
     "testing",

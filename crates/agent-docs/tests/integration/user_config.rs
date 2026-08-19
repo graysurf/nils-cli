@@ -1629,6 +1629,32 @@ fn dsh_context_uses_the_bound_private_user_catalog() {
             .stdout
             .contains(env.private_catalog.to_str().unwrap())
     );
+
+    let stale = env.run(&[
+        "session",
+        "context",
+        "--session-id",
+        "private-dsh-session",
+        "--product",
+        "dsh",
+        "--state-home",
+        state_home.to_str().expect("utf-8 state home"),
+        "--intent",
+        "project-dev",
+        "--request-id",
+        "private-request-stale",
+        "--user-config",
+        "--integration-fingerprint",
+        &"0".repeat(64),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(stale.code, 65, "stderr={}", stale.stderr);
+    assert_eq!(stale.json()["error"]["code"], "stale-integration-decision");
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["then"],
+        "session.context"
+    );
 }
 
 #[test]

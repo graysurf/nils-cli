@@ -642,15 +642,51 @@ pub(crate) fn parse_selected_catalog(
         raw,
     )
     .map_err(sanitized_private_catalog_error)?;
-    let entry_count = catalog
-        .documents
-        .len()
-        .checked_add(catalog.validations.len())
-        .ok_or_else(|| anyhow!("private catalog entry count overflow"))?;
+    validate_private_catalog_entry_count(catalog, raw)
+}
+
+pub(crate) fn parse_selected_dsh_catalog(
+    snapshot: &SecureFile,
+    identity: &ProjectIdentity,
+) -> Result<crate::model::ScopeCatalog> {
+    let raw = std::str::from_utf8(&snapshot.bytes).context("private catalog is not valid UTF-8")?;
+    let catalog = crate::config::load_dsh_scope_catalog_from_str(
+        crate::model::Scope::Project,
+        crate::model::CatalogOrigin::User,
+        &identity.project_path,
+        &snapshot.path,
+        raw,
+    )
+    .map_err(sanitized_private_catalog_error)?;
+    validate_private_catalog_entry_count(catalog, raw)
+}
+
+fn validate_private_catalog_entry_count(
+    catalog: crate::model::ScopeCatalog,
+    raw: &str,
+) -> Result<crate::model::ScopeCatalog> {
+    let entry_count = private_catalog_entry_count(raw)?;
     if entry_count > MAX_PRIVATE_CATALOG_ENTRIES {
         bail!("private catalog exceeds the {MAX_PRIVATE_CATALOG_ENTRIES}-entry selection limit");
     }
     Ok(catalog)
+}
+
+fn private_catalog_entry_count(raw: &str) -> Result<usize> {
+    let parsed = raw
+        .parse::<toml::Table>()
+        .context("private catalog count validation failed")?;
+    let documents = parsed
+        .get("document")
+        .and_then(toml::Value::as_array)
+        .map_or(0, Vec::len);
+    let validations = parsed
+        .get("validation")
+        .and_then(toml::Value::as_array)
+        .map_or(0, Vec::len);
+    documents
+        .checked_add(validations)
+        .ok_or_else(|| anyhow!("private catalog entry count overflow"))
 }
 
 fn sanitized_private_catalog_error(err: crate::model::ConfigLoadError) -> anyhow::Error {
@@ -1288,4 +1324,26 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "secure directory modes are unsupported on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::private_catalog_entry_count;
+
+    #[test]
+    fn private_catalog_limit_counts_entries_before_product_projection() {
+        let mut raw = String::new();
+        for index in 0..513 {
+            raw.push_str(&format!(
+                "[[validation]]\ncontext = \"codex-{index}\"\ncommands = [\"true\"]\nproduct = \"codex\"\n"
+            ));
+        }
+        for index in 0..512 {
+            raw.push_str(&format!(
+                "[[validation]]\ncontext = \"dsh-{index}\"\ncommands = [\"true\"]\nproduct = \"dsh\"\n"
+            ));
+        }
+
+        assert_eq!(private_catalog_entry_count(&raw).unwrap(), 1025);
+    }
 }

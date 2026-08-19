@@ -410,6 +410,7 @@ mod tests {
             target_paths: Vec::new(),
             execution_path: None,
             binding_roots: Vec::new(),
+            dsh_subject: None,
         }
     }
 

@@ -47,8 +47,34 @@ pub enum Command {
     Setup(SetupArgs),
     /// Create, authorize, inspect, consume, or revoke governed recovery.
     Recovery(RecoveryArgs),
+    /// Persist edit generations, execute declared validations, and enforce the DSH stop boundary.
+    FinishLine(FinishLineArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FinishLineArgs {
+    #[command(subcommand)]
+    pub command: FinishLineCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FinishLineCommand {
+    /// Mint one private DSH runner capability for this repository session.
+    Open(FinishLineFormatArgs),
+    /// Durably advance the edit generation before an authoritative mutation.
+    Begin(FinishLineFormatArgs),
+    /// Probe or supervise one foreground DSH Bash command and classify exact validation targets.
+    Run(FinishLineFormatArgs),
+    /// Decide whether every current validation target is satisfied.
+    Stop(FinishLineFormatArgs),
+    /// Inspect bounded redacted finish-line state.
+    Status(FinishLineFormatArgs),
+    #[command(hide = true)]
+    Quiesce(FinishLineFormatArgs),
+    #[command(hide = true)]
+    Release(FinishLineFormatArgs),
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -94,6 +120,31 @@ pub struct FormatArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct FinishLineFormatArgs {
+    /// Automation-safe output format. Finish-line defaults to its service JSON contract.
+    #[arg(long, value_enum, default_value_t = FinishLineOutputFormat::Json)]
+    pub format: FinishLineOutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum FinishLineOutputFormat {
+    /// Human-readable text output.
+    Text,
+    /// Single-record JSON envelope (snake_case).
+    #[default]
+    Json,
+}
+
+impl From<FinishLineOutputFormat> for OutputFormat {
+    fn from(value: FinishLineOutputFormat) -> Self {
+        match value {
+            FinishLineOutputFormat::Text => Self::Text,
+            FinishLineOutputFormat::Json => Self::Json,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

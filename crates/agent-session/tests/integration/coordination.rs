@@ -5147,6 +5147,59 @@ fn coordination_review_target_exit_revokes_copied_capability_without_hiding_publ
 }
 
 #[test]
+fn authenticated_broker_status_binds_the_exact_session_incarnation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+            ),
+        ],
+    );
+    let alpha_capability = capability(&state_dir, "alpha");
+    let beta_capability = capability(&state_dir, "beta");
+
+    let status = |capability: &str| {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state"),
+                "broker",
+                "status",
+                "--session",
+                "alpha",
+                "--capability-file",
+                capability,
+                "--authenticated",
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let valid = status(&alpha_capability);
+    assert_eq!(valid.code, 0, "stderr={}", valid.stderr_text());
+    assert_eq!(data(&valid)["session_id"], "alpha");
+
+    let cross_session = status(&beta_capability);
+    assert_ne!(cross_session.code, 0);
+    assert_eq!(
+        cross_session.stdout_json()["error"]["code"],
+        "coordination-unauthorized"
+    );
+}
+
+#[test]
 fn coordination_review_round2_half_ttl_renew_does_not_self_conflict() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

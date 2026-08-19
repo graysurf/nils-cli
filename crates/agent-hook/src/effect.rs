@@ -15,15 +15,34 @@ pub(crate) fn classify(raw: &[u8], request: &NormalizedRequest) -> OperationEffe
         return OperationEffectClass::SensitiveConfiguration;
     }
     match request.matcher.as_deref() {
-        Some("Write" | "Edit" | "NotebookEdit" | "MultiEdit" | "apply_patch") => {
+        Some(
+            "Write" | "Edit" | "NotebookEdit" | "MultiEdit" | "apply_patch" | "write" | "edit",
+        ) => {
             if local_targets(request) {
                 OperationEffectClass::LocalReversible
             } else {
                 OperationEffectClass::Unknown
             }
         }
+        Some("str_replace_editor") => {
+            let command = serde_json::from_slice::<Value>(raw).ok().and_then(|value| {
+                value
+                    .get("tool")?
+                    .get("arguments")?
+                    .get("command")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+            if command.as_deref() == Some("view") {
+                OperationEffectClass::ReadOnly
+            } else if local_targets(request) {
+                OperationEffectClass::LocalReversible
+            } else {
+                OperationEffectClass::Unknown
+            }
+        }
         Some("Read" | "Glob" | "Grep") => OperationEffectClass::ReadOnly,
-        Some("Bash") => classify_bash(raw, request),
+        Some("Bash" | "bash") => classify_bash(raw, request),
         _ => OperationEffectClass::Unknown,
     }
 }
@@ -471,6 +490,7 @@ mod tests {
             target_paths: Vec::new(),
             execution_path: Some(path.to_path_buf()),
             binding_roots: Vec::new(),
+            dsh_subject: None,
         }
     }
 
