@@ -32,7 +32,10 @@ _agent-session() {
         case $line[1] in
             (start)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent to run]:AGENT:(codex claude hermes)' \
+'--agent=[Agent to run]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
 '--title=[Human-readable session title]:TITLE:_default' \
 '--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
@@ -56,7 +59,10 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (run)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent to run]:AGENT:(codex claude hermes)' \
+'--agent=[Agent to run]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '--cwd=[Working directory for the agent session. Defaults to the current directory]:PATH:_files -/' \
 '--title=[Human-readable session title]:TITLE:_default' \
 '--id=[Short explicit session id. Usually auto-generated]:ID:_default' \
@@ -213,28 +219,37 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (hook)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Provider whose hook payload is on stdin]:AGENT:(codex claude hermes)' \
+'--agent=[Provider whose hook payload is on stdin]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '--event=[Provider event name when the raw payload does not carry one]:EVENT:_default' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (notify)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Provider whose notification payload is supplied as the final argument]:AGENT:(codex claude hermes)' \
+'--agent=[Provider whose notification payload is supplied as the final argument]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '--forward-notify-argv-json=[JSON argv for an existing singular notifier composed by activity setup]:JSON:_default' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 ':payload -- Provider-authored JSON passed by Codex in argv; content is discarded after parsing but is transiently visible to same-host process inspection:_default' \
 && ret=0
 ;;
 (doctor)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Limit diagnostics to one provider]:AGENT:(codex claude hermes)' \
+'--agent=[Limit diagnostics to one provider]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
@@ -245,7 +260,10 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (setup)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Provider to configure]:AGENT:(codex claude hermes)' \
+'--agent=[Provider to configure]:AGENT:((codex\:""
+claude\:""
+hermes\:""
+dsh\:"DeepSeek Harness workers managed by an external runtime (the dsh-runtime-kit bundle); never tmux-launched by this crate"))' \
 '(--dry-run)--expected-preview-digest=[Digest returned by the reviewed Codex repair preview. Required when applying Codex repair and rejected if either planned file changed]:SHA256:_default' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \

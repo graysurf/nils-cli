@@ -802,6 +802,30 @@ fn execute_inner(
 
     match request.action {
         MaintenanceActionId::RemoveConsoleRecord => {
+            // An external runtime owns no tmux session, so the tmux-only
+            // assessment that admits record-only removal says nothing about
+            // whether its lane is alive. Route the decision through the same
+            // positive-evidence rule ordinary deletion uses, or this becomes a
+            // second, ungated way to destroy a running lane's durable state.
+            if crate::dsh_external::is_external_record(&record) {
+                let incarnation = crate::coordination::incarnation(&record)?;
+                match crate::dsh_external::external_lane_disposition(&record) {
+                    crate::dsh_external::ExternalLaneDisposition::NeverAttached
+                    | crate::dsh_external::ExternalLaneDisposition::ProvenStopped
+                        if crate::dsh_external::external_lane_terminal_is_proven(
+                            context,
+                            &record,
+                            &incarnation,
+                        ) => {}
+                    _ => {
+                        return Err(CliError::runtime(
+                            "coordination-runtime-unverified",
+                            "external dsh lane liveness is not proven; the dsh-runtime-kit plugin owns this runtime",
+                            Some(json!({ "id": record.id.clone() })),
+                        ));
+                    }
+                }
+            }
             let resolved = resolve_session_record_path(context, &canonical_id)?;
             validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
             // Deliberately no signal of any kind. This reuses the same atomic

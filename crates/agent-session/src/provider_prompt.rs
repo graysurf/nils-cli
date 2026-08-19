@@ -803,6 +803,7 @@ fn resolve_provider_prompt_source_from_roots(
             )?,
         ),
         AgentKind::Hermes => return None,
+        AgentKind::Dsh => return None,
     };
     Some(ProviderPromptSource {
         provider,

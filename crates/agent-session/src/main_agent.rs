@@ -173,6 +173,7 @@ enum SelfCommand {
 enum RuntimeHookProduct {
     Codex,
     Claude,
+    Dsh,
 }
 
 impl RuntimeHookProduct {
@@ -180,6 +181,7 @@ impl RuntimeHookProduct {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Dsh => "dsh",
         }
     }
 }
@@ -1038,6 +1040,9 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
 }
 
 fn main_agent_capabilities(provider: RuntimeHookProduct) -> Value {
+    if provider == RuntimeHookProduct::Dsh {
+        return dsh_capabilities_envelope(dsh_external_runtime_capability());
+    }
     let runtime_hook_checkpoint_write = runtime_hook_checkpoint_capability(provider);
     json!({
         "schema_version": "main-agent.capabilities.v1",
@@ -1048,6 +1053,59 @@ fn main_agent_capabilities(provider: RuntimeHookProduct) -> Value {
             "runtime_hook_checkpoint_write": runtime_hook_checkpoint_write,
             "run_wide_closeout": "main-agent.run-wide-closeout.v1",
         }
+    })
+}
+
+fn dsh_capabilities_envelope(external_runtime: Option<&'static str>) -> Value {
+    json!({
+        "schema_version": "main-agent.capabilities.v1",
+        "provider": RuntimeHookProduct::Dsh.as_str(),
+        "compatible": external_runtime.is_some(),
+        "capabilities": {
+            "runtime_checkpoint_file": "main-agent.runtime-checkpoint-file.v1",
+            // DSH policy v1 admits only native allow/block decisions; the
+            // store fences every checkpoint, so no hook admission layer
+            // exists or is claimed for this provider.
+            "runtime_hook_checkpoint_write": Value::Null,
+            "run_wide_closeout": "main-agent.run-wide-closeout.v1",
+            "external_runtime": external_runtime,
+        }
+    })
+}
+
+fn dsh_external_runtime_capability() -> Option<&'static str> {
+    let executable = env::current_exe().ok()?;
+    let agent_hook = executable.parent()?.join("agent-hook");
+    let metadata = fs::metadata(&agent_hook).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut command = Command::new(&agent_hook);
+    command.args(["doctor", "--product", "dsh", "--format", "json"]);
+    let output =
+        run_output_with_timeout_and_cap(command, Duration::from_secs(2), 64 * 1024).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let doctor: Value = serde_json::from_slice(&output.stdout).ok()?;
+    if !dsh_doctor_dispatch_supported(&doctor) {
+        return None;
+    }
+    Some("main-agent.external-runtime.v1")
+}
+
+fn dsh_doctor_dispatch_supported(doctor: &Value) -> bool {
+    if doctor["schema_version"] != "cli.agent-hook.doctor.v1" || doctor["ok"] != true {
+        return false;
+    }
+    let Some(records) = doctor["data"].as_array() else {
+        return false;
+    };
+    records.iter().any(|record| {
+        record["schema_version"] == "agent-hook.doctor.v1"
+            && record["product"] == "dsh"
+            && record["dispatch_supported"] == true
+            && record["registration_owner"] == "dsh-runtime-kit"
     })
 }
 
@@ -1094,6 +1152,9 @@ fn runtime_hook_supports_checkpoint(inventory: &Value, provider: RuntimeHookProd
     let matchers = match provider {
         RuntimeHookProduct::Codex => ["Bash", "Write|Edit|NotebookEdit|apply_patch"],
         RuntimeHookProduct::Claude => ["Bash", "Write|Edit|NotebookEdit"],
+        // DSH has no hook checkpoint-write admission; the external-runtime
+        // capability path never consults this predicate.
+        RuntimeHookProduct::Dsh => return false,
     };
     matchers.into_iter().all(|matcher| {
         rules.iter().any(|rule| {
@@ -1150,6 +1211,7 @@ fn runtime_checkpoint_handler_supports_product(provider: RuntimeHookProduct) -> 
     let handler = match provider {
         RuntimeHookProduct::Codex => codex_home.join("hooks/session-coordination-guard.py"),
         RuntimeHookProduct::Claude => home.join(".claude/hooks/session-coordination-guard.py"),
+        RuntimeHookProduct::Dsh => return false,
     };
     runtime_checkpoint_handler_supports_capability(&handler)
 }
@@ -3292,6 +3354,13 @@ fn run_worker_start_single_input(
     validate_idempotency_key(&args.idempotency_key)?;
     let await_ready = parse_await_ready(&args.await_ready)?;
     validate_assignment_input(&input)?;
+    if input.launch.agent == "dsh" && await_ready.is_some() {
+        return Err(CliError::usage(
+            "dsh-await-ready-unsupported",
+            "dsh worker start is launch-only: the external runtime delivers the prompt after this command returns; use --await-ready 0s and observe readiness with worker wait",
+            Some(json!({ "await_ready": args.await_ready })),
+        ));
+    }
     crate::ensure_provider_stop_canary_platform_supported(input.provider_stop_canary.is_some())?;
     let (record, incarnation) = authenticated_self(context)?;
     ensure_active_claim(context, &record)?;
@@ -3730,6 +3799,30 @@ fn run_worker_start_single_input(
             None,
         )
     })?;
+    if agent == AgentKind::Dsh {
+        if pending_prompt_outcome_unknown.is_some() {
+            return Err(CliError::data(
+                "assignment-start-conflict",
+                "dsh worker starts never record ambiguous prompt delivery; the persisted receipt is foreign",
+                Some(json!({ "assignment_id": assignment_id })),
+            ));
+        }
+        return finish_external_worker_start(ExternalWorkerStartRequest {
+            context,
+            args: &args,
+            launch_input: &launch_input,
+            assignment_id: &assignment_id,
+            worker_session_id: &worker_session_id,
+            record: &record,
+            incarnation: &incarnation,
+            request_digest: &request_digest,
+            legacy_request_digest: &legacy_request_digest,
+            expected_packet_digest: &expected_packet_digest,
+            worker_start_fence_key: &worker_start_fence_key,
+            main_agent_bin: &main_agent_bin,
+            batch_lane,
+        });
+    }
     let prompt = worker_start_prompt(&assignment_id, &main_agent_bin);
     let prior_compact_prompt = prior_compact_worker_start_prompt(&assignment_id, &main_agent_bin);
     let legacy_prompt = legacy_worker_start_prompt(&assignment_id, &main_agent_bin);
@@ -4921,6 +5014,326 @@ fn run_worker_start_single_input(
         );
     }
     Ok(outcome)
+}
+
+/// Scoped inputs for the dsh external-runtime worker start arm. The shared
+/// path (validation, claims, digests, replay, assignment record, packet
+/// storage) already ran; this arm replaces only the tmux launch pipeline.
+/// Contract: `docs/specs/main-agent-dsh-external-runtime-v1.md`.
+struct ExternalWorkerStartRequest<'a> {
+    context: &'a CliContext,
+    args: &'a WorkerStartArgs,
+    launch_input: &'a AssignmentInput,
+    assignment_id: &'a str,
+    worker_session_id: &'a str,
+    record: &'a SessionRecord,
+    incarnation: &'a str,
+    request_digest: &'a str,
+    legacy_request_digest: &'a str,
+    expected_packet_digest: &'a str,
+    worker_start_fence_key: &'a str,
+    main_agent_bin: &'a Path,
+    batch_lane: Option<&'a BatchLaneFence<'a>>,
+}
+
+fn finish_external_worker_start(
+    request: ExternalWorkerStartRequest<'_>,
+) -> Result<Value, CliError> {
+    let ExternalWorkerStartRequest {
+        context,
+        args,
+        launch_input,
+        assignment_id,
+        worker_session_id,
+        record,
+        incarnation,
+        request_digest,
+        legacy_request_digest,
+        expected_packet_digest,
+        worker_start_fence_key,
+        main_agent_bin,
+        batch_lane,
+    } = request;
+    let prompt = dsh_worker_start_prompt(assignment_id, main_agent_bin);
+    let replay_prompts = [prompt.as_str()];
+    let existing = match load_session_record(context, worker_session_id) {
+        // Repair a record whose second (extra-key) write was lost to a crash:
+        // the path is derivable, so replay converges instead of wedging.
+        Ok(worker) => Some(crate::dsh_external::ensure_recorded_liveness_path(
+            context, worker,
+        )?),
+        Err(error) if error.code() == "session-not-found" => None,
+        Err(error) => return Err(error),
+    };
+    let mut worker_start_fence = None;
+    let worker_record = match existing {
+        Some(worker) => {
+            ensure_worker_launch_matches(context, &worker, launch_input, &replay_prompts)?;
+            worker
+        }
+        None => {
+            let mut create_guard = || {
+                let fence = crate::coordination::claims::acquire_main_agent_worker_start_fence(
+                    context,
+                    record,
+                    incarnation,
+                    worker_start_fence_key,
+                )?;
+                let validation = (|| {
+                    let mut locked = orchestration::lock_registry(context)?;
+                    if let Some(batch_lane) = batch_lane {
+                        renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
+                    }
+                    validate_worker_start_authority_locked(
+                        &locked.registry,
+                        record,
+                        incarnation,
+                        assignment_id,
+                        worker_session_id,
+                        expected_packet_digest,
+                        &args.idempotency_key,
+                        request_digest,
+                        legacy_request_digest,
+                        &launch_input.launch.cwd,
+                        None,
+                        None,
+                        false,
+                    )?;
+                    if batch_lane.is_some() {
+                        locked.save()?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = validation {
+                    fence.finish(context, false)?;
+                    return Err(error);
+                }
+                worker_start_fence = Some(fence);
+                Ok(())
+            };
+            let created = crate::dsh_external::create_external_worker_record(
+                context,
+                Path::new(&launch_input.launch.cwd),
+                worker_session_id,
+                &prompt,
+                launch_input.launch.coordination_mode,
+                launch_input.launch.title.as_deref(),
+                Some(&mut create_guard),
+            );
+            match created {
+                Ok(worker) => worker,
+                Err(error) => {
+                    if let Some(fence) = worker_start_fence.take() {
+                        fence.finish(context, false)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    };
+    let launch_id = match worker_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .filter(|value| !value.is_empty())
+    {
+        Some(launch_id) => launch_id,
+        None => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, false)?;
+            }
+            return Err(invalid_input("worker session incarnation is unavailable"));
+        }
+    };
+    let expected_worker = session_ref(context, &worker_record, &launch_id);
+    let attachment = (|| {
+        ensure_active_claim(context, record)?;
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(batch_lane) = batch_lane {
+            renew_worker_start_batch_lane_after_child_side_effect_locked(
+                &mut locked.registry,
+                batch_lane,
+            )?;
+        }
+        validate_worker_start_authority_locked(
+            &locked.registry,
+            record,
+            incarnation,
+            assignment_id,
+            worker_session_id,
+            expected_packet_digest,
+            &args.idempotency_key,
+            request_digest,
+            legacy_request_digest,
+            &launch_input.launch.cwd,
+            None,
+            Some(&expected_worker),
+            false,
+        )?;
+        let current = locked
+            .registry
+            .assignments
+            .get_mut(assignment_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        if current.state != "starting"
+            || !((current.revision == 1 && current.worker.is_none())
+                || (current.revision == 2 && current.worker.as_ref() == Some(&expected_worker)))
+        {
+            return Err(CliError::data(
+                "assignment-start-conflict",
+                "assignment changed while the worker was starting",
+                Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
+            ));
+        }
+        if current.revision == 1 {
+            current.worker = Some(expected_worker.clone());
+            current.revision = 2;
+            current.updated_at = timestamp();
+        }
+        let outcome = json!({
+            "schema_version": "main-agent.worker-start-result.v1",
+            "assignment": public_assignment_view(current),
+            "worker": {
+                "session_id": worker_record.id,
+                "session_incarnation": launch_id,
+                "status": "external"
+            },
+            "acceptance": {
+                "state": "pending-worker-checkpoint",
+                "transport_only": true
+            },
+            "delivery": {
+                "state": "external-launch-pending",
+                "proof": "external-runtime-transfer"
+            },
+            "external_launch": external_launch_payload(
+                context,
+                &worker_record,
+                &launch_id,
+                &prompt,
+            )?,
+            "launch_observation": Value::Null,
+            "polling": worker_start_polling_evidence(None)
+        });
+        store_receipt(
+            &mut locked.registry,
+            record,
+            incarnation,
+            &args.idempotency_key,
+            "worker-start",
+            request_digest,
+            outcome.clone(),
+        )?;
+        locked.save()?;
+        Ok(outcome)
+    })();
+    match attachment {
+        Ok(outcome) => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, true)?;
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if let Some(fence) = worker_start_fence.take() {
+                fence.finish(context, false)?;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The plugin-facing launch contract for one dsh lane: the byte-stable
+/// bootstrap prompt, the exact worker environment, and the broker heartbeat
+/// argv the plugin must run for the lane's lifetime.
+fn external_launch_payload(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+    launch_id: &str,
+    prompt: &str,
+) -> Result<Value, CliError> {
+    let state_dir = crate::display_path(&context.state_dir);
+    let capability_file = crate::display_path(&crate::coordination::capability_path(
+        context,
+        &worker_record.id,
+        launch_id,
+    ));
+    let checkpoint_file = crate::display_path(&crate::coordination::checkpoint_path_for_state(
+        &context.state_dir,
+        &worker_record.id,
+        launch_id,
+    ));
+    // Derived, never read back: a crash between the record write and the
+    // extra-key write must not wedge every replay on a missing key. The
+    // persisted key exists only for the context-free sidecar reader.
+    let liveness_file = crate::display_path(&crate::dsh_external::liveness_path(
+        context,
+        &worker_record.id,
+    ));
+    let agent_session_bin = env::current_exe()
+        .ok()
+        .and_then(|executable| Some(executable.parent()?.join("agent-session")))
+        .map(|path| crate::display_path(&path))
+        .ok_or_else(|| {
+            CliError::runtime(
+                "main-agent-executable-unavailable",
+                "the sibling agent-session executable could not be resolved for the external launch contract",
+                None,
+            )
+        })?;
+    Ok(json!({
+        "schema_version": "main-agent.external-launch.v1",
+        "launch_id": launch_id,
+        "prompt": prompt,
+        "worker_env": {
+            "AGENT_SESSION_ID": worker_record.id,
+            "AGENT_SESSION_STATE_DIR": state_dir,
+            "AGENT_SESSION_RUNTIME_ID": launch_id,
+            "AGENT_SESSION_CAPABILITY_FILE": capability_file,
+            "AGENT_SESSION_CHECKPOINT_FILE": checkpoint_file
+        },
+        "broker_heartbeat_argv": [
+            agent_session_bin,
+            "--state-dir",
+            state_dir,
+            "broker",
+            "heartbeat",
+            "--session",
+            worker_record.id,
+            "--incarnation",
+            launch_id,
+            "--generation",
+            "1",
+            "--capability-file",
+            capability_file,
+            "--format",
+            "json"
+        ],
+        "broker_stop_argv": [
+            agent_session_bin,
+            "--state-dir",
+            state_dir,
+            "broker",
+            "stop",
+            "--session",
+            worker_record.id,
+            "--capability-file",
+            capability_file,
+            "--format",
+            "json"
+        ],
+        "liveness_file": liveness_file,
+        "liveness_schema": crate::dsh_external::LIVENESS_SCHEMA
+    }))
+}
+
+fn dsh_worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
+    format!(
+        "Main Agent Mode is explicitly active for this managed worker assignment. Your external runtime supplies the exact session environment for main-agent and agent-session commands. Run exactly `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment."
+    )
 }
 
 fn worker_start_request_digests(
@@ -8958,6 +9371,28 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         },
     };
     let activity_evidence = match session_evidence.value() {
+        // An external lane publishes a turn only while it is open under a live
+        // harness. Once the plugin closed it — or before it ever attached —
+        // there is no turn to report, and that absence is proven rather than
+        // unavailable: treating it as unavailable would fence the very
+        // cancel/reassign routes such a lane needs. `Unproven` stays
+        // unavailable, so a corrupt sidecar still fails closed.
+        Some(record) if crate::dsh_external::is_external_record(record) => {
+            match crate::activity::state_for_view(context, record) {
+                Some(turn_state) if turn_state.phase != crate::activity::TurnPhase::Unknown => {
+                    DiagnosticEvidence::Present(turn_state)
+                }
+                _ => match crate::dsh_external::external_lane_disposition(record) {
+                    crate::dsh_external::ExternalLaneDisposition::NeverAttached => {
+                        DiagnosticEvidence::Absent("worker-lane-never-attached")
+                    }
+                    crate::dsh_external::ExternalLaneDisposition::ProvenStopped => {
+                        DiagnosticEvidence::Absent("worker-lane-stopped")
+                    }
+                    _ => DiagnosticEvidence::Unavailable("worker-activity-unknown".to_string()),
+                },
+            }
+        }
         Some(record) => match crate::activity::activity_status(context, &record.id) {
             Ok(result) if result.turn_state.phase != crate::activity::TurnPhase::Unknown => {
                 DiagnosticEvidence::Present(result.turn_state)
@@ -9217,12 +9652,18 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     let preclaim_blocker = assignment_has_preclaim_blocker(&assignment);
     let terminal_recovery_reconciled =
         terminal_recovery_recorded && worker_status == "stopped" && assignment.worker.is_some();
+    let runtime_never_attached = session_evidence.value().is_some_and(|record| {
+        crate::dsh_external::is_external_record(record)
+            && crate::dsh_external::external_lane_disposition(record)
+                == crate::dsh_external::ExternalLaneDisposition::NeverAttached
+    });
     let failed_preclaim = worker_failed_preclaim(PreClaimEvidence {
         assignment_state: &assignment.state,
         claim_active,
         operations_quiescent: active_operations == 0 && uncertain_operations == 0,
         worker_bound: assignment.worker.is_some(),
         worker_status: &worker_status,
+        runtime_never_attached,
         preclaim_blocker,
         provider_terminated,
         terminal_recovery_reconciled,
@@ -10413,6 +10854,11 @@ struct PreClaimEvidence<'a> {
     operations_quiescent: bool,
     worker_bound: bool,
     worker_status: &'a str,
+    /// A plugin-owned external lane whose runtime never attached to this
+    /// launch. Its status projects as `missing`, which for a tmux lane means
+    /// "no session record at all", so the never-attached case is carried as its
+    /// own fact rather than by widening the `worker_status` match.
+    runtime_never_attached: bool,
     preclaim_blocker: bool,
     provider_terminated: bool,
     terminal_recovery_reconciled: bool,
@@ -10441,7 +10887,11 @@ fn worker_failed_preclaim(evidence: PreClaimEvidence<'_>) -> bool {
         || (starting
             && (evidence.provider_terminated
                 || !evidence.worker_bound
-                || evidence.worker_status == "stopped"))
+                || evidence.worker_status == "stopped"
+                // An external runtime that never attached is as gone as one
+                // that died during startup; without this the lane's assignment
+                // could never be cancelled or reassigned.
+                || evidence.runtime_never_attached))
 }
 
 fn worker_claim_renewal_required(
@@ -11656,7 +12106,13 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
     let preclaim_runtime_gone = !terminal_recovery_reconciled
         && assignment.state == "starting"
         && assignment.worker.is_some()
-        && diagnosis["worker"]["status"] == "stopped";
+        // A plugin-owned lane that never attached to its launch reports
+        // `missing`, never `stopped`, and opened no broker either. The proof
+        // below is the sidecar disposition plus its absent heartbeat.
+        && matches!(
+            diagnosis["worker"]["status"].as_str(),
+            Some("stopped" | "missing")
+        );
     let broker_evidence_waived = terminal_recovery_reconciled || preclaim_runtime_gone;
     // Reconciliation committed this same stopped-runtime proof under the
     // record -> coordination -> orchestration lock order. Reacquire the
@@ -11684,21 +12140,39 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
                 None,
             ));
         }
-        let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
-        let exact_failed_canary_quiescent = preclaim_runtime_gone
-            && crate::provider_stop_canary_failed_startup_runtime_quiescent(
+        if crate::dsh_external::is_external_record(&worker_record) {
+            // A plugin-owned lane has no tmux runtime whose absence could be
+            // proven here, and its runtime evidence is unavailable precisely
+            // when the plugin never attached. Its terminal proof is the sidecar
+            // disposition corroborated by the absent broker heartbeat.
+            if !crate::dsh_external::external_lane_terminal_is_proven(
+                context,
                 &worker_record,
-                &args.assignment_id,
-            );
-        if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
-            && !exact_failed_canary_quiescent)
-            || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
-        {
-            return Err(CliError::data(
-                "worker-runtime-still-live",
-                "cancellation on waived broker evidence requires the exact worker runtime to remain stopped",
-                Some(json!({ "assignment_id": args.assignment_id })),
-            ));
+                worker_incarnation,
+            ) {
+                return Err(CliError::data(
+                    "worker-runtime-still-live",
+                    "cancellation on waived broker evidence requires the plugin-owned lane to be proven never attached or stopped",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
+        } else {
+            let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+            let exact_failed_canary_quiescent = preclaim_runtime_gone
+                && crate::provider_stop_canary_failed_startup_runtime_quiescent(
+                    &worker_record,
+                    &args.assignment_id,
+                );
+            if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
+                && !exact_failed_canary_quiescent)
+                || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+            {
+                return Err(CliError::data(
+                    "worker-runtime-still-live",
+                    "cancellation on waived broker evidence requires the exact worker runtime to remain stopped",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
         }
         Some(lifecycle)
     } else {
@@ -14441,6 +14915,7 @@ fn run_worker_stop_claimed_runtime(
     if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
         return Err(invalid_input("worker incarnation is invalid"));
     }
+    ensure_worker_runtime_stop_not_plugin_owned(context, &args.assignment_id)?;
     let (main, main_incarnation, controller_claim) =
         crate::coordination::authenticate_any_from_file_with_active_claim_observational(
             context, None,
@@ -14694,6 +15169,14 @@ fn run_worker_stop_claimed_runtime(
                 None,
             ));
         }
+        // Re-check ownership under the lock: the unlocked precheck can be
+        // overtaken, and `stop_session_runtime_locked` refuses a plugin-owned
+        // lane only after the identity, fence, and receipt below are durable.
+        ensure_worker_session_runtime_stop_not_plugin_owned(
+            context,
+            &current.assignment_id,
+            &locked_worker.session_id,
+        )?;
         orchestration::persist_session_claimed_runtime_stop_identity(
             context,
             &current.assignment_id,
@@ -15136,6 +15619,110 @@ struct WorkerRuntimeStopAssignment {
     worker: SessionRef,
 }
 
+/// Refuse a CLI-owned runtime stop for a lane whose runtime belongs to the
+/// external dsh plugin, before any reservation, receipt, or authority seal is
+/// persisted: a refusal after those side effects would wedge the assignment
+/// behind a retained runtime-stop reservation that no replay can clear.
+/// Refuse deleting the durable record of a plugin-owned lane whose stop is not
+/// proven, before any fence or receipt is persisted. Deletion itself is gated
+/// again at the record boundary; this only moves the refusal ahead of the
+/// side effects.
+fn ensure_external_lane_deletable(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<(), CliError> {
+    let Some((record, incarnation)) = external_lane_worker_record(context, assignment_id)? else {
+        return Ok(());
+    };
+    match crate::dsh_external::external_lane_disposition(&record) {
+        crate::dsh_external::ExternalLaneDisposition::NeverAttached
+        | crate::dsh_external::ExternalLaneDisposition::ProvenStopped
+            if crate::dsh_external::external_lane_terminal_is_proven(
+                context,
+                &record,
+                &incarnation,
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            "the dsh-runtime-kit plugin owns this lane runtime; close the lane there and let its liveness sidecar and broker prove the stop before deleting the record",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "worker_session_id": record.id
+            })),
+        )),
+    }
+}
+
+/// The bound worker's record and incarnation when the assignment names an
+/// external-runtime lane. A store read failure is an error, never an implicit
+/// "not plugin owned": failing open here would restore the fence-then-refuse
+/// wedge these prechecks exist to prevent.
+fn external_lane_worker_record(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<Option<(SessionRecord, String)>, CliError> {
+    let registry = orchestration::load_registry_readonly(context)?;
+    let Some(assignment) = registry.assignments.get(assignment_id) else {
+        return Ok(None);
+    };
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(None);
+    };
+    let record = match load_session_record(context, &worker.session_id) {
+        Ok(record) => record,
+        Err(error) if error.code() == "session-not-found" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !crate::dsh_external::is_external_record(&record) {
+        return Ok(None);
+    }
+    let incarnation = worker.session_incarnation.clone();
+    Ok(Some((record, incarnation)))
+}
+
+fn ensure_worker_runtime_stop_not_plugin_owned(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<(), CliError> {
+    let registry = orchestration::load_registry_readonly(context)?;
+    let Some(assignment) = registry.assignments.get(assignment_id) else {
+        return Ok(());
+    };
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(());
+    };
+    ensure_worker_session_runtime_stop_not_plugin_owned(context, assignment_id, &worker.session_id)
+}
+
+/// The same refusal for a caller that already resolved the bound worker, so a
+/// check under the registry lock does not have to re-read the registry.
+fn ensure_worker_session_runtime_stop_not_plugin_owned(
+    context: &CliContext,
+    assignment_id: &str,
+    session_id: &str,
+) -> Result<(), CliError> {
+    let record = match load_session_record(context, session_id) {
+        Ok(record) => record,
+        Err(error) if error.code() == "session-not-found" => return Ok(()),
+        // A store read failure must not read as "not plugin owned".
+        Err(error) => return Err(error),
+    };
+    if crate::dsh_external::is_external_record(&record) {
+        return Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            "dsh worker runtimes are owned by the external dsh-runtime-kit plugin; interrupt the lane there, then reconcile once the liveness sidecar proves the lane stopped",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "worker_session_id": session_id
+            })),
+        ));
+    }
+    Ok(())
+}
+
 fn require_worker_runtime_stop_assignment(
     context: &CliContext,
     registry: &orchestration::Registry,
@@ -15215,6 +15802,7 @@ fn run_worker_stop_runtime(
     if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
         return Err(invalid_input("worker incarnation is invalid"));
     }
+    ensure_worker_runtime_stop_not_plugin_owned(context, &args.assignment_id)?;
     let (main, main_incarnation, controller_claim) =
         crate::coordination::authenticate_any_from_file_with_active_claim_observational(
             context, None,
@@ -15402,6 +15990,15 @@ fn run_worker_stop_runtime(
         }
         None => true,
     };
+
+    // Re-check ownership under the lock, ahead of the fence and reservation:
+    // the unlocked precheck can be overtaken, and the refusal inside
+    // `stop_session_runtime_locked` would arrive after both are durable.
+    ensure_worker_session_runtime_stop_not_plugin_owned(
+        context,
+        &current.assignment_id,
+        &worker.session_id,
+    )?;
 
     // Persist the session-owned authority fence before exposing a durable
     // orchestration reservation. Both global registries and the exact worker
@@ -19060,6 +19657,10 @@ fn run_worker_delete(
     args: AssignmentMutationArgs,
 ) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
+    // A refusal after the delete-identity fence is persisted would fence every
+    // assignment mutation behind a delete only an identical replay can clear,
+    // so refuse a plugin-owned live lane before any durable side effect.
+    ensure_external_lane_deletable(context, &args.assignment_id)?;
     let (record, incarnation) = authenticated_self(context)?;
     ensure_active_claim(context, &record)?;
     let request_digest = crate::coordination::request_digest(
@@ -30643,6 +31244,7 @@ mod tests {
             operations_quiescent: true,
             worker_bound: true,
             worker_status: "stopped",
+            runtime_never_attached: false,
             // The provider died before its first turn, so activity-derived
             // termination is not observable.
             provider_terminated: false,
@@ -30803,11 +31405,44 @@ mod tests {
                 operations_quiescent: true,
                 worker_bound: true,
                 worker_status: "stopped",
+                runtime_never_attached: false,
                 preclaim_blocker: false,
                 provider_terminated: false,
                 terminal_recovery_reconciled: false,
             }),
             "a post-claim stopped worker must not be routed through pre_claim_failure"
+        );
+
+        // The never-attached external lane is terminal only before the claim.
+        assert!(
+            worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "starting",
+                claim_active: false,
+                operations_quiescent: true,
+                worker_bound: true,
+                // A plugin-owned lane that never attached projects as
+                // `missing`, never as `stopped`.
+                worker_status: "missing",
+                runtime_never_attached: true,
+                preclaim_blocker: false,
+                provider_terminated: false,
+                terminal_recovery_reconciled: false,
+            }),
+            "an external lane whose runtime never attached must be reassignable"
+        );
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "working",
+                claim_active: false,
+                operations_quiescent: true,
+                worker_bound: true,
+                worker_status: "missing",
+                runtime_never_attached: true,
+                preclaim_blocker: false,
+                provider_terminated: false,
+                terminal_recovery_reconciled: false,
+            }),
+            "a lane that already recorded the working checkpoint is never a pre-claim failure"
         );
     }
 
@@ -32012,6 +32647,114 @@ mod tests {
         };
         assert_eq!(args.provider, RuntimeHookProduct::Codex);
         assert_eq!(args.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn dsh_worker_start_prompt_is_a_byte_stable_replay_contract() {
+        let bootstrap_key = worker_bootstrap_idempotency_key("assignment-one");
+        let prompt = dsh_worker_start_prompt(
+            "assignment-one",
+            std::path::Path::new("/release path/main-agent"),
+        );
+        assert_eq!(
+            prompt,
+            format!(
+                "Main Agent Mode is explicitly active for this managed worker assignment. Your external runtime supplies the exact session environment for main-agent and agent-session commands. Run exactly `'/release path/main-agent' bootstrap --idempotency-key {bootstrap_key} --format json` now. Do not perform any other action before it succeeds; then follow the returned `worker_instructions` and private assignment."
+            ),
+            "the dsh prompt is a byte-stable replay contract"
+        );
+    }
+
+    #[test]
+    fn capabilities_parse_the_dsh_external_runtime_provider() {
+        let cli = MainAgentCli::try_parse_from([
+            "main-agent",
+            "capabilities",
+            "--provider",
+            "dsh",
+            "--format",
+            "json",
+        ])
+        .expect("capabilities command parses");
+        let MainAgentCommand::Capabilities(args) = cli.command else {
+            panic!("expected capabilities");
+        };
+        assert_eq!(args.provider, RuntimeHookProduct::Dsh);
+        assert_eq!(args.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn dsh_capabilities_never_claim_hook_checkpoint_write_admission() {
+        let compatible = dsh_capabilities_envelope(Some("main-agent.external-runtime.v1"));
+        assert_eq!(compatible["schema_version"], "main-agent.capabilities.v1");
+        assert_eq!(compatible["provider"], "dsh");
+        assert_eq!(compatible["compatible"], true);
+        assert_eq!(
+            compatible["capabilities"]["runtime_checkpoint_file"],
+            "main-agent.runtime-checkpoint-file.v1"
+        );
+        assert!(compatible["capabilities"]["runtime_hook_checkpoint_write"].is_null());
+        assert_eq!(
+            compatible["capabilities"]["run_wide_closeout"],
+            "main-agent.run-wide-closeout.v1"
+        );
+        assert_eq!(
+            compatible["capabilities"]["external_runtime"],
+            "main-agent.external-runtime.v1"
+        );
+
+        let incompatible = dsh_capabilities_envelope(None);
+        assert_eq!(incompatible["compatible"], false);
+        assert!(incompatible["capabilities"]["external_runtime"].is_null());
+        assert!(incompatible["capabilities"]["runtime_hook_checkpoint_write"].is_null());
+    }
+
+    #[test]
+    fn dsh_doctor_dispatch_support_requires_bundle_owned_registration() {
+        let supported = json!({
+            "schema_version": "cli.agent-hook.doctor.v1",
+            "ok": true,
+            "data": [{
+                "schema_version": "agent-hook.doctor.v1",
+                "product": "dsh",
+                "status": "unsupported",
+                "supported": false,
+                "dispatch_supported": true,
+                "registration_owner": "dsh-runtime-kit"
+            }]
+        });
+        assert!(dsh_doctor_dispatch_supported(&supported));
+
+        let mut foreign_owner = supported.clone();
+        foreign_owner["data"][0]["registration_owner"] = json!("agent-hook");
+        assert!(!dsh_doctor_dispatch_supported(&foreign_owner));
+
+        let mut dispatch_absent = supported.clone();
+        dispatch_absent["data"][0]["dispatch_supported"] = json!(false);
+        assert!(!dsh_doctor_dispatch_supported(&dispatch_absent));
+
+        let mut wrong_product = supported.clone();
+        wrong_product["data"][0]["product"] = json!("codex");
+        assert!(!dsh_doctor_dispatch_supported(&wrong_product));
+
+        let mut failed_envelope = supported;
+        failed_envelope["ok"] = json!(false);
+        assert!(!dsh_doctor_dispatch_supported(&failed_envelope));
+
+        // The checkpoint-write predicate must never claim dsh support even
+        // against an otherwise-complete inventory.
+        assert!(!runtime_hook_supports_checkpoint(
+            &json!({
+                "schema_version": "cli.agent-hook.inventory.v1",
+                "ok": true,
+                "data": {
+                    "schema_version": "agent-hook.inventory.v1",
+                    "bundle_version": "2026.07.28.1",
+                    "rules": []
+                }
+            }),
+            RuntimeHookProduct::Dsh
+        ));
     }
 
     #[test]

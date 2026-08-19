@@ -38344,3 +38344,620 @@ fn main_agent_quick_no_longer_requires_an_idempotency_key() {
         "must no longer require --idempotency-key: {error}"
     );
 }
+
+#[test]
+fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let worktree = tmp.path().join("lane-worktree");
+    fs::create_dir(&worktree).expect("lane worktree");
+    let assignment_path = tmp.path().join("assignment-dsh.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-dsh",
+            "task_summary": "Exercise the dsh external-runtime launch contract",
+            "task": {},
+            "launch": {
+                "agent": "dsh",
+                "cwd": worktree,
+                "title": null,
+                "session_id": "worker-dsh",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": worktree,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let envs: &[(&str, &str)] = &[
+        ("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ];
+
+    // A non-zero --await-ready refuses before any durable side effect: the
+    // external runtime cannot deliver the prompt while this command blocks.
+    let refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--await-ready",
+            "5m",
+            "--idempotency-key",
+            "worker-start-dsh-await-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(refused.code, 64, "outcome={}", refused.stdout_text());
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "dsh-await-ready-unsupported"
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]
+            .get("assignment-dsh")
+            .is_none(),
+        "await-ready refusal must not persist an assignment"
+    );
+    assert!(
+        !state_dir.join("sessions/worker-dsh").exists(),
+        "await-ready refusal must not create a worker session"
+    );
+
+    // Launch-only start performs the store bookkeeping and returns the
+    // external launch contract instead of pasting a prompt into tmux.
+    let start_args = [
+        "--state-dir",
+        &state_arg,
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--await-ready",
+        "0",
+        "--idempotency-key",
+        "worker-start-dsh-0001",
+        "--format",
+        "json",
+    ];
+    let started = run_main_agent(&checkout, &start_args, envs);
+    assert_eq!(started.code, 0, "outcome={}", started.stdout_text());
+    let envelope = started.stdout_json();
+    let outcome = envelope["data"].clone();
+    assert_eq!(
+        outcome["schema_version"],
+        "main-agent.worker-start-result.v1"
+    );
+    assert_eq!(outcome["delivery"]["state"], "external-launch-pending");
+    assert_eq!(outcome["delivery"]["proof"], "external-runtime-transfer");
+    assert_eq!(outcome["worker"]["session_id"], "worker-dsh");
+    assert_eq!(outcome["worker"]["status"], "external");
+    let external_launch = &outcome["external_launch"];
+    assert_eq!(
+        external_launch["schema_version"],
+        "main-agent.external-launch.v1"
+    );
+    let launch_id = external_launch["launch_id"].as_str().expect("launch id");
+    assert!(!launch_id.is_empty(), "launch id is minted");
+    assert_eq!(
+        outcome["worker"]["session_incarnation"].as_str(),
+        Some(launch_id),
+        "the incarnation is the minted launch id"
+    );
+    let prompt = external_launch["prompt"].as_str().expect("prompt");
+    assert!(
+        prompt.contains("bootstrap --idempotency-key bootstrap-"),
+        "prompt drives the worker bootstrap: {prompt}"
+    );
+    assert!(
+        !prompt.contains("AGENT_SESSION_"),
+        "the prompt is environment-free; env delivery is plugin-owned: {prompt}"
+    );
+    let worker_env = &external_launch["worker_env"];
+    assert_eq!(worker_env["AGENT_SESSION_ID"], "worker-dsh");
+    assert_eq!(
+        worker_env["AGENT_SESSION_RUNTIME_ID"].as_str(),
+        Some(launch_id)
+    );
+    let capability_env = worker_env["AGENT_SESSION_CAPABILITY_FILE"]
+        .as_str()
+        .expect("capability env");
+    assert!(
+        capability_env.contains("sessions/worker-dsh/coordination/capability-"),
+        "capability path is session-scoped: {capability_env}"
+    );
+    let checkpoint_env = worker_env["AGENT_SESSION_CHECKPOINT_FILE"]
+        .as_str()
+        .expect("checkpoint env");
+    assert!(
+        checkpoint_env.contains("sessions/worker-dsh/coordination/main-agent-checkpoint-"),
+        "checkpoint path is session-scoped: {checkpoint_env}"
+    );
+    let heartbeat_argv = external_launch["broker_heartbeat_argv"]
+        .as_array()
+        .expect("heartbeat argv");
+    assert!(
+        heartbeat_argv[0]
+            .as_str()
+            .is_some_and(|bin| bin.ends_with("agent-session")),
+        "heartbeat runs the sibling agent-session binary"
+    );
+    assert!(
+        heartbeat_argv
+            .iter()
+            .any(|value| value.as_str() == Some(launch_id)),
+        "heartbeat argv binds the minted incarnation"
+    );
+    let liveness_file = external_launch["liveness_file"]
+        .as_str()
+        .expect("liveness file");
+    assert!(
+        liveness_file.ends_with("sessions/worker-dsh/dsh-runtime-liveness.json"),
+        "liveness sidecar lives in the session state dir: {liveness_file}"
+    );
+    assert_eq!(
+        external_launch["liveness_schema"],
+        "main-agent.dsh-runtime-liveness.v1"
+    );
+    let registry = orchestration_registry(&state_dir);
+    let assignment = &registry["assignments"]["assignment-dsh"];
+    assert_eq!(assignment["state"], "starting");
+    assert_eq!(assignment["revision"], 2);
+    assert_eq!(assignment["worker"]["session_id"], "worker-dsh");
+    assert_eq!(
+        assignment["worker"]["session_incarnation"].as_str(),
+        Some(launch_id)
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions/worker-dsh/session.json"))
+            .expect("worker record"),
+    )
+    .expect("worker record json");
+    assert_eq!(record["agent"], "dsh");
+    assert_eq!(record["mode"], "external");
+    assert_eq!(record["runtime"]["kind"], "dsh_external");
+    assert_eq!(record["runtime"]["launch_id"].as_str(), Some(launch_id));
+    assert_eq!(record["dsh_liveness_file"].as_str(), Some(liveness_file));
+    let stored_prompt =
+        fs::read_to_string(state_dir.join("sessions/worker-dsh/prompt.md")).expect("stored prompt");
+    assert_eq!(
+        stored_prompt, prompt,
+        "the stored prompt is the replay contract"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "a dsh worker start must never touch tmux"
+    );
+
+    // The recorded receipt makes the start idempotent.
+    let replayed = run_main_agent(&checkout, &start_args, envs);
+    assert_eq!(replayed.code, 0, "outcome={}", replayed.stdout_text());
+    assert_eq!(
+        replayed.stdout_json()["data"],
+        outcome,
+        "replay returns the receipt"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "replay must not touch tmux either"
+    );
+
+    // A CLI-owned runtime stop is refused before any durable side effect: the
+    // external plugin owns the lane runtime.
+    for stop_verb in ["stop-runtime", "stop-claimed-runtime"] {
+        let refused_stop = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                stop_verb,
+                "assignment-dsh",
+                "--worker-incarnation",
+                launch_id,
+                "--if-revision",
+                "2",
+                "--idempotency-key",
+                &format!("worker-{stop_verb}-dsh-0001"),
+                "--format",
+                "json",
+            ],
+            envs,
+        );
+        assert_ne!(
+            refused_stop.code,
+            0,
+            "outcome={}",
+            refused_stop.stdout_text()
+        );
+        assert_eq!(
+            refused_stop.stdout_json()["error"]["code"],
+            "dsh-runtime-plugin-owned",
+            "outcome={}",
+            refused_stop.stdout_text()
+        );
+        let after_stop =
+            orchestration_registry(&state_dir)["assignments"]["assignment-dsh"].clone();
+        assert_eq!(
+            after_stop["revision"], 2,
+            "a refused runtime stop must not mutate the assignment"
+        );
+        assert!(
+            after_stop["runtime_stop"].is_null(),
+            "a refused runtime stop must not persist a reservation"
+        );
+    }
+
+    // No sidecar exists yet, so the plugin never attached to this launch. That
+    // is terminal pre-claim evidence: supervision must route to
+    // reassign/cancel instead of asking a lane that never started to renew a
+    // claim it never held.
+    let diagnosed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "diagnose",
+            "assignment-dsh",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(diagnosed.code, 0, "outcome={}", diagnosed.stdout_text());
+    let diagnosis = diagnosed.stdout_json()["data"].clone();
+    assert_eq!(
+        diagnosis["failed_preclaim"], true,
+        "a never-attached lane is a pre-claim failure: {diagnosis}"
+    );
+    assert_eq!(
+        diagnosis["worker"]["status"], "missing",
+        "a never-attached lane reports missing, never stopped: {diagnosis}"
+    );
+    // The absence of a turn is proven here, not merely unobserved: a lane whose
+    // plugin never attached has no activity to report. Reporting it as
+    // unavailable evidence would be the difference between a recoverable
+    // assignment and a wedged one.
+    assert_eq!(
+        diagnosis["evidence"]["activity"]["state"], "absent",
+        "never-attached activity is proven absent: {diagnosis}"
+    );
+    assert_eq!(
+        diagnosis["evidence"]["activity"]["error_code"], "worker-lane-never-attached",
+        "the absence is typed: {diagnosis}"
+    );
+
+    // Cancellation is the recovery route that diagnosis points at, and it must
+    // not demand the tmux stopped-runtime or broker evidence a lane that never
+    // attached could never produce. Without this the assignment has no
+    // recovery route at all.
+    let cancelled = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "cancel",
+            "assignment-dsh",
+            "--if-revision",
+            "2",
+            "--reason",
+            "the dsh plugin never attached to the launch",
+            "--idempotency-key",
+            "worker-cancel-dsh-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(cancelled.code, 0, "outcome={}", cancelled.stdout_text());
+    let cancelled_assignment =
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"].clone();
+    assert_eq!(cancelled_assignment["state"], "cancelled");
+    let cancelled_revision = cancelled_assignment["revision"]
+        .as_u64()
+        .expect("cancelled revision")
+        .to_string();
+
+    // Unproven liveness fails closed: a corrupted sidecar must never authorize
+    // destroying the record of a lane that may still be running.
+    let write_sidecar = |body: &str| {
+        fs::write(liveness_file, body).expect("sidecar");
+        fs::set_permissions(liveness_file, fs::Permissions::from_mode(0o600))
+            .expect("sidecar mode");
+    };
+    write_sidecar("not json");
+    let delete_options = CmdOptions::new().with_cwd(&checkout).with_envs(&[
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ]);
+    let refused_unproven = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_unproven.code,
+        0,
+        "outcome={}",
+        refused_unproven.stdout_text()
+    );
+    assert_eq!(
+        refused_unproven.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        state_dir.join("sessions/worker-dsh").exists(),
+        "unproven liveness preserves the record"
+    );
+
+    // A live open lane refuses record deletion; a terminated lane deletes.
+    let live_sidecar = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": harness_identity_json(),
+        "lane": { "state": "open" }
+    });
+    write_sidecar(&live_sidecar.to_string());
+    let delete_options = CmdOptions::new().with_cwd(&checkout).with_envs(&[
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ]);
+    let refused_delete = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_delete.code,
+        0,
+        "a live open lane must refuse deletion: {}",
+        refused_delete.stdout_text()
+    );
+    assert!(
+        state_dir.join("sessions/worker-dsh").exists(),
+        "refused deletion preserves the record"
+    );
+
+    // The orchestrated `worker delete` must refuse the same live lane *before*
+    // it persists the delete-identity fence. A fence left behind by a refusal
+    // fences every later assignment mutation behind a delete that only an
+    // identical replay could clear.
+    let refused_delete_verb = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "delete",
+            "assignment-dsh",
+            "--if-revision",
+            &cancelled_revision,
+            "--idempotency-key",
+            "worker-delete-dsh-live-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_ne!(
+        refused_delete_verb.code,
+        0,
+        "outcome={}",
+        refused_delete_verb.stdout_text()
+    );
+    assert_eq!(
+        refused_delete_verb.stdout_json()["error"]["code"],
+        "dsh-runtime-plugin-owned",
+        "outcome={}",
+        refused_delete_verb.stdout_text()
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"]["revision"]
+            .as_u64()
+            .expect("revision")
+            .to_string(),
+        cancelled_revision,
+        "a refused worker delete must not mutate the assignment"
+    );
+
+    // A terminated lane whose harness is still live is only a plugin
+    // assertion, so it stays unproven and refuses deletion.
+    let uncorroborated = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": harness_identity_json(),
+        "lane": { "state": "terminated" }
+    });
+    write_sidecar(&uncorroborated.to_string());
+    let refused_uncorroborated = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_uncorroborated.code,
+        0,
+        "a live harness leaves plugin-asserted termination unproven: {}",
+        refused_uncorroborated.stdout_text()
+    );
+
+    // A terminated lane whose harness is proven gone deletes — but only once
+    // its coordination heartbeat is gone too. The sidecar sits in a directory
+    // the lane's own worker can write, so a lane still holding coordination
+    // authority must not be able to terminalize its own record.
+    let terminated_sidecar = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": { "pid": i32::MAX, "start_time": 1 },
+        "lane": { "state": "terminated" }
+    });
+    write_sidecar(&terminated_sidecar.to_string());
+    let heartbeat_path = state_dir.join("sessions/worker-dsh/coordination/heartbeat");
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    fs::write(&heartbeat_path, format!("{launch_id}:{now_epoch}")).expect("heartbeat");
+    fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
+        .expect("heartbeat mode");
+    let refused_live_heartbeat = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_live_heartbeat.code,
+        0,
+        "a fresh lane heartbeat refutes a plugin-asserted stop: {}",
+        refused_live_heartbeat.stdout_text()
+    );
+    assert_eq!(
+        refused_live_heartbeat.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified",
+        "outcome={}",
+        refused_live_heartbeat.stdout_text()
+    );
+    fs::remove_file(&heartbeat_path).expect("heartbeat removed");
+    let deleted = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_eq!(deleted.code, 0, "outcome={}", deleted.stdout_text());
+    assert!(
+        !state_dir.join("sessions/worker-dsh").exists(),
+        "terminated lane deletion removes the record"
+    );
+    assert!(
+        tmux_calls(&tmux_log).is_empty(),
+        "dsh record deletion must never touch tmux"
+    );
+
+    // The refused delete above left no fence: a distinct idempotency key still
+    // admits. A persisted delete identity would refuse every request but its
+    // own exact replay.
+    let deleted_worker = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "delete",
+            "assignment-dsh",
+            "--if-revision",
+            &cancelled_revision,
+            "--idempotency-key",
+            "worker-delete-dsh-terminal-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(
+        deleted_worker.code,
+        0,
+        "outcome={}",
+        deleted_worker.stdout_text()
+    );
+    assert_eq!(
+        deleted_worker.stdout_json()["data"]["deleted"],
+        true,
+        "outcome={}",
+        deleted_worker.stdout_text()
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"]["revision"]
+            .as_u64()
+            .expect("revision")
+            > cancelled_revision.parse::<u64>().expect("revision"),
+        "the admitted delete advances the assignment"
+    );
+}
+
+/// The pinned harness identity of this test process, matching what the
+/// dsh-runtime-kit plugin writes: pid plus the Linux starttime pin when it is
+/// readable, so liveness is decidable rather than merely "some process exists".
+fn harness_identity_json() -> serde_json::Value {
+    let pid = std::process::id();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let after_comm = &stat[stat.rfind(')').map(|index| index + 1).unwrap_or(0)..];
+            if let Some(start_time) = after_comm
+                .split_whitespace()
+                .nth(19)
+                .and_then(|field| field.parse::<u64>().ok())
+            {
+                return json!({ "pid": pid, "start_time": start_time });
+            }
+        }
+    }
+    json!({ "pid": pid })
+}
