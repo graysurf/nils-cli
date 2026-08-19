@@ -9371,10 +9371,26 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         },
     };
     let activity_evidence = match session_evidence.value() {
+        // An external lane publishes a turn only while it is open under a live
+        // harness. Once the plugin closed it — or before it ever attached —
+        // there is no turn to report, and that absence is proven rather than
+        // unavailable: treating it as unavailable would fence the very
+        // cancel/reassign routes such a lane needs. `Unproven` stays
+        // unavailable, so a corrupt sidecar still fails closed.
         Some(record) if crate::dsh_external::is_external_record(record) => {
-            match crate::dsh_external::external_turn_state(record) {
-                Some(turn_state) => DiagnosticEvidence::Present(turn_state),
-                None => DiagnosticEvidence::Unavailable("worker-activity-unknown".to_string()),
+            match crate::activity::state_for_view(context, record) {
+                Some(turn_state) if turn_state.phase != crate::activity::TurnPhase::Unknown => {
+                    DiagnosticEvidence::Present(turn_state)
+                }
+                _ => match crate::dsh_external::external_lane_disposition(record) {
+                    crate::dsh_external::ExternalLaneDisposition::NeverAttached => {
+                        DiagnosticEvidence::Absent("worker-lane-never-attached")
+                    }
+                    crate::dsh_external::ExternalLaneDisposition::ProvenStopped => {
+                        DiagnosticEvidence::Absent("worker-lane-stopped")
+                    }
+                    _ => DiagnosticEvidence::Unavailable("worker-activity-unknown".to_string()),
+                },
             }
         }
         Some(record) => match crate::activity::activity_status(context, &record.id) {
@@ -9636,12 +9652,18 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     let preclaim_blocker = assignment_has_preclaim_blocker(&assignment);
     let terminal_recovery_reconciled =
         terminal_recovery_recorded && worker_status == "stopped" && assignment.worker.is_some();
+    let runtime_never_attached = session_evidence.value().is_some_and(|record| {
+        crate::dsh_external::is_external_record(record)
+            && crate::dsh_external::external_lane_disposition(record)
+                == crate::dsh_external::ExternalLaneDisposition::NeverAttached
+    });
     let failed_preclaim = worker_failed_preclaim(PreClaimEvidence {
         assignment_state: &assignment.state,
         claim_active,
         operations_quiescent: active_operations == 0 && uncertain_operations == 0,
         worker_bound: assignment.worker.is_some(),
         worker_status: &worker_status,
+        runtime_never_attached,
         preclaim_blocker,
         provider_terminated,
         terminal_recovery_reconciled,
@@ -10832,6 +10854,11 @@ struct PreClaimEvidence<'a> {
     operations_quiescent: bool,
     worker_bound: bool,
     worker_status: &'a str,
+    /// A plugin-owned external lane whose runtime never attached to this
+    /// launch. Its status projects as `missing`, which for a tmux lane means
+    /// "no session record at all", so the never-attached case is carried as its
+    /// own fact rather than by widening the `worker_status` match.
+    runtime_never_attached: bool,
     preclaim_blocker: bool,
     provider_terminated: bool,
     terminal_recovery_reconciled: bool,
@@ -10860,7 +10887,11 @@ fn worker_failed_preclaim(evidence: PreClaimEvidence<'_>) -> bool {
         || (starting
             && (evidence.provider_terminated
                 || !evidence.worker_bound
-                || evidence.worker_status == "stopped"))
+                || evidence.worker_status == "stopped"
+                // An external runtime that never attached is as gone as one
+                // that died during startup; without this the lane's assignment
+                // could never be cancelled or reassigned.
+                || evidence.runtime_never_attached))
 }
 
 fn worker_claim_renewal_required(
@@ -12075,7 +12106,13 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
     let preclaim_runtime_gone = !terminal_recovery_reconciled
         && assignment.state == "starting"
         && assignment.worker.is_some()
-        && diagnosis["worker"]["status"] == "stopped";
+        // A plugin-owned lane that never attached to its launch reports
+        // `missing`, never `stopped`, and opened no broker either. The proof
+        // below is the sidecar disposition plus its absent heartbeat.
+        && matches!(
+            diagnosis["worker"]["status"].as_str(),
+            Some("stopped" | "missing")
+        );
     let broker_evidence_waived = terminal_recovery_reconciled || preclaim_runtime_gone;
     // Reconciliation committed this same stopped-runtime proof under the
     // record -> coordination -> orchestration lock order. Reacquire the
@@ -12103,21 +12140,39 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
                 None,
             ));
         }
-        let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
-        let exact_failed_canary_quiescent = preclaim_runtime_gone
-            && crate::provider_stop_canary_failed_startup_runtime_quiescent(
+        if crate::dsh_external::is_external_record(&worker_record) {
+            // A plugin-owned lane has no tmux runtime whose absence could be
+            // proven here, and its runtime evidence is unavailable precisely
+            // when the plugin never attached. Its terminal proof is the sidecar
+            // disposition corroborated by the absent broker heartbeat.
+            if !crate::dsh_external::external_lane_terminal_is_proven(
+                context,
                 &worker_record,
-                &args.assignment_id,
-            );
-        if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
-            && !exact_failed_canary_quiescent)
-            || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
-        {
-            return Err(CliError::data(
-                "worker-runtime-still-live",
-                "cancellation on waived broker evidence requires the exact worker runtime to remain stopped",
-                Some(json!({ "assignment_id": args.assignment_id })),
-            ));
+                worker_incarnation,
+            ) {
+                return Err(CliError::data(
+                    "worker-runtime-still-live",
+                    "cancellation on waived broker evidence requires the plugin-owned lane to be proven never attached or stopped",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
+        } else {
+            let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+            let exact_failed_canary_quiescent = preclaim_runtime_gone
+                && crate::provider_stop_canary_failed_startup_runtime_quiescent(
+                    &worker_record,
+                    &args.assignment_id,
+                );
+            if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
+                && !exact_failed_canary_quiescent)
+                || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+            {
+                return Err(CliError::data(
+                    "worker-runtime-still-live",
+                    "cancellation on waived broker evidence requires the exact worker runtime to remain stopped",
+                    Some(json!({ "assignment_id": args.assignment_id })),
+                ));
+            }
         }
         Some(lifecycle)
     } else {
@@ -15114,6 +15169,14 @@ fn run_worker_stop_claimed_runtime(
                 None,
             ));
         }
+        // Re-check ownership under the lock: the unlocked precheck can be
+        // overtaken, and `stop_session_runtime_locked` refuses a plugin-owned
+        // lane only after the identity, fence, and receipt below are durable.
+        ensure_worker_session_runtime_stop_not_plugin_owned(
+            context,
+            &current.assignment_id,
+            &locked_worker.session_id,
+        )?;
         orchestration::persist_session_claimed_runtime_stop_identity(
             context,
             &current.assignment_id,
@@ -15560,6 +15623,66 @@ struct WorkerRuntimeStopAssignment {
 /// external dsh plugin, before any reservation, receipt, or authority seal is
 /// persisted: a refusal after those side effects would wedge the assignment
 /// behind a retained runtime-stop reservation that no replay can clear.
+/// Refuse deleting the durable record of a plugin-owned lane whose stop is not
+/// proven, before any fence or receipt is persisted. Deletion itself is gated
+/// again at the record boundary; this only moves the refusal ahead of the
+/// side effects.
+fn ensure_external_lane_deletable(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<(), CliError> {
+    let Some((record, incarnation)) = external_lane_worker_record(context, assignment_id)? else {
+        return Ok(());
+    };
+    match crate::dsh_external::external_lane_disposition(&record) {
+        crate::dsh_external::ExternalLaneDisposition::NeverAttached
+        | crate::dsh_external::ExternalLaneDisposition::ProvenStopped
+            if crate::dsh_external::external_lane_terminal_is_proven(
+                context,
+                &record,
+                &incarnation,
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            "the dsh-runtime-kit plugin owns this lane runtime; close the lane there and let its liveness sidecar and broker prove the stop before deleting the record",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "worker_session_id": record.id
+            })),
+        )),
+    }
+}
+
+/// The bound worker's record and incarnation when the assignment names an
+/// external-runtime lane. A store read failure is an error, never an implicit
+/// "not plugin owned": failing open here would restore the fence-then-refuse
+/// wedge these prechecks exist to prevent.
+fn external_lane_worker_record(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<Option<(SessionRecord, String)>, CliError> {
+    let registry = orchestration::load_registry_readonly(context)?;
+    let Some(assignment) = registry.assignments.get(assignment_id) else {
+        return Ok(None);
+    };
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(None);
+    };
+    let record = match load_session_record(context, &worker.session_id) {
+        Ok(record) => record,
+        Err(error) if error.code() == "session-not-found" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !crate::dsh_external::is_external_record(&record) {
+        return Ok(None);
+    }
+    let incarnation = worker.session_incarnation.clone();
+    Ok(Some((record, incarnation)))
+}
+
 fn ensure_worker_runtime_stop_not_plugin_owned(
     context: &CliContext,
     assignment_id: &str,
@@ -15571,8 +15694,21 @@ fn ensure_worker_runtime_stop_not_plugin_owned(
     let Some(worker) = assignment.worker.as_ref() else {
         return Ok(());
     };
-    let Ok(record) = load_session_record(context, &worker.session_id) else {
-        return Ok(());
+    ensure_worker_session_runtime_stop_not_plugin_owned(context, assignment_id, &worker.session_id)
+}
+
+/// The same refusal for a caller that already resolved the bound worker, so a
+/// check under the registry lock does not have to re-read the registry.
+fn ensure_worker_session_runtime_stop_not_plugin_owned(
+    context: &CliContext,
+    assignment_id: &str,
+    session_id: &str,
+) -> Result<(), CliError> {
+    let record = match load_session_record(context, session_id) {
+        Ok(record) => record,
+        Err(error) if error.code() == "session-not-found" => return Ok(()),
+        // A store read failure must not read as "not plugin owned".
+        Err(error) => return Err(error),
     };
     if crate::dsh_external::is_external_record(&record) {
         return Err(CliError::usage(
@@ -15580,7 +15716,7 @@ fn ensure_worker_runtime_stop_not_plugin_owned(
             "dsh worker runtimes are owned by the external dsh-runtime-kit plugin; interrupt the lane there, then reconcile once the liveness sidecar proves the lane stopped",
             Some(json!({
                 "assignment_id": assignment_id,
-                "worker_session_id": worker.session_id.clone()
+                "worker_session_id": session_id
             })),
         ));
     }
@@ -15854,6 +15990,15 @@ fn run_worker_stop_runtime(
         }
         None => true,
     };
+
+    // Re-check ownership under the lock, ahead of the fence and reservation:
+    // the unlocked precheck can be overtaken, and the refusal inside
+    // `stop_session_runtime_locked` would arrive after both are durable.
+    ensure_worker_session_runtime_stop_not_plugin_owned(
+        context,
+        &current.assignment_id,
+        &worker.session_id,
+    )?;
 
     // Persist the session-owned authority fence before exposing a durable
     // orchestration reservation. Both global registries and the exact worker
@@ -19512,6 +19657,10 @@ fn run_worker_delete(
     args: AssignmentMutationArgs,
 ) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
+    // A refusal after the delete-identity fence is persisted would fence every
+    // assignment mutation behind a delete only an identical replay can clear,
+    // so refuse a plugin-owned live lane before any durable side effect.
+    ensure_external_lane_deletable(context, &args.assignment_id)?;
     let (record, incarnation) = authenticated_self(context)?;
     ensure_active_claim(context, &record)?;
     let request_digest = crate::coordination::request_digest(
@@ -31095,6 +31244,7 @@ mod tests {
             operations_quiescent: true,
             worker_bound: true,
             worker_status: "stopped",
+            runtime_never_attached: false,
             // The provider died before its first turn, so activity-derived
             // termination is not observable.
             provider_terminated: false,
@@ -31255,11 +31405,44 @@ mod tests {
                 operations_quiescent: true,
                 worker_bound: true,
                 worker_status: "stopped",
+                runtime_never_attached: false,
                 preclaim_blocker: false,
                 provider_terminated: false,
                 terminal_recovery_reconciled: false,
             }),
             "a post-claim stopped worker must not be routed through pre_claim_failure"
+        );
+
+        // The never-attached external lane is terminal only before the claim.
+        assert!(
+            worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "starting",
+                claim_active: false,
+                operations_quiescent: true,
+                worker_bound: true,
+                // A plugin-owned lane that never attached projects as
+                // `missing`, never as `stopped`.
+                worker_status: "missing",
+                runtime_never_attached: true,
+                preclaim_blocker: false,
+                provider_terminated: false,
+                terminal_recovery_reconciled: false,
+            }),
+            "an external lane whose runtime never attached must be reassignable"
+        );
+        assert!(
+            !worker_failed_preclaim(PreClaimEvidence {
+                assignment_state: "working",
+                claim_active: false,
+                operations_quiescent: true,
+                worker_bound: true,
+                worker_status: "missing",
+                runtime_never_attached: true,
+                preclaim_blocker: false,
+                provider_terminated: false,
+                terminal_recovery_reconciled: false,
+            }),
+            "a lane that already recorded the working checkpoint is never a pre-claim failure"
         );
     }
 

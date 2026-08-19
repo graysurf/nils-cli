@@ -125,7 +125,7 @@ Consumption. The reader resolves one of four dispositions:
 | --- | --- | --- |
 | never attached | no sidecar exists | `missing` |
 | running | valid sidecar, lane `open`, pinned harness proven live | `running` |
-| proven stopped | lane `terminated` with the harness not proven live, or the pinned harness proven gone (ESRCH, or a starttime mismatch proving pid reuse) | `stopped` |
+| proven stopped | the pinned harness is proven gone (ESRCH, or a starttime mismatch proving pid reuse) — required whether the lane reads `open` or `terminated` | `stopped` |
 | unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; or the harness state is undecidable (see the platform rule below) | `unknown` |
 
 Platform rule for the incarnation pin: where a starttime source exists (Linux
@@ -137,11 +137,23 @@ and pid reuse remains an accepted residual risk, exactly as it is for the tmux
 process-group probe on the same platforms. Plugins should always write
 `start_time` where the platform can read it.
 
-- Destructive operations require positive evidence: record deletion is
-  admitted only for a never-attached or proven-stopped lane. A running lane
-  refuses, and an unproven lane refuses with
-  `coordination-runtime-unverified` — a corrupted sidecar must never authorize
-  destroying a live lane's record.
+- Destructive operations require positive evidence: record deletion (and the
+  `remove-console-record` maintenance action) is admitted only for a
+  never-attached or proven-stopped lane. A running lane refuses, and an
+  unproven lane refuses with `coordination-runtime-unverified` — a corrupted
+  sidecar must never authorize destroying a live lane's record.
+- A proven-stopped lane must additionally be corroborated by its coordination
+  broker: the sidecar path must be the one this CLI derives for the record, and
+  the lane's broker heartbeat must be absent or stale. The sidecar is writable
+  by the lane's own worker, so sidecar evidence alone is forgeable; requiring
+  the separately maintained heartbeat to be gone means a forged stop must also
+  surrender coordination authority, which is itself observable. This raises the
+  bar — it is not an OS boundary, and the same-uid caveat above still stands.
+- A never-attached lane is terminal for pre-claim recovery: while its
+  assignment is still `starting` and holds no claim, `worker cancel` and
+  `worker reassign` treat it exactly as they treat a runtime that died during
+  startup. Its `missing` status must not be read as "evidence unavailable",
+  which would leave the assignment with no recovery route at all.
 - An idle-but-resumable lane is *running*: cold resume is always available
   while the harness lives and the lane is open.
 - `lane.state == "terminated"` is a **plugin assertion**, deliberately weaker
@@ -161,9 +173,15 @@ sidecar instead of the provider hook spool: a valid open lane under a live
 harness whose sidecar carries a known `turn.phase` reports that phase with
 `source.kind: "runtime"`, `provider: "dsh"`, and authoritative confidence
 (the harness observes its own agent directly, so the signal is authoritative
-rather than inferred). Any other state yields no activity evidence, and
-diagnosis degrades conservatively. The classification table itself is not
-modified.
+rather than inferred). This projection is the shared one, so every activity
+consumer — diagnosis, views, claim gates — reads the same evidence.
+
+Any other state yields no activity evidence, and diagnosis then distinguishes
+proven absence from missing evidence: a never-attached or proven-stopped lane
+has no turn to report and is classified as *absent* activity, while an unproven
+lane is *unavailable* and keeps the fail-closed guards engaged. Classifying a
+closed lane as unavailable instead would fence the cancel/reassign routes that
+lane needs. The classification table itself is not modified.
 
 ## Typed refusals
 
@@ -172,6 +190,28 @@ modified.
   store-side unchanged once the sidecar proves the lane stopped.
 - `agent-session resume`/provider resume surfaces: dsh sessions are not
   CLI-resumable (same typed-refusal pattern as Hermes).
+- `agent-session delete`, `maintenance` `remove-console-record`: an unproven
+  lane refuses with `coordination-runtime-unverified`.
+
+## Closing out an unproven lane
+
+An unproven lane is closed out by producing evidence, never by forcing the
+refusal. In order:
+
+1. Ask the owning plugin to publish a fresh sidecar for the recorded launch. A
+   plugin that still owns the lane can always re-derive `harness` and
+   `lane.state`, which resolves the disposition either way.
+2. If the harness is genuinely gone, confirm the recorded pid is not live and
+   remove the stale sidecar file. The lane then reads as never attached, which
+   is a terminal pre-claim disposition, and the assignment can be cancelled or
+   reassigned.
+3. If the harness is undecidable because the platform has no starttime source,
+   the lane's own broker heartbeat is the remaining evidence: once it is stale
+   the operator can stop the harness process, after which the pid probe decides.
+
+The CLI intentionally offers no force flag for this path. A force flag would be
+indistinguishable from the forged-stop case the corroboration rule exists to
+prevent, and the recovery above needs no new authority.
 
 ## Non-goals (v1)
 

@@ -38618,6 +38618,78 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         );
     }
 
+    // No sidecar exists yet, so the plugin never attached to this launch. That
+    // is terminal pre-claim evidence: supervision must route to
+    // reassign/cancel instead of asking a lane that never started to renew a
+    // claim it never held.
+    let diagnosed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "diagnose",
+            "assignment-dsh",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(diagnosed.code, 0, "outcome={}", diagnosed.stdout_text());
+    let diagnosis = diagnosed.stdout_json()["data"].clone();
+    assert_eq!(
+        diagnosis["failed_preclaim"], true,
+        "a never-attached lane is a pre-claim failure: {diagnosis}"
+    );
+    assert_eq!(
+        diagnosis["worker"]["status"], "missing",
+        "a never-attached lane reports missing, never stopped: {diagnosis}"
+    );
+    // The absence of a turn is proven here, not merely unobserved: a lane whose
+    // plugin never attached has no activity to report. Reporting it as
+    // unavailable evidence would be the difference between a recoverable
+    // assignment and a wedged one.
+    assert_eq!(
+        diagnosis["evidence"]["activity"]["state"], "absent",
+        "never-attached activity is proven absent: {diagnosis}"
+    );
+    assert_eq!(
+        diagnosis["evidence"]["activity"]["error_code"], "worker-lane-never-attached",
+        "the absence is typed: {diagnosis}"
+    );
+
+    // Cancellation is the recovery route that diagnosis points at, and it must
+    // not demand the tmux stopped-runtime or broker evidence a lane that never
+    // attached could never produce. Without this the assignment has no
+    // recovery route at all.
+    let cancelled = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "cancel",
+            "assignment-dsh",
+            "--if-revision",
+            "2",
+            "--reason",
+            "the dsh plugin never attached to the launch",
+            "--idempotency-key",
+            "worker-cancel-dsh-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(cancelled.code, 0, "outcome={}", cancelled.stdout_text());
+    let cancelled_assignment =
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"].clone();
+    assert_eq!(cancelled_assignment["state"], "cancelled");
+    let cancelled_revision = cancelled_assignment["revision"]
+        .as_u64()
+        .expect("cancelled revision")
+        .to_string();
+
     // Unproven liveness fails closed: a corrupted sidecar must never authorize
     // destroying the record of a lane that may still be running.
     let write_sidecar = |body: &str| {
@@ -38691,6 +38763,49 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         state_dir.join("sessions/worker-dsh").exists(),
         "refused deletion preserves the record"
     );
+
+    // The orchestrated `worker delete` must refuse the same live lane *before*
+    // it persists the delete-identity fence. A fence left behind by a refusal
+    // fences every later assignment mutation behind a delete that only an
+    // identical replay could clear.
+    let refused_delete_verb = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "delete",
+            "assignment-dsh",
+            "--if-revision",
+            &cancelled_revision,
+            "--idempotency-key",
+            "worker-delete-dsh-live-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_ne!(
+        refused_delete_verb.code,
+        0,
+        "outcome={}",
+        refused_delete_verb.stdout_text()
+    );
+    assert_eq!(
+        refused_delete_verb.stdout_json()["error"]["code"],
+        "dsh-runtime-plugin-owned",
+        "outcome={}",
+        refused_delete_verb.stdout_text()
+    );
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"]["revision"]
+            .as_u64()
+            .expect("revision")
+            .to_string(),
+        cancelled_revision,
+        "a refused worker delete must not mutate the assignment"
+    );
+
     // A terminated lane whose harness is still live is only a plugin
     // assertion, so it stays unproven and refuses deletion.
     let uncorroborated = json!({
@@ -38719,7 +38834,10 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         refused_uncorroborated.stdout_text()
     );
 
-    // A terminated lane whose harness is proven gone deletes.
+    // A terminated lane whose harness is proven gone deletes — but only once
+    // its coordination heartbeat is gone too. The sidecar sits in a directory
+    // the lane's own worker can write, so a lane still holding coordination
+    // authority must not be able to terminalize its own record.
     let terminated_sidecar = json!({
         "schema_version": "main-agent.dsh-runtime-liveness.v1",
         "launch_id": launch_id,
@@ -38727,6 +38845,39 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         "lane": { "state": "terminated" }
     });
     write_sidecar(&terminated_sidecar.to_string());
+    let heartbeat_path = state_dir.join("sessions/worker-dsh/coordination/heartbeat");
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    fs::write(&heartbeat_path, format!("{launch_id}:{now_epoch}")).expect("heartbeat");
+    fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
+        .expect("heartbeat mode");
+    let refused_live_heartbeat = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_live_heartbeat.code,
+        0,
+        "a fresh lane heartbeat refutes a plugin-asserted stop: {}",
+        refused_live_heartbeat.stdout_text()
+    );
+    assert_eq!(
+        refused_live_heartbeat.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified",
+        "outcome={}",
+        refused_live_heartbeat.stdout_text()
+    );
+    fs::remove_file(&heartbeat_path).expect("heartbeat removed");
     let deleted = run_resolved(
         "agent-session",
         &[
@@ -38747,6 +38898,46 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
     assert!(
         tmux_calls(&tmux_log).is_empty(),
         "dsh record deletion must never touch tmux"
+    );
+
+    // The refused delete above left no fence: a distinct idempotency key still
+    // admits. A persisted delete identity would refuse every request but its
+    // own exact replay.
+    let deleted_worker = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "delete",
+            "assignment-dsh",
+            "--if-revision",
+            &cancelled_revision,
+            "--idempotency-key",
+            "worker-delete-dsh-terminal-0001",
+            "--format",
+            "json",
+        ],
+        envs,
+    );
+    assert_eq!(
+        deleted_worker.code,
+        0,
+        "outcome={}",
+        deleted_worker.stdout_text()
+    );
+    assert_eq!(
+        deleted_worker.stdout_json()["data"]["deleted"],
+        true,
+        "outcome={}",
+        deleted_worker.stdout_text()
+    );
+    assert!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh"]["revision"]
+            .as_u64()
+            .expect("revision")
+            > cancelled_revision.parse::<u64>().expect("revision"),
+        "the admitted delete advances the assignment"
     );
 }
 

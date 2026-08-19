@@ -12181,7 +12181,21 @@ fn delete_session_locked_with_timeouts(
                 ));
             }
             dsh_external::ExternalLaneDisposition::NeverAttached
-            | dsh_external::ExternalLaneDisposition::ProvenStopped => {}
+            | dsh_external::ExternalLaneDisposition::ProvenStopped => {
+                // Sidecar evidence alone is forgeable by the lane's own worker,
+                // and an absent sidecar asserts nothing at all, so destroying
+                // durable state additionally requires the lane's broker
+                // heartbeat — maintained by a separate plugin-owned process —
+                // to be gone.
+                let incarnation = coordination::incarnation(&record)?;
+                if !dsh_external::external_lane_terminal_is_proven(context, &record, &incarnation) {
+                    return Err(CliError::runtime(
+                        "coordination-runtime-unverified",
+                        "external dsh lane termination is not corroborated by its coordination broker",
+                        Some(json!({ "id": record.id.clone() })),
+                    ));
+                }
+            }
         }
         let registry_fence = SessionRegistryFence::from_record(&record);
         return finish_session_delete(context, record, session_dir, registry_fence);

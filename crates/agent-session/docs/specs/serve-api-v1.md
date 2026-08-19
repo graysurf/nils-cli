@@ -110,8 +110,15 @@ recorded in `sympoies/nils-cli#1409`.
   must require both the global protocol advertisement and the per-session
   capability before presenting managed handoff controls.
   Sessions report
-  `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
-  the recorded `cwd`. New interactive records also expose optional
+  `running`, `stopped`, `unknown`, or `missing` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
+  the recorded `cwd`. `missing` is reported only for an external-runtime record
+  (`runtime.kind = "dsh_external"`) whose owning plugin never attached to the
+  recorded launch; consumers must treat it as "no runtime exists for this
+  launch", never as a terminated runtime that could be resumed. Every
+  external-runtime record reports `resumable: false` — it carries no provider
+  resume identity — and its runtime is owned by the external plugin, so the
+  input path refuses it with `dsh-runtime-plugin-owned`. Resume and input
+  controls belong to that plugin, not to this daemon. New interactive records also expose optional
   `runtime_started_at`, `turn_state`, `last_prompt`, `last_prompt_state`,
   `last_prompt_continuity`, and `startup`; a profiled
   session also

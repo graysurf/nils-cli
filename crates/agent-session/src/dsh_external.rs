@@ -161,7 +161,10 @@ pub(crate) fn ensure_recorded_liveness_path(
     context: &CliContext,
     record: SessionRecord,
 ) -> Result<SessionRecord, CliError> {
-    if !is_external_record(&record) || recorded_liveness_path(&record).is_some() {
+    // Repair a missing key (a crash between the two writes) and also a shaped
+    // but foreign path, so a tampered record converges on the derived path
+    // instead of quietly sourcing evidence from somewhere else.
+    if !is_external_record(&record) || recorded_liveness_path_is_derived(context, &record) {
         return Ok(record);
     }
     let expected = json!(crate::display_path(&liveness_path(context, &record.id)));
@@ -190,15 +193,73 @@ pub(crate) fn liveness_path(context: &CliContext, session_id: &str) -> PathBuf {
 /// directory: a record-supplied path pointing anywhere else is not evidence
 /// about this lane.
 fn recorded_liveness_path(record: &SessionRecord) -> Option<PathBuf> {
-    let path = record.extra.get(LIVENESS_PATH_KEY)?.as_str()?;
-    let path = Path::new(path);
+    let raw = record.extra.get(LIVENESS_PATH_KEY)?.as_str()?;
+    let path = Path::new(raw);
     if !path.is_absolute() || path.file_name()? != LIVENESS_FILE {
         return None;
     }
     if path.parent()?.file_name()? != record.id.as_str() {
         return None;
     }
+    // Reject traversal outright: a normalizing comparison would accept
+    // `.../sessions/<id>/../../elsewhere/<id>/<file>` because both sides
+    // normalize the same way, so the recorded path must already be canonical.
+    if crate::display_path(path) != raw {
+        return None;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     Some(path.to_path_buf())
+}
+
+/// Whether the record's sidecar path is the exact path this CLI derives for it.
+/// Only a context-bearing caller can check this; the context-free reader keeps
+/// the shape checks above.
+fn recorded_liveness_path_is_derived(context: &CliContext, record: &SessionRecord) -> bool {
+    recorded_liveness_path(record)
+        .is_some_and(|recorded| recorded == liveness_path(context, &record.id))
+}
+
+/// The stop proof a destructive operation requires, which is deliberately
+/// stronger than the status projection.
+///
+/// The sidecar lives in the same-uid state directory a lane's own worker can
+/// reach, so sidecar evidence alone is forgeable: a live worker could name a
+/// dead pid and have its own lane terminalized. Requiring the lane's broker
+/// heartbeat — a separate file maintained by a separate process the plugin
+/// owns — to be absent or stale means a forged stop must also stop the real
+/// coordination heartbeat, which is itself an observable loss of authority.
+/// This raises the bar; it is not an OS boundary, and the same-uid caveat in
+/// the spec still stands.
+///
+/// It holds when either the plugin never attached to this launch, or its
+/// published termination is corroborated. Both additionally require the lane's
+/// coordination heartbeat to be gone, so a lane that is live enough to hold
+/// coordination authority can never be terminalized through an absent or forged
+/// sidecar.
+///
+/// `NeverAttached` is included deliberately: without it a lane whose plugin
+/// never took the launch has no terminal disposition at all, and its assignment
+/// can be neither cancelled nor reassigned.
+pub(crate) fn external_lane_terminal_is_proven(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+) -> bool {
+    if !recorded_liveness_path_is_derived(context, record) {
+        return false;
+    }
+    if !matches!(
+        external_lane_disposition(record),
+        ExternalLaneDisposition::NeverAttached | ExternalLaneDisposition::ProvenStopped
+    ) {
+        return false;
+    }
+    !coordination::broker::heartbeat_fresh(context, &record.id, incarnation, 0)
 }
 
 /// Typed outcome of reading the sidecar against a specific session record.
@@ -466,10 +527,14 @@ pub(crate) fn external_runtime_evidence(
             ));
         }
     };
+    // `lane.state` is part of the identity: without it a plugin-asserted
+    // termination flip leaves the digest unchanged, so a consumer comparing
+    // digests could not see that the evidence changed at all.
     let identity = json!({
         "kind": DSH_RUNTIME_KIND,
         "launch_id": liveness.launch_id,
         "harness": liveness.harness,
+        "lane_state": liveness.lane.state,
     });
     let bytes = serde_json::to_vec(&identity).map_err(|_| {
         CliError::runtime(
@@ -478,10 +543,15 @@ pub(crate) fn external_runtime_evidence(
             None,
         )
     })?;
-    let status = if liveness.lane.state == "terminated" {
-        CoordinationRuntimeStatus::Stopped
-    } else {
-        harness_process_status(&liveness.harness)
+    // One function owns the corroboration rule. Deriving the status here from
+    // the disposition keeps this evidence and the destructive-operation gate
+    // from disagreeing about what a plugin-asserted termination proves.
+    let status = match external_lane_disposition(record) {
+        ExternalLaneDisposition::Running => CoordinationRuntimeStatus::Running,
+        ExternalLaneDisposition::ProvenStopped => CoordinationRuntimeStatus::Stopped,
+        ExternalLaneDisposition::NeverAttached | ExternalLaneDisposition::Unproven(_) => {
+            CoordinationRuntimeStatus::Unknown
+        }
     };
     Ok(CoordinationRuntimeEvidence {
         identity_digest: coordination::digest_bytes(&bytes),
