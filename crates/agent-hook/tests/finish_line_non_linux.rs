@@ -21,6 +21,7 @@ fn open_fails_closed_with_the_documented_non_linux_containment_error() {
         "session_id": "session-a",
         "turn_id": "turn-1",
         "cwd": fixture.root,
+        "attempt_token": "attempt-non-linux",
     });
     let output = fixture.run(
         &["finish-line", "open", "--format", "json"],

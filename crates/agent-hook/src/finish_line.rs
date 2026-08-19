@@ -1,10 +1,19 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1279,15 +1288,7 @@ fn quiesce(state_root: &Path, request: QuiesceRequest) -> Result<Outcome, HookEr
     };
 
     if let Some((_, _, _, _, Some(unit))) = pending.as_ref() {
-        validate_contained_unit_name(unit)?;
-        stop_contained_unit(unit)?;
-        if !contained_unit_is_quiescent(unit)? {
-            return Err(finish_line_unavailable(
-                "finish-line-containment-failed",
-                "finish-line contained execution unit did not become quiescent",
-            ));
-        }
-        let _ = reset_contained_unit(unit);
+        quiesce_contained_unit(unit)?;
     }
 
     if let Some((kind, generation, sequence, target_digest, active_unit)) = pending {
@@ -2431,6 +2432,28 @@ fn validate_contained_runner_config(config: &ContainedRunnerConfig) -> Result<()
             "finish-line contained runner config is invalid or exceeds its bounds",
         ));
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn quiesce_contained_unit(_unit: &str) -> Result<(), HookError> {
+    Err(finish_line_unavailable(
+        "finish-line-containment-unavailable",
+        "authoritative finish-line execution requires Linux systemd cgroup containment",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn quiesce_contained_unit(unit: &str) -> Result<(), HookError> {
+    validate_contained_unit_name(unit)?;
+    stop_contained_unit(unit)?;
+    if !contained_unit_is_quiescent(unit)? {
+        return Err(finish_line_unavailable(
+            "finish-line-containment-failed",
+            "finish-line contained execution unit did not become quiescent",
+        ));
+    }
+    let _ = reset_contained_unit(unit);
     Ok(())
 }
 
