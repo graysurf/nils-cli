@@ -138,7 +138,11 @@ phase = "edit"
         ]);
         assert_eq!(code, 0);
 
-        let roots = ResolvedRoots::for_paths(docs_home.clone(), project);
+        let roots = crate::env::resolve_roots(&crate::env::PathOverrides {
+            docs_home: Some(docs_home.clone()),
+            project_path: Some(project),
+        })
+        .expect("resolved roots");
         let intent = crate::model::Context::parse("project-dev").expect("intent");
         let phase = crate::model::Phase::parse("edit").expect("phase");
         assert!(session_intent_is_current(
