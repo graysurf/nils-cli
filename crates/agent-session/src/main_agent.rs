@@ -5036,6 +5036,29 @@ struct ExternalWorkerStartRequest<'a> {
     batch_lane: Option<&'a BatchLaneFence<'a>>,
 }
 
+/// Establish the coordination broker for one external-runtime lane worker.
+///
+/// Idempotent by design: `worker start` is replayable, and re-provisioning a
+/// live incarnation would rotate the credentials a running lane authenticates
+/// with (or refuse outright once its heartbeat is fresh). An existing
+/// capability for this exact incarnation is therefore accepted as already
+/// established.
+fn ensure_external_worker_broker(
+    context: &CliContext,
+    worker_record: &SessionRecord,
+) -> Result<(), CliError> {
+    let incarnation = crate::coordination::incarnation(worker_record)?;
+    if crate::coordination::capability_path(context, &worker_record.id, &incarnation).exists() {
+        return Ok(());
+    }
+    crate::coordination::provision(context, worker_record).map(|_| ())
+    // Deliberately not `activate_ready`: that step belongs to a launcher that
+    // already has a live runtime and a fresh heartbeat. An external lane has
+    // neither at this point — its runtime evidence and its heartbeat both begin
+    // once the plugin adopts this payload — so readiness is established by the
+    // heartbeat the plugin starts, not by this call.
+}
+
 fn finish_external_worker_start(
     request: ExternalWorkerStartRequest<'_>,
 ) -> Result<Value, CliError> {
@@ -5145,6 +5168,19 @@ fn finish_external_worker_start(
             return Err(invalid_input("worker session incarnation is unavailable"));
         }
     };
+    // Provision the lane's coordination broker before advertising its heartbeat
+    // argv. A tmux worker gets these credentials from `establish_coordination_
+    // broker` during launch; an external lane has no launch of ours to hang that
+    // off, so without this the capability file the payload names is never
+    // created and `agent-session broker heartbeat` refuses the lane with
+    // `coordination-unauthorized` — the worker can then never authenticate
+    // bootstrap or any checkpoint.
+    if let Err(error) = ensure_external_worker_broker(context, &worker_record) {
+        if let Some(fence) = worker_start_fence.take() {
+            fence.finish(context, false)?;
+        }
+        return Err(error);
+    }
     let expected_worker = session_ref(context, &worker_record, &launch_id);
     let attachment = (|| {
         ensure_active_claim(context, record)?;
