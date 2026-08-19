@@ -38615,6 +38615,15 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         Some(launch_id),
         "the provisioned broker is bound to the minted launch incarnation"
     );
+    // Provisioned, deliberately not activated: readiness needs runtime evidence
+    // and a fresh heartbeat, and an external lane has neither until the plugin
+    // adopts this payload. Activating here would advertise a lane as ready
+    // before anything of the sort exists.
+    assert_eq!(
+        brokers["brokers"]["worker-dsh"]["state"].as_str(),
+        Some("starting"),
+        "worker start provisions the lane broker without activating readiness"
+    );
     let registry = orchestration_registry(&state_dir);
     let assignment = &registry["assignments"]["assignment-dsh"];
     assert_eq!(assignment["state"], "starting");
