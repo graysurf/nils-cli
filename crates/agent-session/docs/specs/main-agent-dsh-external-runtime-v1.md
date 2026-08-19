@@ -126,7 +126,16 @@ Consumption. The reader resolves one of four dispositions:
 | never attached | no sidecar exists | `missing` |
 | running | valid sidecar, lane `open`, pinned harness proven live | `running` |
 | proven stopped | lane `terminated` with the harness not proven live, or the pinned harness proven gone (ESRCH, or a starttime mismatch proving pid reuse) | `stopped` |
-| unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; or the harness state is undecidable (EPERM without a readable starttime, no `start_time`, unreadable `/proc`) | `unknown` |
+| unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; or the harness state is undecidable (see the platform rule below) | `unknown` |
+
+Platform rule for the incarnation pin: where a starttime source exists (Linux
+`/proc`), a liveness claim without a verified `start_time` match is *undecided*
+rather than live, so a recycled pid can never masquerade as a live harness —
+including when `kill` reports `EPERM`. On platforms with no starttime source the
+pid signal is the only liveness evidence that exists, so it is decisive there
+and pid reuse remains an accepted residual risk, exactly as it is for the tmux
+process-group probe on the same platforms. Plugins should always write
+`start_time` where the platform can read it.
 
 - Destructive operations require positive evidence: record deletion is
   admitted only for a never-attached or proven-stopped lane. A running lane

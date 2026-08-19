@@ -289,12 +289,26 @@ pub(crate) fn harness_process_status(identity: &DshHarnessIdentity) -> Coordinat
         // is gone and the pid was recycled.
         (Some(expected), Some(actual)) if expected != actual => CoordinationRuntimeStatus::Stopped,
         (Some(_), Some(_)) => CoordinationRuntimeStatus::Running,
-        // Pinned but unreadable, or never pinned: a live pid alone cannot prove
-        // this incarnation, so liveness stays undecided rather than vouching
-        // for a possibly recycled pid.
-        _ => CoordinationRuntimeStatus::Unknown,
+        // Where a starttime source exists, a live pid without a verified pin
+        // cannot prove this incarnation, so liveness stays undecided rather
+        // than vouching for a possibly recycled pid.
+        _ if INCARNATION_PIN_AVAILABLE => CoordinationRuntimeStatus::Unknown,
+        // On platforms with no starttime source the pid signal is the only
+        // liveness evidence that exists; treating it as undecided would make
+        // every lane permanently unterminalizable. Pid reuse therefore remains
+        // an accepted residual risk there, exactly as it is for the tmux
+        // process-group probe on the same platforms.
+        _ => CoordinationRuntimeStatus::Running,
     }
 }
+
+/// Whether this platform can pin a process incarnation by starttime. When it
+/// can, a liveness claim without a verified pin is undecided rather than live.
+#[cfg(target_os = "linux")]
+const INCARNATION_PIN_AVAILABLE: bool = true;
+
+#[cfg(not(target_os = "linux"))]
+const INCARNATION_PIN_AVAILABLE: bool = false;
 
 #[cfg(target_os = "linux")]
 fn linux_process_start_time(pid: i32) -> Option<u64> {
@@ -360,10 +374,10 @@ pub(crate) fn external_lane_disposition(record: &SessionRecord) -> ExternalLaneD
                 // the pinned harness identity — a still-running harness means
                 // the assertion is unproven, not proven.
                 return match harness {
-                    CoordinationRuntimeStatus::Running => {
-                        ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
-                    }
-                    _ => ExternalLaneDisposition::ProvenStopped,
+                    // Only a harness proven gone corroborates the assertion;
+                    // a live or undecidable harness leaves it unproven.
+                    CoordinationRuntimeStatus::Stopped => ExternalLaneDisposition::ProvenStopped,
+                    _ => ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness),
                 };
             }
             match harness {
@@ -537,8 +551,12 @@ mod tests {
         };
         assert_eq!(
             harness_process_status(&unpinned),
-            CoordinationRuntimeStatus::Unknown,
-            "an unpinned pid never vouches for a live harness"
+            if INCARNATION_PIN_AVAILABLE {
+                CoordinationRuntimeStatus::Unknown
+            } else {
+                CoordinationRuntimeStatus::Running
+            },
+            "an unpinned pid is undecided wherever a starttime pin exists"
         );
 
         #[cfg(target_os = "linux")]
@@ -701,17 +719,10 @@ mod tests {
             .to_string(),
             0o600,
         );
-        let terminated = external_lane_disposition(&record);
-        #[cfg(target_os = "linux")]
         assert_eq!(
-            terminated,
+            external_lane_disposition(&record),
             ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness),
-            "a live harness leaves plugin-asserted termination unproven"
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            terminated,
-            ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
+            "only a harness proven gone corroborates plugin-asserted termination"
         );
     }
 
