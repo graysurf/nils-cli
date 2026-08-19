@@ -220,6 +220,7 @@ capability = { id = "dsh.policy.v1", group = "operation-lifecycle" }
     .to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn post_request(fixture: &Fixture, call_id: &str, is_error: bool) -> String {
     json!({
         "schema_version": "agent-hook.dsh-ingress.v4",
@@ -257,6 +258,7 @@ fn install_release_binary(destination: &std::path::Path) {
         .expect("sync agent-hook parent");
 }
 
+#[cfg(target_os = "linux")]
 fn install_operation_session_fixture(
     destination: &std::path::Path,
     state_dir: &std::path::Path,
@@ -555,6 +557,7 @@ fn dsh_agent_activity_emits_only_metadata_and_partial_identity_fails_closed() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn dsh_operation_lifecycle_admits_and_completes_one_exact_private_operation() {
     let fixture = Fixture::new(&operation_policy());
     git(&fixture, &["init", "--quiet"]);
@@ -719,6 +722,7 @@ fn dsh_operation_lifecycle_admits_and_completes_one_exact_private_operation() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn certain_operation_denials_reclaim_capacity_before_the_next_admission() {
     let fixture = Fixture::new(&operation_policy());
     git(&fixture, &["init", "--quiet"]);
@@ -828,6 +832,7 @@ fn dsh_operation_lifecycle_is_optional_when_unmanaged_and_closed_when_partial() 
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn dsh_operation_post_without_a_matching_pre_does_not_create_private_state() {
     let fixture = Fixture::new(&operation_policy());
     git(&fixture, &["init", "--quiet"]);
@@ -858,6 +863,7 @@ fn dsh_operation_post_without_a_matching_pre_does_not_create_private_state() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn collect_named_files(root: &std::path::Path, name: &str, output: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;

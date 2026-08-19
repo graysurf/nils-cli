@@ -1224,3 +1224,36 @@ fn digest(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_primitives_preserve_redaction_and_private_layout() {
+        assert_eq!(Outcome::clean().status, Status::Clean);
+        assert_eq!(Outcome::not_run().status, Status::NotRun);
+        let pending = Outcome::pending("reconcile the operation");
+        assert_eq!(pending.status, Status::Pending);
+        assert_eq!(pending.message.as_deref(), Some("reconcile the operation"));
+
+        assert_eq!(TerminalOutcome::Pass.as_str(), "pass");
+        assert_eq!(TerminalOutcome::Fail.as_str(), "fail");
+
+        let operation_dir = PathBuf::from("/private/operations/operation-digest");
+        let (state, targets, token) = paths_for_directory_without_lock(operation_dir.clone());
+        assert_eq!(state, operation_dir.join("state.json"));
+        assert_eq!(targets, operation_dir.join("targets.json"));
+        assert_eq!(token, operation_dir.join("execution-token"));
+        assert_eq!(
+            operations_root(Path::new("/private/state")),
+            Path::new("/private/state/agent-hook/dsh-operations")
+        );
+
+        let secret = "raw-provider-correlation";
+        let redacted = digest(secret.as_bytes());
+        assert_eq!(redacted.len(), 64);
+        assert!(redacted.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!redacted.contains(secret));
+    }
+}

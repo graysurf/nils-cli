@@ -4,11 +4,19 @@ mod completion;
 mod contract;
 mod degradation;
 mod degraded;
+#[cfg(target_os = "linux")]
+mod dsh_coordination;
+#[cfg(not(target_os = "linux"))]
+#[path = "dsh_coordination_unsupported.rs"]
 mod dsh_coordination;
 mod dsh_policy;
 mod effect;
 mod error;
 mod evaluator;
+#[cfg(target_os = "linux")]
+mod finish_line;
+#[cfg(not(target_os = "linux"))]
+#[path = "finish_line_unsupported.rs"]
 mod finish_line;
 mod liveness;
 mod model;

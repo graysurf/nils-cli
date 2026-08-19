@@ -857,9 +857,11 @@ pub fn apply_session_coordination(
                 crate::dsh_coordination::Status::NotRun => {
                     (DecisionAction::Allow, CoordinationHandlerStatus::NotRun)
                 }
+                #[cfg(target_os = "linux")]
                 crate::dsh_coordination::Status::Clean => {
                     (DecisionAction::Allow, CoordinationHandlerStatus::Clean)
                 }
+                #[cfg(target_os = "linux")]
                 crate::dsh_coordination::Status::Pending => {
                     (DecisionAction::Block, CoordinationHandlerStatus::Pending)
                 }
