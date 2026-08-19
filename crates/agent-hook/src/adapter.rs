@@ -10,16 +10,20 @@ use sha2::{Digest, Sha256};
 use crate::contract::{digest, matcher_input_field, supported_event};
 use crate::error::HookError;
 use crate::model::{
-    DecisionAction, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
+    DecisionAction, DshSubject, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
 };
 use crate::path_binding::{TargetBinding, resolve_target_bindings};
 use crate::strict_json;
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
-const DSH_INGRESS_VERSION: &str = "agent-hook.dsh-ingress.v1";
+const DSH_INGRESS_V1: &str = "agent-hook.dsh-ingress.v1";
+const DSH_INGRESS_V2: &str = "agent-hook.dsh-ingress.v2";
+const DSH_INGRESS_V3: &str = "agent-hook.dsh-ingress.v3";
+const DSH_INGRESS_V4: &str = "agent-hook.dsh-ingress.v4";
 const MAX_PROVIDER_ID_CHARS: usize = 256;
 const MAX_MUTATION_TARGETS: usize = 256;
 const MAX_MUTATION_TARGET_BYTES: usize = 4096;
+const MAX_DSH_PROMPT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Serialize)]
 struct ActivityEvent {
@@ -47,9 +51,31 @@ struct ActivityEvent {
 struct DshIngress {
     schema_version: String,
     event: String,
-    call_id: String,
+    #[serde(default)]
+    call_id: Option<String>,
     cwd: PathBuf,
-    tool: DshToolCall,
+    #[serde(default)]
+    subject: Option<DshIngressSubject>,
+    #[serde(default)]
+    tool: Option<DshToolCall>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    result: Option<DshToolResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshIngressSubject {
+    session_id: String,
+    turn: u64,
+    #[serde(default)]
+    step: Option<u64>,
+    #[serde(default)]
+    session_start_source: Option<String>,
+    agent_docs_state_home: PathBuf,
+    #[serde(default)]
+    agent_docs_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +83,12 @@ struct DshIngress {
 struct DshToolCall {
     name: String,
     arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DshToolResult {
+    is_error: bool,
 }
 
 pub fn read_stdin() -> Result<Vec<u8>, HookError> {
@@ -137,15 +169,79 @@ fn normalize_dsh(
     let ingress: DshIngress = serde_json::from_value(raw).map_err(|_| {
         HookError::data(
             "dsh-ingress-invalid",
-            "DSH ingress must match the strict agent-hook.dsh-ingress.v1 object",
+            "DSH ingress must match a strict supported agent-hook.dsh-ingress object",
         )
     })?;
-    if ingress.schema_version != DSH_INGRESS_VERSION {
+    if !matches!(
+        ingress.schema_version.as_str(),
+        DSH_INGRESS_V1 | DSH_INGRESS_V2 | DSH_INGRESS_V3 | DSH_INGRESS_V4
+    ) {
         return Err(HookError::data(
             "dsh-ingress-version-invalid",
             "DSH ingress schema_version is unsupported",
         ));
     }
+    let dsh_subject = match (ingress.schema_version.as_str(), ingress.subject) {
+        (DSH_INGRESS_V1, None) => None,
+        (DSH_INGRESS_V2 | DSH_INGRESS_V4, Some(subject))
+            if !subject.session_id.is_empty()
+                && subject.session_id.chars().count() <= MAX_PROVIDER_ID_CHARS
+                && subject.turn > 0
+                && subject.step.is_some_and(|step| step > 0)
+                && subject.session_start_source.is_none()
+                && subject.agent_docs_state_home.is_absolute()
+                && subject
+                    .agent_docs_home
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute()) =>
+        {
+            Some(DshSubject {
+                session_id: subject.session_id,
+                call_id: ingress.call_id.clone(),
+                turn: subject.turn,
+                step: subject.step,
+                session_start_source: None,
+                agent_docs_state_home: subject.agent_docs_state_home,
+                agent_docs_home: subject.agent_docs_home,
+            })
+        }
+        (DSH_INGRESS_V3, Some(subject))
+            if !subject.session_id.is_empty()
+                && subject.session_id.chars().count() <= MAX_PROVIDER_ID_CHARS
+                && subject.turn > 0
+                && subject.step.is_none_or(|step| step > 0)
+                && subject
+                    .session_start_source
+                    .as_deref()
+                    .is_none_or(|source| {
+                        matches!(
+                            source,
+                            "startup" | "resume" | "clear" | "compact" | "observed"
+                        )
+                    })
+                && subject.agent_docs_state_home.is_absolute()
+                && subject
+                    .agent_docs_home
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute()) =>
+        {
+            Some(DshSubject {
+                session_id: subject.session_id,
+                call_id: None,
+                turn: subject.turn,
+                step: subject.step,
+                session_start_source: subject.session_start_source,
+                agent_docs_state_home: subject.agent_docs_state_home,
+                agent_docs_home: subject.agent_docs_home,
+            })
+        }
+        _ => {
+            return Err(HookError::data(
+                "dsh-ingress-invalid",
+                "DSH ingress subject does not match its schema version",
+            ));
+        }
+    };
     if let Some(argument) = event_arg
         && argument != ingress.event
     {
@@ -155,7 +251,20 @@ fn normalize_dsh(
         ));
     }
     let event = match ingress.event.as_str() {
-        "tools/pre-execute" => "PreToolUse",
+        "tools/pre-execute" if ingress.schema_version != DSH_INGRESS_V4 => "PreToolUse",
+        "tools/post-execute" if ingress.schema_version == DSH_INGRESS_V4 => {
+            if ingress
+                .result
+                .as_ref()
+                .is_some_and(|result| result.is_error)
+            {
+                "PostToolUseFailure"
+            } else {
+                "PostToolUse"
+            }
+        }
+        "agent/pre-step" if ingress.schema_version == DSH_INGRESS_V3 => "UserPromptSubmit",
+        "agent/turn-stopping" if ingress.schema_version == DSH_INGRESS_V3 => "Stop",
         _ => {
             return Err(HookError::data(
                 "provider-event-unsupported",
@@ -163,16 +272,67 @@ fn normalize_dsh(
             ));
         }
     };
-    if ingress.call_id.is_empty()
-        || ingress.call_id.chars().count() > MAX_PROVIDER_ID_CHARS
-        || ingress.tool.name.is_empty()
-        || ingress.tool.name.chars().count() > MAX_PROVIDER_ID_CHARS
-        || !ingress.cwd.is_absolute()
-        || !ingress.tool.arguments.is_object()
-    {
+    if !ingress.cwd.is_absolute() {
         return Err(HookError::data(
             "dsh-ingress-invalid",
-            "DSH ingress requires bounded call/tool identifiers, an absolute cwd, and object arguments",
+            "DSH ingress requires an absolute cwd",
+        ));
+    }
+
+    let tool_shape = event == "PreToolUse"
+        && ingress.call_id.as_deref().is_some_and(|call_id| {
+            !call_id.is_empty() && call_id.chars().count() <= MAX_PROVIDER_ID_CHARS
+        })
+        && ingress.tool.as_ref().is_some_and(|tool| {
+            !tool.name.is_empty()
+                && tool.name.chars().count() <= MAX_PROVIDER_ID_CHARS
+                && tool.arguments.is_object()
+        })
+        && ingress.prompt.is_none()
+        && ingress.result.is_none()
+        && dsh_subject
+            .as_ref()
+            .is_none_or(|subject| subject.step.is_some() && subject.session_start_source.is_none());
+    let prompt_shape = event == "UserPromptSubmit"
+        && ingress.schema_version == DSH_INGRESS_V3
+        && ingress.call_id.is_none()
+        && ingress.tool.is_none()
+        && ingress
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.len() <= MAX_DSH_PROMPT_BYTES)
+        && dsh_subject
+            .as_ref()
+            .is_some_and(|subject| subject.step.is_some())
+        && ingress.result.is_none();
+    let stop_shape = event == "Stop"
+        && ingress.schema_version == DSH_INGRESS_V3
+        && ingress.call_id.is_none()
+        && ingress.tool.is_none()
+        && ingress.prompt.is_none()
+        && ingress.result.is_none()
+        && dsh_subject.as_ref().is_some_and(|subject| {
+            subject.step.is_none() && subject.session_start_source.is_none()
+        });
+    let post_tool_shape = matches!(event, "PostToolUse" | "PostToolUseFailure")
+        && ingress.schema_version == DSH_INGRESS_V4
+        && ingress.call_id.as_deref().is_some_and(|call_id| {
+            !call_id.is_empty() && call_id.chars().count() <= MAX_PROVIDER_ID_CHARS
+        })
+        && ingress.tool.as_ref().is_some_and(|tool| {
+            !tool.name.is_empty()
+                && tool.name.chars().count() <= MAX_PROVIDER_ID_CHARS
+                && tool.arguments.is_object()
+        })
+        && ingress.prompt.is_none()
+        && ingress.result.is_some()
+        && dsh_subject.as_ref().is_some_and(|subject| {
+            subject.step.is_some() && subject.session_start_source.is_none()
+        });
+    if !(tool_shape || post_tool_shape || prompt_shape || stop_shape) {
+        return Err(HookError::data(
+            "dsh-ingress-invalid",
+            "DSH ingress fields do not match the selected lifecycle event",
         ));
     }
 
@@ -181,21 +341,26 @@ fn normalize_dsh(
         "cwd".to_string(),
         Value::String(ingress.cwd.to_string_lossy().into_owned()),
     );
-    canonical.insert(
-        "tool_name".to_string(),
-        Value::String(ingress.tool.name.clone()),
-    );
-    canonical.insert("tool_input".to_string(), ingress.tool.arguments);
-
-    let matcher = Some(ingress.tool.name);
-    finalize_normalized_request(
+    let matcher = if let Some(tool) = ingress.tool {
+        canonical.insert("tool_name".to_string(), Value::String(tool.name.clone()));
+        canonical.insert("tool_input".to_string(), tool.arguments);
+        Some(tool.name)
+    } else {
+        if let Some(prompt) = ingress.prompt {
+            canonical.insert("prompt".to_string(), Value::String(prompt));
+        }
+        None
+    };
+    let mut request = finalize_normalized_request(
         Product::Dsh,
         event.to_string(),
         matcher,
         input,
         &canonical,
         None,
-    )
+    )?;
+    request.dsh_subject = dsh_subject;
+    Ok(request)
 }
 
 fn finalize_normalized_request(
@@ -256,6 +421,7 @@ fn finalize_normalized_request(
         target_paths,
         execution_path,
         binding_roots,
+        dsh_subject: None,
     })
 }
 
@@ -442,6 +608,46 @@ pub fn normalize_activity_event(
     runtime_id: &str,
 ) -> Result<Option<Vec<u8>>, HookError> {
     validate_provider_id("runtime_id", runtime_id)?;
+    if request.product == Product::Dsh {
+        let subject = request.dsh_subject.as_ref().ok_or_else(|| {
+            HookError::data(
+                "provider-hook-correlation-missing",
+                "DSH activity event is missing its normalized subject",
+            )
+        })?;
+        let kind = match request.event.as_str() {
+            "UserPromptSubmit" => "turn_started",
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "progress",
+            "Stop" => "stop_observed",
+            _ => return Ok(None),
+        };
+        let event = ActivityEvent {
+            schema_version: "agent-session.turn-event.v1",
+            event_id: format!(
+                "agent-hook:v1:{}",
+                request
+                    .snapshot_digest
+                    .strip_prefix("sha256:")
+                    .unwrap_or_default()
+            ),
+            runtime_id: runtime_id.to_string(),
+            provider: "dsh",
+            provider_session_id: Some(subject.session_id.clone()),
+            provider_turn_id: Some(subject.turn.to_string()),
+            kind,
+            failure_reason: None,
+            attention_id: None,
+            attention_kind: None,
+            confidence: "observed",
+            source_kind: "provider_hook",
+        };
+        return serde_json::to_vec(&event).map(Some).map_err(|_| {
+            HookError::runtime(
+                "session-activity-render-failed",
+                "metadata-only DSH activity event could not be rendered",
+            )
+        });
+    }
     let raw = parse_provider_json(input)?;
     let object = raw.as_object().ok_or_else(|| {
         HookError::data(
@@ -626,12 +832,44 @@ fn target_paths(
     object: &Map<String, Value>,
     matcher: Option<&str>,
 ) -> Result<(Vec<PathBuf>, Option<PathBuf>), HookError> {
-    let execution = string_at(object, &["cwd", "working_directory"])
+    let mut execution = string_at(object, &["cwd", "working_directory"])
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
     let nested = object.get("tool_input").and_then(Value::as_object);
     let mut targets = if product == Product::Dsh {
-        execution.iter().cloned().collect()
+        let Some(input) = nested else {
+            return if matcher.is_none() {
+                Ok((Vec::new(), execution))
+            } else {
+                Err(untrusted_target("DSH tool is missing object arguments"))
+            };
+        };
+        match matcher {
+            Some("bash") => {
+                if let Some(value) = input.get("workdir") {
+                    let raw = required_string(Some(value))?;
+                    execution = Some(resolve_mutation_target(raw, execution.as_deref())?);
+                }
+                execution.iter().cloned().collect()
+            }
+            Some("write" | "edit") => {
+                let path = required_string(input.get("file_path"))?;
+                vec![resolve_mutation_target(path, execution.as_deref())?]
+            }
+            Some("str_replace_editor") => match input.get("command").and_then(Value::as_str) {
+                Some("create" | "str_replace" | "insert") => {
+                    let path = required_string(input.get("path"))?;
+                    vec![resolve_mutation_target(path, execution.as_deref())?]
+                }
+                Some("view") => execution.iter().cloned().collect(),
+                _ => {
+                    return Err(untrusted_target(
+                        "DSH str_replace_editor command is unsupported",
+                    ));
+                }
+            },
+            _ => execution.iter().cloned().collect(),
+        }
     } else {
         match matcher {
             Some("Write" | "Edit" | "MultiEdit") => {

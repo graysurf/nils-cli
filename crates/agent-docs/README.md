@@ -38,7 +38,7 @@ design in `sympoies/agent-runtime-kit`
 | `remove` | Remove a `[[document]]` entry from the project catalog. |
 | `config enroll/exclude/show/list/remove` | Preview or apply exact user-local enrollment and exclusion rules. |
 | `integration resolve` | Resolve a typed integration action and content-bound fingerprint. |
-| `session activate/prepare/status/verify` | Persist and verify intent activation scoped to a session, repository, product, and integration decision. |
+| `session activate/prepare/context/status/verify` | Persist and verify intent activation; `context` returns a bounded DSH policy decision. |
 | `completion` | Generate shell completion scripts. |
 
 There is no top-level `resolve` command. The retired `baseline` / `scaffold-*` /
@@ -95,7 +95,7 @@ A catalog declares two array-of-tables sections:
 context  = "project-dev"            # free-form intent identifier
 scope    = "project"                # home | project | global
 path     = "DEVELOPMENT.md"         # relative to the scope root
-product  = "codex"                  # optional: codex | claude | hermes | a list
+product  = "codex"                  # optional: codex | claude | hermes | dsh | a list
 phase    = ["edit", "review"]       # optional: free-form phase name or a list
 required = true                     # default: false
 when     = "path-exists:Cargo.toml" # default: always (see grammar below)
@@ -138,9 +138,10 @@ document and validation entry whose `context` equals `X`.
 ### Products
 
 `product` is optional on both `[[document]]` and `[[validation]]`. It accepts a
-single product string or a non-empty list of product strings. Supported values
-are `codex`, `claude`, and `hermes`. Unscoped entries apply to every product; scoped
-entries are included only when the requested `--product` matches.
+single catalog tag or a non-empty list. Supported tags are `codex`, `claude`,
+`hermes`, and the isolated runtime tag `dsh`. Unscoped entries apply to every
+view; stable product commands select their matching tag, while DSH-only
+commands select unscoped plus DSH-tagged entries.
 
 ### Phases
 
@@ -160,8 +161,9 @@ phase filter and returns every document (today's behavior, byte-for-byte). A
 the no-phase set rather than erroring — so a phase with no dedicated documents
 still works. A malformed `--phase` value is a usage error (exit `64`).
 
-`--phase` is accepted by `preflight`, `session prepare`, and `session verify`
-(one phase per call, "the current phase"; `--intent` stays repeatable).
+`--phase` is accepted by `preflight`, `session prepare`, `session context`, and
+`session verify` (one phase per call, "the current phase"; `--intent` stays
+repeatable except for `session context`, which requires exactly one intent).
 
 ### `when` grammar
 
@@ -400,6 +402,21 @@ for the v2 product model; CLI JSON consumers should treat
 `agent-docs.preflight.v2` and `agent-docs.audit.v2` as the product-aware
 contract boundaries.
 
+The public Rust `Product` enum remains the stable closed
+`Codex | Claude | Hermes` contract. `dsh` is parsed as an isolated catalog tag,
+not exposed as a fourth public enum variant. Generic product-aware commands
+project DSH-only entries out (while retaining known tags from mixed arrays);
+the DSH-specific context, integration, and validation helpers project the same
+fully validated catalog to unscoped plus DSH-tagged entries. This keeps
+exhaustive downstream Rust matches source-compatible within 1.x.
+
+Rust integrations use the additive `agent_docs::dsh` boundary rather than a
+`Product::Dsh` variant. `validation_contracts_from_roots` returns the fully
+validated unscoped-plus-DSH validation view. `session_intent_is_current` is a
+read-only, fail-closed check for the exact activation written by `session
+context`; it never creates or refreshes session state. The DSH pre-edit policy
+gate uses that narrow verifier instead of widening generic `session verify`.
+
 Private catalog provenance is intentionally internal to the resolver and the
 new integration-decision response. It does not add a public `DocumentSource`
 variant or a required field to public `ScopeCatalog` literals, and it does not
@@ -435,6 +452,53 @@ agent-docs --user-config --integration-fingerprint "$FINGERPRINT" \
 Omit `--user-config` for the repository-catalog-only behavior. Products without
 hooks may still use these shared CLI records, but the record does not claim that
 product-native hooks invoked activation.
+
+### Bounded DSH context decision
+
+`session context` is the single-call policy loading boundary for DeepSeek
+Harness. It accepts the normal session scope, exactly one `--intent`, an
+optional caller-supplied `--phase`, and a caller-generated `--request-id`. It is
+valid only for `--product dsh`. DSH is intentionally not accepted by generic
+`list`, `preflight`, `session prepare`, `session status`, or `session verify`
+product selectors. While holding the same per-record lock, `context`
+strictly resolves the selected catalog, refreshes or creates the activation,
+and returns the current satisfied required documents. Repeating the call still
+returns those documents after compaction; only `decision.reason` changes from
+`prepared` to `already-current` when the fingerprint was already current.
+
+```bash
+agent-docs session context --session-id "$SESSION_ID" --product dsh \
+  --state-home "$STATE_HOME" --intent project-dev --phase edit \
+  --request-id "$REQUEST_ID" --max-bytes 20480 --format json
+```
+
+The success envelope uses `cli.agent-docs.session.context.v1` and its only data
+field is `decision`. That object uses `decision.context.v1` and contains the
+echoed request id, product, intent, optional phase, reason, `verified = true`,
+ordered `documents`, `document_count`, and `total_bytes`. Each document contains
+only `source`, `scope`, and `content`; the response never includes the catalog,
+optional documents, validation commands, document paths, record path, raw
+session id, or project path. This decision supplies context only and does not
+authorize a tool execution. The optional phase merely records the exact
+caller-supplied resolution scope; it is not decision authority. Repeating the
+same `session context` call is the verification/replay surface for DSH policy.
+
+Request ids are 1–128 ASCII bytes: an alphanumeric first character followed by
+alphanumerics or `-_.:`. The content budget defaults to 20 KiB and has a 64 KiB
+hard cap; at most 128 currently required documents may be returned.
+`total_bytes` is the sum of returned UTF-8 document content bytes. Optional and
+condition-false documents are not opened. Every emitted document must use a
+relative traversal-free catalog path, resolve inside its declared scope (or a
+verified linked-worktree fallback), and be a regular non-symlink file. If the
+complete required set exceeds either budget, the command fails with
+`context-budget-exceeded`; it emits no partial policy and writes no activation
+for that request. An unsafe document fails with `context-document-unsafe` under
+the same atomic rule. Omitting `--phase` intentionally retains the existing
+full prepare semantics and includes required documents from every phase;
+callers that know the current workflow phase should pass it to select the
+no-phase plus matching phase documents. A failed context refresh never mutates
+the prior record; the caller repairs the catalog or increases the requested
+budget within the hard cap, then repeats `session context`.
 
 ### Phase-scoped preparation
 

@@ -579,11 +579,21 @@ pub(crate) fn stop(context: &CliContext, args: BrokerStopArgs) -> Result<Value, 
 }
 
 pub(crate) fn status(context: &CliContext, args: BrokerStatusArgs) -> Result<Value, CliError> {
+    let authenticated_incarnation = if args.authenticated {
+        Some(authenticate_from_file(context, &args.session, args.capability_file.as_deref())?.1)
+    } else {
+        None
+    };
     let locked = lock_registry(context)?;
     let broker = locked
         .registry
         .brokers
         .get(&args.session)
+        .filter(|broker| {
+            authenticated_incarnation
+                .as_ref()
+                .is_none_or(|incarnation| broker.incarnation == *incarnation)
+        })
         .ok_or_else(unavailable)?;
     let incarnation = broker.incarnation.clone();
     let claim = locked

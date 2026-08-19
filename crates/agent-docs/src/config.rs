@@ -31,6 +31,36 @@ const ALLOWED_VALIDATION_FIELDS: [&str; 5] =
 
 const ALLOWED_SKILLS_FIELDS: [&str; 3] = ["enforce_name_prefix", "allowed_prefixes", "dir"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogView {
+    Standard,
+    Dsh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CatalogProduct {
+    Known(Product),
+    Dsh,
+}
+
+/// A catalog projected specifically for the DSH runtime boundary.
+///
+/// Keeping the wrapper private to this crate prevents an empty `products`
+/// vector from being mistaken for a generic, unfiltered catalog by public
+/// library callers.
+#[derive(Debug, Clone)]
+pub(crate) struct DshCatalog(LoadedCatalog);
+
+impl DshCatalog {
+    pub(crate) fn as_loaded(&self) -> &LoadedCatalog {
+        &self.0
+    }
+
+    pub(crate) fn into_loaded(self) -> LoadedCatalog {
+        self.0
+    }
+}
+
 pub fn config_path_for_root(root: &Path) -> PathBuf {
     root.join(CONFIG_FILE_NAME)
 }
@@ -39,11 +69,25 @@ pub fn load_catalog_from_roots(roots: &ResolvedRoots) -> Result<LoadedCatalog, C
     load_catalog(&roots.docs_home, &roots.project_path)
 }
 
+pub(crate) fn load_dsh_catalog_from_roots(
+    roots: &ResolvedRoots,
+) -> Result<DshCatalog, ConfigLoadError> {
+    load_catalog_with_view(&roots.docs_home, &roots.project_path, CatalogView::Dsh).map(DshCatalog)
+}
+
 pub fn load_catalog(
     docs_home: &Path,
     project_path: &Path,
 ) -> Result<LoadedCatalog, ConfigLoadError> {
-    let home = load_scope_catalog(Scope::Home, docs_home)?;
+    load_catalog_with_view(docs_home, project_path, CatalogView::Standard)
+}
+
+fn load_catalog_with_view(
+    docs_home: &Path,
+    project_path: &Path,
+    view: CatalogView,
+) -> Result<LoadedCatalog, ConfigLoadError> {
+    let home = load_scope_catalog_with_view(Scope::Home, docs_home, view)?;
 
     // When the docs-home and project share the same catalog file (a repo that
     // is its own docs-home, e.g. the kit itself), load it once as the home
@@ -55,13 +99,21 @@ pub fn load_catalog(
         });
     }
 
-    let project = load_scope_catalog(Scope::Project, project_path)?;
+    let project = load_scope_catalog_with_view(Scope::Project, project_path, view)?;
     Ok(LoadedCatalog { home, project })
 }
 
 pub fn load_scope_catalog(
     source_scope: Scope,
     root: &Path,
+) -> Result<Option<ScopeCatalog>, ConfigLoadError> {
+    load_scope_catalog_with_view(source_scope, root, CatalogView::Standard)
+}
+
+fn load_scope_catalog_with_view(
+    source_scope: Scope,
+    root: &Path,
+    view: CatalogView,
 ) -> Result<Option<ScopeCatalog>, ConfigLoadError> {
     let file_path = config_path_for_root(root);
     if !file_path.exists() {
@@ -71,14 +123,20 @@ pub fn load_scope_catalog(
         Scope::Home | Scope::Global => CatalogOrigin::Home,
         Scope::Project => CatalogOrigin::Repository,
     };
-    load_catalog_file(source_scope, origin, root, &file_path).map(Some)
+    load_catalog_file(source_scope, origin, root, &file_path, view).map(Some)
 }
 
 pub fn load_external_project_catalog(
     project_root: &Path,
     file_path: &Path,
 ) -> Result<ScopeCatalog, ConfigLoadError> {
-    load_catalog_file(Scope::Project, CatalogOrigin::User, project_root, file_path)
+    load_catalog_file(
+        Scope::Project,
+        CatalogOrigin::User,
+        project_root,
+        file_path,
+        CatalogView::Standard,
+    )
 }
 
 fn load_catalog_file(
@@ -86,6 +144,7 @@ fn load_catalog_file(
     origin: CatalogOrigin,
     root: &Path,
     file_path: &Path,
+    view: CatalogView,
 ) -> Result<ScopeCatalog, ConfigLoadError> {
     let raw = fs::read_to_string(file_path).map_err(|err| {
         ConfigLoadError::io(
@@ -93,7 +152,7 @@ fn load_catalog_file(
             format!("failed to read {}: {err}", file_path.display()),
         )
     })?;
-    load_scope_catalog_from_str(source_scope, origin, root, file_path, &raw)
+    load_scope_catalog_from_str_with_view(source_scope, origin, root, file_path, &raw, view)
 }
 
 pub(crate) fn load_scope_catalog_from_str(
@@ -103,9 +162,44 @@ pub(crate) fn load_scope_catalog_from_str(
     file_path: &Path,
     raw: &str,
 ) -> Result<ScopeCatalog, ConfigLoadError> {
+    load_scope_catalog_from_str_with_view(
+        source_scope,
+        origin,
+        root,
+        file_path,
+        raw,
+        CatalogView::Standard,
+    )
+}
+
+pub(crate) fn load_dsh_scope_catalog_from_str(
+    source_scope: Scope,
+    origin: CatalogOrigin,
+    root: &Path,
+    file_path: &Path,
+    raw: &str,
+) -> Result<ScopeCatalog, ConfigLoadError> {
+    load_scope_catalog_from_str_with_view(
+        source_scope,
+        origin,
+        root,
+        file_path,
+        raw,
+        CatalogView::Dsh,
+    )
+}
+
+fn load_scope_catalog_from_str_with_view(
+    source_scope: Scope,
+    origin: CatalogOrigin,
+    root: &Path,
+    file_path: &Path,
+    raw: &str,
+    view: CatalogView,
+) -> Result<ScopeCatalog, ConfigLoadError> {
     let parsed = parse_toml(file_path, raw, origin)?;
-    let documents = parse_documents(source_scope, origin, file_path, &parsed)?;
-    let validations = parse_validations(file_path, &parsed)?;
+    let documents = parse_documents(source_scope, origin, file_path, &parsed, view)?;
+    let validations = parse_validations(file_path, &parsed, view)?;
     let skill_policy = parse_skill_policy(file_path, &parsed)?;
     let path_classes = parse_path_classes(source_scope, file_path, &parsed)?;
 
@@ -193,6 +287,7 @@ fn parse_documents(
     origin: CatalogOrigin,
     file_path: &Path,
     parsed: &Value,
+    view: CatalogView,
 ) -> Result<Vec<DocumentEntry>, ConfigLoadError> {
     let Some(raw_documents) = array_of_tables(parsed, file_path, "document")? else {
         return Ok(Vec::new());
@@ -229,6 +324,9 @@ fn parse_documents(
         let freshness_days = parse_u64(file_path, index, table, "last-reviewed-within-days")?;
         let notes = parse_opt_string(file_path, "document", index, table, "notes")?;
 
+        let Some(products) = project_products(&products, view) else {
+            continue;
+        };
         documents.push(DocumentEntry {
             context,
             scope,
@@ -250,6 +348,7 @@ fn parse_documents(
 fn parse_validations(
     file_path: &Path,
     parsed: &Value,
+    view: CatalogView,
 ) -> Result<Vec<ValidationEntry>, ConfigLoadError> {
     let Some(raw_validations) = array_of_tables(parsed, file_path, "validation")? else {
         return Ok(Vec::new());
@@ -280,6 +379,9 @@ fn parse_validations(
         let marker = parse_opt_string(file_path, "validation", index, table, "marker")?;
         let description = parse_opt_string(file_path, "validation", index, table, "description")?;
 
+        let Some(products) = project_products(&products, view) else {
+            continue;
+        };
         validations.push(ValidationEntry {
             context,
             products,
@@ -297,7 +399,7 @@ fn parse_products(
     section: &'static str,
     index: usize,
     table: &toml::map::Map<String, Value>,
-) -> Result<Vec<Product>, ConfigLoadError> {
+) -> Result<Vec<CatalogProduct>, ConfigLoadError> {
     let Some(value) = table.get("product") else {
         return Ok(Vec::new());
     };
@@ -355,20 +457,45 @@ fn parse_product(
     section: &'static str,
     index: usize,
     raw: &str,
-) -> Result<Product, ConfigLoadError> {
-    Product::from_config_value(raw.trim()).ok_or_else(|| {
-        ConfigLoadError::validation(
-            file_path.to_path_buf(),
-            section,
-            index,
-            "product",
-            format!(
-                "unsupported product `{}`; allowed: {}",
-                raw.trim(),
-                Product::supported_values().join(", ")
-            ),
-        )
-    })
+) -> Result<CatalogProduct, ConfigLoadError> {
+    let raw = raw.trim();
+    if raw == "dsh" {
+        return Ok(CatalogProduct::Dsh);
+    }
+    Product::from_config_value(raw)
+        .map(CatalogProduct::Known)
+        .ok_or_else(|| {
+            ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                section,
+                index,
+                "product",
+                format!(
+                    "unsupported product `{}`; allowed: {}",
+                    raw,
+                    [Product::supported_values(), &["dsh"]].concat().join(", ")
+                ),
+            )
+        })
+}
+
+fn project_products(products: &[CatalogProduct], view: CatalogView) -> Option<Vec<Product>> {
+    if products.is_empty() {
+        return Some(Vec::new());
+    }
+    match view {
+        CatalogView::Standard => {
+            let known = products
+                .iter()
+                .filter_map(|product| match product {
+                    CatalogProduct::Known(product) => Some(*product),
+                    CatalogProduct::Dsh => None,
+                })
+                .collect::<Vec<_>>();
+            (!known.is_empty()).then_some(known)
+        }
+        CatalogView::Dsh => products.contains(&CatalogProduct::Dsh).then(Vec::new),
+    }
 }
 
 fn parse_phases(
@@ -1258,6 +1385,172 @@ typo = true
         field_error(
             "[[validation]]\ncontext = \"x\"\ncommands = [\"a\"]\nproduct = 5\n",
             "product",
+        );
+    }
+
+    #[test]
+    fn standard_catalog_projection_hides_dsh_only_entries_and_keeps_known_tags() {
+        let catalog = load(
+            r#"
+[[document]]
+context = "unscoped"
+scope = "project"
+path = "unscoped.md"
+
+[[document]]
+context = "dsh-only"
+scope = "project"
+path = "dsh.md"
+product = "dsh"
+
+[[document]]
+context = "mixed"
+scope = "project"
+path = "mixed.md"
+product = ["dsh", "codex", "dsh"]
+
+[[validation]]
+context = "dsh-only"
+commands = ["dsh-check"]
+product = "dsh"
+
+[[validation]]
+context = "mixed"
+commands = ["mixed-check"]
+product = ["dsh", "hermes"]
+"#,
+        )
+        .expect("catalog");
+
+        assert_eq!(
+            catalog
+                .documents
+                .iter()
+                .map(|entry| entry.context.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unscoped", "mixed"]
+        );
+        assert_eq!(catalog.documents[1].products, vec![Product::Codex]);
+        assert_eq!(catalog.validations.len(), 1);
+        assert_eq!(catalog.validations[0].context.as_str(), "mixed");
+        assert_eq!(catalog.validations[0].products, vec![Product::Hermes]);
+    }
+
+    #[test]
+    fn dsh_catalog_projection_keeps_unscoped_and_dsh_tagged_entries_only() {
+        let catalog = load_dsh_scope_catalog_from_str(
+            Scope::Project,
+            CatalogOrigin::Repository,
+            Path::new("/repo"),
+            Path::new(FILE),
+            r#"
+[[document]]
+context = "unscoped"
+scope = "project"
+path = "unscoped.md"
+
+[[document]]
+context = "dsh-only"
+scope = "project"
+path = "dsh.md"
+product = "dsh"
+
+[[document]]
+context = "known-only"
+scope = "project"
+path = "known.md"
+product = "codex"
+
+[[document]]
+context = "mixed"
+scope = "project"
+path = "mixed.md"
+product = ["dsh", "hermes", "dsh"]
+
+[[validation]]
+context = "unscoped"
+commands = ["unscoped-check"]
+
+[[validation]]
+context = "dsh-only"
+commands = ["dsh-check"]
+product = "dsh"
+
+[[validation]]
+context = "known-only"
+commands = ["known-check"]
+product = "claude"
+"#,
+        )
+        .expect("DSH catalog");
+
+        assert_eq!(
+            catalog
+                .documents
+                .iter()
+                .map(|entry| entry.context.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unscoped", "dsh-only", "mixed"]
+        );
+        assert!(
+            catalog
+                .documents
+                .iter()
+                .all(|entry| entry.products.is_empty())
+        );
+        assert_eq!(
+            catalog
+                .validations
+                .iter()
+                .map(|entry| entry.context.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unscoped", "dsh-only"]
+        );
+    }
+
+    #[test]
+    fn both_catalog_views_validate_entries_before_projection() {
+        let malformed_known_only = r#"
+[[document]]
+context = "known-only"
+scope = "project"
+path = "known.md"
+product = "codex"
+required = "not-a-boolean"
+"#;
+        assert_eq!(
+            load(malformed_known_only)
+                .expect_err("standard projection must reject malformed entry")
+                .field
+                .as_deref(),
+            Some("required")
+        );
+        assert_eq!(
+            load_dsh_scope_catalog_from_str(
+                Scope::Project,
+                CatalogOrigin::Repository,
+                Path::new("/repo"),
+                Path::new(FILE),
+                malformed_known_only,
+            )
+            .expect_err("DSH projection must reject malformed excluded entry")
+            .field
+            .as_deref(),
+            Some("required")
+        );
+
+        let malformed_dsh_only = r#"
+[[validation]]
+context = "dsh-only"
+commands = []
+product = "dsh"
+"#;
+        assert_eq!(
+            load(malformed_dsh_only)
+                .expect_err("standard projection must reject malformed excluded entry")
+                .field
+                .as_deref(),
+            Some("commands")
         );
     }
 

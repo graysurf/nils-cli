@@ -4,14 +4,26 @@ mod completion;
 mod contract;
 mod degradation;
 mod degraded;
+#[cfg(target_os = "linux")]
+mod dsh_coordination;
+#[cfg(not(target_os = "linux"))]
+#[path = "dsh_coordination_unsupported.rs"]
+mod dsh_coordination;
+mod dsh_policy;
 mod effect;
 mod error;
 mod evaluator;
+#[cfg(target_os = "linux")]
+mod finish_line;
+#[cfg(not(target_os = "linux"))]
+#[path = "finish_line_unsupported.rs"]
+mod finish_line;
 mod liveness;
 mod model;
 mod observe;
 mod path_binding;
 mod paths;
+pub mod policy_parity;
 mod read_only;
 pub mod recovery;
 pub mod setup;
@@ -31,7 +43,7 @@ use nils_common::cli_contract::{
 use serde::Serialize;
 use serde_json::json;
 
-use cli::{Cli, Command, DispatchFormat, RecoveryCommand};
+use cli::{Cli, Command, DispatchFormat, FinishLineCommand, RecoveryCommand};
 use error::HookError;
 use model::{
     Capability, DECISION_VERSION, DecisionAction, DecisionReason, NormalizedDecision,
@@ -51,6 +63,16 @@ where
     T: Into<OsString> + Clone,
 {
     let raw = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if raw
+        .get(1)
+        .is_some_and(|argument| argument == finish_line::CONTAINED_RUNNER_ARG)
+    {
+        if raw.len() != 2 {
+            eprintln!("agent-hook: finish-line contained runner arguments are invalid");
+            return 203;
+        }
+        finish_line::exec_contained_runner();
+    }
     let json_requested = detect_format_from_args(&raw) == OutputFormat::Json;
     let cli = match Cli::try_parse_from(raw) {
         Ok(cli) => cli,
@@ -132,6 +154,7 @@ fn render_clap_message(error: &clap::Error) -> String {
 fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: Command) -> i32 {
     match command {
         Command::Completion(args) => completion::run(args.shell),
+        Command::FinishLine(args) => run_finish_line(&layout, args.command),
         Command::Dispatch(args) => run_dispatch(&layout, policy_override, args),
         Command::Validate(args) => {
             let loaded = match contract::load(&layout, policy_override) {
@@ -302,6 +325,56 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
             }
         }
         Command::Recovery(args) => run_recovery(&layout, policy_override, args.command),
+    }
+}
+
+fn run_finish_line(layout: &Layout, command: FinishLineCommand) -> i32 {
+    let (name, format, operation) = match command {
+        FinishLineCommand::Open(args) => (
+            "agent-hook finish-line open",
+            args.format,
+            finish_line::Operation::Open,
+        ),
+        FinishLineCommand::Begin(args) => (
+            "agent-hook finish-line begin",
+            args.format,
+            finish_line::Operation::Begin,
+        ),
+        FinishLineCommand::Run(args) => (
+            "agent-hook finish-line run",
+            args.format,
+            finish_line::Operation::Run,
+        ),
+        FinishLineCommand::Stop(args) => (
+            "agent-hook finish-line stop",
+            args.format,
+            finish_line::Operation::Stop,
+        ),
+        FinishLineCommand::Status(args) => (
+            "agent-hook finish-line status",
+            args.format,
+            finish_line::Operation::Status,
+        ),
+        FinishLineCommand::Quiesce(args) => (
+            "agent-hook finish-line quiesce",
+            args.format,
+            finish_line::Operation::Quiesce,
+        ),
+        FinishLineCommand::Release(args) => (
+            "agent-hook finish-line release",
+            args.format,
+            finish_line::Operation::Release,
+        ),
+    };
+    let format = OutputFormat::from(format);
+    match finish_line::run(&layout.state_root, operation) {
+        Ok(outcome) => {
+            let exit_code = outcome.exit_code;
+            let emitted = emit_success(name, format, &outcome.data, || outcome.text);
+            debug_assert_eq!(emitted, 0);
+            exit_code
+        }
+        Err(error) => emit_error(name, &error, format == OutputFormat::Json),
     }
 }
 
@@ -783,7 +856,13 @@ fn emergency_decision<'a>(
     let mut reasons = Vec::new();
     let mut coordination_rule = None;
     for rule in rules {
-        if matches!(rule.capability, Capability::SessionCoordination { .. }) {
+        if matches!(
+            rule.capability,
+            Capability::SessionCoordination { .. }
+                | Capability::DshPolicy {
+                    group: policy_parity::DshCapabilityGroup::OperationLifecycle
+                }
+        ) {
             if coordination_rule.replace(rule).is_some() {
                 return Err(HookError::data(
                     "coordination-capability-ambiguous",
@@ -809,14 +888,18 @@ fn emergency_decision<'a>(
                 Capability::Transform { .. } => {
                     (DecisionAction::Transform, "recovery-manifest-transform")
                 }
-                Capability::SessionCoordination { .. } => {
+                Capability::SessionCoordination { .. }
+                | Capability::DshPolicy {
+                    group: policy_parity::DshCapabilityGroup::OperationLifecycle,
+                } => {
                     unreachable!("session coordination is deferred above")
                 }
                 Capability::SessionActivity { .. }
                 | Capability::OwnerLiveness { .. }
                 | Capability::SemanticConflict { .. }
                 | Capability::ExecutionReadOnly { .. }
-                | Capability::RuntimeKitHandler { .. } => match rule.failure_posture {
+                | Capability::RuntimeKitHandler { .. }
+                | Capability::DshPolicy { .. } => match rule.failure_posture {
                     model::FailurePosture::Open => {
                         (DecisionAction::Allow, "recovery-manifest-failure-open")
                     }
@@ -983,6 +1066,7 @@ fn capability_id(capability: &Capability) -> &'static str {
         Capability::SessionCoordination { .. } => "agent-session.coordination.v1",
         Capability::ExecutionReadOnly { .. } => "execution.read-only.v1",
         Capability::RuntimeKitHandler { .. } => "runtime-kit.handler.v1",
+        Capability::DshPolicy { .. } => "dsh.policy.v1",
     }
 }
 

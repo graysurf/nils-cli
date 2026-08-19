@@ -34,6 +34,31 @@ impl HookError {
         )
     }
 
+    pub fn unavailable_with(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self::new(
+            code,
+            message,
+            Some(Box::new(details)),
+            nils_common::cli_contract::exit::UNAVAILABLE,
+        )
+    }
+
+    pub fn temporary(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(code, message, None, 75)
+    }
+
+    pub fn temporary_with(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self::new(code, message, Some(Box::new(details)), 75)
+    }
+
     pub fn blocked(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(code, message, None, 1)
     }

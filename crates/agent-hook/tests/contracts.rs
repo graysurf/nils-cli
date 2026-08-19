@@ -393,6 +393,7 @@ fn cli_help_version_and_completion_surface_are_complete() {
         "doctor",
         "setup",
         "recovery",
+        "finish-line",
         "completion",
         "-V, --version",
     ] {
@@ -406,11 +407,103 @@ fn cli_help_version_and_completion_surface_are_complete() {
     assert_eq!(version.code, 0, "stderr={}", version.stderr_text());
     assert!(version.stdout_text().starts_with("agent-hook "));
 
+    let finish_line_help = fixture.run(&["finish-line", "--help"], None);
+    assert_eq!(
+        finish_line_help.code,
+        0,
+        "stderr={}",
+        finish_line_help.stderr_text()
+    );
+    let finish_line_help_text = finish_line_help.stdout_text();
+    assert!(finish_line_help_text.contains("Probe or supervise one foreground DSH Bash command"));
+    assert!(finish_line_help_text.contains("classify exact validation targets"));
+    for required in ["open", "begin", "run", "stop", "status"] {
+        assert!(
+            finish_line_help_text.contains(required),
+            "finish-line help missing {required}: {finish_line_help_text}"
+        );
+    }
+    for removed in ["complete", "waive", "approve", "revoke"] {
+        assert!(
+            !finish_line_help_text.contains(removed),
+            "finish-line help retains removed {removed}: {finish_line_help_text}"
+        );
+    }
+    assert!(
+        !finish_line_help_text.contains("quiesce"),
+        "internal quiesce leaked into public finish-line help: {finish_line_help_text}"
+    );
+    assert!(
+        !finish_line_help_text.contains("release"),
+        "internal release leaked into public finish-line help: {finish_line_help_text}"
+    );
+    let begin_help = fixture.run(&["finish-line", "begin", "--help"], None);
+    assert_eq!(begin_help.code, 0, "stderr={}", begin_help.stderr_text());
+    assert!(begin_help.stdout_text().contains("[default: json]"));
+    assert!(!begin_help.stdout_text().contains("text output (default)"));
+    let run_help = fixture.run(&["finish-line", "run", "--help"], None);
+    assert_eq!(run_help.code, 0, "stderr={}", run_help.stderr_text());
+    assert!(run_help.stdout_text().contains("[default: json]"));
+    assert!(!run_help.stdout_text().contains("text output (default)"));
+
     for shell in ["bash", "zsh"] {
         let completion = fixture.run(&["completion", shell], None);
         assert_eq!(completion.code, 0, "shell={shell}");
         let script = completion.stdout_text();
+        assert!(
+            !script.contains("quiesce"),
+            "internal quiesce leaked anywhere in public completion; shell={shell}"
+        );
+        assert!(
+            !script.contains("release"),
+            "internal release leaked anywhere in public completion; shell={shell}"
+        );
         assert!(script.contains("dispatch"), "shell={shell}");
         assert!(script.contains("--expected-plan-digest"), "shell={shell}");
+        let (scope_start, scope_end) = if shell == "bash" {
+            (
+                "        agent__hook__finish__line)\n",
+                "        agent__hook__finish__line__begin)\n",
+            )
+        } else {
+            (
+                "_agent-hook__subcmd__finish-line_commands() {\n",
+                "_agent-hook__subcmd__finish-line__subcmd__begin_commands() {\n",
+            )
+        };
+        let start = script
+            .find(scope_start)
+            .expect("finish-line completion start");
+        let relative_end = script[start + scope_start.len()..]
+            .find(scope_end)
+            .expect("finish-line completion end");
+        let finish_line_scope = &script[start..start + scope_start.len() + relative_end];
+        for required in ["open", "begin", "run", "stop", "status"] {
+            assert!(
+                finish_line_scope.contains(required),
+                "missing {required}; shell={shell}"
+            );
+        }
+        for removed in ["complete", "waive", "approve", "revoke"] {
+            assert!(
+                !finish_line_scope.contains(removed),
+                "retains removed {removed}; shell={shell}"
+            );
+        }
+        assert!(
+            !finish_line_scope.contains("quiesce"),
+            "internal quiesce leaked into public completion; shell={shell}"
+        );
+        assert!(
+            !finish_line_scope.contains("release"),
+            "internal release leaked into public completion; shell={shell}"
+        );
+        if shell == "zsh" {
+            assert!(
+                finish_line_scope.contains("foreground DSH Bash command"),
+                "finish-line run description drifted; shell={shell}"
+            );
+        }
+        assert!(!finish_line_scope.contains("text output (default)"));
     }
 }

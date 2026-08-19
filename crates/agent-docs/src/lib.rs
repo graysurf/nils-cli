@@ -3,6 +3,7 @@ pub mod commands;
 mod completion;
 pub mod config;
 pub mod content;
+pub mod dsh;
 pub mod env;
 mod integration;
 pub mod model;

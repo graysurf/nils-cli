@@ -109,6 +109,10 @@ schema, normalizes severity and confidence, deduplicates by stable fingerprint,
 renders local Markdown/JSON profiles, writes small artifact bundles, and
 classifies Git diffs for specialist routing. It does not run LLM prompts, spawn
 subagents, post comments, open issues, merge PRs, or close issues.
+Finding validation accepts the closed specialist set `api-contract`,
+`data-migration`, `maintainability`, `performance`, `quick`, `red-team`,
+`security`, and `testing`; scope selection keeps `quick` outside the
+multi-specialist initial wave.
 
 For delivery workflows, pass `--mode delivery` to `validate`, `merge`, or
 `bundle`. Delivery mode requires an explicit stable

@@ -67,7 +67,7 @@ fn dsh_ingress_rejects_unknown_versions_and_fields() {
     let fixture = Fixture::new(POLICY);
 
     let wrong_version =
-        request(&fixture).replace("agent-hook.dsh-ingress.v1", "agent-hook.dsh-ingress.v2");
+        request(&fixture).replace("agent-hook.dsh-ingress.v1", "agent-hook.dsh-ingress.v5");
     let output = fixture.run(
         &["dispatch", "--product", "dsh", "--format", "json"],
         Some(&wrong_version),
@@ -199,6 +199,109 @@ fn dsh_ingress_enforces_field_boundaries_and_event_identity() {
             "field={field}"
         );
     }
+}
+
+#[test]
+fn dsh_v4_post_tool_ingress_is_strict_and_projects_only_the_terminal_fact() {
+    let fixture = Fixture::new(POLICY);
+    let value = json!({
+        "schema_version": "agent-hook.dsh-ingress.v4",
+        "event": "tools/post-execute",
+        "call_id": "dsh-call-1",
+        "cwd": fixture.root,
+        "subject": {
+            "session_id": "session-1",
+            "turn": 1,
+            "step": 2,
+            "agent_docs_state_home": fixture.home.join("state"),
+        },
+        "tool": {
+            "name": "runtime_kit_plus_one",
+            "arguments": {"value": 41},
+        },
+        "result": {"is_error": false},
+    });
+    let output = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&value.to_string()),
+    );
+    assert_eq!(output.code, 0, "envelope={}", output.stdout_text());
+    assert_eq!(output.stdout_json()["data"]["event"], "PostToolUse");
+
+    for mutation in [
+        (
+            "result",
+            "content",
+            json!([{"type": "text", "text": "private"}]),
+        ),
+        ("result", "is_error", json!("false")),
+        ("tool", "unknown", json!(true)),
+    ] {
+        let mut invalid = value.clone();
+        invalid[mutation.0][mutation.1] = mutation.2;
+        let rejected = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&invalid.to_string()),
+        );
+        assert_eq!(rejected.code, 65, "input={invalid}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "dsh-ingress-invalid"
+        );
+    }
+}
+
+#[test]
+fn dsh_v3_freezes_every_session_start_source_and_rejects_unknown_values() {
+    let fixture = Fixture::new(POLICY);
+    for source in ["startup", "resume", "clear", "compact", "observed"] {
+        let value = json!({
+            "schema_version": "agent-hook.dsh-ingress.v3",
+            "event": "agent/pre-step",
+            "cwd": fixture.root,
+            "prompt": "hello",
+            "subject": {
+                "session_id": "session-1",
+                "turn": 1,
+                "step": 1,
+                "session_start_source": source,
+                "agent_docs_state_home": fixture.home.join("state"),
+            },
+        });
+        let output = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&value.to_string()),
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "source={source} envelope={}",
+            output.stdout_text()
+        );
+    }
+
+    let unknown = json!({
+        "schema_version": "agent-hook.dsh-ingress.v3",
+        "event": "agent/pre-step",
+        "cwd": fixture.root,
+        "prompt": "hello",
+        "subject": {
+            "session_id": "session-1",
+            "turn": 1,
+            "step": 1,
+            "session_start_source": "reconnect",
+            "agent_docs_state_home": fixture.home.join("state"),
+        },
+    });
+    let rejected = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&unknown.to_string()),
+    );
+    assert_eq!(rejected.code, 65, "envelope={}", rejected.stdout_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "dsh-ingress-invalid"
+    );
 }
 
 #[test]

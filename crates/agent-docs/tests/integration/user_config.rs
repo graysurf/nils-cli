@@ -1568,6 +1568,96 @@ required = false
 }
 
 #[test]
+fn dsh_context_uses_the_bound_private_user_catalog() {
+    let env = UserConfigEnv::new();
+    env.write_private_catalog();
+    let enroll = env.run(&[
+        "config",
+        "enroll",
+        "--catalog",
+        env.private_catalog.to_str().expect("utf-8 catalog"),
+        "--apply",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(enroll.code, 0, "stderr={}", enroll.stderr);
+    let resolved = env.run(&[
+        "integration",
+        "resolve",
+        "--product",
+        "dsh",
+        "--format",
+        "json",
+    ]);
+    assert_resolve_action(&resolved, "integrate", "user-enrollment");
+    let fingerprint = resolved.json()["data"]["decision_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let state_home = env.home.join("dsh-state");
+    let output = env.run(&[
+        "session",
+        "context",
+        "--session-id",
+        "private-dsh-session",
+        "--product",
+        "dsh",
+        "--state-home",
+        state_home.to_str().expect("utf-8 state home"),
+        "--intent",
+        "project-dev",
+        "--request-id",
+        "private-request-1",
+        "--user-config",
+        "--integration-fingerprint",
+        &fingerprint,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.code, 0, "stderr={}", output.stderr);
+    assert_eq!(output.json()["data"]["decision"]["product"], "dsh");
+    assert_eq!(
+        output.json()["data"]["decision"]["documents"],
+        serde_json::json!([{
+            "source": "project",
+            "scope": "project",
+            "content": "# Private policy\n"
+        }])
+    );
+    assert!(
+        !output
+            .stdout
+            .contains(env.private_catalog.to_str().unwrap())
+    );
+
+    let stale = env.run(&[
+        "session",
+        "context",
+        "--session-id",
+        "private-dsh-session",
+        "--product",
+        "dsh",
+        "--state-home",
+        state_home.to_str().expect("utf-8 state home"),
+        "--intent",
+        "project-dev",
+        "--request-id",
+        "private-request-stale",
+        "--user-config",
+        "--integration-fingerprint",
+        &"0".repeat(64),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(stale.code, 65, "stderr={}", stale.stderr);
+    assert_eq!(stale.json()["error"]["code"], "stale-integration-decision");
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["then"],
+        "session.context"
+    );
+}
+
+#[test]
 fn unsupported_user_config_schema_falls_back_without_granting_policy() {
     let env = UserConfigEnv::new();
     env.write_user_config("schema_version = 2\n");

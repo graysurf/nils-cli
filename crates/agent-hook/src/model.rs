@@ -227,6 +227,10 @@ pub enum Capability {
     },
     #[serde(rename = "runtime-kit.handler.v1")]
     RuntimeKitHandler { handler_id: String },
+    #[serde(rename = "dsh.policy.v1")]
+    DshPolicy {
+        group: crate::policy_parity::DshCapabilityGroup,
+    },
 }
 
 fn default_legacy_ttl() -> u64 {
@@ -260,6 +264,19 @@ pub struct NormalizedRequest {
     pub execution_path: Option<PathBuf>,
     #[serde(skip)]
     pub binding_roots: Vec<PathBuf>,
+    #[serde(skip)]
+    pub dsh_subject: Option<DshSubject>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DshSubject {
+    pub session_id: String,
+    pub call_id: Option<String>,
+    pub turn: u64,
+    pub step: Option<u64>,
+    pub session_start_source: Option<String>,
+    pub agent_docs_state_home: PathBuf,
+    pub agent_docs_home: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -273,6 +273,20 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
                 "session coordination rules must be enforce, fail closed, and locked",
             ));
         }
+        if matches!(
+            rule.capability,
+            Capability::DshPolicy {
+                group: crate::policy_parity::DshCapabilityGroup::OperationLifecycle
+            }
+        ) && (!matches!(rule.mode, RuleMode::Enforce)
+            || !matches!(rule.failure_posture, FailurePosture::Closed)
+            || !matches!(rule.override_class, OverrideClass::Locked))
+        {
+            return Err(HookError::data(
+                "coordination-rule-not-locked",
+                "DSH operation lifecycle rules must be enforce, fail closed, and locked",
+            ));
+        }
         for product in &rule.products {
             for event in &rule.events {
                 validate_capability_binding(*product, event, &rule.capability)?;
@@ -390,6 +404,16 @@ fn validate_capability_binding(
     event: &str,
     capability: &Capability,
 ) -> Result<(), HookError> {
+    if let Capability::DshPolicy { group } = capability {
+        return if product == Product::Dsh && dsh_policy_event_supported(*group, event) {
+            Ok(())
+        } else {
+            Err(HookError::data(
+                "policy-capability-event-unsupported",
+                "dsh.policy.v1 group is not implemented on the selected DSH lifecycle event",
+            ))
+        };
+    }
     if product == Product::Dsh && matches!(capability, Capability::RuntimeKitHandler { .. }) {
         return Err(HookError::data(
             "policy-capability-event-unsupported",
@@ -431,6 +455,7 @@ fn validate_capability_binding(
         Capability::OwnerLiveness { .. } | Capability::SemanticConflict { .. } => {
             supports_context(product, event) && supports_block(product, event)
         }
+        Capability::DshPolicy { .. } => false,
     };
     if compatible {
         Ok(())
@@ -464,7 +489,7 @@ fn supports_context(product: Product, event: &str) -> bool {
                 | "SubagentStop"
                 | "Stop"
         ),
-        Product::Dsh => false,
+        Product::Dsh => matches!(event, "PreToolUse" | "UserPromptSubmit" | "Stop"),
         Product::Hermes => false,
     }
 }
@@ -497,7 +522,7 @@ fn supports_block(product: Product, event: &str) -> bool {
                 | "Elicitation"
                 | "ElicitationResult"
         ),
-        Product::Dsh => event == "PreToolUse",
+        Product::Dsh => matches!(event, "PreToolUse" | "UserPromptSubmit" | "Stop"),
         Product::Hermes => false,
     }
 }
@@ -581,6 +606,16 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
             }
             Ok(())
         }
+        Capability::DshPolicy { group } => {
+            if group.task_3_2() || group.task_3_3() || group.task_3_4() {
+                Ok(())
+            } else {
+                Err(HookError::data(
+                    "policy-capability-event-unsupported",
+                    "dsh.policy.v1 group is not implemented",
+                ))
+            }
+        }
     }
 }
 
@@ -649,11 +684,52 @@ pub fn supported_event(product: Product, event: &str) -> bool {
                 | "Elicitation"
                 | "ElicitationResult"
         ),
-        Product::Dsh => event == "PreToolUse",
+        Product::Dsh => matches!(
+            event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "UserPromptSubmit" | "Stop"
+        ),
         Product::Hermes => matches!(
             event,
             "pre_llm_call" | "post_llm_call" | "pre_approval_request" | "post_approval_response"
         ),
+    }
+}
+
+fn dsh_policy_event_supported(
+    group: crate::policy_parity::DshCapabilityGroup,
+    event: &str,
+) -> bool {
+    use crate::policy_parity::DshCapabilityGroup as Group;
+    match group {
+        Group::OwnerUnclaimed
+        | Group::SemanticConflict
+        | Group::AgentScopeLockGuard
+        | Group::BlockDirectGitCommit
+        | Group::BlockDirectGitWorktree
+        | Group::BlockDirectPrCreate
+        | Group::BlockDirectPython
+        | Group::BlockProjectMemoryWrite
+        | Group::BlockUnsafeDefaultDelivery
+        | Group::CheckoutLeaseGuard
+        | Group::ForgeLabelReminder
+        | Group::McpSecretScan
+        | Group::MemoryWritePrincipleReminder
+        | Group::PortablePathsScan
+        | Group::PreEditIntentGate
+        | Group::SemanticCommitBodyGate => event == "PreToolUse",
+        Group::SessionStartHealthcheck
+        | Group::SkillUsageReminder
+        | Group::UserPromptAgentMemory => event == "UserPromptSubmit",
+        Group::StopPrePrReminder => event == "Stop",
+        Group::AgentActivity => matches!(
+            event,
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
+        ),
+        Group::OperationLifecycle => matches!(
+            event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
+        ),
+        Group::FinishLineRecord => false,
     }
 }
 

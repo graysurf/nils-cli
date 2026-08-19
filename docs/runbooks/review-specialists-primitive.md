@@ -32,7 +32,10 @@ Required fields are `severity`, `confidence`, `path`, `summary`, `evidence`,
 
 Severity aliases normalize to `critical`, `high`, `medium`, `low`, and `info`.
 Confidence must be `0.0..=1.0`. Unknown fields are rejected so fixture drift is
-visible during validation.
+visible during validation. The closed specialist values are `api-contract`,
+`data-migration`, `maintainability`, `performance`, `quick`, `red-team`,
+`security`, and `testing`; `quick` is accepted as a finding producer but is not
+part of the scope command's multi-specialist initial wave.
 
 ## Commands
 

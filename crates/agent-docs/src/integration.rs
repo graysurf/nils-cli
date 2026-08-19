@@ -12,7 +12,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::cli::{IntegrationArgs, IntegrationCommand, IntegrationResolveArgs};
-use crate::config::{config_path_for_root, load_scope_catalog_from_str};
+use crate::config::{
+    config_path_for_root, load_dsh_scope_catalog_from_str, load_scope_catalog_from_str,
+};
 use crate::env::{
     DocsHomeSource, PathOverrides, PrimaryWorktreeFallback, ProjectIdentity, ResolvedRoots,
     RootIdentity, resolve_roots,
@@ -22,8 +24,8 @@ use crate::model::{
 };
 use crate::user_config::{
     ConfigDiagnostic, ConfigRead, ConfigState, ProjectRule, RuleMode, SelectorKind, config_path,
-    matching_rules_for_selection, parse_selected_catalog, read_config_for_identity,
-    read_selected_catalog,
+    matching_rules_for_selection, parse_selected_catalog, parse_selected_dsh_catalog,
+    read_config_for_identity, read_selected_catalog,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -133,26 +135,26 @@ pub struct SelectedCatalog {
     pub digest: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct IntegrationResult {
-    pub action: IntegrationAction,
-    pub reason_code: String,
-    pub product: Product,
-    pub config_path: PathBuf,
-    pub config_state: ConfigState,
-    pub identity: IntegrationIdentity,
+#[derive(Debug, Serialize)]
+struct IntegrationResultCore {
+    action: IntegrationAction,
+    reason_code: String,
+    product: &'static str,
+    config_path: PathBuf,
+    config_state: ConfigState,
+    identity: IntegrationIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub matched_selector: Option<MatchedSelector>,
-    pub selected_catalog: Option<SelectedCatalog>,
+    matched_selector: Option<MatchedSelector>,
+    selected_catalog: Option<SelectedCatalog>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<ConfigDiagnostic>,
-    pub decision_fingerprint: String,
+    diagnostics: Vec<ConfigDiagnostic>,
+    decision_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
 struct FingerprintInput<'a> {
     schema_version: u32,
-    product: Product,
+    product: &'a str,
     fallback_mode: FallbackMode,
     project_identity: &'a RootIdentity,
     primary_worktree_fallback: Option<&'a PrimaryWorktreeFallback>,
@@ -172,8 +174,23 @@ struct FingerprintInput<'a> {
 }
 
 struct ResolutionSnapshot {
-    result: IntegrationResult,
+    result: IntegrationResultCore,
     catalog: Option<EffectiveCatalog>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CatalogSelection {
+    Stable(Product),
+    Dsh,
+}
+
+impl CatalogSelection {
+    const fn product_label(self) -> &'static str {
+        match self {
+            Self::Stable(product) => product.as_str(),
+            Self::Dsh => "dsh",
+        }
+    }
 }
 
 pub(crate) struct EffectiveCatalog {
@@ -273,18 +290,24 @@ fn run_resolve(
         exit_code: 4,
         source,
     })?;
-    let result = resolve_decision(&roots, args.product, fallback_mode).map_err(|source| {
-        let exit_code = if source.downcast_ref::<UserConfigResolutionError>().is_some() {
-            3
-        } else {
-            4
-        };
-        IntegrationCommandError {
-            code: "integration-resolve-failed",
-            exit_code,
-            source,
-        }
-    })?;
+    let selection = match args.product.as_stable_product() {
+        Some(product) => CatalogSelection::Stable(product),
+        None => CatalogSelection::Dsh,
+    };
+    let result = resolve_snapshot(&roots, selection, fallback_mode)
+        .map(|snapshot| snapshot.result)
+        .map_err(|source| {
+            let exit_code = if source.downcast_ref::<UserConfigResolutionError>().is_some() {
+                3
+            } else {
+                4
+            };
+            IntegrationCommandError {
+                code: "integration-resolve-failed",
+                exit_code,
+                source,
+            }
+        })?;
     match args.format {
         OutputFormat::Json => {
             let envelope = Envelope::success(
@@ -310,17 +333,9 @@ fn run_resolve(
     }
 }
 
-pub fn resolve_decision(
-    roots: &ResolvedRoots,
-    product: Product,
-    fallback_mode: FallbackMode,
-) -> Result<IntegrationResult> {
-    Ok(resolve_snapshot(roots, product, fallback_mode)?.result)
-}
-
 fn resolve_snapshot(
     roots: &ResolvedRoots,
-    product: Product,
+    selection: CatalogSelection,
     fallback_mode: FallbackMode,
 ) -> Result<ResolutionSnapshot> {
     let identity = project_identity(roots);
@@ -360,7 +375,7 @@ fn resolve_snapshot(
                 Some(rule),
                 None,
             ),
-            RuleMode::Enroll => match selected_user_catalog(rule, &identity, roots) {
+            RuleMode::Enroll => match selected_user_catalog(rule, &identity, roots, selection) {
                 Ok(selected) => (
                     IntegrationAction::Integrate,
                     "user-enrollment".to_string(),
@@ -374,7 +389,7 @@ fn resolve_snapshot(
             },
         }
     } else if repository_present {
-        match selected_repository_catalog(roots) {
+        match selected_repository_catalog(roots, selection) {
             Ok(selected) => (
                 IntegrationAction::Integrate,
                 "repository-catalog".to_string(),
@@ -417,7 +432,7 @@ fn resolve_snapshot(
     let primary_worktree_fallback = roots.primary_worktree_fallback();
     let fingerprint_input = FingerprintInput {
         schema_version: 2,
-        product,
+        product: selection.product_label(),
         fallback_mode,
         project_identity: &roots.project_identity,
         primary_worktree_fallback: primary_worktree_fallback.as_ref(),
@@ -443,10 +458,10 @@ fn resolve_snapshot(
     });
 
     Ok(ResolutionSnapshot {
-        result: IntegrationResult {
+        result: IntegrationResultCore {
             action,
             reason_code,
-            product,
+            product: selection.product_label(),
             config_path,
             config_state,
             identity: IntegrationIdentity {
@@ -480,8 +495,25 @@ pub(crate) fn load_bound_catalog_with_fingerprint(
     fallback_mode: FallbackMode,
     expected_fingerprint: Option<&str>,
 ) -> std::result::Result<(EffectiveCatalog, String), BoundCatalogError> {
-    let snapshot =
-        resolve_snapshot(roots, product, fallback_mode).map_err(BoundCatalogError::Resolution)?;
+    let snapshot = resolve_snapshot(roots, CatalogSelection::Stable(product), fallback_mode)
+        .map_err(BoundCatalogError::Resolution)?;
+    bound_catalog_from_snapshot(snapshot, expected_fingerprint)
+}
+
+pub(crate) fn load_dsh_bound_catalog_with_fingerprint(
+    roots: &ResolvedRoots,
+    fallback_mode: FallbackMode,
+    expected_fingerprint: Option<&str>,
+) -> std::result::Result<(EffectiveCatalog, String), BoundCatalogError> {
+    let snapshot = resolve_snapshot(roots, CatalogSelection::Dsh, fallback_mode)
+        .map_err(BoundCatalogError::Resolution)?;
+    bound_catalog_from_snapshot(snapshot, expected_fingerprint)
+}
+
+fn bound_catalog_from_snapshot(
+    snapshot: ResolutionSnapshot,
+    expected_fingerprint: Option<&str>,
+) -> std::result::Result<(EffectiveCatalog, String), BoundCatalogError> {
     if let Some(expected) = expected_fingerprint
         && expected != snapshot.result.decision_fingerprint
     {
@@ -505,6 +537,7 @@ fn selected_user_catalog(
     rule: &ProjectRule,
     identity: &ProjectIdentity,
     roots: &ResolvedRoots,
+    selection: CatalogSelection,
 ) -> std::result::Result<DecisionCatalog, (&'static str, ConfigDiagnostic)> {
     let path = rule.catalog.as_ref().expect("validated enrollment catalog");
     let snapshot = read_selected_catalog(path, identity).map_err(|err| {
@@ -516,7 +549,11 @@ fn selected_user_catalog(
             },
         )
     })?;
-    let project = parse_selected_catalog(&snapshot, identity).map_err(|err| {
+    let project = match selection {
+        CatalogSelection::Stable(_) => parse_selected_catalog(&snapshot, identity),
+        CatalogSelection::Dsh => parse_selected_dsh_catalog(&snapshot, identity),
+    }
+    .map_err(|err| {
         (
             "selected-catalog-invalid",
             ConfigDiagnostic {
@@ -534,7 +571,7 @@ fn selected_user_catalog(
             },
         )
     })?;
-    let (home, docs_home_digest) = load_home_catalog(roots).map_err(|err| {
+    let (home, docs_home_digest) = load_home_catalog(roots, selection).map_err(|err| {
         (
             "effective-catalog-invalid",
             ConfigDiagnostic {
@@ -583,14 +620,18 @@ fn private_allowed_roots(identity: &ProjectIdentity) -> Result<Vec<PathBuf>> {
 
 fn selected_repository_catalog(
     roots: &ResolvedRoots,
+    selection: CatalogSelection,
 ) -> std::result::Result<DecisionCatalog, ConfigDiagnostic> {
-    load_repository_catalog(roots).map_err(|err| ConfigDiagnostic {
+    load_repository_catalog(roots, selection).map_err(|err| ConfigDiagnostic {
         code: "repository-catalog-invalid".to_string(),
         message: err.to_string(),
     })
 }
 
-fn load_repository_catalog(roots: &ResolvedRoots) -> Result<DecisionCatalog> {
+fn load_repository_catalog(
+    roots: &ResolvedRoots,
+    selection: CatalogSelection,
+) -> Result<DecisionCatalog> {
     let project_path = config_path_for_root(&roots.project_path);
     let project_file = read_catalog_file(&project_path)?
         .ok_or_else(|| anyhow!("repository catalog {} disappeared", project_path.display()))?;
@@ -605,15 +646,17 @@ fn load_repository_catalog(roots: &ResolvedRoots) -> Result<DecisionCatalog> {
             CatalogOrigin::Home,
             &roots.docs_home,
             &project_file,
+            selection,
         )?;
         (Some(home), None, project_file.digest.clone())
     } else {
-        let (home, digest) = load_home_catalog(roots)?;
+        let (home, digest) = load_home_catalog(roots, selection)?;
         let project = parse_catalog_file(
             Scope::Project,
             CatalogOrigin::Repository,
             &roots.project_path,
             &project_file,
+            selection,
         )?;
         (home, Some(project), digest)
     };
@@ -631,12 +674,21 @@ fn load_repository_catalog(roots: &ResolvedRoots) -> Result<DecisionCatalog> {
     })
 }
 
-fn load_home_catalog(roots: &ResolvedRoots) -> Result<(Option<ScopeCatalog>, String)> {
+fn load_home_catalog(
+    roots: &ResolvedRoots,
+    selection: CatalogSelection,
+) -> Result<(Option<ScopeCatalog>, String)> {
     let path = config_path_for_root(&roots.docs_home);
     let Some(file) = read_catalog_file(&path)? else {
         return Ok((None, "missing".to_string()));
     };
-    let catalog = parse_catalog_file(Scope::Home, CatalogOrigin::Home, &roots.docs_home, &file)?;
+    let catalog = parse_catalog_file(
+        Scope::Home,
+        CatalogOrigin::Home,
+        &roots.docs_home,
+        &file,
+        selection,
+    )?;
     Ok((Some(catalog), file.digest))
 }
 
@@ -664,9 +716,17 @@ fn parse_catalog_file(
     origin: CatalogOrigin,
     root: &Path,
     file: &CatalogFile,
+    selection: CatalogSelection,
 ) -> Result<ScopeCatalog> {
-    load_scope_catalog_from_str(scope, origin, root, &file.path, &file.raw)
-        .map_err(|err| anyhow!(err.to_string()))
+    match selection {
+        CatalogSelection::Stable(_) => {
+            load_scope_catalog_from_str(scope, origin, root, &file.path, &file.raw)
+        }
+        CatalogSelection::Dsh => {
+            load_dsh_scope_catalog_from_str(scope, origin, root, &file.path, &file.raw)
+        }
+    }
+    .map_err(|err| anyhow!(err.to_string()))
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {

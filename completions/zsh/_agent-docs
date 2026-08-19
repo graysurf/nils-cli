@@ -235,7 +235,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (resolve)
 _arguments "${_arguments_options[@]}" : \
-'--product=[Product whose automatic integration decision is being resolved]:PRODUCT:(codex claude hermes)' \
+'--product=[Product whose automatic integration decision is being resolved]:PRODUCT:(codex claude hermes dsh)' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
@@ -294,6 +294,25 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[]:FORMAT:(text json)' \
 '*--intent=[]:INTENT:_default' \
 '--phase=[Scope preparation to a workflow phase (no-phase docs always apply)]:PHASE:_default' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(context)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[]:ID:_default' \
+'--product=[]:PRODUCT:(dsh)' \
+'--state-home=[]:DIR:_files' \
+'--format=[]:FORMAT:(text json)' \
+'--intent=[]:INTENT:_default' \
+'--phase=[Scope preparation to a workflow phase (no-phase docs always apply)]:PHASE:_default' \
+'--request-id=[Bounded caller correlation id echoed by the context decision]:ID:_default' \
+'--max-bytes=[Maximum aggregate UTF-8 bytes of returned policy content (hard cap\: 65536)]:BYTES:_default' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -479,6 +498,7 @@ _agent-docs__subcmd__session_commands() {
     local commands; commands=(
 'activate:Strictly preflight and atomically activate one or more declared intents' \
 'prepare:Atomically prepare one or more declared intents (activate + strict preflight) and report a stable JSON result usable by a runtime hook' \
+'context:Resolve and prepare exactly one DSH intent, returning only its bounded satisfied required document content as a replay-bound decision' \
 'status:Show active intents for the current session/project/product scope' \
 'verify:Re-resolve the catalog and verify required intents are active and fresh' \
     )
@@ -488,6 +508,11 @@ _agent-docs__subcmd__session_commands() {
 _agent-docs__subcmd__session__subcmd__activate_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs session activate commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__session__subcmd__context_commands] )) ||
+_agent-docs__subcmd__session__subcmd__context_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs session context commands' commands "$@"
 }
 (( $+functions[_agent-docs__subcmd__session__subcmd__prepare_commands] )) ||
 _agent-docs__subcmd__session__subcmd__prepare_commands() {

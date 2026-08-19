@@ -61,7 +61,37 @@ above.
 - `agent-hook.dsh-ingress.v1`: strict DSH-to-policy transport for one native
   extension event. Version 1 carries exactly `event`, bounded `call_id`, an
   absolute `cwd`, and a `tool` object with bounded `name` and object-valued
-  `arguments`. Unknown fields are rejected at the root and nested tool object.
+  `arguments`. Unknown fields are rejected at the root and nested tool object,
+  so v1 explicitly forbids `subject`.
+- `agent-hook.dsh-ingress.v2`: the current DSH transport. It retains the v1
+  fields and adds one strict `subject` containing bounded `session_id`, positive
+  `turn` and `step`, an absolute `agent_docs_state_home`, and an optional
+  absolute `agent_docs_home`; v2 requires this complete subject. V1 remains
+  accepted for compatibility, but typed
+  identity-dependent DSH policy groups fail closed without the v2 subject.
+- `agent-hook.dsh-ingress.v3`: the DSH lifecycle transport. It accepts exactly
+  `agent/pre-step` with a required UTF-8 prompt of at most 64 KiB, a positive
+  step, and an optional closed-enum session-start source. The accepted values
+  are `startup`, `resume`, `clear`, `compact`, and `observed`; the first four
+  are rc.7 lifecycle sources and `observed` is the adapter-derived value for a
+  late or hot-reloaded attachment. It also accepts
+  `agent/turn-stopping` with neither prompt nor step/source. Both shapes retain
+  the v2 subject identity and absolute agent-docs roots. Unknown or cross-event
+  fields are rejected. The runtime bundle continues to use v2 for tool ingress.
+- `agent-hook.dsh-ingress.v4`: the DSH post-tool transport. It carries the same
+  strict call, subject, cwd, and object-valued tool identity as v2 plus exactly
+  `result.is_error: boolean`. `false` normalizes to `PostToolUse`; `true`
+  normalizes to `PostToolUseFailure`. Candidate value, content, error objects,
+  stdout, and stderr are neither accepted nor persisted.
+- `agent-hook.finish-line.{open,begin,run,stop,status}.v1`: strict DSH lifecycle
+  requests for the native execution-owned finish line. Their
+  command result schemas use the matching
+  `agent-hook.finish-line.<command>-result.v1` name and the normal
+  `cli.agent-hook.finish-line-<command>.v1` service envelope.
+- `agent-hook.finish-line.{quiesce,release}.v1`: strict internal DSH cleanup and
+  session-retirement requests. Their matching result and service schemas follow
+  the same naming rule, but both commands are intentionally absent from public
+  help and completion.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, and config /
   policy digests.
@@ -100,8 +130,8 @@ above.
 Service JSON uses the workspace envelope: `schema_version`, `ok`, then `data`;
 failures contain `error.code`, `error.message`, and
 optional redacted `error.details`. Text is the human default except `dispatch`,
-whose default is provider output so the documented ingress command is usable.
-`--format json` always selects the service envelope.
+whose default is provider output, and `finish-line`, whose default is service
+JSON. `--format json` always selects the service envelope.
 
 ## Provider normalization and rendering
 
@@ -119,20 +149,24 @@ Supported canonical events are:
   `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
   `Notification`, `SubagentStart`, `SubagentStop`, `Elicitation`, and
   `ElicitationResult`.
-- DSH: `PreToolUse`, normalized only from native `tools/pre-execute` ingress in
-  this version.
+- DSH: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`,
+  and `Stop`, normalized respectively from native `tools/pre-execute`,
+  `tools/post-execute`, `agent/pre-step`, and `agent/turn-stopping` ingress.
 
 The Codex/Claude/Hermes adapter accepts the event from `--event` or the
 provider's documented `hook_event_name`/`event` field and rejects a mismatch.
-The DSH adapter requires `agent-hook.dsh-ingress.v1`; an optional `--event`
-must equal its native event string before that string is mapped to the canonical
-policy event. Matcher values are normalized only from documented fields:
+The DSH adapter accepts strict `agent-hook.dsh-ingress.v1`, v2, v3, or v4; the
+runtime bundle uses v2 before tools, v4 after tools, and v3 for agent lifecycle
+events. An optional
+`--event` must equal its native event string before that string is mapped to
+the canonical policy event. Matcher values are normalized only from documented
+fields:
 
 | Provider events | Matcher input field |
 | --- | --- |
 | Codex/Claude `SessionStart` | `source` |
 | Codex/Claude `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | `tool_name` |
-| DSH `PreToolUse` | `tool.name` |
+| DSH `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | `tool.name` |
 | Codex/Claude `PreCompact`; Codex `PostCompact` | `trigger` |
 | Codex/Claude `SubagentStart`, `SubagentStop` | `agent_type` |
 | Claude `Notification` | `notification_type` |
@@ -169,15 +203,44 @@ Owner-liveness evaluates every distinct target checkout plus the execution
 checkout and returns the strongest result; an active foreign owner therefore
 cannot be masked by a self-owned or unclaimed target.
 
-DSH v1 preserves the complete object-valued tool arguments for policy
-normalization, but it does not yet declare tool-specific mutation path mappings.
-Until those mappings are added, DSH `PreToolUse` binds target/effect context to
-the absolute session `cwd`; tool-name policy can still allow or block, but
-target-granular owner-liveness is not claimed. Policy validation therefore
-accepts only `decision.allow.v1` and `decision.block.v1` for DSH v1; context,
-warning, activity, coordination, read-only, owner-liveness, semantic-conflict,
-transform, and retired handler capabilities are rejected until their native
-semantics exist.
+DSH tool ingress preserves the complete object-valued tool arguments for policy
+normalization. Native `write` and `edit` map `file_path`, and mutating
+`str_replace_editor` commands map `path`, to an exact checkout-bound target.
+Opaque Bash mutation uses the canonical repository target and the
+`agent-session` shell-coverage contract; an exact file claim remains narrow.
+Policy validation supports native allow/block admission and bounded model
+context. DSH does not support policy argument transforms or retired file
+handlers. Identity-dependent `dsh.policy.v1` groups require the complete
+v2/v3/v4 subject.
+
+Task 3.4 implements `agent-activity` and `operation-lifecycle`. Activity is
+derived only from the normalized DSH subject and canonical event: it sends
+provider/session/turn metadata, event kind, confidence, and digests to
+`agent-session activity event`; prompt and tool arguments are never parsed for
+that event. A managed activity identity requires both session and runtime ID.
+
+Operation lifecycle is one locked after-policy capability. An unmanaged process
+does not run it. A managed process requires session ID, an absolute capability
+file, and an absolute state root; the presence of any forwarded managed-session
+selector makes an incomplete identity fail closed. Before a covered mutation, it obtains the
+active claim, atomically writes owner-private targets, execution token, hashed
+provider correlation, and deterministic idempotency keys, then invokes the
+same-release sibling `agent-session work-context admit`. The post-tool v4 fact
+drives the matching `complete --outcome pass|fail`. A repeated pre-tool identity
+never authorizes a second execution; terminal post retries reauthenticate the
+same idempotent completion and retain the original admitted revision. A known
+denial removes its complete provisional directory; an ambiguous child/transport
+result remains pending. Stop calls hidden authenticated `agent-session broker
+status` and permits exit only when the exact incarnation reports zero active and
+zero uncertain operations. Local state is a retry cache and cannot satisfy
+Stop. State never contains raw
+arguments, output, prompt, capability content, or the provider call ID.
+Read-only and unmatched post calls create no state. A private session lock
+serializes capacity changes, successful terminal retry records carry a durable
+monotonic completion sequence and compact to 64,
+and the bridge refuses a new admission once 128 operation directories remain;
+active, uncertain, malformed, extra, or currently locked state is never evicted
+to make room.
 
 Built-in semantic-conflict and owner-liveness admission applies only to a
 managed process. When `AGENT_SESSION_ID`, `AGENT_SESSION_RUNTIME_ID`,
@@ -221,13 +284,274 @@ runtime bundle maps `block` to a `tools/pre-execute` denial, delegates `allow`,
 and fails closed on every malformed, truncated, signaled, exit-mismatched,
 replayed, timed-out, oversized, or unsupported response.
 
+## Native DSH finish line
+
+`agent-hook finish-line <command> --format json` reads exactly one strict JSON
+object from standard input. Version 1 accepts only `product = "dsh"`; every
+request carries bounded non-space ASCII `session_id` and `turn_id` values plus
+an absolute, already-canonical, non-symlink `cwd`. That value must be the exact
+Git top-level resolved independently from both the request and the running
+process; nested directories, nested repositories, unrelated repositories, and
+non-repositories fail closed. Input is capped at 64 KiB; duplicate keys and
+unknown fields fail with exit `65`. Every successful response carries the same
+opaque `correlation_id` for one product/repository/session binding; consumers
+must reject lifecycle responses whose correlation changes.
+Finish-line commands default to the versioned service JSON envelope; text is
+available only through an explicit `--format text` selection. Recoverable exit
+`69`/`75` errors include typed `retryable`, `next_action`, and bounded
+`recovery` details.
+
+The DSH plugin routes every foreground Bash request through a non-executing
+`run` probe before any execution. It rejects background Bash before invoking
+the finish-line service. This is an integration boundary: the public
+finish-line request does not accept a caller assertion that a command was
+foreground, background, completed, or successful.
+
+The public CLI surface is exactly `open`, `begin`, `run`, `stop`, and `status`.
+Hidden `quiesce` and `release` commands exist only for DSH cancellation,
+failed-execution cleanup, and authenticated disposed-session retirement. Both
+are deliberately absent from public help and completion.
+
+The request and response contracts are:
+
+- `open` adds a caller-generated unpredictable `attempt_token`. It
+  deterministically derives and returns one unpredictable `runner_capability`
+  bound to that token, the exact repository, and the DSH session, while storing
+  only the capability digest and a 24-hour lease expiry. Retrying the exact
+  binding returns `status = "duplicate"`, the same capability, and a renewed
+  lease, so a lost success response is recoverable. A different attempt for a
+  live session returns `finish-line-session-active` and cannot rotate or learn
+  its capability. The capability derivation includes a persisted monotonic
+  incarnation sequence. After authenticated release, a new attempt may open a new
+  capability incarnation for the same stable session identity, including an
+  rc.7 resumed session. The old capability remains tombstoned and cannot affect
+  the new incarnation. The attempt token is private idempotency material for
+  the current live incarnation, not an authorization bearer or permanent
+  revocation identity. Reusing it after release therefore starts a new
+  persisted incarnation and derives a byte-distinct capability; it cannot
+  resurrect the retired bearer. Bounded tombstone compaction may age out the
+  old release's duplicate receipt but does not roll back the monotonic sequence
+  or make the old capability valid. The
+  caller must keep both attempt token and bearer
+  private; `run` rejects a missing, stale, or cross-session value.
+  Containment-host validation precedes identity and state mutation; non-Linux
+  activation fails with exit `69` and
+  `finish-line-containment-unavailable`. Linux activation also requires the
+  trusted fixed systemd binaries, unified cgroup v2, enabled unprivileged user
+  namespaces, and a responsive user manager.
+- `begin` adds `operation_id`, a caller-generated unpredictable
+  `attempt_token`, and `operation = {"kind":"edit"}`. It atomically advances
+  the repository's monotonic integer generation before the edit proceeds. The
+  token is never echoed or persisted; only its digest is stored. Retrying the
+  exact request with the same binding returns `status = "duplicate"`, so a lost
+  success response is recoverable. A reused operation ID with a different
+  binding is invalid.
+- `run` adds `operation_id`, `intent`, the exact command string, the private
+  `runner_capability`, an optional `execution`, and a timeout from 1 ms through
+  60 minutes (30 minutes by default). The intent and command are compared
+  byte-for-byte with the current `agent-docs` validation contracts resolved for
+  DSH. Omitting `execution` performs the required non-executing capability and
+  target probe: an exact current validation target returns `status = "ready"`
+  with its target and contract digests, while a non-target returns
+  `status = "ordinary-ready"`. Neither probe runs the command or creates
+  execution evidence.
+
+  With `execution.kind = "bash-v1"`, nils is the executor for both branches. An
+  exact target is reserved before launch and may create validation evidence. A
+  non-target first advances the shared repository generation, is registered as
+  an ordinary shell operation, and then runs; the first terminal response has
+  `status = "ordinary-applied"` even when its observed exit is nonzero. An
+  ordinary operation never creates target validation evidence, and its
+  generation advance makes prior validation evidence stale. Exact retries of a
+  terminal exact or ordinary binding return `duplicate` without re-execution or
+  output replay.
+
+  Exact validation execution requires the authoritative repository root as its
+  work directory. Ordinary execution preserves its canonical requested work
+  directory while advancing the generation of the authoritative repository
+  named by the common request identity. Each output stream is bounded to at
+  most 64 KiB. `unsandboxed` and
+  `danger-full-access` runners use the trusted fixed
+  `/bin/bash -c <exact-command>` path. A `confined` runner executes the
+  provider-supplied bounded argv only when it ends in the exact
+  `-- bash -c <exact-command>` tuple; its declared mode, enforcement strength,
+  denial signatures, and runner-failure rules are validated and returned as
+  bounded sandbox facts. Git environment overrides are removed and stdin is
+  closed.
+
+  Authoritative execution is Linux-only and fails closed elsewhere. On Linux,
+  nils verifies the fixed `/usr/bin/systemd-run` and `/usr/bin/systemctl`
+  executables as root-owned, executable, non-symlink regular files without
+  group/world write bits. Before launch, nils serializes the bounded config into
+  an anonymous memfd, sets mode `0400`, and requires the write, grow, shrink,
+  and further-seal locks. No path-backed runner config exists.
+
+  Systemd `OpenFile` opens `/proc/<supervisor-pid>/exe` as named descriptor 3,
+  the sealed config memfd as named descriptor 4, and an unlinked mode-`0600`
+  control memfd as named descriptor 5 for the unit. Nils reads the current
+  runner's ELF program headers, verifies its dynamic interpreter as a root-owned
+  executable without group/world write bits, and invokes that interpreter with
+  `/proc/self/fd/3`. The contained runner accepts exactly the three expected
+  systemd listen descriptors, verifies the config is an unlinked sealed regular
+  file, and then parses the strict config. This binds execution to the current
+  runner inode and immutable config rather than re-opening mutable path names.
+
+  The config carries a random control nonce. Before spawning the provider, the
+  contained runner validates descriptor 5, sets `FD_CLOEXEC`, makes its process
+  non-dumpable, and publishes a nonce-bound `ready` record. The supervisor
+  acknowledges only after that proves systemd opened the descriptors: it closes
+  the config, changes control mode to `0400`, drops its writable control view,
+  makes itself non-dumpable, and publishes the matching acknowledgement. The
+  runner requires that exact acknowledgement and mode, then clears the
+  acknowledgement before provider spawn. Provider code therefore cannot reopen
+  a nonce-bearing config or writable control memfd through the outer or runner
+  procfs descriptors; a forced stop before terminal publication leaves the
+  intended empty, unsealed control state.
+
+  After observing the child, the runner writes exactly one bounded strict-schema,
+  nonce-bound provider exit, provider signal, or infrastructure-failure result
+  and immediately seals descriptor 5 against all further writes. After the
+  transient unit and cgroup are quiescent, the supervisor accepts only an
+  already sealed result with the exact schema and nonce. Internal runner state
+  therefore does not reserve provider exit codes or signals: exits 134 and 204
+  remain exits, and Linux signals are returned as canonical `NodeJS.Signals`.
+  An unrecognized signal fails closed.
+
+  The config also binds the supervisor PID. The contained runner obtains a
+  pidfd for that process and monitors it while the workload runs; supervisor
+  disappearance triggers immediate workload process-group termination and a
+  runner failure. Nils launches the runner in a transient user unit with
+  `PrivateUsers=yes`, `Delegate=no`, `KillMode=control-group`, immediate
+  `SIGKILL` stop/final-kill behavior, and a bounded `RuntimeMaxSec`. The unit
+  admits only `AF_INET` and `AF_INET6` and denies localhost. Timeout or
+  cancellation stops the whole unit. After the runner exits, nils queries the
+  unit through the trusted `systemctl` and records execution facts only when
+  `ActiveState` is `inactive` or `failed`.
+
+  The transient cgroup boundary covers descendants that change process groups,
+  call `setsid`, or double-fork. Private user-namespace capability reduction,
+  the lack of `AF_UNIX`, and localhost denial close the tested parent-cgroup and
+  user-manager delegation routes. These settings are not a general network
+  namespace and do not claim to prevent every possible network or IPC
+  delegation mechanism.
+
+  Nils derives success or failure solely from the observed exit status, signal,
+  timeout, and cancellation state. The caller cannot report an outcome,
+  stdout, stderr, or completion decision. Initial execution returns the bounded
+  observed output and execution facts. For an exact target, a later edit,
+  changed contract, or newer attempt returns `stale` or `superseded` and cannot
+  satisfy the current generation. A provider-runner or control failure does not
+  become validation evidence and retains the pending unit binding until
+  authenticated quiescence proves cleanup.
+- `stop` resolves every exact command of every current DSH validation contract.
+  It returns `action = "allow"` and exit `0` only when the current session has
+  success evidence for every target at the current repository generation and
+  exact contract digest. Missing, pending, failed, stale, or drifted evidence
+  returns `action = "block"`, bounded reason and remediation arrays, and exit
+  `1` while retaining `ok = true` in the service envelope. A repository at
+  generation zero remains allowed. Once any session advances the shared
+  repository generation, every session must supply its own success evidence at
+  that current generation; an otherwise untouched session blocks rather than
+  borrowing another session's evidence.
+- `status` returns only the generation, current contract digest, correlation,
+  target intent/digest/status, and optional attempt generation. It never returns
+  raw commands, paths, identities, capabilities, tokens, or child output.
+- The internal `release` request carries the common identity and exact
+  session-bound `runner_capability`. It refuses release while any operation for
+  that session is nonterminal or retains an active unit. Once quiescent, it
+  removes the session and its terminal operation records. A bounded
+  capability-digest tombstone makes an exact lost-response retry return
+  `status = "duplicate"`. The tombstone binds that released capability
+  incarnation rather than permanently retiring the stable session identity.
+  A later open may create a new incarnation; retrying the old release remains
+  duplicate while its bounded tombstone remains and cannot remove the new one.
+  Reusing an old attempt token after release creates a new sequence-bound
+  capability rather than resurrecting the old one. A defensive live-state
+  check takes precedence over the duplicate path if persisted state ever
+  contains both the tombstone and its matching live capability.
+
+The internal `quiesce` request carries the common identity, exact
+`operation_id`, and session-bound `runner_capability`. Pending validation and
+ordinary operation records retain their generated `active_unit`. Cleanup
+validates that binding and performs bounded trusted-`systemctl` stop and
+inspection loops. Every loop also runs an exact-unit `list-jobs` barrier. A
+single absent-unit observation is insufficient: cleanup requires three
+consecutive observations 25 ms apart with no pending job and either a missing
+unit or an inactive/failed, dead/failed unit whose extant cgroup reports
+`populated 0`. Only after that stabilized proof does it remove the pending
+operation and target attempt. Execution/control errors retain `active_unit` and
+pending state so authenticated cleanup remains possible. The idempotent result is
+`status = "quiescent"`; it cannot create terminal execution or validation
+evidence.
+
+There is no public `complete`, `waive`, `approve`, or `revoke` finish-line operation.
+There is no caller-reported result path, review authority, waiver artifact, or
+ambient waiver environment variable. Only a `run` execution observed by nils
+can create success evidence.
+
+The engine holds one transaction lock per repository for every state read or
+mutation. Repository generation is shared across sessions, while target facts
+remain product/session isolated. State keys bind the canonical
+repository top-level and Git common-directory device/inode identities, exact
+contract set, contract context, and exact command target. State never uses file
+mtime as authority. The persistent repository lock is also an initialization
+anchor: once created, disappearance of the paired state record fails closed
+instead of resetting the generation. A safe prior marker is reported only as unresolved
+transitional evidence; an unsafe marker is reported separately and neither can
+satisfy native generation state.
+Terminal operations are compacted deterministically by ascending sequence at a
+256-record trigger down to a 192-record recent-idempotency window. Pending
+operations are never compacted. Obsolete-generation target facts and empty
+sessions without a runner capability are removed without changing current
+generation enforcement. Authenticated release tombstones retain only digested
+session and capability bindings plus sequence, are keyed by capability
+incarnation, and compact to the most recent 64 entries; they do not consume the
+live 64-session limit. Attempt tokens are not persisted. The monotonic
+incarnation sequence makes every post-release capability byte-distinct even
+when the caller reuses an old attempt token. Exact live `open` replay renews a
+capability lease. Lease expiry alone
+never removes a session, terminal evidence, or pending state. At the hard
+live-session bound, a bounded recovery scan may reclaim an expired crash orphan
+or quiescent expired session. It retires only the one entry required for the
+new admission. A persisted deterministic cursor rotates the eight-candidate
+window across eligible sessions, so an older busy window cannot indefinitely
+hide a later reclaimable candidate. Every busy operation must retain an exact valid transient-unit identity,
+passive status shows no live unit or pending job, and bounded stop/status,
+`list-jobs`, and cgroup checks then prove stable quiescence. The store is locked
+again and the exact capability digest, lease, operation keys, sequences, and
+unit identities must still match before the session is tombstoned and removed.
+Active, indeterminate, unbound, oversized, or migrated no-lease sessions remain
+protected. A reclaimed stable identity may open a new lease with fresh or
+reused caller-held retry material. Every post-release open advances the
+persisted incarnation sequence and therefore derives a byte-distinct
+capability; the retired bearer remains invalid after its duplicate-release
+tombstone is compacted. An excess of nonterminal
+operations still fails at the hard
+512-operation bound. Both `open` session admission and `begin` edit admission
+may invoke this recovery, so a new DSH session does not need to execute Bash
+before its first edit can reclaim provably quiescent orphan capacity.
+
+Finish-line directories must be private and owner-controlled. Lock and state
+files are opened with `O_NOFOLLOW`, checked through their open descriptors as
+owner-controlled regular files, and bounded to 384 KiB. Each update writes a
+private create-new temp file, calls `fsync`, atomically renames it, and requires
+the parent-directory `fsync` to succeed before reporting success. Lock/open
+unavailability exits `69`; bounded lock contention exits `75`. Pending
+operations may persist the generated active-unit identifier needed by internal
+cleanup. Raw validation output is returned only in the initial bounded `run`
+response and is never persisted. Contained config and nonce-bound control state
+are held only in anonymous memfds; the trusted runner seals their contents
+before either is accepted. No Python handler, shell command rewrite, `EXIT` trap,
+caller-reported outcome, or waiver state participates in the engine.
+
 Policy validation also checks the complete provider/event/capability binding,
 not only each component in isolation. `decision.warn.v1` and
 `decision.context.v1` require an event with native model-context semantics;
 `decision.block.v1` requires native block, continuation, feedback, or decline
 semantics; and `decision.transform.v1` is limited to Codex `PreToolUse` plus
-Claude `PreToolUse`, `PermissionRequest`, and `PostToolUse`. DSH v1 does not
-transform arguments and accepts only native allow/block capabilities.
+Claude `PreToolUse`, `PermissionRequest`, and `PostToolUse`. DSH does not
+transform arguments; it accepts native allow/block and context capabilities at
+the three supported boundaries.
 `agent-session.owner-liveness.v1` and
 `agent-session.semantic-conflict.v1` require both context and block semantics
 because their result is data-dependent. Neutral `decision.allow.v1`, metadata
@@ -278,6 +602,65 @@ The stable built-in capability ID set for policy v1 is closed:
 - `agent-session.coordination.v1` (`reason_code`)
 - `execution.read-only.v1` (`reason_code`, optional `fallback_handler_id`)
 - `runtime-kit.handler.v1` (`handler_id` from the compiled v1 allowlist)
+- `dsh.policy.v1` (`group` from the eleven implemented Task 3.2, nine
+  implemented Task 3.3, and two implemented Task 3.4 `DshCapabilityGroup`
+  values)
+
+The separate `agent-hook.dsh-policy-capability-groups.v1` Rust/JSON schema
+freezes the 23 deterministic groups selected by the DSH migration inventory.
+The matching fixture records whether each group was delivered by finish-line
+Task 2.3 or is owned by policy Tasks 3.2, 3.3, or 3.4. `dsh.policy.v1` makes
+the Task 3.2 through Task 3.4 IDs executable only on their declared DSH
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, or `Stop`
+event; adding a fixture ID alone cannot activate it. Task 3.3 tool and lifecycle
+rules may add bounded model
+context, while neither task can transform tool arguments.
+These evaluators use normalized exact
+targets, bounded command parsing, trusted same-release nils companions, and
+private session-bound lease state. The DSH parity verifier compares its ordered
+nils-capability set to this fixture before either repository can claim inventory
+parity.
+
+Task 3.3 Bash privacy checks classify output redirection with quote-aware shell
+syntax and resolve adjacent quoted target fragments before comparing paths.
+Known writers expose literal destinations, destination-directory options are
+joined with source basenames, dynamic or malformed destinations fail closed,
+and an otherwise unknown executable with a protected-path operand is
+indeterminate rather than read-only. A small closed set of non-writing tools
+remains readable when no output redirection is present. MCP native writes and
+partial edits scan maintained credential shapes, generic credential labels,
+and structural sensitive JSON keys. Edit and str-replace old/new value pairs
+also preserve the sensitive old-value context: replacement is allowed only for
+removal or a strict `$NAME`/`${NAME}` environment reference whose name matches
+`[A-Za-z_][A-Za-z0-9_]*`. Fragments that cannot be parsed safely remain blocked
+when they name a sensitive key. Startup memory is validated against the exact
+companion schema and byte count, redacted across both shaped credentials and
+generic `token`, `authorization`, or `private_key` labels, and rendered only as one escaped
+`SHARED_AGENT_MEMORY_JSON` string so recalled content cannot terminate its
+untrusted container.
+
+For `block-unsafe-default-delivery`, the engine records an owner-private
+projection of the canonical common Git directory identity and the primary
+branch before admitting Bash or native file mutation. A usable default branch
+requires that pinned branch and the cached remote HEAD agree; drift is
+fail-closed and native write/edit/str-replace targets inside Git metadata are
+denied. Raw merge, pull, cherry-pick, rebase, revert, am, reset, update-ref,
+branch, push, and fetch shapes are classified against the resolved `git -C` or
+semantic `--repo` target. `fetch --update-head-ok`, protected fetch
+destinations, and stdin/server-driven ref-update plumbing are denied. A shell
+builtin or assignment that can retarget cwd, exported variables, tracing hooks,
+command lookup, or aliases before a later command makes every
+command-dependent group fail closed. Git command-consuming forms such as
+rebase exec and submodule foreach, plus explicit transport-helper selection,
+are rejected rather than partially parsed.
+Exact abort/quit recovery and owned delivery CLIs remain admissible.
+`semantic-commit --message-file` and repeated scalar message/repository options
+are not accepted at this transcript boundary.
+
+Trusted policy companions receive a cleared environment. The scope-lock
+companion resolves a fixed trusted Git binary and disables repository
+fsmonitor, hooks, pager, untracked-cache, external-diff, and textconv behavior
+for every policy-time Git probe.
 
 `execution.read-only.v1` evaluates only `PreToolUse` requests through the
 same-release operation-effect verifier. Enforce mode admits only an exact,

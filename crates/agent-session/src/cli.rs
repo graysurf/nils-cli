@@ -570,6 +570,9 @@ pub struct BrokerStatusArgs {
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
+    /// Require the capability to authenticate the exact broker incarnation.
+    #[arg(long, hide = true)]
+    pub authenticated: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }

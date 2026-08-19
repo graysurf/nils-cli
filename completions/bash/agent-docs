@@ -70,6 +70,9 @@ _agent__docs() {
             agent__docs__session,activate)
                 cmd="agent__docs__session__activate"
                 ;;
+            agent__docs__session,context)
+                cmd="agent__docs__session__context"
+                ;;
             agent__docs__session,prepare)
                 cmd="agent__docs__session__prepare"
                 ;;
@@ -513,7 +516,7 @@ _agent__docs() {
             fi
             case "${prev}" in
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude hermes dsh" -- "${cur}"))
                     return 0
                     ;;
                 --format)
@@ -708,7 +711,7 @@ _agent__docs() {
             return 0
             ;;
         agent__docs__session)
-            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help activate prepare status verify"
+            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help activate prepare context status verify"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -765,6 +768,68 @@ _agent__docs() {
                     return 0
                     ;;
                 --phase)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__session__context)
+            opts="-h --session-id --product --state-home --format --intent --phase --request-id --max-bytes --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "dsh" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --phase)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --request-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-bytes)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
@@ -135,6 +136,48 @@ fn validate_succeeds_when_changed_paths_are_allowed() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["result"]["violations"].as_array().unwrap().len(), 0);
     assert_eq!(value["result"]["changed_paths"][0], "src/lib.rs");
+}
+
+#[test]
+fn validate_does_not_execute_repository_configured_git_helpers() {
+    let repo = init_repo();
+    let create = run(repo.path(), &["create", "--path", "README.md"]);
+    assert_eq!(create.code, 0, "stderr={}", create.stderr_text());
+
+    let marker = repo.path().join(".git/fsmonitor-ran");
+    let helper = repo.path().join(".git/hostile-fsmonitor.sh");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"${{SCOPE_LOCK_SECRET-unset}}\" > '{}'\nprintf '\\n'\n",
+            marker.display()
+        ),
+    )
+    .expect("fsmonitor helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+    git(
+        repo.path(),
+        &[
+            "config",
+            "core.fsmonitor",
+            helper.to_str().expect("helper UTF-8"),
+        ],
+    );
+    fs::write(repo.path().join("README.md"), "changed\n").expect("changed file");
+
+    let output = run_resolved_in_dir(
+        "agent-scope-lock",
+        repo.path(),
+        &["validate", "--format", "json"],
+        &[("SCOPE_LOCK_SECRET", "must-not-reach-repository-helper")],
+        None,
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert!(
+        !marker.exists(),
+        "repository fsmonitor helper ran with: {}",
+        fs::read_to_string(&marker).unwrap_or_default()
+    );
 }
 
 #[test]

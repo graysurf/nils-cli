@@ -7,7 +7,7 @@
 - Contract owner: Codex
 - Target PR: pending
 - Status: implemented
-- Last updated: 2026-07-20
+- Last updated: 2026-08-18
 - Enforcement: `completion_mode=clap-first`;
   `completion_mode_toggles=forbidden`;
   `alternate_completion_dispatch=forbidden`;
@@ -26,10 +26,14 @@
 | `recovery authorize` | challenge/output paths and reviewed digest |
 | `recovery consume` | capability path and exact binding values |
 | `recovery status`, `recovery revoke` | public capability selector and output enum |
+| `finish-line open`, `begin`, `run`, `stop`, `status` | JSON-default output enum; request data is strict service JSON on stdin; `run` describes foreground probe/supervision rather than caller-reported validation; internal `quiesce` and `release` lifecycle RPCs are excluded |
 | `completion` | `bash` and `zsh` shell enum |
 
-Every completion source is clap metadata in `src/cli.rs`; no hidden or
-deprecated command path exists.
+Every completion source is clap metadata in `src/cli.rs`. The hidden paths are
+`finish-line quiesce` for cancellation/failure cleanup and `finish-line
+release` for authenticated disposed-session retirement. They are callable by
+the DSH integration but intentionally absent from public help and completion.
+No deprecated command path exists.
 
 ## Value providers and aliases
 
@@ -45,6 +49,8 @@ runtime candidates and no aliases for `agent-hook`.
 | No runtime completion-mode toggle | `src/cli.rs`, `src/completion.rs` | grep audit |
 | No alternate dispatcher | `src/completion.rs` | grep audit |
 | Generated-load failure is closed | committed shell assets | completion tests |
+| Finish-line JSON default is represented accurately | dedicated clap output enum | help proves `[default: json]`; generated completion has no text-default annotation |
+| Internal lifecycle stays non-public | hidden `finish-line quiesce` and `release` clap metadata | CLI contract proves public help and both completion scopes omit both commands |
 
 ## Validation
 

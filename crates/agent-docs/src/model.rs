@@ -856,6 +856,26 @@ impl fmt::Display for RemoveOutcome {
     }
 }
 
+#[cfg(test)]
+mod compatibility_tests {
+    use super::Product;
+
+    #[test]
+    fn public_product_boundary_remains_the_stable_three_variant_contract() {
+        fn exhaustive_name(product: Product) -> &'static str {
+            match product {
+                Product::Codex => "codex",
+                Product::Claude => "claude",
+                Product::Hermes => "hermes",
+            }
+        }
+
+        assert_eq!(Product::supported_values(), &["codex", "claude", "hermes"]);
+        assert_eq!(Product::from_config_value("dsh"), None);
+        assert_eq!(exhaustive_name(Product::Hermes), "hermes");
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoveReport {
     pub config_path: PathBuf,

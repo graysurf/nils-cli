@@ -32,3 +32,23 @@ fn help_snapshot_root_help() {
         ],
     ));
 }
+
+#[test]
+fn help_snapshot_dsh_context_help() {
+    assert_help_contains(HelpCase {
+        bin: "agent-docs",
+        args: &["session", "context", "--help"],
+        expected: &[
+            "Usage:",
+            "--session-id",
+            "--product",
+            "dsh",
+            "--state-home",
+            "--intent",
+            "--phase",
+            "--request-id",
+            "--max-bytes",
+            "--format",
+        ],
+    });
+}

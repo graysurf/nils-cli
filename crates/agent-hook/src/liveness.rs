@@ -137,6 +137,41 @@ impl<'snapshot, 'io> DispatchProjection<'snapshot, 'io> {
         }
     }
 
+    pub(crate) fn new_dsh(
+        snapshot: Option<&'snapshot Snapshot>,
+        session_id: Option<&str>,
+        mode_override: Option<CoordinationMode>,
+        io: &'io dyn LivenessIo,
+    ) -> Self {
+        let now = now_epoch();
+        let principal = session_id.and_then(|session_id| {
+            let snapshot = snapshot?;
+            let broker = snapshot.registry.brokers.get(session_id)?;
+            (broker.session_id == session_id
+                && broker.state == "ready"
+                && coordination_projection::heartbeat_fresh(
+                    &snapshot.state_root,
+                    session_id,
+                    &broker.incarnation,
+                    now,
+                ))
+            .then(|| CurrentPrincipal {
+                session_id: session_id.to_string(),
+                incarnation: broker.incarnation.clone(),
+            })
+        });
+        let mode = mode_override.or_else(|| effective_mode(snapshot, principal.as_ref(), now, io));
+        Self {
+            snapshot,
+            mode,
+            now,
+            principal,
+            unmanaged: snapshot.is_none(),
+            roots: RefCell::new(BTreeMap::new()),
+            io,
+        }
+    }
+
     pub(crate) fn mode(&self) -> Option<CoordinationMode> {
         self.mode
     }
@@ -369,6 +404,66 @@ pub fn derive_semantic_conflict(
         SemanticConflict::Potential
     } else {
         let _ = request;
+        SemanticConflict::Clear
+    }
+}
+
+pub(crate) fn derive_dsh_semantic_conflict(
+    request: &NormalizedRequest,
+    projection: &DispatchProjection<'_, '_>,
+    session_id: &str,
+) -> SemanticConflict {
+    let Some(snapshot) = projection.snapshot else {
+        return SemanticConflict::Clear;
+    };
+    let fingerprints = request
+        .binding_roots
+        .iter()
+        .map(|root| {
+            coordination_projection::worktree_fingerprint(
+                snapshot.registry.fingerprint_epoch,
+                &snapshot.registry.fingerprint_key,
+                root,
+            )
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(fingerprints) = fingerprints else {
+        return SemanticConflict::Unknown;
+    };
+    let mut saw_unknown = false;
+    for claim in snapshot.registry.claims.iter().filter(|claim| {
+        claim.state == "active"
+            && claim.expires_at_epoch >= projection.now
+            && claim
+                .worktrees
+                .iter()
+                .any(|value| fingerprints.contains(value))
+    }) {
+        let Some(broker) = snapshot.registry.brokers.get(&claim.session_id) else {
+            saw_unknown = true;
+            continue;
+        };
+        if broker.coordination_mode == CoordinationMode::Off {
+            continue;
+        }
+        let fresh = broker.session_id == claim.session_id
+            && broker.incarnation == claim.session_incarnation
+            && broker.state == "ready"
+            && coordination_projection::heartbeat_fresh(
+                &snapshot.state_root,
+                &claim.session_id,
+                &broker.incarnation,
+                projection.now,
+            );
+        if !fresh {
+            saw_unknown = true;
+        } else if claim.session_id != session_id {
+            return SemanticConflict::Definite;
+        }
+    }
+    if saw_unknown {
+        SemanticConflict::Unknown
+    } else {
         SemanticConflict::Clear
     }
 }

@@ -18,6 +18,8 @@ mod content_validation;
 mod control_plane;
 #[path = "integration/docs_home.rs"]
 mod docs_home;
+#[path = "integration/dsh_context.rs"]
+mod dsh_context;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
 #[path = "integration/explain_list_remove.rs"]
