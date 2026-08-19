@@ -1246,6 +1246,13 @@ fn rewrite_registry(state_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("registry mode");
 }
 
+fn coordination_registry(state_dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json")
+}
+
 fn orchestration_registry(state_dir: &Path) -> serde_json::Value {
     serde_json::from_slice(
         &fs::read(state_dir.join("orchestration/registry.json")).expect("orchestration registry"),
@@ -38581,6 +38588,32 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
     assert_eq!(
         external_launch["liveness_schema"],
         "main-agent.dsh-runtime-liveness.v1"
+    );
+    // The lane's coordination broker is provisioned by this start, so the
+    // capability the heartbeat argv names actually exists. Without it the
+    // emitted heartbeat refuses with `coordination-unauthorized` and the lane
+    // worker can never authenticate `bootstrap` or any checkpoint — the payload
+    // would advertise a runtime contract the store cannot honour.
+    let capability_env = worker_env["AGENT_SESSION_CAPABILITY_FILE"]
+        .as_str()
+        .expect("capability env");
+    assert!(
+        Path::new(capability_env).is_file(),
+        "worker start must provision the lane broker credential: {capability_env}"
+    );
+    let heartbeat_capability = heartbeat_argv
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|value| value == capability_env);
+    assert!(
+        heartbeat_capability,
+        "the heartbeat argv must name the provisioned capability"
+    );
+    let brokers = coordination_registry(&state_dir);
+    assert_eq!(
+        brokers["brokers"]["worker-dsh"]["incarnation"].as_str(),
+        Some(launch_id),
+        "the provisioned broker is bound to the minted launch incarnation"
     );
     let registry = orchestration_registry(&state_dir);
     let assignment = &registry["assignments"]["assignment-dsh"];

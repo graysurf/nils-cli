@@ -79,12 +79,38 @@ launch boundary the arm diverges:
 
 The plugin must deliver `prompt` verbatim as the worker's initial message,
 run `broker_heartbeat_argv` as a supervised background process for the lane's
-lifetime (worker authentication reads the capability file that the heartbeat
-maintains), run `broker_stop_argv` at lane end, and arrange the worker's
+lifetime, run `broker_stop_argv` at lane end, and arrange the worker's
 `main-agent`/`agent-session` invocations to carry `worker_env`. The prompt is
 deliberately environment-free so it stays a byte-stable replay contract; env
 delivery is a plugin responsibility (per-child instruction context or a
 wrapping native tool).
+
+`broker_heartbeat_argv[0]` is the trusted `agent-session` binary, but the verb
+is **not** at a fixed index: global options (`--state-dir`, and `--host` where a
+host label applies) precede it. A consumer validating the argv must walk past
+option/value pairs to find `broker`.
+
+### Coordination-broker lifecycle for a lane
+
+This is the sequence that makes the lane's worker able to authenticate at all,
+and each step belongs to exactly one side:
+
+1. **`worker start` provisions the lane's broker** and mints the capability file
+   that `worker_env.AGENT_SESSION_CAPABILITY_FILE` and the heartbeat argv both
+   name. A tmux worker gets this from its launch path; an external lane has no
+   launch of ours, so the external arm provisions it here. Provisioning is
+   idempotent for replay: an existing capability for the same incarnation is
+   accepted rather than rotated under a running lane.
+2. **The plugin publishes the liveness sidecar**, then starts the heartbeat. The
+   order matters: the heartbeat's first act is to read this lane's runtime
+   evidence, so the sidecar must already exist rather than arrive inside the
+   heartbeat's startup retry window.
+3. **The heartbeat activates the broker** on its first live beat. Readiness
+   cannot be established at step 1 — neither the lane's runtime evidence nor its
+   heartbeat exists yet — so the first beat is the earliest provable moment. A
+   lane's authenticated calls (starting with `main-agent bootstrap`) fail
+   `coordination-unauthorized` until then, which is ordinary startup latency of
+   about one heartbeat interval, not an error state.
 
 The dsh prompt is a fifth byte-stable replay variant alongside the four
 existing prompts; `ensure_worker_launch_matches` accepts it for replay

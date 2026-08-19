@@ -1042,6 +1042,7 @@ pub(crate) fn run_heartbeat_sidecar(
     let started = Instant::now();
     let mut established_owner = false;
     let mut observed_stopped = false;
+    let mut activated_external_broker = false;
     loop {
         let record = match crate::load_session_record(context, &args.session) {
             Ok(record) => record,
@@ -1093,6 +1094,18 @@ pub(crate) fn run_heartbeat_sidecar(
             SECRET_FILE_MODE,
         )
         .map_err(|_| unavailable())?;
+        // An external-runtime lane has no launcher of ours to activate its
+        // broker. `main-agent worker start` can only provision it: at that
+        // point neither the lane's runtime evidence nor this heartbeat exists,
+        // and `activate_ready` requires both. The first live beat is therefore
+        // the earliest moment readiness is provable, and without activating
+        // here the broker stays `starting` forever — every authenticated worker
+        // call, starting with `main-agent bootstrap`, fails
+        // `coordination-unauthorized`. Tmux launches keep their existing
+        // launcher-driven activation and never reach this branch.
+        if !activated_external_broker && crate::dsh_external::is_external_record(&record) {
+            activated_external_broker = activate_ready(context, &record).is_ok()
+        }
         thread::sleep(Duration::from_secs(2));
     }
     if established_owner
