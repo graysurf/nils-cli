@@ -8750,6 +8750,21 @@ fn delete_tmux_buffer(tmux_bin: &Path, buffer_name: &str) {
     let _ = run_status_with_timeout(command, "tmux delete-buffer", PANE_INPUT_COMMAND_TIMEOUT);
 }
 
+/// External runtimes own no tmux pane, so input delivery must refuse by
+/// runtime kind rather than relying on the minted tmux name not existing.
+fn ensure_not_external_runtime(record: &SessionRecord, surface: &str) -> Result<(), CliError> {
+    if dsh_external::is_external_record(record) {
+        return Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            format!(
+                "{surface} is unavailable for dsh sessions: the external dsh-runtime-kit runtime owns worker input"
+            ),
+            Some(json!({ "id": record.id.clone() })),
+        ));
+    }
+    Ok(())
+}
+
 fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResult, CliError> {
     let text = read_send_text(&args.text, args.text_stdin)?;
     if text.is_none() && args.keys.is_empty() {
@@ -8760,6 +8775,7 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
         ));
     }
     let observed = load_session_record(context, &args.id)?;
+    ensure_not_external_runtime(&observed, "send")?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let record_lock = acquire_session_record_lock(context, &observed.id)?;
     let mut manual_input = ManualInputSection::new(record_lock);
@@ -11825,6 +11841,12 @@ fn last_terminal_activity_at(
     if status != "running" {
         return None;
     }
+    // External runtimes own no tmux session, so probing one is guaranteed to
+    // fail — and this probe has no timeout, so a wedged tmux server must never
+    // block a path that by design never touches tmux.
+    if dsh_external::is_external_record(record) {
+        return None;
+    }
     tmux_window_activity_at(tmux_bin, &record.tmux_session)
 }
 
@@ -11849,6 +11871,13 @@ fn session_list_runtime_snapshot(
     tmux_snapshots: Option<&TmuxSessionSnapshots>,
     record: &SessionRecord,
 ) -> (String, Option<String>) {
+    // A batched tmux snapshot can never see an external runtime's lane: the
+    // record's tmux name is minted but never created. Dispatch first so list
+    // projections agree with single-record status instead of reporting every
+    // live dsh lane as stopped.
+    if dsh_external::is_external_record(record) {
+        return (dsh_external::external_session_status(record), None);
+    }
     match tmux_snapshots {
         Some(snapshots) => match snapshots.sessions.get(&record.tmux_session) {
             Some(snapshot) => (
@@ -12130,16 +12159,29 @@ fn delete_session_locked_with_timeouts(
     verify_timeout: Duration,
 ) -> Result<DeleteResult, CliError> {
     if dsh_external::is_external_record(&record) {
-        // There is no tmux runtime to terminate. Deleting the durable record
-        // is admitted only once nothing proves the lane may still be running:
-        // a terminated or proven-stopped lane deletes; a live lane must be
-        // interrupted by the plugin first.
-        if dsh_external::external_session_status(&record) == "running" {
-            return Err(session_termination_error(
-                &record,
-                SessionTerminationFailure::StillRunning,
-                SessionTerminationOperation::Delete,
-            ));
+        // There is no tmux runtime to terminate, so deletion is admitted only
+        // on positive evidence: the external runtime never attached, or the
+        // lane's stop is proven. A running lane must be interrupted by the
+        // plugin first, and unproven liveness fails closed the same way an
+        // unavailable tmux runtime identity does — a corrupted sidecar must
+        // never authorize destroying a live lane's record.
+        match dsh_external::external_lane_disposition(&record) {
+            dsh_external::ExternalLaneDisposition::Running => {
+                return Err(session_termination_error(
+                    &record,
+                    SessionTerminationFailure::StillRunning,
+                    SessionTerminationOperation::Delete,
+                ));
+            }
+            dsh_external::ExternalLaneDisposition::Unproven(reason) => {
+                return Err(CliError::runtime(
+                    "coordination-runtime-unverified",
+                    reason.message(),
+                    Some(json!({ "id": record.id.clone() })),
+                ));
+            }
+            dsh_external::ExternalLaneDisposition::NeverAttached
+            | dsh_external::ExternalLaneDisposition::ProvenStopped => {}
         }
         let registry_fence = SessionRegistryFence::from_record(&record);
         return finish_session_delete(context, record, session_dir, registry_fence);

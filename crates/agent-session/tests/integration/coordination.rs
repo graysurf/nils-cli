@@ -38572,14 +38572,99 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         "replay must not touch tmux either"
     );
 
+    // A CLI-owned runtime stop is refused before any durable side effect: the
+    // external plugin owns the lane runtime.
+    for stop_verb in ["stop-runtime", "stop-claimed-runtime"] {
+        let refused_stop = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                stop_verb,
+                "assignment-dsh",
+                "--worker-incarnation",
+                launch_id,
+                "--if-revision",
+                "2",
+                "--idempotency-key",
+                &format!("worker-{stop_verb}-dsh-0001"),
+                "--format",
+                "json",
+            ],
+            envs,
+        );
+        assert_ne!(
+            refused_stop.code,
+            0,
+            "outcome={}",
+            refused_stop.stdout_text()
+        );
+        assert_eq!(
+            refused_stop.stdout_json()["error"]["code"],
+            "dsh-runtime-plugin-owned",
+            "outcome={}",
+            refused_stop.stdout_text()
+        );
+        let after_stop =
+            orchestration_registry(&state_dir)["assignments"]["assignment-dsh"].clone();
+        assert_eq!(
+            after_stop["revision"], 2,
+            "a refused runtime stop must not mutate the assignment"
+        );
+        assert!(
+            after_stop["runtime_stop"].is_null(),
+            "a refused runtime stop must not persist a reservation"
+        );
+    }
+
+    // Unproven liveness fails closed: a corrupted sidecar must never authorize
+    // destroying the record of a lane that may still be running.
+    let write_sidecar = |body: &str| {
+        fs::write(liveness_file, body).expect("sidecar");
+        fs::set_permissions(liveness_file, fs::Permissions::from_mode(0o600))
+            .expect("sidecar mode");
+    };
+    write_sidecar("not json");
+    let delete_options = CmdOptions::new().with_cwd(&checkout).with_envs(&[
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+    ]);
+    let refused_unproven = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_unproven.code,
+        0,
+        "outcome={}",
+        refused_unproven.stdout_text()
+    );
+    assert_eq!(
+        refused_unproven.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified"
+    );
+    assert!(
+        state_dir.join("sessions/worker-dsh").exists(),
+        "unproven liveness preserves the record"
+    );
+
     // A live open lane refuses record deletion; a terminated lane deletes.
     let live_sidecar = json!({
         "schema_version": "main-agent.dsh-runtime-liveness.v1",
         "launch_id": launch_id,
-        "harness": { "pid": std::process::id() },
+        "harness": harness_identity_json(),
         "lane": { "state": "open" }
     });
-    fs::write(liveness_file, live_sidecar.to_string()).expect("live sidecar");
+    write_sidecar(&live_sidecar.to_string());
     let delete_options = CmdOptions::new().with_cwd(&checkout).with_envs(&[
         ("AGENT_SESSION_TMUX_BIN", tmux_arg.as_str()),
         ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
@@ -38606,13 +38691,42 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         state_dir.join("sessions/worker-dsh").exists(),
         "refused deletion preserves the record"
     );
+    // A terminated lane whose harness is still live is only a plugin
+    // assertion, so it stays unproven and refuses deletion.
+    let uncorroborated = json!({
+        "schema_version": "main-agent.dsh-runtime-liveness.v1",
+        "launch_id": launch_id,
+        "harness": harness_identity_json(),
+        "lane": { "state": "terminated" }
+    });
+    write_sidecar(&uncorroborated.to_string());
+    let refused_uncorroborated = run_resolved(
+        "agent-session",
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "worker-dsh",
+            "--format",
+            "json",
+        ],
+        &delete_options,
+    );
+    assert_ne!(
+        refused_uncorroborated.code,
+        0,
+        "a live harness leaves plugin-asserted termination unproven: {}",
+        refused_uncorroborated.stdout_text()
+    );
+
+    // A terminated lane whose harness is proven gone deletes.
     let terminated_sidecar = json!({
         "schema_version": "main-agent.dsh-runtime-liveness.v1",
         "launch_id": launch_id,
-        "harness": { "pid": std::process::id() },
+        "harness": { "pid": i32::MAX, "start_time": 1 },
         "lane": { "state": "terminated" }
     });
-    fs::write(liveness_file, terminated_sidecar.to_string()).expect("terminated sidecar");
+    write_sidecar(&terminated_sidecar.to_string());
     let deleted = run_resolved(
         "agent-session",
         &[
@@ -38634,4 +38748,25 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         tmux_calls(&tmux_log).is_empty(),
         "dsh record deletion must never touch tmux"
     );
+}
+
+/// The pinned harness identity of this test process, matching what the
+/// dsh-runtime-kit plugin writes: pid plus the Linux starttime pin when it is
+/// readable, so liveness is decidable rather than merely "some process exists".
+fn harness_identity_json() -> serde_json::Value {
+    let pid = std::process::id();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let after_comm = &stat[stat.rfind(')').map(|index| index + 1).unwrap_or(0)..];
+            if let Some(start_time) = after_comm
+                .split_whitespace()
+                .nth(19)
+                .and_then(|field| field.parse::<u64>().ok())
+            {
+                return json!({ "pid": pid, "start_time": start_time });
+            }
+        }
+    }
+    json!({ "pid": pid })
 }

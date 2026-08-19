@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,25 @@ pub(crate) fn create_external_worker_record(
     Ok(created.record.clone())
 }
 
+/// Converge a record whose liveness-path key was lost between the record write
+/// and the extra-key write (a crash in that window). The path is derivable, so
+/// a replay repairs it instead of failing permanently.
+pub(crate) fn ensure_recorded_liveness_path(
+    context: &CliContext,
+    record: SessionRecord,
+) -> Result<SessionRecord, CliError> {
+    if !is_external_record(&record) || recorded_liveness_path(&record).is_some() {
+        return Ok(record);
+    }
+    let expected = json!(crate::display_path(&liveness_path(context, &record.id)));
+    crate::mutate_session_record(context, &record.id, |current| {
+        current
+            .extra
+            .insert(LIVENESS_PATH_KEY.to_string(), expected.clone());
+        Ok(current.clone())
+    })
+}
+
 pub(crate) fn is_external_record(record: &SessionRecord) -> bool {
     record
         .runtime
@@ -165,11 +185,20 @@ pub(crate) fn liveness_path(context: &CliContext, session_id: &str) -> PathBuf {
 }
 
 /// The record-declared sidecar path, or `None` when the record does not carry
-/// a usable absolute path (treated as invalid evidence by callers).
+/// a usable absolute path (treated as invalid evidence by callers). The path
+/// must also be the exact conventional file inside the record's own session
+/// directory: a record-supplied path pointing anywhere else is not evidence
+/// about this lane.
 fn recorded_liveness_path(record: &SessionRecord) -> Option<PathBuf> {
     let path = record.extra.get(LIVENESS_PATH_KEY)?.as_str()?;
     let path = Path::new(path);
-    path.is_absolute().then(|| path.to_path_buf())
+    if !path.is_absolute() || path.file_name()? != LIVENESS_FILE {
+        return None;
+    }
+    if path.parent()?.file_name()? != record.id.as_str() {
+        return None;
+    }
+    Some(path.to_path_buf())
 }
 
 /// Typed outcome of reading the sidecar against a specific session record.
@@ -188,13 +217,31 @@ pub(crate) fn read_liveness(record: &SessionRecord) -> LivenessEvidence {
     let Some(path) = recorded_liveness_path(record) else {
         return LivenessEvidence::Invalid;
     };
-    let file = match fs::File::open(&path) {
+    // Evidence that gates destructive operations is opened with the same trust
+    // bar as the coordination files beside it: never follow a symlink, and
+    // accept only an owner-only, single-link regular file.
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LivenessEvidence::Missing;
         }
         Err(_) => return LivenessEvidence::Invalid,
     };
+    let Ok(metadata) = file.metadata() else {
+        return LivenessEvidence::Invalid;
+    };
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > MAX_LIVENESS_BYTES
+    {
+        return LivenessEvidence::Invalid;
+    }
     let mut bytes = Vec::new();
     if file
         .take(MAX_LIVENESS_BYTES + 1)
@@ -229,16 +276,23 @@ pub(crate) fn read_liveness(record: &SessionRecord) -> LivenessEvidence {
 pub(crate) fn harness_process_status(identity: &DshHarnessIdentity) -> CoordinationRuntimeStatus {
     let alive = unsafe { libc::kill(identity.pid, 0) };
     if alive != 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => CoordinationRuntimeStatus::Stopped,
-            Some(libc::EPERM) => CoordinationRuntimeStatus::Running,
-            _ => CoordinationRuntimeStatus::Unknown,
-        };
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => return CoordinationRuntimeStatus::Stopped,
+            // EPERM proves some process holds the pid but says nothing about
+            // which incarnation, so it still needs the starttime pin below.
+            Some(libc::EPERM) => {}
+            _ => return CoordinationRuntimeStatus::Unknown,
+        }
     }
     match (identity.start_time, linux_process_start_time(identity.pid)) {
+        // A different starttime on the same pid proves the pinned incarnation
+        // is gone and the pid was recycled.
         (Some(expected), Some(actual)) if expected != actual => CoordinationRuntimeStatus::Stopped,
-        (Some(_), None) => CoordinationRuntimeStatus::Unknown,
-        _ => CoordinationRuntimeStatus::Running,
+        (Some(_), Some(_)) => CoordinationRuntimeStatus::Running,
+        // Pinned but unreadable, or never pinned: a live pid alone cannot prove
+        // this incarnation, so liveness stays undecided rather than vouching
+        // for a possibly recycled pid.
+        _ => CoordinationRuntimeStatus::Unknown,
     }
 }
 
@@ -256,23 +310,83 @@ fn linux_process_start_time(_pid: i32) -> Option<u64> {
     None
 }
 
-/// `session_status` for external dsh records: `missing` when nothing is
-/// proven for this launch, `stopped` when the lane is terminated or the
-/// harness process is proven gone, `running` while the lane is open under a
-/// live harness (idle lanes stay `running`; cold resume is always available).
-pub(crate) fn external_session_status(record: &SessionRecord) -> String {
-    match read_liveness(record) {
-        LivenessEvidence::Missing | LivenessEvidence::Invalid => "missing".to_string(),
-        LivenessEvidence::Present(liveness) => {
-            if liveness.lane.state == "terminated" {
-                return "stopped".to_string();
-            }
-            match harness_process_status(&liveness.harness) {
-                CoordinationRuntimeStatus::Running => "running".to_string(),
-                CoordinationRuntimeStatus::Stopped => "stopped".to_string(),
-                CoordinationRuntimeStatus::Unknown => "missing".to_string(),
+/// Why a lane's liveness could not be proven. Destructive callers report the
+/// reason instead of treating unproven liveness as absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnprovenReason {
+    /// A sidecar exists but is unreadable, malformed, oversized, or bound to a
+    /// different launch than this record's.
+    InvalidEvidence,
+    /// The sidecar is valid but the pinned harness process state cannot be
+    /// decided (permission, unreadable `/proc`, or a missing starttime pin).
+    UndecidableHarness,
+}
+
+impl UnprovenReason {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::InvalidEvidence => "external dsh runtime liveness evidence is invalid",
+            Self::UndecidableHarness => {
+                "external dsh runtime liveness could not be decided for the pinned harness"
             }
         }
+    }
+}
+
+/// The four lane states a destructive or diagnostic caller must distinguish.
+/// Collapsing `Unproven` into "absent" would let a corrupted sidecar authorize
+/// destroying the record of a running lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalLaneDisposition {
+    /// No sidecar exists: the external runtime never attached to this launch.
+    NeverAttached,
+    Running,
+    ProvenStopped,
+    Unproven(UnprovenReason),
+}
+
+pub(crate) fn external_lane_disposition(record: &SessionRecord) -> ExternalLaneDisposition {
+    match read_liveness(record) {
+        LivenessEvidence::Missing => ExternalLaneDisposition::NeverAttached,
+        LivenessEvidence::Invalid => {
+            ExternalLaneDisposition::Unproven(UnprovenReason::InvalidEvidence)
+        }
+        LivenessEvidence::Present(liveness) => {
+            let harness = harness_process_status(&liveness.harness);
+            if liveness.lane.state == "terminated" {
+                // Plugin-asserted termination, deliberately weaker than the
+                // tmux kernel-backed proof: the sidecar lives in the same-uid
+                // state dir a lane's own worker can reach. Corroborate it with
+                // the pinned harness identity — a still-running harness means
+                // the assertion is unproven, not proven.
+                return match harness {
+                    CoordinationRuntimeStatus::Running => {
+                        ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
+                    }
+                    _ => ExternalLaneDisposition::ProvenStopped,
+                };
+            }
+            match harness {
+                CoordinationRuntimeStatus::Running => ExternalLaneDisposition::Running,
+                CoordinationRuntimeStatus::Stopped => ExternalLaneDisposition::ProvenStopped,
+                CoordinationRuntimeStatus::Unknown => {
+                    ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
+                }
+            }
+        }
+    }
+}
+
+/// `session_status` for external dsh records: `missing` when the runtime never
+/// attached, `stopped` when termination is proven, `running` while the lane is
+/// open under a live harness (idle lanes stay `running`; cold resume is always
+/// available), and `unknown` when liveness cannot be proven.
+pub(crate) fn external_session_status(record: &SessionRecord) -> String {
+    match external_lane_disposition(record) {
+        ExternalLaneDisposition::NeverAttached => "missing".to_string(),
+        ExternalLaneDisposition::Running => "running".to_string(),
+        ExternalLaneDisposition::ProvenStopped => "stopped".to_string(),
+        ExternalLaneDisposition::Unproven(_) => "unknown".to_string(),
     }
 }
 
@@ -415,13 +529,16 @@ mod tests {
 
     #[test]
     fn harness_status_distinguishes_live_dead_and_recycled_processes() {
-        let live = DshHarnessIdentity {
+        // Unpinned identity: a live pid alone cannot prove which incarnation
+        // holds it, so liveness stays undecided.
+        let unpinned = DshHarnessIdentity {
             pid: std::process::id() as i32,
             start_time: None,
         };
         assert_eq!(
-            harness_process_status(&live),
-            CoordinationRuntimeStatus::Running
+            harness_process_status(&unpinned),
+            CoordinationRuntimeStatus::Unknown,
+            "an unpinned pid never vouches for a live harness"
         );
 
         #[cfg(target_os = "linux")]
@@ -445,5 +562,243 @@ mod tests {
                 "a start-time mismatch proves pid reuse"
             );
         }
+    }
+
+    /// Build an external record whose sidecar path points into a scratch dir.
+    fn external_record(root: &Path, launch_id: &str) -> SessionRecord {
+        let session_dir = root.join("sessions").join("worker-dsh");
+        fs::create_dir_all(&session_dir).expect("session dir");
+        let mut record: SessionRecord = serde_json::from_value(json!({
+            "schema_version": "agent-session.session.v1",
+            "id": "worker-dsh",
+            "agent": "dsh",
+            "mode": "external",
+            "title": null,
+            "cwd": "/lane/worktree",
+            "tmux_session": "",
+            "prompt_file": null,
+            "log_file": null,
+            "created_at": "0",
+            "updated_at": "0",
+            "runtime": {
+                "kind": DSH_RUNTIME_KIND,
+                "tmux_session": "",
+                "generation": 1,
+                "started_at": "0",
+                "launch_id": launch_id
+            }
+        }))
+        .expect("external record");
+        record.extra.insert(
+            LIVENESS_PATH_KEY.to_string(),
+            json!(session_dir.join(LIVENESS_FILE).to_string_lossy()),
+        );
+        record
+    }
+
+    fn write_sidecar(record: &SessionRecord, body: &str, mode: u32) {
+        let path = recorded_liveness_path(record).expect("recorded path");
+        fs::write(&path, body).expect("write sidecar");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("mode");
+    }
+
+    fn pinned_harness() -> serde_json::Value {
+        let pid = std::process::id() as i32;
+        match linux_process_start_time(pid) {
+            Some(start_time) => json!({ "pid": pid, "start_time": start_time }),
+            None => json!({ "pid": pid }),
+        }
+    }
+
+    #[test]
+    fn lane_disposition_requires_positive_evidence() {
+        let scratch = tempfile::TempDir::new().expect("tempdir");
+        let record = external_record(scratch.path(), "launch-1");
+
+        // No sidecar: the runtime never attached.
+        assert_eq!(
+            external_lane_disposition(&record),
+            ExternalLaneDisposition::NeverAttached
+        );
+        assert_eq!(external_session_status(&record), "missing");
+
+        // Malformed, schema-mismatched, and launch-mismatched sidecars are all
+        // unproven, never a quiet absence.
+        for body in [
+            "not json".to_string(),
+            json!({
+                "schema_version": "main-agent.dsh-runtime-liveness.v999",
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "open" }
+            })
+            .to_string(),
+            json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-2",
+                "harness": pinned_harness(),
+                "lane": { "state": "open" }
+            })
+            .to_string(),
+        ] {
+            write_sidecar(&record, &body, 0o600);
+            assert_eq!(
+                external_lane_disposition(&record),
+                ExternalLaneDisposition::Unproven(UnprovenReason::InvalidEvidence),
+                "invalid evidence must stay unproven: {body}"
+            );
+            assert_eq!(external_session_status(&record), "unknown");
+            assert!(external_runtime_evidence(&record).is_err());
+            assert!(external_turn_state(&record).is_none());
+        }
+
+        // A group-readable sidecar fails the owner-only trust bar.
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "open" }
+            })
+            .to_string(),
+            0o644,
+        );
+        assert_eq!(
+            external_lane_disposition(&record),
+            ExternalLaneDisposition::Unproven(UnprovenReason::InvalidEvidence),
+            "a group-readable sidecar is not trusted evidence"
+        );
+
+        // A dead pid proves the lane stopped.
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": { "pid": i32::MAX, "start_time": 1_u64 },
+                "lane": { "state": "open" }
+            })
+            .to_string(),
+            0o600,
+        );
+        assert_eq!(
+            external_lane_disposition(&record),
+            ExternalLaneDisposition::ProvenStopped
+        );
+        assert_eq!(external_session_status(&record), "stopped");
+
+        // A terminated lane whose harness is still live is an uncorroborated
+        // plugin assertion, not a proof.
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "terminated" }
+            })
+            .to_string(),
+            0o600,
+        );
+        let terminated = external_lane_disposition(&record);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            terminated,
+            ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness),
+            "a live harness leaves plugin-asserted termination unproven"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            terminated,
+            ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
+        );
+    }
+
+    #[test]
+    fn recorded_liveness_path_is_confined_to_the_record_session_dir() {
+        let scratch = tempfile::TempDir::new().expect("tempdir");
+        let mut record = external_record(scratch.path(), "launch-1");
+        assert!(recorded_liveness_path(&record).is_some());
+
+        for hostile in [
+            scratch.path().join("elsewhere").join(LIVENESS_FILE),
+            scratch
+                .path()
+                .join("sessions")
+                .join("worker-dsh")
+                .join("other.json"),
+            PathBuf::from("relative/dsh-runtime-liveness.json"),
+        ] {
+            record.extra.insert(
+                LIVENESS_PATH_KEY.to_string(),
+                json!(hostile.to_string_lossy()),
+            );
+            assert!(
+                recorded_liveness_path(&record).is_none(),
+                "path outside the record's own session dir is not evidence: {hostile:?}"
+            );
+            assert_eq!(
+                external_lane_disposition(&record),
+                ExternalLaneDisposition::Unproven(UnprovenReason::InvalidEvidence)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn turn_evidence_yields_authoritative_runtime_activity() {
+        let scratch = tempfile::TempDir::new().expect("tempdir");
+        let record = external_record(scratch.path(), "launch-1");
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "open" },
+                "turn": {
+                    "phase": "working",
+                    "phase_changed_at": "100",
+                    "current_turn": { "started_at": "100", "last_progress_at": "110" },
+                    "last_turn": { "completed_at": "90", "outcome": "completed" }
+                }
+            })
+            .to_string(),
+            0o600,
+        );
+        let turn = external_turn_state(&record).expect("turn evidence is present");
+        assert_eq!(turn.phase, crate::activity::TurnPhase::Working);
+        assert_eq!(turn.source.kind, crate::activity::SourceKind::Runtime);
+        assert_eq!(turn.source.provider.as_deref(), Some("dsh"));
+        assert_eq!(
+            turn.source.confidence,
+            crate::activity::Confidence::Authoritative
+        );
+        assert_eq!(
+            turn.current_turn
+                .as_ref()
+                .and_then(|current| current.last_progress_at.as_deref()),
+            Some("110")
+        );
+        assert_eq!(
+            turn.last_turn.as_ref().map(|last| last.outcome.as_str()),
+            Some("completed")
+        );
+
+        // An unknown phase is not evidence.
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "open" },
+                "turn": { "phase": "surprised", "phase_changed_at": "100" }
+            })
+            .to_string(),
+            0o600,
+        );
+        assert!(external_turn_state(&record).is_none());
     }
 }

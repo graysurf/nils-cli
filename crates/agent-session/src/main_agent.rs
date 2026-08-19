@@ -5057,7 +5057,11 @@ fn finish_external_worker_start(
     let prompt = dsh_worker_start_prompt(assignment_id, main_agent_bin);
     let replay_prompts = [prompt.as_str()];
     let existing = match load_session_record(context, worker_session_id) {
-        Ok(worker) => Some(worker),
+        // Repair a record whose second (extra-key) write was lost to a crash:
+        // the path is derivable, so replay converges instead of wedging.
+        Ok(worker) => Some(crate::dsh_external::ensure_recorded_liveness_path(
+            context, worker,
+        )?),
         Err(error) if error.code() == "session-not-found" => None,
         Err(error) => return Err(error),
     };
@@ -5259,12 +5263,13 @@ fn external_launch_payload(
         &worker_record.id,
         launch_id,
     ));
-    let liveness_file = worker_record
-        .extra
-        .get(crate::dsh_external::LIVENESS_PATH_KEY)
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_input("external worker record has no liveness sidecar path"))?
-        .to_string();
+    // Derived, never read back: a crash between the record write and the
+    // extra-key write must not wedge every replay on a missing key. The
+    // persisted key exists only for the context-free sidecar reader.
+    let liveness_file = crate::display_path(&crate::dsh_external::liveness_path(
+        context,
+        &worker_record.id,
+    ));
     let agent_session_bin = env::current_exe()
         .ok()
         .and_then(|executable| Some(executable.parent()?.join("agent-session")))
@@ -14855,6 +14860,7 @@ fn run_worker_stop_claimed_runtime(
     if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
         return Err(invalid_input("worker incarnation is invalid"));
     }
+    ensure_worker_runtime_stop_not_plugin_owned(context, &args.assignment_id)?;
     let (main, main_incarnation, controller_claim) =
         crate::coordination::authenticate_any_from_file_with_active_claim_observational(
             context, None,
@@ -15550,6 +15556,37 @@ struct WorkerRuntimeStopAssignment {
     worker: SessionRef,
 }
 
+/// Refuse a CLI-owned runtime stop for a lane whose runtime belongs to the
+/// external dsh plugin, before any reservation, receipt, or authority seal is
+/// persisted: a refusal after those side effects would wedge the assignment
+/// behind a retained runtime-stop reservation that no replay can clear.
+fn ensure_worker_runtime_stop_not_plugin_owned(
+    context: &CliContext,
+    assignment_id: &str,
+) -> Result<(), CliError> {
+    let registry = orchestration::load_registry_readonly(context)?;
+    let Some(assignment) = registry.assignments.get(assignment_id) else {
+        return Ok(());
+    };
+    let Some(worker) = assignment.worker.as_ref() else {
+        return Ok(());
+    };
+    let Ok(record) = load_session_record(context, &worker.session_id) else {
+        return Ok(());
+    };
+    if crate::dsh_external::is_external_record(&record) {
+        return Err(CliError::usage(
+            "dsh-runtime-plugin-owned",
+            "dsh worker runtimes are owned by the external dsh-runtime-kit plugin; interrupt the lane there, then reconcile once the liveness sidecar proves the lane stopped",
+            Some(json!({
+                "assignment_id": assignment_id,
+                "worker_session_id": worker.session_id.clone()
+            })),
+        ));
+    }
+    Ok(())
+}
+
 fn require_worker_runtime_stop_assignment(
     context: &CliContext,
     registry: &orchestration::Registry,
@@ -15629,6 +15666,7 @@ fn run_worker_stop_runtime(
     if args.worker_incarnation.trim().is_empty() || args.worker_incarnation.len() > 256 {
         return Err(invalid_input("worker incarnation is invalid"));
     }
+    ensure_worker_runtime_stop_not_plugin_owned(context, &args.assignment_id)?;
     let (main, main_incarnation, controller_claim) =
         crate::coordination::authenticate_any_from_file_with_active_claim_observational(
             context, None,

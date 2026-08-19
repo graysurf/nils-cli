@@ -93,47 +93,68 @@ matching exactly like the others.
 ## Liveness sidecar — `main-agent.dsh-runtime-liveness.v1`
 
 Path: `<session dir>/dsh-runtime-liveness.json`, written and refreshed only by
-the plugin (owner-only file mode). Fields:
+the plugin. The reader requires an owner-only (`0600`-class), single-link,
+non-symlink regular file at exactly that path, at most 64 KiB, and rejects
+unknown fields at every level. Fields:
 
 ```jsonc
 {
   "schema_version": "main-agent.dsh-runtime-liveness.v1",
   "launch_id": "<must equal runtime.launch_id>",
   "harness": {
-    // process identity of the DSH harness process, TmuxRuntimeIdentity-shaped:
-    "pane_pid": <harness pid>,
-    "process_group_id": <pgid or null>,
-    "process_session_id": <sid or null>,
-    "control_group": "<cgroup path or null>",
-    "pid_namespace": "<pid ns identity or null>",
-    "pane_start_time": <starttime ticks or null>
+    "pid": <harness pid>,
+    // Linux /proc starttime ticks. Required to prove the exact incarnation:
+    // without it liveness is undecidable and destructive operations refuse.
+    "start_time": <starttime ticks, optional>
   },
   "lane": { "state": "open" | "terminated" },
+  // Optional turn evidence; absent means diagnosis degrades conservatively.
+  "turn": {
+    "phase": "working" | "waiting",
+    "phase_changed_at": "<epoch seconds>",
+    "current_turn": { "started_at": "<epoch seconds>", "last_progress_at": "<epoch seconds, optional>" },
+    "last_turn": { "completed_at": "<epoch seconds>", "outcome": "completed" | "failed" | "interrupted" }
+  },
   "updated_at": "<epoch seconds>"
 }
 ```
 
-Consumption:
+Consumption. The reader resolves one of four dispositions:
 
-- `session_status` for a `dsh_external` record: `missing` when the sidecar is
-  absent; `stopped` when `lane.state == "terminated"`, when `launch_id` does
-  not match the record, or when the harness process identity proves stopped;
-  otherwise `running`. An idle-but-resumable lane is *running* — cold resume
-  is always available while the harness lives and the lane is open.
-- `coordination_runtime_evidence` for a `dsh_external` record builds the
-  runtime identity from `harness` (validated against `launch_id`) and reuses
-  the existing process-liveness proof. Unknown stays conservative exactly as
-  for tmux runtimes.
+| Disposition | When | `session_status` |
+| --- | --- | --- |
+| never attached | no sidecar exists | `missing` |
+| running | valid sidecar, lane `open`, pinned harness proven live | `running` |
+| proven stopped | lane `terminated` with the harness not proven live, or the pinned harness proven gone (ESRCH, or a starttime mismatch proving pid reuse) | `stopped` |
+| unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; or the harness state is undecidable (EPERM without a readable starttime, no `start_time`, unreadable `/proc`) | `unknown` |
+
+- Destructive operations require positive evidence: record deletion is
+  admitted only for a never-attached or proven-stopped lane. A running lane
+  refuses, and an unproven lane refuses with
+  `coordination-runtime-unverified` — a corrupted sidecar must never authorize
+  destroying a live lane's record.
+- An idle-but-resumable lane is *running*: cold resume is always available
+  while the harness lives and the lane is open.
+- `lane.state == "terminated"` is a **plugin assertion**, deliberately weaker
+  than the tmux kernel-backed proof: the sidecar lives in the same-uid state
+  dir a lane's own worker can reach. It is therefore corroborated against the
+  pinned harness identity, and a still-live harness makes the assertion
+  unproven rather than proven.
+- `coordination_runtime_evidence` builds the runtime identity from `harness`
+  (validated against `launch_id`) and reuses the existing process-liveness
+  proof. Unproven stays conservative exactly as for tmux runtimes.
 
 ## Diagnose/supervise evidence
 
 Store, claim, packet, worktree, and coordination evidence are provider-neutral
 and unchanged. For `dsh` workers the activity evidence is derived from the
-sidecar (`lane.state` + harness liveness) instead of the provider hook spool:
-an open lane with a live harness reports a waiting/working turn phase at
-observed confidence, so a healthy dsh lane classifies on the same table as the
-managed products without the provider-hook activity pipeline. The
-classification table itself is not modified.
+sidecar instead of the provider hook spool: a valid open lane under a live
+harness whose sidecar carries a known `turn.phase` reports that phase with
+`source.kind: "runtime"`, `provider: "dsh"`, and authoritative confidence
+(the harness observes its own agent directly, so the signal is authoritative
+rather than inferred). Any other state yields no activity evidence, and
+diagnosis degrades conservatively. The classification table itself is not
+modified.
 
 ## Typed refusals
 
