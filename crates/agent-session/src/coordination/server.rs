@@ -654,7 +654,7 @@ pub(crate) fn operator_reconcile_provider_turn(
     )? {
         return Ok(replay);
     }
-    let runtime_evidence = crate::coordination_runtime_evidence(&record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &record)?;
     if runtime_evidence.status != crate::CoordinationRuntimeStatus::Running {
         return Err(CliError::data(
             "operator-provider-turn-reconcile-runtime-conflict",

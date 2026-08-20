@@ -13849,10 +13849,11 @@ pub(crate) struct CoordinationRuntimeEvidence {
 }
 
 pub(crate) fn coordination_runtime_evidence(
+    context: &CliContext,
     record: &SessionRecord,
 ) -> Result<CoordinationRuntimeEvidence, CliError> {
     if dsh_external::is_external_record(record) {
-        return dsh_external::external_runtime_evidence(record);
+        return dsh_external::external_runtime_evidence(context, record);
     }
     let identity = persisted_tmux_runtime_identity(record)
         .map_err(|_| {

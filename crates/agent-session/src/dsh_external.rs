@@ -579,6 +579,7 @@ pub(crate) fn external_turn_state(record: &SessionRecord) -> Option<crate::activ
 /// the sidecar's launch-bound harness identity; missing or invalid sidecars
 /// fail with the same typed error as an unavailable tmux runtime identity.
 pub(crate) fn external_runtime_evidence(
+    context: &CliContext,
     record: &SessionRecord,
 ) -> Result<CoordinationRuntimeEvidence, CliError> {
     let liveness = match read_liveness(record) {
@@ -616,8 +617,11 @@ pub(crate) fn external_runtime_evidence(
     })?;
     // One function owns the corroboration rule. Deriving the status here from
     // the disposition keeps this evidence and the destructive-operation gate
-    // from disagreeing about what a plugin-asserted termination proves.
-    let status = match external_lane_disposition(record) {
+    // from disagreeing about what a plugin-asserted termination proves — which
+    // is why it must read the *same* disposition, broker witness included. With
+    // the context-free reader here, `worker reconcile-stopped` refused a lane
+    // that `agent-session delete` and `session_status` already called stopped.
+    let status = match external_lane_disposition_with_broker(context, record) {
         ExternalLaneDisposition::Running => CoordinationRuntimeStatus::Running,
         ExternalLaneDisposition::ProvenStopped => CoordinationRuntimeStatus::Stopped,
         ExternalLaneDisposition::NeverAttached | ExternalLaneDisposition::Unproven(_) => {
@@ -813,7 +817,7 @@ mod tests {
                 "invalid evidence must stay unproven: {body}"
             );
             assert_eq!(external_session_status(&context, &record), "unknown");
-            assert!(external_runtime_evidence(&record).is_err());
+            assert!(external_runtime_evidence(&context, &record).is_err());
             assert!(external_turn_state(&record).is_none());
         }
 
@@ -929,6 +933,16 @@ mod tests {
             ExternalLaneDisposition::ProvenStopped
         );
         assert_eq!(external_session_status(&context, &record), "stopped");
+        // Runtime evidence must agree with the projection and the destructive
+        // gate. It is the input `worker reconcile-stopped` reads, and while it
+        // classified from the context-free disposition it reported `Unknown`
+        // here — so a lane `delete` would terminalize refused to reconcile.
+        assert_eq!(
+            external_runtime_evidence(&context, &record)
+                .expect("runtime evidence")
+                .status,
+            CoordinationRuntimeStatus::Stopped
+        );
 
         // A lane still beating holds coordination authority: nothing is proven,
         // the reason names the retained authority rather than the harness, and
@@ -942,6 +956,13 @@ mod tests {
         assert!(
             !external_lane_terminal_is_proven(&context, &record, "launch-1"),
             "a lane that still holds coordination authority is not proven stopped"
+        );
+        assert_eq!(
+            external_runtime_evidence(&context, &record)
+                .expect("runtime evidence")
+                .status,
+            CoordinationRuntimeStatus::Unknown,
+            "reconcile-stopped must refuse a lane that still holds authority"
         );
 
         // A heartbeat for a different incarnation is not this lane's authority.
