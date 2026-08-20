@@ -423,6 +423,12 @@ impl UnprovenReason {
 /// different process and observed through a different file. A forged stop has
 /// to stop the real heartbeat too, which is itself a loss of authority the
 /// store can see.
+///
+/// This witness is deliberately weaker than the harness one, and the spec's
+/// "residual risk, stated exactly" paragraph says how: both files are same-uid,
+/// so a hostile lane can kill its own heartbeat and keep running, whereas it
+/// cannot kill the harness without killing itself. What it gives up in exchange
+/// is every authenticated call it could still make.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaneBrokerWitness {
     /// The heartbeat is fresh: this lane still holds coordination authority.

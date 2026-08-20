@@ -197,6 +197,20 @@ process-group probe on the same platforms. Plugins should always write
   heartbeat stays fresh`. A reader with no way to consult the heartbeat (no state
   context on hand) treats the lane exactly as one that still holds authority, so
   a reader that cannot check never widens what is provable.
+
+  **Residual risk, stated exactly.** The heartbeat witness is weaker than the
+  harness witness, and knowing how is the point. Both the sidecar and the
+  heartbeat process are same-uid, so a hostile lane worker can write a
+  `terminated` sidecar and kill its own heartbeat, after which its record is
+  deletable while the lane keeps computing. It cannot do the equivalent to the
+  harness witness: killing the harness kills the lane with it. What the trade
+  costs the attacker is the authority it just surrendered — with a stale broker,
+  every authenticated call it makes, `main-agent checkpoint` included, fails
+  `coordination-unauthorized`, so the lane can no longer touch the run it was
+  hiding from. The exchange is deliberate: it buys a controller the ability to
+  reclaim one lane's assignment while its sibling lanes keep working, instead of
+  waiting for the whole harness to exit. Coordination remains a same-uid
+  boundary, not an OS one, exactly as the caveat above says.
 - `coordination_runtime_evidence` builds the runtime identity from `harness`
   (validated against `launch_id`) and reuses the existing process-liveness
   proof. Unproven stays conservative exactly as for tmux runtimes.
