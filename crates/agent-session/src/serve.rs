@@ -6429,7 +6429,7 @@ async fn attach_handler(
         let tmux = tmux.clone();
         move || {
             let record = load_session_record(&context, &id)?;
-            let status = session_status(&tmux, &record);
+            let status = session_status(&context, &tmux, &record);
             Ok::<_, CliError>((record, status))
         }
     })

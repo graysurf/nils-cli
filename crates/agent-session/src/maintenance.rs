@@ -809,7 +809,7 @@ fn execute_inner(
             // second, ungated way to destroy a running lane's durable state.
             if crate::dsh_external::is_external_record(&record) {
                 let incarnation = crate::coordination::incarnation(&record)?;
-                match crate::dsh_external::external_lane_disposition(&record) {
+                match crate::dsh_external::external_lane_disposition_with_broker(context, &record) {
                     crate::dsh_external::ExternalLaneDisposition::NeverAttached
                     | crate::dsh_external::ExternalLaneDisposition::ProvenStopped
                         if crate::dsh_external::external_lane_terminal_is_proven(

@@ -2187,7 +2187,7 @@ fn start_session_with_create_guard(
             provider_resume_persistence,
         )?;
     }
-    let status = session_status(&tmux_bin, &created.record);
+    let status = session_status(context, &tmux_bin, &created.record);
     if prompt_delivery_error.is_none() {
         reconcile_owned_startup_projection(context, &mut created.record, &status);
     }
@@ -2494,7 +2494,7 @@ pub(crate) fn start_provider_resume_session(
     }
     advance_owned_startup_stage(context, &mut created.record, "runtime")?;
 
-    let status = session_status(&tmux_bin, &created.record);
+    let status = session_status(context, &tmux_bin, &created.record);
     reconcile_owned_startup_projection(context, &mut created.record, &status);
     let result = session_view(context, &created.record, Some(status), Some(&tmux_bin));
     record_workdir_usage(context, &cwd);
@@ -9282,7 +9282,7 @@ fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<Stri
 fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceResult, CliError> {
     let mut record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let status = session_status(&tmux_bin, &record);
+    let status = session_status(context, &tmux_bin, &record);
     let (reconciled, status) = reconcile_startup_projection(context, record, status, None);
     record = reconciled;
     if status != "running" {
@@ -9541,7 +9541,7 @@ fn update_session_title_if_revision(
             Ok((record.clone(), previous_title))
         },
     )?;
-    let status = session_status(tmux_bin, &record);
+    let status = session_status(context, tmux_bin, &record);
     // The persisted record above is the source of truth. Claude also carries its
     // own prompt-bar display name, which we set once via `--name` at launch
     // (`start_interactive_tmux`) and which never changes afterwards, so a renamed
@@ -9718,7 +9718,7 @@ fn resume_session_locked(
     tmux_bin: &Path,
 ) -> Result<ResumeSessionOutcome, CliError> {
     orchestration::ensure_session_not_quarantined(context, &record)?;
-    match session_status(tmux_bin, &record).as_str() {
+    match session_status(context, tmux_bin, &record).as_str() {
         "running" => {
             return Ok(ResumeSessionOutcome {
                 session: session_view(
@@ -10889,8 +10889,12 @@ fn list_sessions_with_shadow_sampling(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-                let (status, observed_last_terminal_activity_at) =
-                    session_list_runtime_snapshot(&tmux_bin, tmux_snapshots.as_ref(), &record);
+                let (status, observed_last_terminal_activity_at) = session_list_runtime_snapshot(
+                    context,
+                    &tmux_bin,
+                    tmux_snapshots.as_ref(),
+                    &record,
+                );
                 let observed_status = status.clone();
                 let (record, status) = reconcile_startup_projection(
                     context,
@@ -10939,7 +10943,7 @@ fn load_session_view(
     let tmux_bin = tmux_bin
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
-    let status = session_status(&tmux_bin, &record);
+    let status = session_status(context, &tmux_bin, &record);
     let (reconciled, status) = reconcile_startup_projection(context, record, status, None);
     record = reconciled;
     if status != "running" {
@@ -11601,7 +11605,7 @@ fn session_view(
             &fallback_tmux
         }
     };
-    let status = forced_status.unwrap_or_else(|| session_status(tmux_bin, record));
+    let status = forced_status.unwrap_or_else(|| session_status(context, tmux_bin, record));
     let last_terminal_activity_at = last_terminal_activity_at(tmux_bin, record, &status);
     session_view_from_parts(
         context,
@@ -11867,6 +11871,7 @@ impl TmuxSessionSnapshots {
 }
 
 fn session_list_runtime_snapshot(
+    context: &CliContext,
     tmux_bin: &Path,
     tmux_snapshots: Option<&TmuxSessionSnapshots>,
     record: &SessionRecord,
@@ -11876,7 +11881,7 @@ fn session_list_runtime_snapshot(
     // projections agree with single-record status instead of reporting every
     // live dsh lane as stopped.
     if dsh_external::is_external_record(record) {
-        return (dsh_external::external_session_status(record), None);
+        return (dsh_external::external_session_status(context, record), None);
     }
     match tmux_snapshots {
         Some(snapshots) => match snapshots.sessions.get(&record.tmux_session) {
@@ -11886,7 +11891,7 @@ fn session_list_runtime_snapshot(
             ),
             None => ("stopped".to_string(), None),
         },
-        None => (session_status(tmux_bin, record), None),
+        None => (session_status(context, tmux_bin, record), None),
     }
 }
 
@@ -12165,7 +12170,7 @@ fn delete_session_locked_with_timeouts(
         // plugin first, and unproven liveness fails closed the same way an
         // unavailable tmux runtime identity does — a corrupted sidecar must
         // never authorize destroying a live lane's record.
-        match dsh_external::external_lane_disposition(&record) {
+        match dsh_external::external_lane_disposition_with_broker(context, &record) {
             dsh_external::ExternalLaneDisposition::Running => {
                 return Err(session_termination_error(
                     &record,
@@ -12223,7 +12228,7 @@ fn delete_session_locked_after_failed_canary_proof(
     tmux_bin: &Path,
     proof: ProviderStopCanaryFailedStartupQuiescenceProof,
 ) -> Result<DeleteResult, CliError> {
-    if !proof.matches(&record) || session_status(tmux_bin, &record) != "stopped" {
+    if !proof.matches(&record) || session_status(context, tmux_bin, &record) != "stopped" {
         return Err(session_termination_error(
             &record,
             SessionTerminationFailure::StillRunning,
@@ -15833,9 +15838,9 @@ fn managed_tmux_pane_target(tmux_session: &str) -> String {
     format!("={tmux_session}:0.0")
 }
 
-fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
+fn session_status(context: &CliContext, tmux_bin: &Path, record: &SessionRecord) -> String {
     if dsh_external::is_external_record(record) {
-        return dsh_external::external_session_status(record);
+        return dsh_external::external_session_status(context, record);
     }
     live_status(tmux_bin, &record.tmux_session)
 }

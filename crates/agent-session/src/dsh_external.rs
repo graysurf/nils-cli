@@ -254,7 +254,7 @@ pub(crate) fn external_lane_terminal_is_proven(
         return false;
     }
     if !matches!(
-        external_lane_disposition(record),
+        external_lane_disposition_with_broker(context, record),
         ExternalLaneDisposition::NeverAttached | ExternalLaneDisposition::ProvenStopped
     ) {
         return false;
@@ -395,6 +395,10 @@ pub(crate) enum UnprovenReason {
     /// The sidecar is valid but the pinned harness process state cannot be
     /// decided (permission, unreadable `/proc`, or a missing starttime pin).
     UndecidableHarness,
+    /// The sidecar claims the lane is terminated, but the lane's coordination
+    /// heartbeat is still fresh: it retains the authority a stopped lane gives
+    /// up, so the claim has no second witness.
+    LaneRetainsCoordinationAuthority,
 }
 
 impl UnprovenReason {
@@ -404,7 +408,47 @@ impl UnprovenReason {
             Self::UndecidableHarness => {
                 "external dsh runtime liveness could not be decided for the pinned harness"
             }
+            Self::LaneRetainsCoordinationAuthority => {
+                "external dsh lane termination is uncorroborated while its coordination \
+                 heartbeat stays fresh"
+            }
         }
+    }
+}
+
+/// What the lane's own coordination heartbeat says about its authority.
+///
+/// The plugin releases a lane's heartbeat when it closes that lane, so the
+/// heartbeat is a second witness to the sidecar's termination claim, owned by a
+/// different process and observed through a different file. A forged stop has
+/// to stop the real heartbeat too, which is itself a loss of authority the
+/// store can see.
+///
+/// This witness is deliberately weaker than the harness one, and the spec's
+/// "residual risk, stated exactly" paragraph says how: both files are same-uid,
+/// so a hostile lane can kill its own heartbeat and keep running, whereas it
+/// cannot kill the harness without killing itself. What it gives up in exchange
+/// is every authenticated call it could still make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneBrokerWitness {
+    /// The heartbeat is fresh: this lane still holds coordination authority.
+    Live,
+    /// The heartbeat is absent or stale: the authority is gone.
+    Released,
+    /// The witness could not be read — no context, or no incarnation on the
+    /// record. Treated exactly like a live lane so a reader that cannot check
+    /// never widens what is provable.
+    Unread,
+}
+
+fn lane_broker_witness(context: &CliContext, record: &SessionRecord) -> LaneBrokerWitness {
+    let Ok(incarnation) = coordination::incarnation(record) else {
+        return LaneBrokerWitness::Unread;
+    };
+    if coordination::broker::heartbeat_fresh(context, &record.id, &incarnation, 0) {
+        LaneBrokerWitness::Live
+    } else {
+        LaneBrokerWitness::Released
     }
 }
 
@@ -420,7 +464,22 @@ pub(crate) enum ExternalLaneDisposition {
     Unproven(UnprovenReason),
 }
 
+/// Classify without a broker witness. Every reader that can supply one should
+/// use [`external_lane_disposition_with_broker`]: without it a lane the plugin
+/// closed stays unproven until the whole harness exits.
 pub(crate) fn external_lane_disposition(record: &SessionRecord) -> ExternalLaneDisposition {
+    lane_disposition(record, LaneBrokerWitness::Unread)
+}
+
+/// Classify with the lane's coordination heartbeat as a second witness.
+pub(crate) fn external_lane_disposition_with_broker(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> ExternalLaneDisposition {
+    lane_disposition(record, lane_broker_witness(context, record))
+}
+
+fn lane_disposition(record: &SessionRecord, broker: LaneBrokerWitness) -> ExternalLaneDisposition {
     match read_liveness(record) {
         LivenessEvidence::Missing => ExternalLaneDisposition::NeverAttached,
         LivenessEvidence::Invalid => {
@@ -431,14 +490,26 @@ pub(crate) fn external_lane_disposition(record: &SessionRecord) -> ExternalLaneD
             if liveness.lane.state == "terminated" {
                 // Plugin-asserted termination, deliberately weaker than the
                 // tmux kernel-backed proof: the sidecar lives in the same-uid
-                // state dir a lane's own worker can reach. Corroborate it with
-                // the pinned harness identity — a still-running harness means
-                // the assertion is unproven, not proven.
-                return match harness {
-                    // Only a harness proven gone corroborates the assertion;
-                    // a live or undecidable harness leaves it unproven.
-                    CoordinationRuntimeStatus::Stopped => ExternalLaneDisposition::ProvenStopped,
-                    _ => ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness),
+                // state dir a lane's own worker can reach. It needs a second
+                // witness owned by a different process — either the pinned
+                // harness proven gone, or this lane's coordination heartbeat
+                // released. One of the two is enough; a lane cannot be live
+                // enough to hold coordination authority and terminated at the
+                // same time.
+                return match (harness, broker) {
+                    (CoordinationRuntimeStatus::Stopped, _) => {
+                        ExternalLaneDisposition::ProvenStopped
+                    }
+                    // The plugin releases a lane's heartbeat when it closes the
+                    // lane, so a released heartbeat corroborates the claim even
+                    // while the harness keeps serving its other lanes.
+                    (_, LaneBrokerWitness::Released) => ExternalLaneDisposition::ProvenStopped,
+                    (_, LaneBrokerWitness::Live) => ExternalLaneDisposition::Unproven(
+                        UnprovenReason::LaneRetainsCoordinationAuthority,
+                    ),
+                    (_, LaneBrokerWitness::Unread) => {
+                        ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness)
+                    }
                 };
             }
             match harness {
@@ -456,8 +527,8 @@ pub(crate) fn external_lane_disposition(record: &SessionRecord) -> ExternalLaneD
 /// attached, `stopped` when termination is proven, `running` while the lane is
 /// open under a live harness (idle lanes stay `running`; cold resume is always
 /// available), and `unknown` when liveness cannot be proven.
-pub(crate) fn external_session_status(record: &SessionRecord) -> String {
-    match external_lane_disposition(record) {
+pub(crate) fn external_session_status(context: &CliContext, record: &SessionRecord) -> String {
+    match external_lane_disposition_with_broker(context, record) {
         ExternalLaneDisposition::NeverAttached => "missing".to_string(),
         ExternalLaneDisposition::Running => "running".to_string(),
         ExternalLaneDisposition::ProvenStopped => "stopped".to_string(),
@@ -702,13 +773,19 @@ mod tests {
     fn lane_disposition_requires_positive_evidence() {
         let scratch = tempfile::TempDir::new().expect("tempdir");
         let record = external_record(scratch.path(), "launch-1");
+        // This lane never writes a heartbeat, so the broker witness is
+        // `Released` throughout: every case below turns on sidecar evidence.
+        let context = CliContext {
+            state_dir: scratch.path().to_path_buf(),
+            host: None,
+        };
 
         // No sidecar: the runtime never attached.
         assert_eq!(
             external_lane_disposition(&record),
             ExternalLaneDisposition::NeverAttached
         );
-        assert_eq!(external_session_status(&record), "missing");
+        assert_eq!(external_session_status(&context, &record), "missing");
 
         // Malformed, schema-mismatched, and launch-mismatched sidecars are all
         // unproven, never a quiet absence.
@@ -735,7 +812,7 @@ mod tests {
                 ExternalLaneDisposition::Unproven(UnprovenReason::InvalidEvidence),
                 "invalid evidence must stay unproven: {body}"
             );
-            assert_eq!(external_session_status(&record), "unknown");
+            assert_eq!(external_session_status(&context, &record), "unknown");
             assert!(external_runtime_evidence(&record).is_err());
             assert!(external_turn_state(&record).is_none());
         }
@@ -774,7 +851,7 @@ mod tests {
             external_lane_disposition(&record),
             ExternalLaneDisposition::ProvenStopped
         );
-        assert_eq!(external_session_status(&record), "stopped");
+        assert_eq!(external_session_status(&context, &record), "stopped");
 
         // A terminated lane whose harness is still live is an uncorroborated
         // plugin assertion, not a proof.
@@ -792,7 +869,86 @@ mod tests {
         assert_eq!(
             external_lane_disposition(&record),
             ExternalLaneDisposition::Unproven(UnprovenReason::UndecidableHarness),
-            "only a harness proven gone corroborates plugin-asserted termination"
+            "a context-free reader has no broker witness, so a live harness leaves \
+             plugin-asserted termination unproven"
+        );
+    }
+
+    /// Write the lane's broker heartbeat with a current epoch, the way the
+    /// lane's own heartbeat process does while it holds authority.
+    ///
+    /// Gated with its only caller: proving a *live* harness needs the Linux
+    /// starttime pin, so the corroboration test cannot run anywhere else.
+    #[cfg(target_os = "linux")]
+    fn write_lane_heartbeat(context: &CliContext, record: &SessionRecord, incarnation: &str) {
+        let path =
+            nils_common::coordination_projection::heartbeat_path(&context.state_dir, &record.id);
+        fs::create_dir_all(path.parent().expect("coordination parent")).expect("coordination dir");
+        fs::write(
+            &path,
+            format!("{incarnation}:{}", coordination::now_epoch()),
+        )
+        .expect("write heartbeat");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("heartbeat mode");
+    }
+
+    /// The lane's own coordination heartbeat is the second witness to a
+    /// plugin-asserted termination: the plugin releases it when it closes the
+    /// lane, so a forged stop has to give up the lane's coordination authority
+    /// too — which the store observes independently of the sidecar.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_released_lane_heartbeat_corroborates_plugin_asserted_termination() {
+        let scratch = tempfile::TempDir::new().expect("tempdir");
+        let record = external_record(scratch.path(), "launch-1");
+        let context = CliContext {
+            state_dir: scratch.path().to_path_buf(),
+            host: None,
+        };
+        write_sidecar(
+            &record,
+            &json!({
+                "schema_version": LIVENESS_SCHEMA,
+                "launch_id": "launch-1",
+                "harness": pinned_harness(),
+                "lane": { "state": "terminated" }
+            })
+            .to_string(),
+            0o600,
+        );
+
+        // This harness is this test process, so it is provably alive. The lane
+        // heartbeat is gone, so the assertion is corroborated anyway and the
+        // destructive routes open.
+        assert!(
+            external_lane_terminal_is_proven(&context, &record, "launch-1"),
+            "a released lane heartbeat corroborates plugin-asserted termination"
+        );
+        assert_eq!(
+            external_lane_disposition_with_broker(&context, &record),
+            ExternalLaneDisposition::ProvenStopped
+        );
+        assert_eq!(external_session_status(&context, &record), "stopped");
+
+        // A lane still beating holds coordination authority: nothing is proven,
+        // the reason names the retained authority rather than the harness, and
+        // the destructive routes stay closed.
+        write_lane_heartbeat(&context, &record, "launch-1");
+        assert_eq!(
+            external_lane_disposition_with_broker(&context, &record),
+            ExternalLaneDisposition::Unproven(UnprovenReason::LaneRetainsCoordinationAuthority)
+        );
+        assert_eq!(external_session_status(&context, &record), "unknown");
+        assert!(
+            !external_lane_terminal_is_proven(&context, &record, "launch-1"),
+            "a lane that still holds coordination authority is not proven stopped"
+        );
+
+        // A heartbeat for a different incarnation is not this lane's authority.
+        write_lane_heartbeat(&context, &record, "launch-2");
+        assert_eq!(
+            external_lane_disposition_with_broker(&context, &record),
+            ExternalLaneDisposition::ProvenStopped
         );
     }
 

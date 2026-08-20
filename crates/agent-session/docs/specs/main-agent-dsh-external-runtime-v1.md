@@ -151,8 +151,8 @@ Consumption. The reader resolves one of four dispositions:
 | --- | --- | --- |
 | never attached | no sidecar exists | `missing` |
 | running | valid sidecar, lane `open`, pinned harness proven live | `running` |
-| proven stopped | the pinned harness is proven gone (ESRCH, or a starttime mismatch proving pid reuse) — required whether the lane reads `open` or `terminated` | `stopped` |
-| unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; or the harness state is undecidable (see the platform rule below) | `unknown` |
+| proven stopped | the pinned harness is proven gone (ESRCH, or a starttime mismatch proving pid reuse) — for a lane reading `open` this is the only proof; or the lane reads `terminated` and this lane's broker heartbeat is absent or stale | `stopped` |
+| unproven | sidecar unreadable, malformed, oversized, wrongly owned, or launch-mismatched; the harness state is undecidable (see the platform rule below) with no broker witness available; or the lane reads `terminated` while its own broker heartbeat is still fresh | `unknown` |
 
 Platform rule for the incarnation pin: where a starttime source exists (Linux
 `/proc`), a liveness claim without a verified `start_time` match is *undecided*
@@ -184,9 +184,33 @@ process-group probe on the same platforms. Plugins should always write
   while the harness lives and the lane is open.
 - `lane.state == "terminated"` is a **plugin assertion**, deliberately weaker
   than the tmux kernel-backed proof: the sidecar lives in the same-uid state
-  dir a lane's own worker can reach. It is therefore corroborated against the
-  pinned harness identity, and a still-live harness makes the assertion
-  unproven rather than proven.
+  dir a lane's own worker can reach. It is therefore never believed on its own.
+  Either of two witnesses, each owned by a different process, corroborates it:
+  - the pinned harness proven gone, or
+  - this lane's own broker heartbeat absent or stale.
+
+  The plugin releases a lane's heartbeat when it closes that lane, so a closed
+  lane is provable while the harness keeps serving its other lanes. A lane whose
+  heartbeat is still fresh holds the coordination authority a stopped lane gives
+  up, so the assertion stays unproven with
+  `external dsh lane termination is uncorroborated while its coordination
+  heartbeat stays fresh`. A reader with no way to consult the heartbeat (no state
+  context on hand) treats the lane exactly as one that still holds authority, so
+  a reader that cannot check never widens what is provable.
+
+  **Residual risk, stated exactly.** The heartbeat witness is weaker than the
+  harness witness, and knowing how is the point. Both the sidecar and the
+  heartbeat process are same-uid, so a hostile lane worker can write a
+  `terminated` sidecar and kill its own heartbeat, after which its record is
+  deletable while the lane keeps computing. It cannot do the equivalent to the
+  harness witness: killing the harness kills the lane with it. What the trade
+  costs the attacker is the authority it just surrendered — with a stale broker,
+  every authenticated call it makes, `main-agent checkpoint` included, fails
+  `coordination-unauthorized`, so the lane can no longer touch the run it was
+  hiding from. The exchange is deliberate: it buys a controller the ability to
+  reclaim one lane's assignment while its sibling lanes keep working, instead of
+  waiting for the whole harness to exit. Coordination remains a same-uid
+  boundary, not an OS one, exactly as the caveat above says.
 - `coordination_runtime_evidence` builds the runtime identity from `harness`
   (validated against `launch_id`) and reuses the existing process-liveness
   proof. Unproven stays conservative exactly as for tmux runtimes.
@@ -232,8 +256,11 @@ refusal. In order:
    is a terminal pre-claim disposition, and the assignment can be cancelled or
    reassigned.
 3. If the harness is undecidable because the platform has no starttime source,
-   the lane's own broker heartbeat is the remaining evidence: once it is stale
-   the operator can stop the harness process, after which the pid probe decides.
+   the lane's own broker heartbeat is the remaining evidence: a lane whose
+   sidecar reads `terminated` becomes provable as soon as that heartbeat goes
+   stale, with no need to stop the harness. A lane whose sidecar still reads
+   `open` has no second witness, so there the operator stops the harness process
+   and the pid probe decides.
 
 The CLI intentionally offers no force flag for this path. A force flag would be
 indistinguishable from the forged-stop case the corroboration rule exists to

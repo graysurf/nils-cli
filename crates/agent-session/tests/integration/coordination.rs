@@ -38901,8 +38901,12 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         "a refused worker delete must not mutate the assignment"
     );
 
-    // A terminated lane whose harness is still live is only a plugin
-    // assertion, so it stays unproven and refuses deletion.
+    // A terminated lane whose harness is still live needs its second witness.
+    // While the lane's own coordination heartbeat stays fresh it still holds
+    // the authority a stopped lane gives up, so the assertion is uncorroborated
+    // and deletion refuses. The sidecar sits in a directory the lane's own
+    // worker can write, so this is the check that stops a live lane from
+    // terminalizing its own record.
     let uncorroborated = json!({
         "schema_version": "main-agent.dsh-runtime-liveness.v1",
         "launch_id": launch_id,
@@ -38910,6 +38914,17 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         "lane": { "state": "terminated" }
     });
     write_sidecar(&uncorroborated.to_string());
+    let heartbeat_path = state_dir.join("sessions/worker-dsh/coordination/heartbeat");
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let write_lane_heartbeat = || {
+        fs::write(&heartbeat_path, format!("{launch_id}:{now_epoch}")).expect("heartbeat");
+        fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
+            .expect("heartbeat mode");
+    };
+    write_lane_heartbeat();
     let refused_uncorroborated = run_resolved(
         "agent-session",
         &[
@@ -38925,14 +38940,19 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
     assert_ne!(
         refused_uncorroborated.code,
         0,
-        "a live harness leaves plugin-asserted termination unproven: {}",
+        "a lane that still holds coordination authority is not proven stopped: {}",
+        refused_uncorroborated.stdout_text()
+    );
+    assert_eq!(
+        refused_uncorroborated.stdout_json()["error"]["code"],
+        "coordination-runtime-unverified",
+        "outcome={}",
         refused_uncorroborated.stdout_text()
     );
 
     // A terminated lane whose harness is proven gone deletes — but only once
-    // its coordination heartbeat is gone too. The sidecar sits in a directory
-    // the lane's own worker can write, so a lane still holding coordination
-    // authority must not be able to terminalize its own record.
+    // its coordination heartbeat is gone too, which is the same rule read
+    // through the other witness.
     let terminated_sidecar = json!({
         "schema_version": "main-agent.dsh-runtime-liveness.v1",
         "launch_id": launch_id,
@@ -38940,14 +38960,7 @@ fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux
         "lane": { "state": "terminated" }
     });
     write_sidecar(&terminated_sidecar.to_string());
-    let heartbeat_path = state_dir.join("sessions/worker-dsh/coordination/heartbeat");
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("epoch")
-        .as_secs();
-    fs::write(&heartbeat_path, format!("{launch_id}:{now_epoch}")).expect("heartbeat");
-    fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
-        .expect("heartbeat mode");
+    write_lane_heartbeat();
     let refused_live_heartbeat = run_resolved(
         "agent-session",
         &[
