@@ -3910,7 +3910,7 @@ fn run_worker_start_single_input(
     let (worker_record, mut worker_status, mut launch_observation) = if let Some(worker) = existing
     {
         ensure_worker_launch_matches(context, &worker, &launch_input, &replay_prompts)?;
-        let status = session_status(&resolve_tmux_bin(None), &worker);
+        let status = session_status(context, &resolve_tmux_bin(None), &worker);
         (worker, status, None)
     } else {
         let mut create_guard = || {
@@ -4785,7 +4785,8 @@ fn run_worker_start_single_input(
                         Some(&expected_worker),
                     )?;
                     locked.save()?;
-                    worker_status = session_status(&resolve_tmux_bin(None), &worker_record);
+                    worker_status =
+                        session_status(context, &resolve_tmux_bin(None), &worker_record);
                     Ok(CanaryReplayAction::Continue)
                 }
                 Err(error) if error.code() == "managed-worker-prompt-delivery-outcome-unknown" => {
@@ -9418,7 +9419,9 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
                 Some(turn_state) if turn_state.phase != crate::activity::TurnPhase::Unknown => {
                     DiagnosticEvidence::Present(turn_state)
                 }
-                _ => match crate::dsh_external::external_lane_disposition(record) {
+                _ => match crate::dsh_external::external_lane_disposition_with_broker(
+                    context, record,
+                ) {
                     crate::dsh_external::ExternalLaneDisposition::NeverAttached => {
                         DiagnosticEvidence::Absent("worker-lane-never-attached")
                     }
@@ -9497,7 +9500,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     };
     let worker_status = session_evidence
         .value()
-        .map(|record| session_status(&resolve_tmux_bin(None), record))
+        .map(|record| session_status(context, &resolve_tmux_bin(None), record))
         .unwrap_or_else(|| "missing".to_string());
     let claim_active = coordination_evidence
         .value()
@@ -9688,6 +9691,9 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
     let preclaim_blocker = assignment_has_preclaim_blocker(&assignment);
     let terminal_recovery_reconciled =
         terminal_recovery_recorded && worker_status == "stopped" && assignment.worker.is_some();
+    // `NeverAttached` is decided by the absence of a sidecar alone, so the
+    // broker witness cannot change this answer; the context-free reader is the
+    // exact question being asked.
     let runtime_never_attached = session_evidence.value().is_some_and(|record| {
         crate::dsh_external::is_external_record(record)
             && crate::dsh_external::external_lane_disposition(record)
@@ -12201,7 +12207,7 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
                 );
             if (runtime_evidence.status != crate::CoordinationRuntimeStatus::Stopped
                 && !exact_failed_canary_quiescent)
-                || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+                || session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped"
             {
                 return Err(CliError::data(
                     "worker-runtime-still-live",
@@ -12605,7 +12611,7 @@ fn run_worker_reconcile_stopped(
                 ));
             }
         }
-        if session_status(&resolve_tmux_bin(None), &worker_record) != "stopped" {
+        if session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped" {
             return Err(CliError::data(
                 "worker-runtime-still-live",
                 "the assignment cannot be terminalized while the exact worker runtime can still act",
@@ -12801,7 +12807,7 @@ fn run_worker_reconcile_stopped(
         }
     }
     if runtime_evidence.identity_digest != progress.runtime_identity_digest
-        || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+        || session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped"
     {
         return Err(CliError::data(
             "worker-runtime-still-live",
@@ -14135,7 +14141,7 @@ fn run_worker_provider_stop_canary(
         current_provider_stop_canary_live_evidence(context, &worker_record, &assignment, &packet)?
     };
     if !release_replay_stopped
-        && session_status(&resolve_tmux_bin(None), &worker_record) != "running"
+        && session_status(context, &resolve_tmux_bin(None), &worker_record) != "running"
     {
         return Err(CliError::data(
             "provider-stop-canary-wrapper-not-live",
@@ -14505,7 +14511,7 @@ fn run_worker_provider_stop_canary(
         if release {
             let runtime = crate::coordination_runtime_evidence(&worker_record)?;
             if runtime.status == crate::CoordinationRuntimeStatus::Stopped
-                && session_status(&resolve_tmux_bin(None), &worker_record) == "stopped"
+                && session_status(context, &resolve_tmux_bin(None), &worker_record) == "stopped"
             {
                 break;
             }
@@ -14516,7 +14522,8 @@ fn run_worker_provider_stop_canary(
             &reservation.idempotency_key,
             reservation.child_pid,
             reservation.child_start_ticks,
-        )? && session_status(&resolve_tmux_bin(None), &worker_record) == "running"
+        )? && session_status(context, &resolve_tmux_bin(None), &worker_record)
+            == "running"
         {
             crate::record_provider_stop_canary_proof(
                 context,
@@ -15098,7 +15105,7 @@ fn run_worker_stop_claimed_runtime(
     let _activity_lock =
         crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
     let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
-    let tmux_status = session_status(&resolve_tmux_bin(None), &worker_record);
+    let tmux_status = session_status(context, &resolve_tmux_bin(None), &worker_record);
     // An interrupted stop can leave a stale tmux wrapper visible after the
     // exact recorded process identity is durably stopped. The receipt plus the
     // session-owned fence makes that state attributable to this operation, so
@@ -15670,7 +15677,7 @@ fn ensure_external_lane_deletable(
     let Some((record, incarnation)) = external_lane_worker_record(context, assignment_id)? else {
         return Ok(());
     };
-    match crate::dsh_external::external_lane_disposition(&record) {
+    match crate::dsh_external::external_lane_disposition_with_broker(context, &record) {
         crate::dsh_external::ExternalLaneDisposition::NeverAttached
         | crate::dsh_external::ExternalLaneDisposition::ProvenStopped
             if crate::dsh_external::external_lane_terminal_is_proven(
@@ -15937,7 +15944,7 @@ fn run_worker_stop_runtime(
         ));
     }
     let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
-    let tmux_status = session_status(&resolve_tmux_bin(None), &worker_record);
+    let tmux_status = session_status(context, &resolve_tmux_bin(None), &worker_record);
     let runtime_ready = if resumed {
         matches!(
             runtime_evidence.status,
@@ -16645,7 +16652,7 @@ fn run_worker_reconcile_recovery(
             ));
         }
     }
-    if session_status(&resolve_tmux_bin(None), &worker_record) != "stopped" {
+    if session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped" {
         return Err(CliError::data(
             "submit-recovery-runtime-still-live",
             "recovery cannot be terminalized while the exact worker runtime can still act",
@@ -19520,7 +19527,7 @@ fn verify_worker_reenter_runtime(
     }
     if worker_record.agent != AgentKind::Codex.as_str()
         || worker_record.coordination_mode == CoordinationMode::Off
-        || session_status(&resolve_tmux_bin(None), &worker_record) != "running"
+        || session_status(context, &resolve_tmux_bin(None), &worker_record) != "running"
     {
         return Err(CliError::data(
             "worker-reentry-runtime-not-ready",
@@ -20750,7 +20757,7 @@ fn prepare_orphan_provider_stop_canary_adoption(
     }
     let runtime = crate::coordination_runtime_evidence(&worker_record)?;
     if runtime.status != crate::CoordinationRuntimeStatus::Stopped
-        || session_status(&resolve_tmux_bin(None), &worker_record) != "stopped"
+        || session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped"
     {
         return Err(CliError::unavailable(
             "provider-stop-canary-orphan-not-quiescent",
