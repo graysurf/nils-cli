@@ -140,7 +140,7 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     crate::orchestration::ensure_session_not_quarantined(context, record)?;
     prepare(context, record)?;
     let incarnation = incarnation(record)?;
-    let runtime = crate::coordination_runtime_evidence(record).ok();
+    let runtime = crate::coordination_runtime_evidence(context, record).ok();
     let generation = record
         .runtime
         .as_ref()
@@ -342,7 +342,7 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
 
 pub(crate) fn activate_ready(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
     let incarnation = incarnation(record)?;
-    let _runtime = crate::coordination_runtime_evidence(record)?;
+    let _runtime = crate::coordination_runtime_evidence(context, record)?;
     let started = Instant::now();
     while !heartbeat_fresh(context, &record.id, &incarnation, 0) {
         if started.elapsed() >= Duration::from_secs(2) {
@@ -782,7 +782,7 @@ pub(crate) fn recover(
             ));
         }
     }
-    let runtime = crate::coordination_runtime_evidence(&record)?;
+    let runtime = crate::coordination_runtime_evidence(context, &record)?;
     if runtime.status != crate::CoordinationRuntimeStatus::Running {
         return Err(CliError::runtime(
             "coordination-runtime-unverified",
@@ -893,7 +893,7 @@ pub(crate) fn recover(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let runtime = crate::coordination_runtime_evidence(&record)?;
+    let runtime = crate::coordination_runtime_evidence(context, &record)?;
     if runtime.status != crate::CoordinationRuntimeStatus::Running
         || runtime.identity_digest != broker_snapshot.runtime_identity_digest
     {
@@ -1064,7 +1064,7 @@ pub(crate) fn run_heartbeat_sidecar(
             break;
         }
         established_owner = true;
-        match crate::coordination_runtime_evidence(&record) {
+        match crate::coordination_runtime_evidence(context, &record) {
             Ok(runtime) if runtime.status == crate::CoordinationRuntimeStatus::Running => {}
             Ok(runtime)
                 if runtime.status == crate::CoordinationRuntimeStatus::Stopped

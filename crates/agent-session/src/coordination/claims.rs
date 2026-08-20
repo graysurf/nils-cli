@@ -1276,7 +1276,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             None,
         ));
     }
-    let runtime = crate::coordination_runtime_evidence(&record)?;
+    let runtime = crate::coordination_runtime_evidence(context, &record)?;
     if runtime.status != crate::CoordinationRuntimeStatus::Running {
         return Err(CliError::runtime(
             "coordination-unavailable",
@@ -1653,7 +1653,7 @@ pub(crate) fn reconcile(
     ) {
         return Err(revision_conflict("operation-revision-conflict"));
     }
-    let runtime = crate::coordination_runtime_evidence(&record)?;
+    let runtime = crate::coordination_runtime_evidence(context, &record)?;
     if runtime.identity_digest != lease_snapshot.runtime_identity_digest
         || runtime.status == crate::CoordinationRuntimeStatus::Unknown
     {
@@ -2388,7 +2388,7 @@ pub(crate) fn operator_reconcile_evidence(
     record: &crate::SessionRecord,
     snapshot: &OperationLease,
 ) -> Result<OperatorReconcileEvidence, CliError> {
-    let runtime = crate::coordination_runtime_evidence(record)?;
+    let runtime = crate::coordination_runtime_evidence(context, record)?;
     let activity = crate::activity::state_for_view(context, record);
     Ok(OperatorReconcileEvidence {
         runtime_identity_matches: !snapshot.runtime_identity_digest.is_empty()

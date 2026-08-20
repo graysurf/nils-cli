@@ -2577,7 +2577,7 @@ fn lock_registry_with_maintenance(
                 continue;
             };
             let runtime_matches =
-                crate::coordination_runtime_evidence(&record).is_ok_and(|runtime| {
+                crate::coordination_runtime_evidence(context, &record).is_ok_and(|runtime| {
                     runtime.status == crate::CoordinationRuntimeStatus::Running
                         && runtime.identity_digest == lease.runtime_identity_digest
                 });

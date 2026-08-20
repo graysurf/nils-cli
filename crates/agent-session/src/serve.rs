@@ -23855,7 +23855,7 @@ exit 0
             .insert("delete_tmux_identity".to_string(), stopped_runtime);
         crate::write_session_record(&state.context, &alpha).expect("stopped runtime identity");
         let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
-        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&state.context, &alpha)
             .expect("runtime evidence")
             .identity_digest;
         let _session_capability = provision_ready_coordination_fixture(&state.context, &alpha);
@@ -24297,7 +24297,7 @@ exit 0
         assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
         assert_eq!(rejected["error"]["code"], "activity-revision-conflict");
 
-        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&state.context, &alpha)
             .expect("runtime evidence")
             .identity_digest;
         let mut registry: Value =
@@ -24977,7 +24977,7 @@ exit 0
         );
         crate::write_session_record(&state.context, &alpha).expect("stopped runtime identity");
         let generation = alpha.runtime.as_ref().expect("alpha runtime").generation;
-        let runtime_identity_digest = crate::coordination_runtime_evidence(&alpha)
+        let runtime_identity_digest = crate::coordination_runtime_evidence(&state.context, &alpha)
             .expect("runtime evidence")
             .identity_digest;
         provision_ready_coordination_fixture(&state.context, &alpha);

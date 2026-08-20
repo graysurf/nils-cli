@@ -2200,7 +2200,7 @@ fn run_controller_recover(
             None,
         ));
     }
-    let mut runtime = crate::coordination_runtime_evidence(&record)?;
+    let mut runtime = crate::coordination_runtime_evidence(context, &record)?;
     #[cfg(debug_assertions)]
     match env::var("NILS_AGENT_SESSION_TEST_CONTROLLER_RUNTIME_STATUS").as_deref() {
         Ok("stopped") => runtime.status = crate::CoordinationRuntimeStatus::Stopped,
@@ -2765,7 +2765,7 @@ fn await_worker_start_bootstrap_handshake(
     };
     let runtime_identity_digest = format!(
         "sha256:{}",
-        crate::coordination_runtime_evidence(record)?.identity_digest
+        crate::coordination_runtime_evidence(context, record)?.identity_digest
     );
     let quarantine_matches = orchestration::session_authority_quarantine_matches(
         context,
@@ -3972,7 +3972,7 @@ fn run_worker_start_single_input(
                 let expected_worker = session_ref(context, worker, worker_incarnation);
                 let runtime_identity_digest = format!(
                     "sha256:{}",
-                    crate::coordination_runtime_evidence(worker)?.identity_digest
+                    crate::coordination_runtime_evidence(context, worker)?.identity_digest
                 );
                 orchestration::persist_session_authority_quarantine(
                     context,
@@ -4965,7 +4965,7 @@ fn run_worker_start_single_input(
                 pause_canary_authority_release_for_test()?;
                 let runtime_identity_digest = format!(
                     "sha256:{}",
-                    crate::coordination_runtime_evidence(&worker_record)?.identity_digest
+                    crate::coordination_runtime_evidence(context, &worker_record)?.identity_digest
                 );
                 if let Err(error) = orchestration::clear_matching_session_authority_quarantine(
                     context,
@@ -5472,7 +5472,7 @@ fn finish_retained_worker_start_fence_for_outcome(
         }
         let runtime_identity_digest = format!(
             "sha256:{}",
-            crate::coordination_runtime_evidence(&worker_record)?.identity_digest
+            crate::coordination_runtime_evidence(context, &worker_record)?.identity_digest
         );
         orchestration::clear_matching_session_authority_quarantine(
             context,
@@ -9668,7 +9668,7 @@ fn diagnose_worker(context: &CliContext, assignment_id: &str) -> Result<Value, C
         assignment.worker.is_some() && matches!(&session_evidence, DiagnosticEvidence::Absent(_));
     let durable_runtime_status = session_evidence
         .value()
-        .and_then(|record| crate::coordination_runtime_evidence(record).ok())
+        .and_then(|record| crate::coordination_runtime_evidence(context, record).ok())
         .map(|evidence| evidence.status);
     let stopped_runtime_unverified = !cfg!(target_os = "linux")
         && assignment.worker.is_some()
@@ -12199,7 +12199,7 @@ fn run_worker_cancel(context: &CliContext, args: WorkerCancelArgs) -> Result<Val
                 ));
             }
         } else {
-            let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+            let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
             let exact_failed_canary_quiescent = preclaim_runtime_gone
                 && crate::provider_stop_canary_failed_startup_runtime_quiescent(
                     &worker_record,
@@ -12593,7 +12593,7 @@ fn run_worker_reconcile_stopped(
                 None,
             ));
         }
-        let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+        let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
         match runtime_evidence.status {
             crate::CoordinationRuntimeStatus::Stopped => {}
             crate::CoordinationRuntimeStatus::Running => {
@@ -12788,7 +12788,7 @@ fn run_worker_reconcile_stopped(
             None,
         ));
     }
-    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     match runtime_evidence.status {
         crate::CoordinationRuntimeStatus::Stopped => {}
         crate::CoordinationRuntimeStatus::Running => {
@@ -13155,7 +13155,7 @@ fn current_authoritative_idle_live_evidence(
             None,
         )
     })?;
-    let runtime_evidence = crate::coordination_runtime_evidence(worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, worker_record)?;
     match runtime_evidence.status {
         crate::CoordinationRuntimeStatus::Running => {
             Ok((activity.revision, runtime_evidence.identity_digest))
@@ -13255,7 +13255,7 @@ fn current_provider_stop_canary_live_evidence(
             None,
         )
     })?;
-    let runtime_evidence = crate::coordination_runtime_evidence(worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, worker_record)?;
     match runtime_evidence.status {
         crate::CoordinationRuntimeStatus::Running => {
             Ok((activity.revision, runtime_evidence.identity_digest))
@@ -14115,7 +14115,7 @@ fn run_worker_provider_stop_canary(
                 && reservation.release_idempotency_key.as_deref()
                     == Some(args.idempotency_key.as_str())
         })
-        && crate::coordination_runtime_evidence(&worker_record)?.status
+        && crate::coordination_runtime_evidence(context, &worker_record)?.status
             == crate::CoordinationRuntimeStatus::Stopped;
     let (activity_revision, runtime_identity_digest) = if release {
         let reservation = assignment_reservation.as_ref().ok_or_else(|| {
@@ -14125,7 +14125,7 @@ fn run_worker_provider_stop_canary(
                 None,
             )
         })?;
-        let evidence = crate::coordination_runtime_evidence(&worker_record)?;
+        let evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
         if !release_replay_stopped && evidence.status != crate::CoordinationRuntimeStatus::Running {
             return Err(CliError::data(
                 "provider-stop-canary-wrapper-not-live",
@@ -14509,7 +14509,7 @@ fn run_worker_provider_stop_canary(
     let deadline = Instant::now() + provider_stop_canary_transition_timeout();
     loop {
         if release {
-            let runtime = crate::coordination_runtime_evidence(&worker_record)?;
+            let runtime = crate::coordination_runtime_evidence(context, &worker_record)?;
             if runtime.status == crate::CoordinationRuntimeStatus::Stopped
                 && session_status(context, &resolve_tmux_bin(None), &worker_record) == "stopped"
             {
@@ -15104,7 +15104,7 @@ fn run_worker_stop_claimed_runtime(
     }
     let _activity_lock =
         crate::activity::acquire_coordination_activity_lock(context, &worker_record.id)?;
-    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     let tmux_status = session_status(context, &resolve_tmux_bin(None), &worker_record);
     // An interrupted stop can leave a stale tmux wrapper visible after the
     // exact recorded process identity is durably stopped. The receipt plus the
@@ -15358,7 +15358,7 @@ fn run_worker_stop_claimed_runtime(
         }
         crate::stop_session_runtime_locked(context, &mut worker_record, &resolve_tmux_bin(None))?;
     }
-    let stopped_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let stopped_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     if stopped_evidence.status != crate::CoordinationRuntimeStatus::Stopped {
         return Err(CliError::runtime(
             "coordination-runtime-unverified",
@@ -15943,7 +15943,7 @@ fn run_worker_stop_runtime(
             None,
         ));
     }
-    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     let tmux_status = session_status(context, &resolve_tmux_bin(None), &worker_record);
     let runtime_ready = if resumed {
         matches!(
@@ -16110,7 +16110,7 @@ fn run_worker_stop_runtime(
     pause_worker_runtime_stop_for_test("after_authority_seal")?;
 
     crate::stop_session_runtime_locked(context, &mut worker_record, &resolve_tmux_bin(None))?;
-    let stopped_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let stopped_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     if stopped_evidence.status != crate::CoordinationRuntimeStatus::Stopped {
         return Err(CliError::runtime(
             "coordination-runtime-unverified",
@@ -16634,7 +16634,7 @@ fn run_worker_reconcile_recovery(
             None,
         ));
     }
-    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     match runtime_evidence.status {
         crate::CoordinationRuntimeStatus::Stopped => {}
         crate::CoordinationRuntimeStatus::Running => {
@@ -20755,7 +20755,7 @@ fn prepare_orphan_provider_stop_canary_adoption(
             None,
         ));
     }
-    let runtime = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime = crate::coordination_runtime_evidence(context, &worker_record)?;
     if runtime.status != crate::CoordinationRuntimeStatus::Stopped
         || session_status(context, &resolve_tmux_bin(None), &worker_record) != "stopped"
     {
@@ -20820,7 +20820,7 @@ fn recover_missing_claim_revocation_quarantine_for_adopt(
             })),
         ));
     }
-    let runtime_evidence = crate::coordination_runtime_evidence(&worker_record)?;
+    let runtime_evidence = crate::coordination_runtime_evidence(context, &worker_record)?;
     if runtime_evidence.status != crate::CoordinationRuntimeStatus::Running
         || runtime_evidence.identity_digest != progress.runtime_identity_digest
     {
