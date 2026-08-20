@@ -870,6 +870,10 @@ mod tests {
 
     /// Write the lane's broker heartbeat with a current epoch, the way the
     /// lane's own heartbeat process does while it holds authority.
+    ///
+    /// Gated with its only caller: proving a *live* harness needs the Linux
+    /// starttime pin, so the corroboration test cannot run anywhere else.
+    #[cfg(target_os = "linux")]
     fn write_lane_heartbeat(context: &CliContext, record: &SessionRecord, incarnation: &str) {
         let path =
             nils_common::coordination_projection::heartbeat_path(&context.state_dir, &record.id);
