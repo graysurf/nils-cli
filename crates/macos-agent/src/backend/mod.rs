@@ -1544,7 +1544,7 @@ fn plist_string(dictionary: roxmltree::Node<'_, '_>, key: &str) -> Option<String
         .children()
         .filter(roxmltree::Node::is_element)
         .collect::<Vec<_>>();
-    let mut matches = elements.chunks_exact(2).filter_map(|pair| {
+    let mut matches = elements.as_chunks::<2>().0.iter().filter_map(|pair| {
         (pair[0].has_tag_name("key")
             && pair[0].text() == Some(key)
             && pair[1].has_tag_name("string"))

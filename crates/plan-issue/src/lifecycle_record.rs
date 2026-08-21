@@ -1646,7 +1646,7 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(input.len() / 2);
     let bytes = input.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_value(pair[0])
             .ok_or_else(|| format!("invalid hex digit `{}`", char::from(pair[0])))?;
         let lo = hex_value(pair[1])

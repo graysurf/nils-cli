@@ -1242,7 +1242,9 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, ForgeError> {
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).expect("ASCII checked");
             u8::from_str_radix(pair, 16).map_err(|error| {
