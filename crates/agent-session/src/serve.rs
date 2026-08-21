@@ -15641,20 +15641,22 @@ esac
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
-        let (status, body) = call(
-            router(st.clone()),
-            post_json(
-                "/sessions",
-                Some(TOKEN),
-                json!({
-                    "agent": "hermes",
-                    "provider_resume_id": "external-id"
-                }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "unsupported-provider-resume-agent");
+        for agent in ["hermes", "dsh"] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json(
+                    "/sessions",
+                    Some(TOKEN),
+                    json!({
+                        "agent": agent,
+                        "provider_resume_id": "external-id"
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "unsupported-provider-resume-agent");
+        }
     }
 
     #[tokio::test]

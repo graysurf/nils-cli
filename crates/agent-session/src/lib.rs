@@ -630,6 +630,13 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
 }
 
 fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result<Value, CliError> {
+    if args.agent == AgentKind::Dsh {
+        return Err(CliError::usage(
+            "unsupported-activity-agent",
+            "dsh lifecycle state is owned by the external dsh-runtime-kit runtime; there is no provider activity configuration to manage",
+            Some(json!({ "agent": args.agent.as_str() })),
+        ));
+    }
     let explicit_binary = std::env::var_os("AGENT_HOOK_BIN");
     let binary = explicit_binary
         .clone()
