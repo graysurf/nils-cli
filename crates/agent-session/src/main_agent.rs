@@ -4901,26 +4901,8 @@ fn run_worker_start_single_input(
             Some(&expected_worker),
             launch_input.provider_stop_canary.is_some(),
         )?;
-        let current = locked
-            .registry
-            .assignments
-            .get_mut(&assignment_id)
-            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
-        if current.state != "starting"
-            || !((current.revision == 1 && current.worker.is_none())
-                || (current.revision == 2 && current.worker.as_ref() == Some(&expected_worker)))
-        {
-            return Err(CliError::data(
-                "assignment-start-conflict",
-                "assignment changed while the worker was starting",
-                Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
-            ));
-        }
-        if current.revision == 1 {
-            current.worker = Some(expected_worker.clone());
-            current.revision = 2;
-            current.updated_at = timestamp();
-        }
+        let current =
+            attach_starting_worker_locked(&mut locked.registry, &assignment_id, &expected_worker)?;
         let outcome = json!({
             "schema_version": "main-agent.worker-start-result.v1",
             "assignment": public_assignment_view(current),
@@ -5093,6 +5075,42 @@ fn finish_external_worker_start(
     let worker_record = match existing {
         Some(worker) => {
             ensure_worker_launch_matches(context, &worker, launch_input, &replay_prompts)?;
+            let fence = crate::coordination::claims::acquire_main_agent_worker_start_fence(
+                context,
+                record,
+                incarnation,
+                worker_start_fence_key,
+            )?;
+            let validation = (|| {
+                let mut locked = orchestration::lock_registry(context)?;
+                if let Some(batch_lane) = batch_lane {
+                    renew_worker_start_batch_lane_locked(&mut locked.registry, batch_lane)?;
+                }
+                validate_worker_start_authority_locked(
+                    &locked.registry,
+                    record,
+                    incarnation,
+                    assignment_id,
+                    worker_session_id,
+                    expected_packet_digest,
+                    &args.idempotency_key,
+                    request_digest,
+                    legacy_request_digest,
+                    &launch_input.launch.cwd,
+                    None,
+                    None,
+                    false,
+                )?;
+                if batch_lane.is_some() {
+                    locked.save()?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                fence.finish(context, false)?;
+                return Err(error);
+            }
+            worker_start_fence = Some(fence);
             worker
         }
         None => {
@@ -5182,6 +5200,12 @@ fn finish_external_worker_start(
         }
         return Err(error);
     }
+    if let Err(error) = pause_batch_lane_for_test("before_external_worker_attachment") {
+        if let Some(fence) = worker_start_fence.take() {
+            fence.finish(context, false)?;
+        }
+        return Err(error);
+    }
     let expected_worker = session_ref(context, &worker_record, &launch_id);
     let attachment = (|| {
         ensure_active_claim(context, record)?;
@@ -5207,26 +5231,8 @@ fn finish_external_worker_start(
             Some(&expected_worker),
             false,
         )?;
-        let current = locked
-            .registry
-            .assignments
-            .get_mut(assignment_id)
-            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
-        if current.state != "starting"
-            || !((current.revision == 1 && current.worker.is_none())
-                || (current.revision == 2 && current.worker.as_ref() == Some(&expected_worker)))
-        {
-            return Err(CliError::data(
-                "assignment-start-conflict",
-                "assignment changed while the worker was starting",
-                Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
-            ));
-        }
-        if current.revision == 1 {
-            current.worker = Some(expected_worker.clone());
-            current.revision = 2;
-            current.updated_at = timestamp();
-        }
+        let current =
+            attach_starting_worker_locked(&mut locked.registry, assignment_id, &expected_worker)?;
         let outcome = json!({
             "schema_version": "main-agent.worker-start-result.v1",
             "assignment": public_assignment_view(current),
@@ -5278,6 +5284,33 @@ fn finish_external_worker_start(
             Err(error)
         }
     }
+}
+
+fn attach_starting_worker_locked<'a>(
+    registry: &'a mut orchestration::Registry,
+    assignment_id: &str,
+    expected_worker: &orchestration::SessionRef,
+) -> Result<&'a mut orchestration::AssignmentRecord, CliError> {
+    let current = registry
+        .assignments
+        .get_mut(assignment_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    if current.state != "starting"
+        || !((current.revision == 1 && current.worker.is_none())
+            || (current.revision == 2 && current.worker.as_ref() == Some(expected_worker)))
+    {
+        return Err(CliError::data(
+            "assignment-start-conflict",
+            "assignment changed while the worker was starting",
+            Some(json!({ "assignment_id": assignment_id, "revision": current.revision })),
+        ));
+    }
+    if current.revision == 1 {
+        current.worker = Some(expected_worker.clone());
+        current.revision = 2;
+        current.updated_at = timestamp();
+    }
+    Ok(current)
 }
 
 /// The plugin-facing launch contract for one dsh lane: the byte-stable

@@ -4081,6 +4081,7 @@ async fn wait_for_codex_control_within(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn wait_for_account_binding(
     state: &ServeState,
     id: &str,
@@ -4174,6 +4175,7 @@ pub(crate) fn structured_prompt_incarnation_conflict(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn load_structured_prompt_record_locked(
     state: &ServeState,
     id: &str,
@@ -4208,6 +4210,7 @@ async fn load_structured_prompt_record_locked(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn wait_for_structured_prompt_control(
     state: &ServeState,
     id: &str,
@@ -4228,6 +4231,7 @@ async fn wait_for_structured_prompt_control(
     ))
 }
 
+#[allow(clippy::result_large_err)]
 async fn submit_structured_prompt_locked(
     state: &ServeState,
     id: &str,
@@ -15641,20 +15645,22 @@ esac
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
-        let (status, body) = call(
-            router(st.clone()),
-            post_json(
-                "/sessions",
-                Some(TOKEN),
-                json!({
-                    "agent": "hermes",
-                    "provider_resume_id": "external-id"
-                }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "unsupported-provider-resume-agent");
+        for agent in ["hermes", "dsh"] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json(
+                    "/sessions",
+                    Some(TOKEN),
+                    json!({
+                        "agent": agent,
+                        "provider_resume_id": "external-id"
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "unsupported-provider-resume-agent");
+        }
     }
 
     #[tokio::test]

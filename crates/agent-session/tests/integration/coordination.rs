@@ -38406,6 +38406,526 @@ fn main_agent_quick_no_longer_requires_an_idempotency_key() {
 }
 
 #[test]
+fn dsh_tmux_owned_entrypoints_refuse_before_provider_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let checkout_arg = checkout.to_string_lossy().into_owned();
+
+    for (verb, extra, expected_code) in [
+        ("start", Vec::<&str>::new(), "unsupported-start-agent"),
+        (
+            "run",
+            vec!["--prompt", "do not launch"],
+            "unsupported-run-agent",
+        ),
+    ] {
+        let mut args = vec![
+            "--state-dir",
+            state_arg.as_str(),
+            verb,
+            "--agent",
+            "dsh",
+            "--cwd",
+            checkout_arg.as_str(),
+        ];
+        args.extend(extra);
+        args.extend(["--format", "json"]);
+        let refused = run(&checkout, &args);
+        assert_eq!(refused.code, 64, "outcome={}", refused.stdout_text());
+        assert_eq!(refused.stdout_json()["error"]["code"], expected_code);
+    }
+    assert!(
+        !state_dir.join("sessions").exists()
+            || fs::read_dir(state_dir.join("sessions"))
+                .expect("sessions dir")
+                .next()
+                .is_none(),
+        "managed start/run refusals must not create session records"
+    );
+
+    let provider_marker = tmp.path().join("provider-setup-invoked");
+    let fake_agent_hook = tmp.path().join("agent-hook");
+    fs::write(
+        &fake_agent_hook,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexit 1\n",
+            provider_marker.display()
+        ),
+    )
+    .expect("fake agent-hook");
+    fs::set_permissions(&fake_agent_hook, fs::Permissions::from_mode(0o700))
+        .expect("fake agent-hook mode");
+    let fake_agent_hook_arg = fake_agent_hook.to_string_lossy().into_owned();
+    let refused_setup = run_with_env(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "setup",
+            "--agent",
+            "dsh",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_HOOK_BIN", fake_agent_hook_arg.as_str())],
+    );
+    assert_eq!(
+        refused_setup.code,
+        64,
+        "outcome={}",
+        refused_setup.stdout_text()
+    );
+    assert_eq!(
+        refused_setup.stdout_json()["error"]["code"],
+        "unsupported-activity-agent"
+    );
+    assert!(
+        !provider_marker.exists(),
+        "the unsupported DSH activity setup must refuse before invoking a provider binary"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_dsh_replay_joins_the_pre_attachment_authority_fence() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let worktree = tmp.path().join("lane-worktree");
+    init_checkout(&worktree, "https://example.invalid/example/repository.git");
+    let assignment_path = tmp.path().join("assignment-dsh-fence-replay.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-dsh-fence-replay",
+            "task_summary": "Join the retained external worker start fence",
+            "task": {},
+            "launch": {
+                "agent": "dsh", "cwd": worktree, "title": null,
+                "session_id": "worker-dsh-fence-replay",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": worktree, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let barrier = tmp.path().join("dsh-fence-replay-barrier");
+    fs::create_dir(&barrier).expect("barrier");
+    let contender_ready = tmp.path().join("dsh-fence-contender-ready");
+    let make_command = |pause: bool| {
+        let mut command = Command::new(bin::resolve("main-agent"));
+        command
+            .current_dir(&checkout)
+            .args([
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "worker",
+                "start",
+                "--assignment-file",
+                assignment_path.to_str().expect("assignment path"),
+                "--await-ready",
+                "0",
+                "--idempotency-key",
+                "worker-start-dsh-fence-replay-0001",
+                "--format",
+                "json",
+            ])
+            .env("AGENT_SESSION_CAPABILITY_FILE", &main_capability)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if pause {
+            command
+                .env(
+                    "NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_STAGE",
+                    "before_external_worker_attachment",
+                )
+                .env("NILS_AGENT_SESSION_TEST_BATCH_LANE_BARRIER_DIR", &barrier);
+        } else {
+            command.env(
+                "NILS_AGENT_SESSION_TEST_FENCE_CONTENDER_READY",
+                &contender_ready,
+            );
+        }
+        command
+    };
+
+    let mut interrupted = make_command(true).spawn().expect("spawn interrupted start");
+    let barrier_deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("ready").is_file() {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "external start never reached durable pre-attachment state"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        state_dir.join("sessions/worker-dsh-fence-replay").is_dir(),
+        "the worker record is durable before the attachment"
+    );
+    let retained_registry = load_coordination_registry(&state_dir);
+    let retained_fences = retained_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|operation| operation["operation"] == "main-agent-worker-start")
+        .collect::<Vec<_>>();
+    assert_eq!(retained_fences.len(), 1);
+    let retained_lease_id = retained_fences[0]["lease_id"]
+        .as_str()
+        .expect("fence lease id")
+        .to_string();
+
+    let mut replay = make_command(false).spawn().expect("spawn exact replay");
+    let contender_deadline = Instant::now() + Duration::from_secs(10);
+    while !contender_ready.is_file() && replay.try_wait().expect("poll exact replay").is_none() {
+        assert!(
+            Instant::now() < contender_deadline,
+            "external replay neither joined the fence nor completed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        contender_ready.is_file(),
+        "an exact external replay must join the live pre-attachment fence"
+    );
+    assert!(
+        replay.try_wait().expect("poll joined replay").is_none(),
+        "the joined replay must wait for the current fence owner"
+    );
+
+    interrupted.kill().expect("interrupt first external start");
+    let interrupted = interrupted.wait().expect("wait interrupted external start");
+    assert!(!interrupted.success());
+    let output = replay.wait_with_output().expect("wait exact replay");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replayed_outcome: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("replayed outcome");
+    let terminal_replay = make_command(false)
+        .output()
+        .expect("terminal external replay");
+    assert!(terminal_replay.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&terminal_replay.stdout)
+            .expect("terminal replay outcome"),
+        replayed_outcome,
+        "a crash-converged external replay returns the identical launch payload"
+    );
+    let completed_registry = load_coordination_registry(&state_dir);
+    let completed_fences = completed_registry["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|operation| operation["operation"] == "main-agent-worker-start")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_fences.len(),
+        1,
+        "replay must reuse the retained fence"
+    );
+    assert_eq!(completed_fences[0]["lease_id"], retained_lease_id);
+    assert_eq!(completed_fences[0]["state"], "completed");
+    assert_eq!(
+        orchestration_registry(&state_dir)["assignments"]["assignment-dsh-fence-replay"]["worker"]
+            ["session_id"],
+        "worker-dsh-fence-replay"
+    );
+
+    let launch = &replayed_outcome["data"]["external_launch"];
+    let launch_id = launch["launch_id"].as_str().expect("launch id").to_string();
+    let worker_env = launch["worker_env"].as_object().expect("worker env");
+    let worker_capability = worker_env["AGENT_SESSION_CAPABILITY_FILE"]
+        .as_str()
+        .expect("worker capability")
+        .to_string();
+    let worker_checkpoint = worker_env["AGENT_SESSION_CHECKPOINT_FILE"]
+        .as_str()
+        .expect("worker checkpoint")
+        .to_string();
+    let liveness_file = launch["liveness_file"]
+        .as_str()
+        .expect("liveness file")
+        .to_string();
+    let liveness_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("liveness epoch")
+        .as_secs();
+    write_private_json(
+        Path::new(&liveness_file),
+        &json!({
+            "schema_version": "main-agent.dsh-runtime-liveness.v1",
+            "launch_id": launch_id,
+            "harness": harness_identity_json(),
+            "lane": { "state": "open" },
+            "turn": {
+                "phase": "working",
+                "phase_changed_at": liveness_epoch.to_string(),
+                "current_turn": { "started_at": liveness_epoch.to_string() },
+                "last_turn": null
+            },
+            "updated_at": liveness_epoch
+        }),
+    );
+    let heartbeat_argv = launch["broker_heartbeat_argv"]
+        .as_array()
+        .expect("heartbeat argv")
+        .iter()
+        .map(|value| value.as_str().expect("heartbeat arg").to_string())
+        .collect::<Vec<_>>();
+    let mut heartbeat = Command::new(&heartbeat_argv[0])
+        .args(&heartbeat_argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn emitted heartbeat argv");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = run(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "broker",
+                "status",
+                "--session",
+                "worker-dsh-fence-replay",
+                "--capability-file",
+                &worker_capability,
+                "--format",
+                "json",
+            ],
+        );
+        if status.code == 0 && data(&status)["state"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "the emitted heartbeat never activated the external broker: {}",
+            status.stdout_text()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        heartbeat.try_wait().expect("poll heartbeat").is_none(),
+        "the emitted heartbeat remains the live lane owner"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        let controller_claim = registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .iter_mut()
+            .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+            .expect("active controller claim");
+        controller_claim["repositories"] = json!([]);
+        controller_claim["scopes"] = json!([]);
+    });
+
+    let worker_envs = [
+        ("AGENT_SESSION_ID", "worker-dsh-fence-replay"),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", launch_id.as_str()),
+        ("AGENT_SESSION_CAPABILITY_FILE", worker_capability.as_str()),
+        ("AGENT_SESSION_CHECKPOINT_FILE", worker_checkpoint.as_str()),
+    ];
+    let bootstrap = run_main_agent(
+        &worktree,
+        &[
+            "--state-dir",
+            &state_arg,
+            "bootstrap",
+            "--idempotency-key",
+            "worker-bootstrap-dsh-fence-replay-0001",
+            "--format",
+            "json",
+        ],
+        &worker_envs,
+    );
+    assert_eq!(bootstrap.code, 0, "outcome={}", bootstrap.stdout_text());
+    assert_eq!(data(&bootstrap)["assignment"]["record"]["state"], "working");
+    assert_eq!(data(&bootstrap)["assignment"]["record"]["revision"], 3);
+    write_private_json(
+        Path::new(&worker_checkpoint),
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "External worker reached a fenced checkpoint",
+            "next_action": "Continue the bounded lane",
+            "state": "working",
+            "result_summary": null,
+            "blocker_summary": null
+        }),
+    );
+    let checkpoint = run_main_agent(
+        &worktree,
+        &[
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            &worker_checkpoint,
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "worker-checkpoint-dsh-fence-replay-0001",
+            "--format",
+            "json",
+        ],
+        &worker_envs,
+    );
+    assert_eq!(checkpoint.code, 0, "outcome={}", checkpoint.stdout_text());
+    assert_eq!(data(&checkpoint)["assignment"]["state"], "working");
+    assert_eq!(data(&checkpoint)["assignment"]["revision"], 4);
+
+    for verb in ["diagnose", "supervise"] {
+        let observed = run_main_agent(
+            &checkout,
+            &[
+                "--state-dir",
+                &state_arg,
+                "worker",
+                verb,
+                "assignment-dsh-fence-replay",
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str())],
+        );
+        assert_eq!(
+            observed.code,
+            0,
+            "{verb} must consume the live external evidence: {}",
+            observed.stdout_text()
+        );
+        if verb == "diagnose" {
+            assert_eq!(
+                data(&observed)["worker"]["status"],
+                "running",
+                "diagnosis must project the external runtime: {}",
+                observed.stdout_text()
+            );
+        }
+    }
+
+    let stop_argv = launch["broker_stop_argv"]
+        .as_array()
+        .expect("stop argv")
+        .iter()
+        .map(|value| value.as_str().expect("stop arg").to_string())
+        .collect::<Vec<_>>();
+    let stopped = Command::new(&stop_argv[0])
+        .args(&stop_argv[1..])
+        .output()
+        .expect("run emitted broker stop argv");
+    assert!(
+        stopped.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let heartbeat_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if heartbeat
+            .try_wait()
+            .expect("poll stopped heartbeat")
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= heartbeat_deadline {
+            heartbeat.kill().expect("kill stuck heartbeat fixture");
+            panic!("the emitted heartbeat did not stop after its broker was released");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let heartbeat_file = state_dir.join("sessions/worker-dsh-fence-replay/coordination/heartbeat");
+    if heartbeat_file.exists() {
+        fs::remove_file(&heartbeat_file).expect("release external lane heartbeat witness");
+    }
+    write_private_json(
+        Path::new(&liveness_file),
+        &json!({
+            "schema_version": "main-agent.dsh-runtime-liveness.v1",
+            "launch_id": launch_id,
+            "harness": harness_identity_json(),
+            "lane": { "state": "terminated" },
+            "updated_at": liveness_epoch + 1
+        }),
+    );
+    let reconciled = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "reconcile-stopped",
+            "assignment-dsh-fence-replay",
+            "--if-revision",
+            "4",
+            "--reason",
+            "external lane released its heartbeat",
+            "--idempotency-key",
+            "worker-reconcile-dsh-fence-replay-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", main_capability.as_str())],
+    );
+    assert_eq!(reconciled.code, 0, "outcome={}", reconciled.stdout_text());
+    assert_eq!(data(&reconciled)["assignment"]["state"], "cancelled");
+
+    let conflicting_worktree = tmp.path().join("conflicting-lane-worktree");
+    fs::create_dir(&conflicting_worktree).expect("conflicting lane worktree");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-dsh-fence-replay",
+            "task_summary": "Join the retained external worker start fence",
+            "task": {},
+            "launch": {
+                "agent": "dsh", "cwd": conflicting_worktree, "title": null,
+                "session_id": "worker-dsh-fence-replay",
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": conflicting_worktree,
+            "base_ref": "main", "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let conflict = make_command(false)
+        .output()
+        .expect("conflicting external replay");
+    assert!(!conflict.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&conflict.stdout)
+            .expect("conflicting replay error")["error"]["code"],
+        "idempotency-conflict"
+    );
+}
+
+#[test]
 fn main_agent_worker_start_dsh_returns_the_external_launch_contract_without_tmux() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

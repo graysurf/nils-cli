@@ -515,7 +515,7 @@ impl Sha256 {
         self.compress(&block);
 
         let mut out = [0u8; 32];
-        for (index, chunk) in out.chunks_exact_mut(4).enumerate() {
+        for (index, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             chunk.copy_from_slice(&self.state[index].to_be_bytes());
         }
         out

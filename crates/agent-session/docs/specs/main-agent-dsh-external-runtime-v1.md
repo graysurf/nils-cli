@@ -116,6 +116,14 @@ The dsh prompt is a fifth byte-stable replay variant alongside the four
 existing prompts; `ensure_worker_launch_matches` accepts it for replay
 matching exactly like the others.
 
+An exact replay that finds the external worker record but not the terminal
+worker-start receipt MUST acquire or join the original worker-start authority
+fence before committing the assignment attachment. The external and managed
+runtime arms share the same revision-1-to-2 attachment helper, so a crash after
+record creation cannot leave an unowned fence while another caller commits the
+attachment outside it. A conflicting replay is rejected by the existing
+request-digest/idempotency contract.
+
 ## Liveness sidecar — `main-agent.dsh-runtime-liveness.v1`
 
 Path: `<session dir>/dsh-runtime-liveness.json`, written and refreshed only by
@@ -238,6 +246,9 @@ lane needs. The classification table itself is not modified.
 - `worker stop-runtime`, `worker stop-claimed-runtime`: `dsh-runtime-plugin-owned`
   — the plugin interrupts the lane; `worker reconcile-stopped` then proceeds
   store-side unchanged once the sidecar proves the lane stopped.
+- `agent-session start`, `run`, provider-resume import, and `activity setup`
+  refuse before provider launch or configuration side effects; dsh sessions
+  and lifecycle configuration are external-runtime owned.
 - `agent-session resume`/provider resume surfaces: dsh sessions are not
   CLI-resumable (same typed-refusal pattern as Hermes).
 - `agent-session delete`, `maintenance` `remove-console-record`: an unproven

@@ -1901,7 +1901,9 @@ fn record_close_live_reuses_and_recovers_latest_semantic_closeout_without_repost
     assert_eq!(hex.len() % 2, 0, "payload carrier hex width");
     let payload_bytes = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             u8::from_str_radix(std::str::from_utf8(pair).expect("hex pair"), 16)
                 .expect("payload hex")
