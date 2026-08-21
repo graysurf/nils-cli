@@ -4081,6 +4081,7 @@ async fn wait_for_codex_control_within(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn wait_for_account_binding(
     state: &ServeState,
     id: &str,
@@ -4174,6 +4175,7 @@ pub(crate) fn structured_prompt_incarnation_conflict(
     )
 }
 
+#[allow(clippy::result_large_err)]
 async fn load_structured_prompt_record_locked(
     state: &ServeState,
     id: &str,
@@ -4208,6 +4210,7 @@ async fn load_structured_prompt_record_locked(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn wait_for_structured_prompt_control(
     state: &ServeState,
     id: &str,
@@ -4228,6 +4231,7 @@ async fn wait_for_structured_prompt_control(
     ))
 }
 
+#[allow(clippy::result_large_err)]
 async fn submit_structured_prompt_locked(
     state: &ServeState,
     id: &str,
