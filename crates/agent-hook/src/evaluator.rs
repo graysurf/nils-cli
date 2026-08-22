@@ -383,6 +383,11 @@ fn evaluate_with_io(
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
     let mut execution_budgets = ExecutionBudgets::new();
+    let activity_recovery_candidate = exact_capability_recovery_candidate_for_session_coordination(
+        request,
+        raw,
+        prepared.session_coordination.is_some(),
+    );
     let operation_effect = if prepared.rules.iter().any(|prepared_rule| {
         prepared_rule.mode == RuleMode::Enforce
             && (prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
@@ -500,6 +505,16 @@ fn evaluate_with_io(
             liveness.as_ref(),
         ) {
             Ok(outcome) => outcome,
+            Err(error)
+                if activity_recovery_candidate
+                    && matches!(rule.capability, Capability::SessionActivity { .. })
+                    && activity_recovery_failure_is_deferrable(&error) =>
+            {
+                simple(
+                    DecisionAction::Allow,
+                    "activity-recovery-deferred-to-coordination",
+                )
+            }
             Err(error) if error.code == "capability-timeout" => timeout_outcome(
                 loaded,
                 request,
@@ -525,6 +540,29 @@ fn evaluate_with_io(
         raw,
         prepared.session_coordination,
         CoordinationExecution::new(coordination_mode, operation_effect, coordination.unmanaged),
+    )
+}
+
+fn exact_capability_recovery_candidate_for_session_coordination(
+    request: &NormalizedRequest,
+    raw: &[u8],
+    has_session_coordination: bool,
+) -> bool {
+    has_session_coordination
+        && request.event == "PreToolUse"
+        && request.matcher.as_deref() == Some("Bash")
+        && crate::adapter::exact_main_agent_capability_recovery_command(raw)
+}
+
+fn activity_recovery_failure_is_deferrable(error: &HookError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "session-activity-failed"
+            | "capability-unavailable"
+            | "capability-timeout"
+            | "capability-wait-failed"
+            | "capability-input-failed"
+            | "capability-output-failed"
     )
 }
 

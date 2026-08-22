@@ -271,7 +271,15 @@ issue #676 transaction.
 
 `agent-session.activity.v1` emits only a normalized metadata event to
 `agent-session activity event`; it never forwards raw provider JSON. Shadow
-evaluation skips every side-effecting capability.
+evaluation skips every side-effecting capability. If that activity update is
+temporarily unavailable, only the finite, shell-uncomposed Main Agent
+rehydration, recovery, status, rebind, and bootstrap shapes may defer the
+activity failure to a selected locked `agent-session.coordination.v1`
+transaction. This deferral is shape evidence, not authority: the fixed
+coordination consumer must still authenticate the exact release, private
+capability, owner/claim state, and command, and any missing or failed consumer
+keeps the request fail-closed. Ordinary shell commands and near-miss recovery
+forms never receive this deferral.
 
 Recovery uses a private challenge/authorize/consume lifecycle. Capability
 files are exact, expiring, state-bound bearers. Each challenge binds a signed

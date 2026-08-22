@@ -118,6 +118,222 @@ capability = {{ id = "agent-session.coordination.v1", reason_code = "coordinatio
     )
 }
 
+fn activity_recovery_policy(include_coordination: bool) -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.08.22.1"
+
+[[rules]]
+id = "runtime.activity"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.activity.v1", reason_code = "activity-recorded" }}
+
+{coordination}
+"#,
+        coordination = if include_coordination {
+            r#"[[rules]]
+id = "runtime.coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 900
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }"#
+        } else {
+            ""
+        }
+    )
+}
+
+#[test]
+fn exact_recovery_reaches_authenticated_coordination_when_activity_is_stale() {
+    let fixture = Fixture::new(&activity_recovery_policy(true));
+    let activity = fixture.root.join("agent-session-stale-activity");
+    fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+    fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+        .expect("activity helper mode");
+    install_coordination_handler(&fixture);
+    let capture = fixture.root.join("recovery-coordination.json");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "recover-after-rehydrate",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "main-agent self recover --idempotency-key recover-12345678 --format json"
+        }
+    })
+    .to_string();
+    let recovered = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            (
+                "AGENT_SESSION_BIN",
+                activity.to_str().expect("activity path"),
+            ),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(
+        recovered.code,
+        0,
+        "exact recovery must reach the later authenticated coordination boundary: stdout={} stderr={}",
+        recovered.stdout_text(),
+        recovered.stderr_text()
+    );
+    assert_eq!(recovered.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][0]["code"],
+        "activity-recovery-deferred-to-coordination"
+    );
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][1]["code"],
+        "coordination-admitted"
+    );
+    assert_eq!(
+        fs::read_to_string(capture).expect("captured recovery request"),
+        payload
+    );
+}
+
+#[test]
+fn activity_recovery_degradation_requires_exact_shape_and_coordination() {
+    let commands = [
+        "pwd",
+        "main-agent self recover --idempotency-key short --format json",
+        "main-agent self recover --idempotency-key recover-12345678 --format json; pwd",
+    ];
+    for command in commands {
+        let fixture = Fixture::new(&activity_recovery_policy(true));
+        let activity = fixture.root.join("agent-session-stale-activity");
+        fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+        fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+            .expect("activity helper mode");
+        install_coordination_handler(&fixture);
+        let capture = fixture.root.join("rejected-coordination.json");
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "recovery-near-miss",
+            "cwd": fixture.root,
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let rejected = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                (
+                    "AGENT_SESSION_BIN",
+                    activity.to_str().expect("activity path"),
+                ),
+                ("AGENT_SESSION_ID", "trusted"),
+                ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+                ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+                (
+                    "COORDINATION_CAPTURE",
+                    capture.to_str().expect("capture path"),
+                ),
+            ],
+        );
+        assert_eq!(rejected.code, 1, "command={command}");
+        assert_eq!(rejected.stdout_json()["data"]["action"], "block");
+        assert_eq!(
+            rejected.stdout_json()["data"]["reasons"][0]["code"],
+            "runtime.activity:capability-failure-closed"
+        );
+        assert!(
+            !capture.exists(),
+            "near miss reached coordination: {command}"
+        );
+    }
+
+    let fixture = Fixture::new(&activity_recovery_policy(false));
+    let activity = fixture.root.join("agent-session-stale-activity");
+    fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+    fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+        .expect("activity helper mode");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "recovery-without-transaction",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "main-agent self recover --idempotency-key recover-12345678 --format json"
+        }
+    })
+    .to_string();
+    let rejected = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            (
+                "AGENT_SESSION_BIN",
+                activity.to_str().expect("activity path"),
+            ),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+        ],
+    );
+    assert_eq!(rejected.code, 1);
+    assert_eq!(
+        rejected.stdout_json()["data"]["reasons"][0]["code"],
+        "runtime.activity:capability-failure-closed"
+    );
+
+    let fixture = Fixture::new(&activity_recovery_policy(true));
+    let activity = fixture.root.join("agent-session-stale-activity");
+    fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+    fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+        .expect("activity helper mode");
+    install_coordination_handler_with(&fixture, "#!/bin/sh\nexit 70\n");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "recovery-with-failed-transaction",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "main-agent self recover --idempotency-key recover-12345678 --format json"
+        }
+    })
+    .to_string();
+    let rejected = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            (
+                "AGENT_SESSION_BIN",
+                activity.to_str().expect("activity path"),
+            ),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+        ],
+    );
+    assert_eq!(rejected.code, 1);
+    assert_eq!(rejected.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        rejected.stdout_json()["data"]["reasons"][1]["code"],
+        "runtime.coordination:capability-failure-closed"
+    );
+}
+
 fn install_foreign_owner(fixture: &Fixture) {
     install_session_mode(fixture, "enforce");
     let now = now_epoch();
