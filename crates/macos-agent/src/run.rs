@@ -19,7 +19,6 @@ pub fn command_label(cli: &Cli) -> &'static str {
         CommandGroup::Doctor(_) => "doctor",
         CommandGroup::Capabilities(_) => "capabilities",
         CommandGroup::Exec(_) => "exec",
-        CommandGroup::Scenario(_) => "scenario",
         CommandGroup::Mcp(_) => "mcp",
         CommandGroup::Journal { command } => match command {
             JournalCommand::Summarize(_) => "journal.summarize",
@@ -47,7 +46,7 @@ pub(crate) fn capability_report(strict: bool) -> Result<serde_json::Value, CliEr
     Ok(serde_json::json!({
         "backend": {"tag": lock.tag, "minimum_macos": lock.minimum_macos},
         "transport": ["local", "ssh"],
-        "interfaces": ["exec", "scenario", "mcp_stdio"],
+        "interfaces": ["exec", "mcp_stdio"],
         "runtime": ["app", "daemon", "auto", "process"],
         "tool_profiles": ["observe", "interact", "extended"],
         "disabled": crate::policy::disabled_capabilities(),
@@ -169,13 +168,6 @@ pub fn run(cli: Cli) -> Result<u8, CliError> {
                 return crate::transport::run_remote_exec(&args, cli.format);
             }
             let outcome = commands::exec::run_local(&args, None, "local")?;
-            emit_with_exit(cli.format, command, outcome.result, outcome.exit_code)
-        }
-        CommandGroup::Scenario(args) => {
-            if args.host.is_some() {
-                return crate::transport::run_remote_scenario(&args, cli.format);
-            }
-            let outcome = commands::scenario::run_local(&args, "local")?;
             emit_with_exit(cli.format, command, outcome.result, outcome.exit_code)
         }
         CommandGroup::Mcp(args) => {

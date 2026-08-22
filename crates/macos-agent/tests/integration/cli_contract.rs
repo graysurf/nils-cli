@@ -175,7 +175,7 @@ fn exec_preserves_upstream_json_and_writes_structural_journal() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     assert!(out.stderr.is_empty());
     let payload = out.stdout_json();
-    assert_eq!(payload["schema_version"], "macos-agent.adapter.v2");
+    assert_eq!(payload["schema_version"], "macos-agent.adapter.v3");
     assert_eq!(payload["command"], "exec");
     assert_eq!(payload["result"]["upstream"]["json"]["success"], true);
     for required in [

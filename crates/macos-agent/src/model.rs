@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::cli::{EvidenceMode, RuntimeMode};
 use crate::error::CliError;
 
-pub const ADAPTER_SCHEMA: &str = "macos-agent.adapter.v2";
+pub const ADAPTER_SCHEMA: &str = "macos-agent.adapter.v3";
 pub const ERROR_SCHEMA: &str = "macos-agent.error.v2";
 
 #[derive(Debug, Clone, Serialize)]

@@ -35,6 +35,8 @@ pub struct PeekabooLock {
     pub required_capability_probes: Vec<CapabilityProbe>,
     #[serde(default)]
     pub rollback_releases: Vec<RollbackReleaseLock>,
+    #[serde(default)]
+    pub upgrade_from_releases: Vec<RollbackReleaseLock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +150,17 @@ impl PeekabooLock {
             .find(|release| release.tag == tag && release.commit == commit)
     }
 
+    pub fn upgrade_from_release(&self, tag: &str, commit: &str) -> Option<&RollbackReleaseLock> {
+        self.upgrade_from_releases
+            .iter()
+            .find(|release| release.tag == tag && release.commit == commit)
+    }
+
+    pub fn transition_release(&self, tag: &str, commit: &str) -> Option<&RollbackReleaseLock> {
+        self.rollback_release(tag, commit)
+            .or_else(|| self.upgrade_from_release(tag, commit))
+    }
+
     fn validate(&self) -> Result<(), CliError> {
         if self.schema_version != 2 {
             return Err(lock_error("unsupported lock schema version"));
@@ -194,10 +207,19 @@ impl PeekabooLock {
             .iter()
             .map(|probe| probe.id.as_str())
             .collect::<BTreeSet<_>>();
-        let mandatory = BTreeSet::from(["bridge", "permissions", "tools", "version"]);
-        if !mandatory.is_subset(&probe_ids)
-            || probe_ids.len() != self.required_capability_probes.len()
-        {
+        let mandatory = BTreeSet::from([
+            "action",
+            "bridge",
+            "click",
+            "mcp_stdio",
+            "observation",
+            "permissions",
+            "press",
+            "tools",
+            "verification",
+            "version",
+        ]);
+        if probe_ids != mandatory || probe_ids.len() != self.required_capability_probes.len() {
             return Err(lock_error(
                 "lock must contain each mandatory capability probe exactly once",
             ));
@@ -213,6 +235,27 @@ impl PeekabooLock {
             {
                 return Err(lock_error(
                     "rollback release identity is malformed or duplicated",
+                ));
+            }
+            validate_assets(
+                &release.assets,
+                &self.repository,
+                &release.tag,
+                &release.commit,
+            )?;
+        }
+        let mut upgrade_tags = BTreeSet::new();
+        for release in &self.upgrade_from_releases {
+            if !release.tag.starts_with('v')
+                || release.commit.len() != 40
+                || !is_lower_hex(&release.commit)
+                || release.tag == self.tag
+                || release.minimum_macos != "15.0"
+                || !upgrade_tags.insert(release.tag.as_str())
+                || rollback_tags.contains(release.tag.as_str())
+            {
+                return Err(lock_error(
+                    "upgrade-from release identity is malformed, duplicated, or rollback-authorized",
                 ));
             }
             validate_assets(
@@ -368,29 +411,34 @@ mod tests {
     #[test]
     fn embedded_lock_is_complete_and_immutable() {
         let lock = PeekabooLock::embedded().expect("embedded lock");
-        assert_eq!(lock.tag, "v3.9.3");
+        assert_eq!(lock.tag, "v4.2.2");
         assert_eq!(lock.assets.len(), 2);
         assert_eq!(lock.cli_asset().architectures, ["arm64", "x86_64"]);
-        assert_eq!(lock.cli_asset().bridge_build, "3.9.3 (3.9.3)");
+        assert_eq!(lock.cli_asset().bridge_build, "4.2.2 (4.2.2)");
         assert_eq!(
             lock.cli_asset().notarization.policy,
-            NotarizationPolicy::Waived
+            NotarizationPolicy::Required
         );
         assert_eq!(
             lock.app_asset().notarization.policy,
             NotarizationPolicy::Required
         );
-        assert_eq!(lock.app_asset().bridge_build, "3.9.3 (3090399)");
+        assert_eq!(lock.app_asset().bridge_build, "4.2.2 (4020299)");
         assert_eq!(
             lock.app_asset().bundle_id.as_deref(),
             Some("boo.peekaboo.mac")
         );
+        assert!(lock.rollback_releases.is_empty());
+        assert!(
+            lock.upgrade_from_release("v3.9.3", "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269")
+                .is_some()
+        );
     }
 
     #[test]
-    fn exact_cli_notarization_waiver_is_fail_closed() {
+    fn transition_only_cli_notarization_waiver_is_fail_closed() {
         let mut mismatched = PeekabooLock::embedded().expect("embedded lock");
-        mismatched.assets[0]
+        mismatched.upgrade_from_releases[0].assets[0]
             .notarization
             .waiver
             .as_mut()
@@ -399,15 +447,18 @@ mod tests {
         assert!(mismatched.validate().is_err());
 
         let mut app_waiver = PeekabooLock::embedded().expect("embedded lock");
-        app_waiver.assets[1].notarization = app_waiver.assets[0].notarization.clone();
+        let cli_waiver = app_waiver.upgrade_from_releases[0].assets[0]
+            .notarization
+            .clone();
+        app_waiver.upgrade_from_releases[0].assets[1].notarization = cli_waiver;
         assert!(app_waiver.validate().is_err());
     }
 
     #[test]
-    fn exact_cli_notarization_waiver_rejects_coordinated_tuple_drift() {
+    fn transition_only_cli_notarization_waiver_rejects_coordinated_tuple_drift() {
         let mut archive = PeekabooLock::embedded().expect("embedded lock");
-        archive.assets[0].sha256 = "0".repeat(64);
-        archive.assets[0]
+        archive.upgrade_from_releases[0].assets[0].sha256 = "0".repeat(64);
+        archive.upgrade_from_releases[0].assets[0]
             .notarization
             .waiver
             .as_mut()
@@ -416,8 +467,8 @@ mod tests {
         assert!(archive.validate().is_err());
 
         let mut executable = PeekabooLock::embedded().expect("embedded lock");
-        executable.assets[0].executable_sha256 = "1".repeat(64);
-        executable.assets[0]
+        executable.upgrade_from_releases[0].assets[0].executable_sha256 = "1".repeat(64);
+        executable.upgrade_from_releases[0].assets[0]
             .notarization
             .waiver
             .as_mut()
@@ -426,8 +477,8 @@ mod tests {
         assert!(executable.validate().is_err());
 
         let mut authority = PeekabooLock::embedded().expect("embedded lock");
-        authority.assets[0].signing_authority = "Different signer".into();
-        authority.assets[0]
+        authority.upgrade_from_releases[0].assets[0].signing_authority = "Different signer".into();
+        authority.upgrade_from_releases[0].assets[0]
             .notarization
             .waiver
             .as_mut()
@@ -436,8 +487,8 @@ mod tests {
         assert!(authority.validate().is_err());
 
         let mut team = PeekabooLock::embedded().expect("embedded lock");
-        team.assets[0].team_id = "DIFFERENT".into();
-        team.assets[0]
+        team.upgrade_from_releases[0].assets[0].team_id = "DIFFERENT".into();
+        team.upgrade_from_releases[0].assets[0]
             .notarization
             .waiver
             .as_mut()
@@ -494,11 +545,11 @@ mod tests {
     fn bridge_builds_are_exact_tag_scoped_immutable_identities() {
         for unsafe_build in [
             "",
-            "3.9.2 (3090399)",
-            "3.9.3",
-            "3.9.3 ()",
-            "3.9.3 (build value)",
-            "3.9.3 (3090399) trailing",
+            "4.2.1 (4020199)",
+            "4.2.2",
+            "4.2.2 ()",
+            "4.2.2 (build value)",
+            "4.2.2 (4020299) trailing",
         ] {
             let mut lock = PeekabooLock::embedded().expect("embedded lock");
             lock.assets[0].bridge_build = unsafe_build.into();

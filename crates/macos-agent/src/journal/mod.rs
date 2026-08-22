@@ -758,11 +758,11 @@ fn classify_replay(
         return ReplayClass::Safe;
     }
     match command {
-        "see" | "list" | "inspect-ui" | "screenshot" | "sleep" | "tools" | "bridge" => {
+        "see" | "verify" | "list" | "inspect-ui" | "screenshot" | "sleep" | "tools" | "bridge" => {
             ReplayClass::Safe
         }
-        "click" | "press" | "hotkey" | "scroll" | "swipe" | "drag" | "move" | "set-value"
-        | "perform-action" | "window" | "app" | "menu" | "menubar"
+        "action" | "click" | "press" | "hotkey" | "scroll" | "swipe" | "drag" | "move"
+        | "set-value" | "perform-action" | "window" | "app" | "menu" | "menubar"
             if snapshot_lineage.is_some() =>
         {
             ReplayClass::Conditional
@@ -1067,7 +1067,6 @@ fn normalize_failure(value: &str) -> String {
         | "upstream"
         | "upstream_malformed_json"
         | "upstream_mcp"
-        | "upstream_scenario"
         | "upstream_signal"
         | "upstream_timeout"
         | "mcp_io"
@@ -1404,6 +1403,7 @@ mod tests {
     fn family_lists_are_safe_without_relaxing_family_mutations() {
         for argv in [
             vec![String::from("app"), String::from("list")],
+            vec![String::from("screen"), String::from("list")],
             vec![String::from("window"), String::from("list")],
         ] {
             assert_eq!(
@@ -1433,6 +1433,71 @@ mod tests {
                 ReplayClass::Conditional
             );
         }
+    }
+
+    #[test]
+    fn v4_verify_is_safe_and_action_requires_snapshot_bound_confirmation() {
+        let verify: Vec<String> = vec![
+            "verify".into(),
+            "--app".into(),
+            "Calculator".into(),
+            "--window-exists".into(),
+        ];
+        assert_eq!(
+            classify_replay(&verify[0], StepStatus::Passed, &verify, None),
+            ReplayClass::Safe
+        );
+
+        let action: Vec<String> = vec!["action".into(), "press".into(), "--on".into(), "B1".into()];
+        assert_eq!(
+            classify_replay(&action[0], StepStatus::Passed, &action, None),
+            ReplayClass::Never
+        );
+        assert_eq!(
+            classify_replay(&action[0], StepStatus::Passed, &action, Some("snapshot-v4")),
+            ReplayClass::Conditional
+        );
+
+        let root = TempDir::new().expect("root");
+        let mut journal = open(root.path(), EvidenceMode::Minimal);
+        let step = journal
+            .record_step(StepInput {
+                parent_id: None,
+                intent: Some("bounded v4 action".into()),
+                expected: Some("button changes".into()),
+                argv: action,
+                status: StepStatus::Passed,
+                failure_class: None,
+                duration_ms: 1,
+                retries: 0,
+                precondition_refs: vec!["snapshot-v4".into()],
+                postcondition_refs: vec!["assertion-v4".into()],
+                snapshot_lineage: Some("snapshot-v4".into()),
+                artifact_refs: vec![],
+            })
+            .expect("step");
+        journal.close().expect("close");
+        assert!(prepare_replay(root.path(), &step.id, false, None, None).is_err());
+        assert!(
+            prepare_replay(
+                root.path(),
+                &step.id,
+                true,
+                Some("stale"),
+                Some("button changed")
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_replay(
+                root.path(),
+                &step.id,
+                true,
+                Some("snapshot-v4"),
+                Some("button changed")
+            )
+            .is_ok()
+        );
     }
 
     #[test]

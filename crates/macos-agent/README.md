@@ -2,7 +2,7 @@
 
 `macos-agent` is a guarded adapter around one immutable Peekaboo release. It
 does not contain a second macOS automation engine: Peekaboo owns observation,
-Accessibility actions, synthetic input, capture, scenarios, and stdio MCP.
+Accessibility actions, synthetic input, capture, and stdio MCP.
 The adapter owns supply-chain verification, local/SSH transport, policy,
 privacy-preserving journals, and guarded replay.
 
@@ -33,20 +33,23 @@ architecture, app metadata, and exact code-signing identities. Download,
 archive, architecture, signature, and Gatekeeper commands use fixed macOS
 system paths rather than caller-controlled `PATH` lookup. App Gatekeeper/notary
 assessment is mandatory during both install and execution verification;
-`--strict` additionally assesses standalone CLI notarization. Only the complete,
-machine-checked v3.9.3 standalone CLI tuple in the lock may continue after a
-normally completed failed notarization assessment; timeout or signal termination
-fails closed. Strict verification reports `notary=waived` and
-`security_posture=reduced`. There is no runtime bypass flag, and later releases
-require notarization unless a separately reviewed lock-schema change says
-otherwise. Lifecycle responses from install,
+`--strict` additionally assesses standalone CLI notarization. The current
+v4.2.2 CLI and app both require notarization and report
+`security_posture=full`.
+Timeout or signal termination always fails closed. There is no runtime bypass
+flag. Lifecycle responses from install,
 status, and rollback also expose `strict`, `cli_notarization_policy`, and
 `security_posture`; an accepted waiver is therefore never collapsed into an
 undifferentiated `verified=true` result. It atomically owns one stable app path.
 Rollback is permitted only
 when the exact prior tag, commit, assets, and executable digests are retained in
 the embedded `rollback_releases` allowlist; mutable receipts are never a trust
-root. A shared verified-backend lease, including the digest recorded in the
+root. The v4.2.2 lock intentionally authorizes no rollback release because the
+v3 command and capability surface cannot satisfy the v4 adapter contract. The
+exact v3.9.3 tuple is retained separately in `upgrade_from_releases` only to
+authenticate and retire an existing installation during an in-place upgrade;
+it can never become active again through rollback. A shared verified-backend
+lease, including the digest recorded in the
 journal, is held for the full lifetime of every execution. Install and rollback
 take the exclusive lifecycle lock, so verified code cannot be swapped between
 check and use. It will not replace an app it cannot prove it owns. It never
@@ -92,21 +95,26 @@ old build is still authorized by the embedded lock. `process` passes
 
 ## Migrating from the native engine
 
-The adapter v2 boundary begins with nils-cli v1.22.6. Existing callers must
-migrate as one breaking contract change; there are no compatibility aliases:
+The adapter v2 boundary began with nils-cli v1.22.6. The Peekaboo v4 migration
+publishes `macos-agent.adapter.v3` because it removes an interface and changes
+the admitted upstream surface. Existing callers must migrate as one breaking
+contract change; there are no compatibility aliases:
 
 - `preflight` → `doctor --strict` for permission, Bridge, runtime, and
   capability readiness.
 - `windows`, `apps`, `window`, `input`, `input-source`, and `ax` → `exec --
   <peekaboo argv>` with an observable `--expected` postcondition for mutations.
+- Peekaboo v3 `list screens` → the exact read-only v4 replacement `exec --
+  screen list`; other `screen` subcommands are not admitted.
 - `observe`, `debug`, `wait`, and `profile` have no adapter-level grammar.
   Use the corresponding reviewed Peekaboo argv through `exec`; structural
   evidence, debug redaction, and postcondition ownership now live in journal v2
   and the calling skill.
-- `scenario` now accepts reviewed Peekaboo scenario JSON through `--file`; the
-  former native scenario schema is not accepted.
+- Peekaboo v4 removed the `.peekaboo.json` runner, so `scenario` is no longer an
+  adapter interface. Chain individually reviewed `exec` calls in the caller;
+  `macos-agent` does not expose a shell fallback.
 - TSV output and the former global retry, timeout, and trace flags are removed.
-  Successful adapter envelopes use `macos-agent.adapter.v2`; upstream JSON is
+  Successful adapter envelopes use `macos-agent.adapter.v3`; upstream JSON is
   nested under `result.upstream`. Typed adapter failures remain on stderr and
   use the exit codes listed below.
 
@@ -129,31 +137,15 @@ Hard-disabled capabilities are published by `capabilities`: `agent`, `analyze`,
 `audio`, `browser`, `clipboard`, `config`, `credentials`, `image`, `mcp_agent`,
 `permission_mutation`, `shell`, HTTP MCP, and SSE MCP.
 
-## Scenarios
-
-Only a regular, non-symlink JSON file of at most 1 MiB is accepted. The adapter
-reads and validates it once, pre-scans disabled commands, hashes the validated
-bytes, and executes only a private mode-0600 staged copy. The caller's source
-is never modified or reopened for execution.
-
-```bash
-macos-agent scenario \
-  --out-dir "$run_dir" \
-  --file ./flow.peekaboo.json \
-  --runtime app \
-  --evidence-mode minimal
-```
-
 ## SSH transport
 
-Add `--host <trusted-alias>` to backend, doctor, capabilities, exec, scenario,
-or MCP commands. SSH uses batch authentication and a fixed remote command. A
+Add `--host <trusted-alias>` to backend, doctor, capabilities, exec, or MCP
+commands. SSH uses batch authentication and a fixed remote command. A
 versioned JSON request is sent over stdin; user argv is never interpolated into
-a shell command. Scenario inputs use digest-verified private staging. Only
-journal-core files and artifact-index-declared files are returned, with path,
-count, size, and SHA256 checks. Remote session cleanup is audited on success,
-failure, timeout, and transfer failure. Host/user/key/config values are not
-persisted or echoed.
+a shell command. Only journal-core files and artifact-index-declared files are
+returned, with path, count, size, and SHA256 checks. Remote session cleanup is
+audited on success, failure, timeout, and transfer failure. Host/user/key/config
+values are not persisted or echoed.
 
 ```bash
 ssh_run_dir="$(agent-out project --topic calculator-inspect-ssh --mkdir)"
@@ -183,9 +175,9 @@ memory or holding a session indefinitely. SSH carries a bounded typed terminal
 status outside protocol stdout, preserving upstream exit class 70 while
 reserving 75 for transport failures. Profiles are monotonic:
 
-- `observe`: `see`, `inspect_ui`, `list`, `permissions`, `sleep`.
-- `interact`: observe plus `click`, `type`, `hotkey`, `scroll`, `swipe`, `drag`,
-  `move`, `set_value`, `perform_action`, `window`, `app`, `menu`.
+- `observe`: `see`, `inspect_ui`, `permissions`, `sleep`, `verify_state`.
+- `interact`: observe plus `click`, `type`, `press`, `scroll`, `drag`, `move`,
+  `set_value`, `action`, `window`, `app`, `menu`.
 - `extended`: interact plus `dialog`, `dock`, `space`, `capture`, `paste`.
 
 The hard-disabled tools remain unavailable even when upstream configuration or
@@ -193,7 +185,7 @@ provider credentials attempt to enable them.
 
 ## Journals and replay
 
-Every exec, scenario, and MCP session writes:
+Every exec and MCP session writes:
 
 - `manifest.json`
 - `steps.jsonl`
@@ -236,7 +228,7 @@ target, so both replay planning and execution refuse those steps. See the
 
 Errors are written only to stderr. `--error-format json` emits
 `macos-agent.error.v2`; successful command envelopes use
-`macos-agent.adapter.v2`.
+`macos-agent.adapter.v3`.
 
 ## Development
 

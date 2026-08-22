@@ -25,14 +25,124 @@ fn lifecycle_status_discloses_locked_notarization_policy() {
     );
     assert_eq!(status.code, 0, "{}", status.stderr_text());
     assert_eq!(status.stdout_json()["result"]["strict"], false);
-    assert_eq!(
-        status.stdout_json()["result"]["security_posture"],
-        "reduced"
-    );
+    assert_eq!(status.stdout_json()["result"]["security_posture"], "full");
     assert_eq!(
         status.stdout_json()["result"]["cli_notarization_policy"],
-        "waived"
+        "required"
     );
+}
+
+#[test]
+fn transition_only_release_can_upgrade_but_cannot_be_reactivated() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.3", '3');
+    let current = candidate(cwd.path(), "v4.2.2", '4');
+    authorize_upgrade_from(&current, &old);
+
+    let old_install = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &old,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(old_install.code, 0, "{}", old_install.stderr_text());
+
+    let upgrade = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &current,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(upgrade.code, 0, "{}", upgrade.stderr_text());
+    assert_eq!(upgrade.stdout_json()["result"]["current"]["tag"], "v4.2.2");
+    assert_eq!(upgrade.stdout_json()["result"]["previous"]["tag"], "v3.9.3");
+    let doctor = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &current,
+        &["--format", "json", "doctor", "--strict"],
+    );
+    assert_eq!(doctor.code, 0, "{}", doctor.stderr_text());
+    assert_eq!(doctor.stdout_json()["result"]["ready"], true);
+
+    let rollback = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &current,
+        &["--error-format", "json", "backend", "rollback"],
+    );
+    assert_eq!(rollback.code, 69, "{}", rollback.stderr_text());
+}
+
+#[test]
+fn transition_only_upgrade_recovers_when_the_old_stable_app_is_still_active() {
+    assert_transition_only_interrupted_upgrade_recovers(false);
+}
+
+#[test]
+fn transition_only_upgrade_recovers_when_the_old_stable_app_is_in_backup() {
+    assert_transition_only_interrupted_upgrade_recovers(true);
+}
+
+fn assert_transition_only_interrupted_upgrade_recovers(old_app_in_backup: bool) {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.3", '3');
+    let current = candidate(cwd.path(), "v4.2.2", '4');
+    authorize_upgrade_from(&current, &old);
+    for candidate in [&old, &current] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let pending = fs::read(backend_root.join("receipts/current.json")).expect("new receipt");
+    let old_current = fs::read(backend_root.join("receipts/previous.json")).expect("old receipt");
+    fs::write(backend_root.join("receipts/current.json"), old_current)
+        .expect("restore transition-only current receipt");
+    fs::write(backend_root.join("receipts/pending.json"), pending)
+        .expect("restore pending current receipt");
+
+    let stable_parent = backend_root.join("stable");
+    let stable = stable_parent.join("Peekaboo.app");
+    fs::remove_dir_all(&stable).expect("remove active new app");
+    copy_fixture_app(
+        &backend_root.join("versions/v3.9.3/app/Peekaboo.app"),
+        &stable,
+    );
+    if old_app_in_backup {
+        fs::rename(&stable, stable_parent.join(".nils-peekaboo-backup"))
+            .expect("simulate crash after old stable app entered backup");
+    }
+
+    let recovered = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &current,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(recovered.code, 0, "{}", recovered.stderr_text());
+    assert_eq!(
+        recovered.stdout_json()["result"]["current"]["tag"],
+        "v4.2.2"
+    );
+    assert!(stable.is_dir());
+    assert!(!stable_parent.join(".nils-peekaboo-incoming").exists());
+    assert!(!stable_parent.join(".nils-peekaboo-backup").exists());
+    assert!(!backend_root.join("receipts/pending.json").exists());
 }
 
 #[test]
@@ -843,7 +953,18 @@ fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
 fn lock_without_each_mandatory_capability_probe_is_rejected() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
-    for missing in ["version", "permissions", "bridge", "tools"] {
+    for missing in [
+        "version",
+        "permissions",
+        "bridge",
+        "tools",
+        "observation",
+        "click",
+        "action",
+        "press",
+        "verification",
+        "mcp_stdio",
+    ] {
         let candidate = candidate(cwd.path(), &format!("v3.9.3-{missing}"), '3');
         let mut lock = read_lock(&candidate.lock);
         lock["required_capability_probes"]
@@ -1167,9 +1288,8 @@ fn app_gatekeeper_is_mandatory_for_non_strict_install_and_execution() {
                 "--out-dir",
                 journal.to_str().expect("journal"),
                 "--",
-                "sleep",
-                "1",
-                "--json",
+                "see",
+                "--help",
             ],
             failure,
         );
@@ -1411,9 +1531,16 @@ esac
             {"id":"version","argv":["--version"]},
             {"id":"permissions","argv":["permissions","status","--json"]},
             {"id":"bridge","argv":["bridge","status","--json"]},
-            {"id":"tools","argv":["tools","--json"]}
+            {"id":"tools","argv":["tools","--json"]},
+            {"id":"observation","argv":["see","--help"]},
+            {"id":"click","argv":["click","--help"]},
+            {"id":"action","argv":["action","--help"]},
+            {"id":"press","argv":["press","--help"]},
+            {"id":"verification","argv":["verify","--help"]},
+            {"id":"mcp_stdio","argv":["mcp","serve","--transport","stdio","--help"]}
         ],
-        "rollback_releases":[]
+        "rollback_releases":[],
+        "upgrade_from_releases":[]
     });
     let lock_path = root.join(format!("lock-{token}.json"));
     fs::write(
@@ -1564,6 +1691,18 @@ fn authorize_rollback(current: &Candidate, previous: &Candidate) {
     let mut current_lock = read_lock(&current.lock);
     let previous_lock = read_lock(&previous.lock);
     current_lock["rollback_releases"] = json!([{
+        "tag": previous_lock["tag"],
+        "commit": previous_lock["commit"],
+        "minimum_macos": previous_lock["minimum_macos"],
+        "assets": previous_lock["assets"],
+    }]);
+    write_lock(&current.lock, &current_lock);
+}
+
+fn authorize_upgrade_from(current: &Candidate, previous: &Candidate) {
+    let mut current_lock = read_lock(&current.lock);
+    let previous_lock = read_lock(&previous.lock);
+    current_lock["upgrade_from_releases"] = json!([{
         "tag": previous_lock["tag"],
         "commit": previous_lock["commit"],
         "minimum_macos": previous_lock["minimum_macos"],

@@ -16,9 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::backend;
-use crate::cli::{
-    EvidenceMode, ExecArgs, McpArgs, OutputFormat, RuntimeMode, ScenarioArgs, ToolProfile,
-};
+use crate::cli::{EvidenceMode, ExecArgs, McpArgs, OutputFormat, RuntimeMode, ToolProfile};
 use crate::commands;
 use crate::error::{CliError, ErrorClass};
 use crate::journal::ArtifactIndex;
@@ -26,7 +24,7 @@ use crate::lock::PeekabooLock;
 use crate::model::SuccessEnvelope;
 use crate::{process, test_mode};
 
-const PROTOCOL_SCHEMA: &str = "macos-agent.remote.v2";
+const PROTOCOL_SCHEMA: &str = "macos-agent.remote.v3";
 const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 256;
 const MAX_TRANSFER_BYTES: usize = 8 * 1024 * 1024;
@@ -65,13 +63,6 @@ pub enum RemoteCommand {
         runtime: RuntimeMode,
         timeout_seconds: u64,
     },
-    Scenario {
-        source_sha256: String,
-        source_base64: String,
-        evidence_mode: EvidenceMode,
-        runtime: RuntimeMode,
-        timeout_seconds: u64,
-    },
     Collect,
 }
 
@@ -82,6 +73,15 @@ struct RemoteRequest {
     peekaboo_commit: String,
     token: String,
     command: RemoteCommand,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteRequestEnvelope {
+    schema_version: String,
+    adapter_version: String,
+    peekaboo_commit: String,
+    token: String,
+    command: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,9 +150,6 @@ pub fn run_remote_control(
         | RemoteCommand::Capabilities { .. } => Duration::from_secs(180),
         RemoteCommand::Exec {
             timeout_seconds, ..
-        }
-        | RemoteCommand::Scenario {
-            timeout_seconds, ..
         } => Duration::from_secs((*timeout_seconds).clamp(1, 3600) + 30),
         RemoteCommand::Collect => Duration::from_secs(30),
     };
@@ -179,32 +176,6 @@ pub fn run_remote_exec(args: &ExecArgs, format: OutputFormat) -> Result<u8, CliE
     )?;
     install_transferred_files(&args.out_dir, &response.artifacts)?;
     emit_remote(format, "exec", response)
-}
-
-pub fn run_remote_scenario(args: &ScenarioArgs, format: OutputFormat) -> Result<u8, CliError> {
-    let host = args
-        .host
-        .as_deref()
-        .ok_or_else(|| transport_error("SSH host is required"))?;
-    let source = commands::scenario::validate_source(args)?;
-    crate::policy::validate_scenario(
-        &serde_json::from_slice(&source)
-            .map_err(|_| CliError::usage("scenario is not valid JSON"))?,
-    )?;
-    let source_sha256 = hex(&Sha256::digest(&source));
-    let response = request(
-        host,
-        RemoteCommand::Scenario {
-            source_sha256,
-            source_base64: base64::engine::general_purpose::STANDARD.encode(source),
-            evidence_mode: args.evidence_mode,
-            runtime: args.runtime,
-            timeout_seconds: args.timeout_seconds,
-        },
-        Duration::from_secs(args.timeout_seconds.clamp(1, 3600) + 30),
-    )?;
-    install_transferred_files(&args.out_dir, &response.artifacts)?;
-    emit_remote(format, "scenario", response)
 }
 
 pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
@@ -635,7 +606,7 @@ fn request_with_token(
     Ok(response)
 }
 
-fn execute_remote(request: RemoteRequest) -> Result<RemoteResponse, CliError> {
+fn execute_remote(request: RemoteRequestEnvelope) -> Result<RemoteResponse, CliError> {
     let lock = PeekabooLock::embedded()?;
     validate_token(&request.token)?;
     if request.schema_version != PROTOCOL_SCHEMA
@@ -647,8 +618,10 @@ fn execute_remote(request: RemoteRequest) -> Result<RemoteResponse, CliError> {
         ));
     }
     let token = request.token;
+    let command = serde_json::from_value(request.command)
+        .map_err(|_| transport_error("remote request command is malformed"))?;
     let root = remote_session_root(&token)?;
-    let operation = execute_remote_operation(&root, request.command);
+    let operation = execute_remote_operation(&root, command);
     let response = match operation {
         Ok((result, exit_code, collect, cleanup_after)) => {
             let artifacts = if collect {
@@ -772,42 +745,6 @@ fn execute_remote_operation(
                 true,
             ))
         }
-        RemoteCommand::Scenario {
-            source_sha256,
-            source_base64,
-            evidence_mode,
-            runtime,
-            timeout_seconds,
-        } => {
-            create_bounded_remote_session(root)?;
-            let input_dir = root.join("input");
-            create_private_dir(&input_dir)?;
-            let source = base64::engine::general_purpose::STANDARD
-                .decode(source_base64)
-                .map_err(|_| transport_error("remote scenario payload is malformed"))?;
-            if source.len() > 1024 * 1024 || hex(&Sha256::digest(&source)) != source_sha256 {
-                return Err(transport_error("remote scenario payload digest mismatch"));
-            }
-            let source_path = input_dir.join("scenario.peekaboo.json");
-            write_atomic(&source_path, &source, SECRET_FILE_MODE)
-                .map_err(|_| transport_error("failed to stage remote scenario"))?;
-            let args = ScenarioArgs {
-                host: None,
-                out_dir: root.join("journal"),
-                file: source_path,
-                evidence_mode,
-                runtime,
-                timeout_seconds,
-            };
-            let outcome = commands::scenario::run_local(&args, "ssh")?;
-            Ok((
-                serde_json::to_value(outcome.result)
-                    .map_err(|_| transport_error("failed to encode scenario response"))?,
-                outcome.exit_code,
-                true,
-                true,
-            ))
-        }
         RemoteCommand::Collect => {
             let artifacts = root.join("journal");
             if !artifacts.is_dir() {
@@ -818,7 +755,7 @@ fn execute_remote_operation(
     }
 }
 
-fn read_request() -> Result<RemoteRequest, CliError> {
+fn read_request() -> Result<RemoteRequestEnvelope, CliError> {
     let mut reader = std::io::stdin().take(MAX_REQUEST_BYTES + 1);
     let mut raw = Vec::new();
     reader

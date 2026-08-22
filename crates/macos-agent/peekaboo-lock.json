@@ -1,52 +1,40 @@
 {
   "schema_version": 2,
   "repository": "https://github.com/openclaw/Peekaboo",
-  "tag": "v3.9.3",
-  "commit": "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269",
-  "released_at": "2026-07-15T02:05:06Z",
+  "tag": "v4.2.2",
+  "commit": "05675b0b5e2c382146963e19493787d9dac0d45b",
+  "released_at": "2026-08-20T11:02:40Z",
   "license": {
     "spdx": "MIT",
-    "source": "https://github.com/openclaw/Peekaboo/blob/v3.9.3/LICENSE"
+    "source": "https://github.com/openclaw/Peekaboo/blob/v4.2.2/LICENSE"
   },
   "minimum_macos": "15.0",
   "assets": [
     {
       "kind": "cli",
       "name": "peekaboo-macos-universal.tar.gz",
-      "url": "https://github.com/openclaw/Peekaboo/releases/download/v3.9.3/peekaboo-macos-universal.tar.gz",
-      "sha256": "793251fd3fd3b3f1ba5e61095c1204aa1cfcd6eae19a4d46fdb443b547a8cccf",
+      "url": "https://github.com/openclaw/Peekaboo/releases/download/v4.2.2/peekaboo-macos-universal.tar.gz",
+      "sha256": "80b1983a9a2468e715e176167b75aabb4f43feb4882d667ffccc9373d706602e",
       "archive_root": "peekaboo-macos-universal",
       "executable": "peekaboo",
-      "executable_sha256": "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072",
-      "bridge_build": "3.9.3 (3.9.3)",
+      "executable_sha256": "795176aaf84396b24e9e3ad10863ac0f8858e09695e3965e2b80b38c67701d8a",
+      "bridge_build": "4.2.2 (4.2.2)",
       "architectures": ["arm64", "x86_64"],
-      "signing_authority": "Developer ID Application: Peter Steinberger (Y5PE65HELJ)",
-      "team_id": "Y5PE65HELJ",
+      "signing_authority": "Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)",
+      "team_id": "FWJYW4S8P8",
       "notarization": {
-        "policy": "waived",
-        "waiver": {
-          "repository": "https://github.com/openclaw/Peekaboo",
-          "tag": "v3.9.3",
-          "commit": "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269",
-          "archive_sha256": "793251fd3fd3b3f1ba5e61095c1204aa1cfcd6eae19a4d46fdb443b547a8cccf",
-          "executable_sha256": "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072",
-          "signing_authority": "Developer ID Application: Peter Steinberger (Y5PE65HELJ)",
-          "team_id": "Y5PE65HELJ",
-          "approved_at": "2026-07-15",
-          "approval": "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753",
-          "reason": "Exact standalone CLI notarization exception; every other trust and usability gate remains required."
-        }
+        "policy": "required"
       }
     },
     {
       "kind": "app",
-      "name": "Peekaboo-3.9.3.app.zip",
-      "url": "https://github.com/openclaw/Peekaboo/releases/download/v3.9.3/Peekaboo-3.9.3.app.zip",
-      "sha256": "660fe5a25636edbb5b3f42fd817fa5948b60a1e9cb6a9c0994b6f105dc73ece9",
+      "name": "Peekaboo-4.2.2.app.zip",
+      "url": "https://github.com/openclaw/Peekaboo/releases/download/v4.2.2/Peekaboo-4.2.2.app.zip",
+      "sha256": "acf7f380c4783813b96abd7f03b28b04ea292461619d69f9d6fb054b5bc8e16e",
       "archive_root": "Peekaboo.app",
       "executable": "Contents/MacOS/Peekaboo",
-      "executable_sha256": "1269052aaa38f484a24cab06ea7e004478515471ffcba6302205f44abda66023",
-      "bridge_build": "3.9.3 (3090399)",
+      "executable_sha256": "f0876b17604f591b983cd9227c6e56fef1fe52058c472e21697e9bab97248030",
+      "bridge_build": "4.2.2 (4020299)",
       "architectures": ["arm64"],
       "bundle_id": "boo.peekaboo.mac",
       "signing_authority": "Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)",
@@ -68,9 +56,65 @@
     {"id": "bridge", "argv": ["bridge", "status", "--json"]},
     {"id": "tools", "argv": ["tools", "--json"]},
     {"id": "observation", "argv": ["see", "--help"]},
-    {"id": "action", "argv": ["click", "--help"]},
-    {"id": "scenario", "argv": ["run", "--help"]},
+    {"id": "click", "argv": ["click", "--help"]},
+    {"id": "action", "argv": ["action", "--help"]},
+    {"id": "press", "argv": ["press", "--help"]},
+    {"id": "verification", "argv": ["verify", "--help"]},
     {"id": "mcp_stdio", "argv": ["mcp", "serve", "--transport", "stdio", "--help"]}
   ],
-  "rollback_releases": []
+  "rollback_releases": [],
+  "upgrade_from_releases": [
+    {
+      "tag": "v3.9.3",
+      "commit": "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269",
+      "minimum_macos": "15.0",
+      "assets": [
+        {
+          "kind": "cli",
+          "name": "peekaboo-macos-universal.tar.gz",
+          "url": "https://github.com/openclaw/Peekaboo/releases/download/v3.9.3/peekaboo-macos-universal.tar.gz",
+          "sha256": "793251fd3fd3b3f1ba5e61095c1204aa1cfcd6eae19a4d46fdb443b547a8cccf",
+          "archive_root": "peekaboo-macos-universal",
+          "executable": "peekaboo",
+          "executable_sha256": "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072",
+          "bridge_build": "3.9.3 (3.9.3)",
+          "architectures": ["arm64", "x86_64"],
+          "signing_authority": "Developer ID Application: Peter Steinberger (Y5PE65HELJ)",
+          "team_id": "Y5PE65HELJ",
+          "notarization": {
+            "policy": "waived",
+            "waiver": {
+              "repository": "https://github.com/openclaw/Peekaboo",
+              "tag": "v3.9.3",
+              "commit": "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269",
+              "archive_sha256": "793251fd3fd3b3f1ba5e61095c1204aa1cfcd6eae19a4d46fdb443b547a8cccf",
+              "executable_sha256": "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072",
+              "signing_authority": "Developer ID Application: Peter Steinberger (Y5PE65HELJ)",
+              "team_id": "Y5PE65HELJ",
+              "approved_at": "2026-07-15",
+              "approval": "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753",
+              "reason": "Exact standalone CLI notarization exception retained only to authenticate an in-place upgrade to v4.2.2."
+            }
+          }
+        },
+        {
+          "kind": "app",
+          "name": "Peekaboo-3.9.3.app.zip",
+          "url": "https://github.com/openclaw/Peekaboo/releases/download/v3.9.3/Peekaboo-3.9.3.app.zip",
+          "sha256": "660fe5a25636edbb5b3f42fd817fa5948b60a1e9cb6a9c0994b6f105dc73ece9",
+          "archive_root": "Peekaboo.app",
+          "executable": "Contents/MacOS/Peekaboo",
+          "executable_sha256": "1269052aaa38f484a24cab06ea7e004478515471ffcba6302205f44abda66023",
+          "bridge_build": "3.9.3 (3090399)",
+          "architectures": ["arm64"],
+          "bundle_id": "boo.peekaboo.mac",
+          "signing_authority": "Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)",
+          "team_id": "FWJYW4S8P8",
+          "notarization": {
+            "policy": "required"
+          }
+        }
+      ]
+    }
+  ]
 }
