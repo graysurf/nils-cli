@@ -1,10 +1,42 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
 use tempfile::TempDir;
 
 use crate::common;
+
+#[test]
+fn remote_v2_scenario_request_fails_as_an_explicit_protocol_mismatch() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let request = serde_json::json!({
+        "schema_version": "macos-agent.remote.v2",
+        "adapter_version": env!("CARGO_PKG_VERSION"),
+        "peekaboo_commit": "05675b0b5e2c382146963e19493787d9dac0d45b",
+        "token": "0123456789abcdef0123456789abcdef",
+        "command": {
+            "kind": "scenario",
+            "source_sha256": "0".repeat(64),
+            "source_base64": "e30=",
+            "evidence_mode": "standard",
+            "runtime": "oneshot",
+            "timeout_seconds": 30
+        }
+    });
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_stdin_str(&serde_json::to_string(&request).expect("request"));
+    let out = harness.run_with_options(cwd.path(), &["__remote"], options);
+    assert_eq!(out.code, 0, "{}", out.stderr_text());
+    let response = out.stdout_json();
+    assert_eq!(response["schema_version"], "macos-agent.remote.v3");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["class"], "transport");
+    assert_eq!(
+        response["error"]["message"],
+        "remote request version or backend lock is incompatible"
+    );
+}
 
 #[test]
 fn ssh_exec_uses_stdin_protocol_preserves_argv_and_cleans_remote_state() {
@@ -196,174 +228,6 @@ fn unsafe_host_and_ssh_failure_are_typed_without_echoing_private_identity() {
     assert!(!stderr.contains("private-user"));
     assert!(!stderr.contains("private-host"));
     assert_eq!(failed.stderr_json()["error"]["class"], "transport");
-}
-
-#[test]
-fn ssh_scenario_stages_by_digest_retains_partial_result_and_preserves_source() {
-    let harness = common::MacosAgentHarness::new();
-    let cwd = TempDir::new().expect("cwd");
-    let fake_peekaboo = cwd.path().join("peekaboo");
-    write_executable(
-        &fake_peekaboo,
-        "#!/bin/sh\nprintf '%s\\n' '{\"success\":false,\"steps\":[{\"status\":\"passed\"},{\"status\":\"failed\"}]}'\nexit 8\n",
-    );
-    let fake_ssh = cwd.path().join("ssh");
-    write_executable(
-        &fake_ssh,
-        r#"#!/bin/sh
-while [ "$1" = "-o" ]; do shift 2; done
-[ "$1" = "--" ] && shift
-shift
-shift
-exec "$NILS_MACOS_AGENT_REMOTE_BIN" "$@"
-"#,
-    );
-    let source = cwd.path().join("flow.peekaboo.json");
-    let source_body = br#"{"steps":[{"command":"see"},{"command":"click","query":"fixture"}]}"#;
-    fs::write(&source, source_body).expect("scenario");
-    let out_dir = cwd.path().join("scenario-journal");
-    let remote_root = cwd.path().join("scenario-remote");
-    let options = harness
-        .cmd_options(cwd.path())
-        .with_env(
-            "NILS_MACOS_AGENT_PEEKABOO_BIN",
-            fake_peekaboo.to_str().expect("peekaboo"),
-        )
-        .with_env("NILS_MACOS_AGENT_SSH_BIN", fake_ssh.to_str().expect("ssh"))
-        .with_env(
-            "NILS_MACOS_AGENT_REMOTE_BIN",
-            harness.macos_agent_bin().to_str().expect("agent"),
-        )
-        .with_env(
-            "NILS_MACOS_AGENT_REMOTE_ROOT",
-            remote_root.to_str().expect("remote"),
-        );
-    let out = harness.run_with_options(
-        cwd.path(),
-        &[
-            "--format",
-            "json",
-            "scenario",
-            "--host",
-            "fixture-role",
-            "--out-dir",
-            out_dir.to_str().expect("out"),
-            "--file",
-            source.to_str().expect("source"),
-        ],
-        options,
-    );
-    assert_eq!(out.code, 70, "stderr: {}", out.stderr_text());
-    let payload = out.stdout_json();
-    assert_eq!(payload["result"]["transport"], "ssh");
-    assert_eq!(
-        payload["result"]["upstream"]["json"]["steps"][0]["status"],
-        "passed"
-    );
-    assert_eq!(fs::read(&source).expect("source"), source_body);
-    let steps = fs::read_to_string(out_dir.join("steps.jsonl")).expect("steps");
-    assert!(steps.contains("scenario-sha256-"));
-    assert!(!steps.contains(source.to_str().expect("source")));
-    assert_eq!(
-        fs::read_dir(&remote_root)
-            .map(|entries| entries.count())
-            .unwrap_or(0),
-        0
-    );
-}
-
-#[test]
-fn local_scenario_executes_only_a_private_immutable_staged_copy() {
-    let harness = common::MacosAgentHarness::new();
-    let cwd = TempDir::new().expect("cwd");
-    let fake_peekaboo = cwd.path().join("peekaboo");
-    let launch_log = cwd.path().join("scenario-launch.log");
-    write_executable(
-        &fake_peekaboo,
-        r#"#!/bin/sh
-case "$(uname -s)" in
-  Darwin) mode=$(stat -f '%Lp' "$2") || exit 91 ;;
-  *) mode=$(stat -c '%a' "$2") || exit 91 ;;
-esac
-printf '%s|%s\n' "$2" "$mode" > "$NILS_MACOS_AGENT_SCENARIO_LAUNCH_LOG"
-printf '%s\n' '{"success":true,"steps":[]}'
-"#,
-    );
-    let source = cwd.path().join("reviewed.peekaboo.json");
-    let source_body = br#"{"steps":[{"command":"see"}]}"#;
-    fs::write(&source, source_body).expect("source");
-    let out_dir = cwd.path().join("local-scenario-journal");
-    let options = harness
-        .cmd_options(cwd.path())
-        .with_env(
-            "NILS_MACOS_AGENT_PEEKABOO_BIN",
-            fake_peekaboo.to_str().expect("fake"),
-        )
-        .with_env(
-            "NILS_MACOS_AGENT_SCENARIO_LAUNCH_LOG",
-            launch_log.to_str().expect("log"),
-        );
-    let out = harness.run_with_options(
-        cwd.path(),
-        &[
-            "--format",
-            "json",
-            "scenario",
-            "--out-dir",
-            out_dir.to_str().expect("out"),
-            "--file",
-            source.to_str().expect("source"),
-        ],
-        options,
-    );
-    assert_eq!(out.code, 0, "{}", out.stderr_text());
-    let launch = fs::read_to_string(&launch_log).expect("launch log");
-    let (executed, mode) = launch.trim().rsplit_once('|').expect("path and mode");
-    assert_ne!(Path::new(executed), source);
-    assert_eq!(mode, "600");
-    assert!(
-        !Path::new(executed).exists(),
-        "staged source was not removed"
-    );
-    assert_eq!(fs::read(&source).expect("source preserved"), source_body);
-}
-
-#[test]
-fn signaled_scenario_is_an_unknown_never_replayable_mutation() {
-    let harness = common::MacosAgentHarness::new();
-    let cwd = TempDir::new().expect("cwd");
-    let fake_peekaboo = cwd.path().join("peekaboo");
-    write_executable(&fake_peekaboo, "#!/bin/sh\nkill -TERM $$\n");
-    let source = cwd.path().join("signaled.peekaboo.json");
-    fs::write(&source, br#"{"steps":[{"command":"see"}]}"#).expect("scenario");
-    let out_dir = cwd.path().join("signaled-scenario-journal");
-    let out = harness.run_with_options(
-        cwd.path(),
-        &[
-            "--format",
-            "json",
-            "scenario",
-            "--out-dir",
-            out_dir.to_str().expect("out"),
-            "--file",
-            source.to_str().expect("source"),
-        ],
-        harness.cmd_options(cwd.path()).with_env(
-            "NILS_MACOS_AGENT_PEEKABOO_BIN",
-            fake_peekaboo.to_str().expect("fake"),
-        ),
-    );
-    assert_eq!(out.code, 70);
-    assert_eq!(out.stdout_json()["result"]["upstream"]["signal"], 15);
-    let step: serde_json::Value = serde_json::from_str(
-        fs::read_to_string(out_dir.join("steps.jsonl"))
-            .expect("journal")
-            .trim(),
-    )
-    .expect("step JSON");
-    assert_eq!(step["status"], "unknown");
-    assert_eq!(step["failure_class"], "unknown_mutation");
-    assert_eq!(step["replay_class"], "never");
 }
 
 #[test]

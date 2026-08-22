@@ -46,7 +46,7 @@ pub enum ToolProfile {
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Run a pinned Peekaboo backend through a guarded macOS adapter.",
     long_about = "Install and verify one immutable Peekaboo release, execute it locally or over SSH, enforce MCP tool profiles, and retain privacy-preserving execution journals.",
-    after_help = "EXAMPLES:\n  macos-agent backend status --format json\n  macos-agent doctor --strict --format json\n  macos-agent exec --out-dir ./run --intent 'Inspect Calculator' -- see --app Calculator --json\n  macos-agent scenario --out-dir ./run --file ./flow.peekaboo.json\n  macos-agent mcp --out-dir ./run --tool-profile interact\n  macos-agent journal review --out-dir ./run --format json\n\nEXIT CODES:\n  0   success\n  64  usage\n  69  backend unavailable or invalid\n  70  upstream failure\n  74  journal or artifact failure\n  75  transport failure\n  77  permission failure\n  78  policy refusal",
+    after_help = "EXAMPLES:\n  macos-agent backend status --format json\n  macos-agent doctor --strict --format json\n  macos-agent exec --out-dir ./run --intent 'Inspect Calculator' -- see --app Calculator --json\n  macos-agent mcp --out-dir ./run --tool-profile interact\n  macos-agent journal review --out-dir ./run --format json\n\nEXIT CODES:\n  0   success\n  64  usage\n  69  backend unavailable or invalid\n  70  upstream failure\n  74  journal or artifact failure\n  75  transport failure\n  77  permission failure\n  78  policy refusal",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -75,8 +75,6 @@ pub enum CommandGroup {
     Capabilities(CapabilitiesArgs),
     /// Execute Peekaboo arguments verbatim after `--`.
     Exec(ExecArgs),
-    /// Run a local `.peekaboo.json` scenario through the locked backend.
-    Scenario(ScenarioArgs),
     /// Proxy Peekaboo's stdio MCP server with a strict tool profile.
     Mcp(McpArgs),
     /// Summarize, review, plan replay, or replay one guarded journal step.
@@ -182,28 +180,6 @@ pub struct ExecArgs {
     /// Peekaboo arguments, passed without grammar translation.
     #[arg(last = true, required = true, allow_hyphen_values = true, num_args = 1..)]
     pub argv: Vec<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ScenarioArgs {
-    /// Runtime-only trusted SSH target; never persisted.
-    #[arg(long)]
-    pub host: Option<String>,
-    /// Caller-owned directory for the structural execution journal.
-    #[arg(long)]
-    pub out_dir: PathBuf,
-    /// Local scenario file staged read-only for execution.
-    #[arg(long)]
-    pub file: PathBuf,
-    /// Evidence retention and suppression mode.
-    #[arg(long, value_enum, default_value_t = EvidenceMode::Minimal)]
-    pub evidence_mode: EvidenceMode,
-    /// Permission/runtime authority used for this invocation.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::App)]
-    pub runtime: RuntimeMode,
-    /// Wall-clock bound for the upstream scenario.
-    #[arg(long, default_value_t = 300)]
-    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Args)]

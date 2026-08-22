@@ -19,7 +19,8 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$MCP_REQUEST_LOG"
   case "$line" in
     *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}' ;;
-    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"see"},{"name":"click"},{"name":"shell"},{"name":"browser"}]}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"see"},{"name":"verify_state"},{"name":"click"},{"name":"shell"},{"name":"browser"}]}}' ;;
+    *'"id":6'*) printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"satisfied"}]}}' ;;
     *'"id":4'*) printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":null}' ;;
   esac
 done
@@ -32,6 +33,7 @@ done
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"shell\",\"arguments\":{\"token\":\"seed-mcp-secret\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"permissions\",\"arguments\":{\"action\":\"grant\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"verify_state\",\"arguments\":{\"app\":\"Calculator\",\"predicates\":[{\"window_exists\":true}]}}}\n",
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":99,\"reason\":\"seed-cancel-secret\"}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":{}}\n",
     );
@@ -65,7 +67,7 @@ done
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("protocol JSON"))
         .collect::<Vec<_>>();
-    assert_eq!(frames.len(), 5);
+    assert_eq!(frames.len(), 6);
     let by_id = |id: i64| {
         frames
             .iter()
@@ -78,13 +80,14 @@ done
         .iter()
         .map(|tool| tool["name"].as_str().expect("name"))
         .collect::<Vec<_>>();
-    assert_eq!(names, ["see", "click"]);
+    assert_eq!(names, ["see", "verify_state", "click"]);
     assert_eq!(by_id(3)["error"]["code"], -32001);
     assert_eq!(by_id(5)["error"]["code"], -32001);
+    assert_eq!(by_id(6)["result"]["content"][0]["text"], "satisfied");
     assert_eq!(by_id(4)["result"], serde_json::Value::Null);
     let journal = fs::read_to_string(out_dir.join("steps.jsonl")).expect("journal");
     assert!(journal.contains("policy_blocked"));
-    assert_eq!(journal.lines().count(), 6);
+    assert_eq!(journal.lines().count(), 7);
     let steps = journal
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("journal JSON"))
@@ -106,6 +109,7 @@ done
     assert!(!forwarded.contains("seed-mcp-secret"));
     assert!(!forwarded.contains("\"id\":3"));
     assert!(!forwarded.contains("\"id\":5"));
+    assert!(forwarded.contains("\"id\":6"));
 }
 
 #[test]

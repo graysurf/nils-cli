@@ -18,7 +18,6 @@ fn root_help_exposes_only_the_peekaboo_adapter_surface() {
         "doctor",
         "capabilities",
         "exec",
-        "scenario",
         "mcp",
         "journal",
     ] {
@@ -27,7 +26,14 @@ fn root_help_exposes_only_the_peekaboo_adapter_surface() {
             "missing new adapter command: {command}"
         );
     }
-    for retired in ["preflight", "input-source", "ax", "observe", "profile"] {
+    for retired in [
+        "preflight",
+        "input-source",
+        "ax",
+        "observe",
+        "profile",
+        "scenario",
+    ] {
         assert!(
             !help.contains(&format!("\n  {retired}")),
             "retired engine command still exposed: {retired}"
@@ -45,8 +51,8 @@ fn readme_maps_every_retired_public_surface_to_the_adapter_v2_boundary() {
         "`preflight` → `doctor --strict`",
         "`windows`, `apps`, `window`, `input`, `input-source`, and `ax`",
         "`observe`, `debug`, `wait`, and `profile`",
-        "`scenario`",
-        "`macos-agent.adapter.v2`",
+        "Peekaboo v4 removed the `.peekaboo.json` runner",
+        "`macos-agent.adapter.v3`",
         "exit codes",
         "nils-cli v1.22.6",
     ] {
@@ -66,19 +72,37 @@ fn repository_contains_a_complete_immutable_peekaboo_lock() {
 
     assert_eq!(lock["schema_version"], 2);
     assert_eq!(lock["repository"], "https://github.com/openclaw/Peekaboo");
-    assert_eq!(lock["tag"], "v3.9.3");
-    assert_eq!(lock["commit"], "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269");
+    assert_eq!(lock["tag"], "v4.2.2");
+    assert_eq!(lock["commit"], "05675b0b5e2c382146963e19493787d9dac0d45b");
     assert_eq!(lock["minimum_macos"], "15.0");
     assert_eq!(lock["assets"].as_array().map(Vec::len), Some(2));
-    assert_eq!(lock["assets"][0]["notarization"]["policy"], "waived");
-    assert_eq!(
-        lock["assets"][0]["notarization"]["waiver"]["approval"],
-        "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753"
-    );
+    assert_eq!(lock["assets"][0]["notarization"]["policy"], "required");
     assert_eq!(lock["assets"][1]["notarization"]["policy"], "required");
-    assert!(
-        lock["required_capability_probes"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty())
+    assert_eq!(lock["rollback_releases"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        lock["upgrade_from_releases"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(lock["upgrade_from_releases"][0]["tag"], "v3.9.3");
+    let probe_ids = lock["required_capability_probes"]
+        .as_array()
+        .expect("probe array")
+        .iter()
+        .map(|probe| probe["id"].as_str().expect("probe id"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        probe_ids,
+        std::collections::BTreeSet::from([
+            "action",
+            "bridge",
+            "click",
+            "mcp_stdio",
+            "observation",
+            "permissions",
+            "press",
+            "tools",
+            "verification",
+            "version",
+        ])
     );
 }

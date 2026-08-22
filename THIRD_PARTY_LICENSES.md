@@ -551,6 +551,6 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 ## Locked Runtime Backend
 
-- Peekaboo `v3.9.3` is licensed under `MIT`.
-- Source and license: <https://github.com/openclaw/Peekaboo/blob/v3.9.3/LICENSE>
+- Peekaboo `v4.2.2` is licensed under `MIT`.
+- Source and license: <https://github.com/openclaw/Peekaboo/blob/v4.2.2/LICENSE>
 - The nils-cli package does not embed Peekaboo. `macos-agent backend install` downloads the exact official release assets named and SHA256-locked in `crates/macos-agent/peekaboo-lock.json` into user-scoped storage.

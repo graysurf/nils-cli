@@ -27,33 +27,30 @@ const HARD_DENIED_CLI: &[&str] = &[
 ];
 
 const ADMITTED_CLI: &[&str] = &[
+    "action",
     "app",
     "capture",
     "click",
     "dialog",
     "dock",
     "drag",
-    "hotkey",
-    "inspect_ui",
-    "list",
     "menu",
     "menubar",
     "move",
     "paste",
-    "perform_action",
     "press",
+    "screen",
     "scroll",
     "see",
     "set_value",
-    "sleep",
     "space",
-    "swipe",
     "tools",
     "type",
+    "verify",
     "window",
 ];
 
-const REVIEWED_CAPTURE_SUBCOMMANDS: &[&str] = &["live", "video", "watch"];
+const REVIEWED_CAPTURE_SUBCOMMANDS: &[&str] = &["live", "video"];
 
 const HARD_DENIED_OPTIONS: &[&str] = &[
     "analyze",
@@ -64,23 +61,22 @@ const HARD_DENIED_OPTIONS: &[&str] = &[
     "provider",
 ];
 
-const OBSERVE: &[&str] = &["see", "inspect_ui", "list", "permissions", "sleep"];
+const OBSERVE: &[&str] = &["see", "inspect_ui", "permissions", "sleep", "verify_state"];
 
 const INTERACT: &[&str] = &[
     "see",
     "inspect_ui",
-    "list",
     "permissions",
     "sleep",
+    "verify_state",
     "click",
     "type",
-    "hotkey",
+    "press",
     "scroll",
-    "swipe",
     "drag",
     "move",
     "set_value",
-    "perform_action",
+    "action",
     "window",
     "app",
     "menu",
@@ -89,18 +85,17 @@ const INTERACT: &[&str] = &[
 const EXTENDED: &[&str] = &[
     "see",
     "inspect_ui",
-    "list",
     "permissions",
     "sleep",
+    "verify_state",
     "click",
     "type",
-    "hotkey",
+    "press",
     "scroll",
-    "swipe",
     "drag",
     "move",
     "set_value",
-    "perform_action",
+    "action",
     "window",
     "app",
     "menu",
@@ -142,6 +137,30 @@ pub fn validate_exec_argv(argv: &[String]) -> Result<(), CliError> {
             ));
         }
     }
+    if command == "screen" {
+        let subcommand = argv.get(1).map(|value| normalize_tool(value));
+        if subcommand.as_deref() != Some("list") {
+            return Err(policy_error(
+                "Peekaboo screen subcommand is not in the pinned adapter allowlist",
+            ));
+        }
+    }
+    if command == "verify"
+        && argv.iter().skip(1).any(|value| {
+            let normalized = normalize_tool(
+                value
+                    .trim_start_matches('-')
+                    .split('=')
+                    .next()
+                    .unwrap_or(value),
+            );
+            normalized == "screenshot"
+        })
+    {
+        return Err(policy_error(
+            "Peekaboo verify screenshots are disabled; use an adapter-owned observation artifact",
+        ));
+    }
     if argv.iter().skip(1).any(|value| denied_option(value)) {
         return Err(policy_error(format!(
             "Peekaboo command `{command}` requests an AI/provider capability disabled by the adapter safety ceiling"
@@ -157,16 +176,14 @@ pub fn exec_command(argv: &[String]) -> Option<String> {
 pub fn mutating_command(command: &str) -> bool {
     matches!(
         normalize_tool(command).as_str(),
-        "click"
+        "action"
+            | "click"
             | "type"
             | "press"
-            | "hotkey"
             | "scroll"
-            | "swipe"
             | "drag"
             | "move"
             | "set_value"
-            | "perform_action"
             | "window"
             | "app"
             | "menu"
@@ -197,7 +214,7 @@ pub(crate) fn read_only_family_invocation(argv: &[String]) -> bool {
     let Some(subcommand) = argv.get(1).map(|value| normalize_tool(value)) else {
         return false;
     };
-    matches!(command.as_str(), "app" | "window") && subcommand == "list"
+    matches!(command.as_str(), "app" | "screen" | "window") && subcommand == "list"
 }
 
 pub fn snapshot_lineage(argv: &[String]) -> Option<String> {
@@ -213,53 +230,6 @@ pub fn snapshot_lineage(argv: &[String]) -> Option<String> {
             .filter(|candidate| !candidate.trim().is_empty())
             .map(str::to_owned)
     })
-}
-
-pub fn validate_scenario(value: &Value) -> Result<(), CliError> {
-    scan_scenario(value, None)
-}
-
-fn scan_scenario(value: &Value, key: Option<&str>) -> Result<(), CliError> {
-    match value {
-        Value::Object(map) => {
-            for (child_key, child) in map {
-                if HARD_DENIED_OPTIONS.contains(&normalize_tool(child_key).as_str()) {
-                    return Err(policy_error(format!(
-                        "scenario requests disabled Peekaboo option `{}`",
-                        normalize_tool(child_key)
-                    )));
-                }
-                scan_scenario(child, Some(child_key))?;
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                scan_scenario(child, key)?;
-            }
-        }
-        Value::String(text)
-            if key
-                .is_some_and(|key| matches!(normalize_tool(key).as_str(), "command" | "tool")) =>
-        {
-            let command = normalize_tool(text);
-            if is_cli_hard_denied(&command) || !ADMITTED_CLI.contains(&command.as_str()) {
-                return Err(policy_error(format!(
-                    "scenario requests disabled or unreviewed Peekaboo capability `{command}`"
-                )));
-            }
-        }
-        Value::String(text)
-            if key.is_some_and(|key| matches!(normalize_tool(key).as_str(), "action" | "name"))
-                && is_cli_hard_denied(&normalize_tool(text)) =>
-        {
-            return Err(policy_error(format!(
-                "scenario requests disabled Peekaboo capability `{}`",
-                normalize_tool(text)
-            )));
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 pub fn allowed_tools(profile: ToolProfile) -> &'static [&'static str] {
@@ -341,7 +311,7 @@ mod tests {
 
     use super::{
         ToolProfile, allowed_tools, mcp_call_allowed, mutating_invocation, tool_allowed,
-        validate_exec_argv, validate_scenario,
+        validate_exec_argv,
     };
 
     #[test]
@@ -407,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_denials_apply_to_cli_and_scenarios() {
+    fn hard_denials_apply_to_cli() {
         assert!(validate_exec_argv(&["see".into(), "--json".into()]).is_ok());
         assert!(
             validate_exec_argv(&["see".into(), "--analyze".into(), "describe".into()]).is_err()
@@ -429,7 +399,7 @@ mod tests {
             ])
             .is_err()
         );
-        for subcommand in ["live", "video", "watch"] {
+        for subcommand in ["live", "video"] {
             assert!(
                 validate_exec_argv(&["capture".into(), subcommand.into(), "--help".into()]).is_ok(),
                 "reviewed capture subcommand {subcommand} must remain admitted"
@@ -441,16 +411,6 @@ mod tests {
                 "/private/path".into(),
                 "see".into()
             ])
-            .is_err()
-        );
-        assert!(validate_scenario(&json!({"steps":[{"command":"shell"}]})).is_err());
-        assert!(
-            validate_scenario(&json!({"steps":[{"command":"future-unsafe-command"}]})).is_err()
-        );
-        assert!(
-            validate_scenario(&json!({
-                "steps":[{"command":"see","analyze":"describe the screen"}]
-            }))
             .is_err()
         );
     }
@@ -479,29 +439,74 @@ mod tests {
     fn profiles_are_exactly_the_documented_upstream_tool_sets() {
         assert_eq!(
             allowed_tools(ToolProfile::Observe),
-            ["see", "inspect_ui", "list", "permissions", "sleep"]
+            ["see", "inspect_ui", "permissions", "sleep", "verify_state"]
         );
         assert_eq!(
             &allowed_tools(ToolProfile::Interact)[5..],
             [
                 "click",
                 "type",
-                "hotkey",
+                "press",
                 "scroll",
-                "swipe",
                 "drag",
                 "move",
                 "set_value",
-                "perform_action",
+                "action",
                 "window",
                 "app",
                 "menu",
             ]
         );
         assert_eq!(
-            &allowed_tools(ToolProfile::Extended)[17..],
+            &allowed_tools(ToolProfile::Extended)[16..],
             ["dialog", "dock", "space", "capture", "paste"]
         );
+    }
+
+    #[test]
+    fn removed_peekaboo_v3_cli_commands_are_not_admitted() {
+        for command in [
+            "hotkey",
+            "inspect-ui",
+            "list",
+            "perform-action",
+            "run",
+            "sleep",
+            "swipe",
+        ] {
+            assert!(
+                validate_exec_argv(&[command.into(), "--help".into()]).is_err(),
+                "removed Peekaboo v3 command remained admitted: {command}",
+            );
+        }
+        for command in ["action", "press", "verify"] {
+            assert!(
+                validate_exec_argv(&[command.into(), "--help".into()]).is_ok(),
+                "Peekaboo v4 command was not admitted: {command}",
+            );
+        }
+        assert!(validate_exec_argv(&["screen".into(), "list".into(), "--json".into()]).is_ok());
+        assert!(validate_exec_argv(&["screen".into(), "capture".into()]).is_err());
+    }
+
+    #[test]
+    fn verify_cannot_write_a_caller_selected_screenshot() {
+        assert!(
+            validate_exec_argv(&[
+                "verify".into(),
+                "--app".into(),
+                "Calculator".into(),
+                "--window-exists".into(),
+            ])
+            .is_ok()
+        );
+        for option in ["--screenshot", "--screenshot=/tmp/verify.png"] {
+            assert!(
+                validate_exec_argv(&["verify".into(), option.into(), "/tmp/verify.png".into()])
+                    .is_err(),
+                "verify screenshot option remained admitted: {option}"
+            );
+        }
     }
 
     #[test]

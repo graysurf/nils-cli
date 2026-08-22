@@ -10,7 +10,6 @@ use crate::test_mode;
 
 pub mod exec;
 pub mod mcp;
-pub mod scenario;
 
 const PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",

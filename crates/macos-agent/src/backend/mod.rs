@@ -517,7 +517,7 @@ fn recover_pending(
         if current.tag == lock.tag && current.commit == lock.commit {
             verify_receipt(paths, lock, current, strict)?;
         } else {
-            verify_receipt_any_version(paths, lock, current, strict)?;
+            verify_transition_receipt(paths, lock, current, strict)?;
         }
     }
     let incoming = paths.stable_app.with_file_name(STABLE_APP_INCOMING);
@@ -537,7 +537,7 @@ fn recover_pending(
     if let Some(current) = current.as_ref()
         && stable_app_matches(paths, current)?
     {
-        verify_receipt_app(&paths.stable_app, lock, current, strict)?;
+        verify_transition_receipt_app(&paths.stable_app, lock, current, strict)?;
         remove_transaction_dir(&incoming)?;
         remove_transaction_dir(&backup)?;
         return fs::remove_file(paths.pending_receipt())
@@ -547,7 +547,7 @@ fn recover_pending(
         && let Some(current) = current.as_ref()
         && app_path_matches(&backup, current)?
     {
-        verify_receipt_app(&backup, lock, current, strict)?;
+        verify_transition_receipt_app(&backup, lock, current, strict)?;
         fs::rename(&backup, &paths.stable_app)
             .map_err(|_| backend_error("failed to restore the previous stable app"))?;
         remove_transaction_dir(&incoming)?;
@@ -810,7 +810,10 @@ fn evaluate_capability_probe(
             )
         };
     }
-    if matches!(id, "observation" | "action" | "scenario" | "mcp_stdio") {
+    if matches!(
+        id,
+        "observation" | "click" | "action" | "press" | "verification" | "mcp_stdio"
+    ) {
         return ("pass", "required adapter surface probe passed");
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
@@ -963,12 +966,8 @@ fn verify_transition_runtime(
     receipt: &Receipt,
     strict: bool,
 ) -> Result<VerifiedTransitionRuntime, CliError> {
-    if receipt.tag == lock.tag && receipt.commit == lock.commit {
-        verify_receipt(paths, lock, receipt, strict)?;
-    } else {
-        verify_receipt_any_version(paths, lock, receipt, strict)?;
-    }
-    let (cli_asset, _, _) = release_contract_for_receipt(lock, receipt)?;
+    verify_transition_receipt(paths, lock, receipt, strict)?;
+    let (cli_asset, _, _) = release_contract_for_transition_receipt(lock, receipt)?;
     let identity = cli_asset
         .executable_sha256
         .get(..16)
@@ -1052,6 +1051,33 @@ fn verify_receipt_any_version(
     let release = lock
         .rollback_release(&receipt.tag, &receipt.commit)
         .ok_or_else(|| backend_error("previous release is not authorized by the embedded lock"))?;
+    verify_historical_receipt(paths, receipt, release, strict)
+}
+
+fn verify_transition_receipt(
+    paths: &BackendPaths,
+    lock: &PeekabooLock,
+    receipt: &Receipt,
+    strict: bool,
+) -> Result<NotarizationAssessment, CliError> {
+    if receipt.tag == lock.tag && receipt.commit == lock.commit {
+        return verify_receipt(paths, lock, receipt, strict);
+    }
+    if receipt.schema_version != RECEIPT_SCHEMA || !safe_tag(&receipt.tag) {
+        return Err(backend_error("transition receipt is malformed"));
+    }
+    let release = lock
+        .transition_release(&receipt.tag, &receipt.commit)
+        .ok_or_else(|| backend_error("outgoing release is not authorized for transition"))?;
+    verify_historical_receipt(paths, receipt, release, strict)
+}
+
+fn verify_historical_receipt(
+    paths: &BackendPaths,
+    receipt: &Receipt,
+    release: &RollbackReleaseLock,
+    strict: bool,
+) -> Result<NotarizationAssessment, CliError> {
     verify_rollback_receipt_identity(receipt, release)?;
     verify_receipt_files(
         paths,
@@ -1137,12 +1163,9 @@ fn refuse_unowned_app(paths: &BackendPaths) -> Result<(), CliError> {
         return Err(backend_error("refusing to replace an unowned Peekaboo app"));
     };
     let lock = PeekabooLock::embedded()?;
-    if receipt.tag == lock.tag && receipt.commit == lock.commit {
-        verify_receipt(paths, &lock, &receipt, false)?;
-    } else {
-        verify_receipt_any_version(paths, &lock, &receipt, false)?;
-    }
-    let (active_app_asset, minimum_macos) = app_contract_for_receipt(&lock, &receipt)?;
+    verify_transition_receipt(paths, &lock, &receipt, false)?;
+    let (_, active_app_asset, minimum_macos) =
+        release_contract_for_transition_receipt(&lock, &receipt)?;
     if !stable_app_matches(paths, &receipt)? {
         return Err(backend_error(
             "refusing to replace a changed or unowned Peekaboo app",
@@ -1176,12 +1199,32 @@ fn verify_receipt_app(
     receipt: &Receipt,
     strict: bool,
 ) -> Result<(), CliError> {
+    let (app_asset, minimum_macos) = app_contract_for_receipt(lock, receipt)?;
+    verify_receipt_app_against_contract(app, receipt, app_asset, minimum_macos, strict)
+}
+
+fn verify_transition_receipt_app(
+    app: &Path,
+    lock: &PeekabooLock,
+    receipt: &Receipt,
+    strict: bool,
+) -> Result<(), CliError> {
+    let (_, app_asset, minimum_macos) = release_contract_for_transition_receipt(lock, receipt)?;
+    verify_receipt_app_against_contract(app, receipt, app_asset, minimum_macos, strict)
+}
+
+fn verify_receipt_app_against_contract(
+    app: &Path,
+    receipt: &Receipt,
+    app_asset: &AssetLock,
+    minimum_macos: &str,
+    strict: bool,
+) -> Result<(), CliError> {
     if !app_path_matches(app, receipt)? {
         return Err(backend_error(
             "stable app transaction digest does not match its receipt",
         ));
     }
-    let (app_asset, minimum_macos) = app_contract_for_receipt(lock, receipt)?;
     verify_signature(app, app_asset, true, strict)?;
     verify_app_metadata(app, app_asset, &receipt.tag, minimum_macos)
 }
@@ -1245,6 +1288,23 @@ fn release_contract_for_receipt<'a>(
     ))
 }
 
+fn release_contract_for_transition_receipt<'a>(
+    lock: &'a PeekabooLock,
+    receipt: &Receipt,
+) -> Result<(&'a AssetLock, &'a AssetLock, &'a str), CliError> {
+    if receipt.tag == lock.tag && receipt.commit == lock.commit {
+        return Ok((lock.cli_asset(), lock.app_asset(), &lock.minimum_macos));
+    }
+    let release = lock
+        .transition_release(&receipt.tag, &receipt.commit)
+        .ok_or_else(|| backend_error("receipt release is not authorized for transition"))?;
+    Ok((
+        release.cli_asset(),
+        release.app_asset(),
+        &release.minimum_macos,
+    ))
+}
+
 fn app_contract_for_receipt<'a>(
     lock: &'a PeekabooLock,
     receipt: &Receipt,
@@ -1263,9 +1323,17 @@ fn obsolete_runtime_contracts(lock: &PeekabooLock, receipt: &Receipt) -> Vec<Run
             release.cli_asset(),
         )
     });
+    let upgrade_from = lock.upgrade_from_releases.iter().map(|release| {
+        (
+            release.tag.as_str(),
+            release.commit.as_str(),
+            release.cli_asset(),
+        )
+    });
     let mut seen = BTreeSet::new();
     current
         .chain(rollback)
+        .chain(upgrade_from)
         .filter(|(tag, commit, _)| *tag != receipt.tag || *commit != receipt.commit)
         .filter_map(|(_, _, asset)| {
             let identity = asset.executable_sha256[..16].to_string();
@@ -2081,8 +2149,13 @@ mod tests {
         };
 
         let contracts = obsolete_runtime_contracts(&lock, &receipt);
-        assert_eq!(contracts.len(), 1);
-        assert_eq!(contracts[0].identity(), "2222222222222222");
-        assert_eq!(contracts[0].bridge_build(), "3.9.2 (historical)");
+        assert_eq!(contracts.len(), 2);
+        assert!(contracts.iter().any(|contract| {
+            contract.identity() == "6380687e62cf42d1" && contract.bridge_build() == "3.9.3 (3.9.3)"
+        }));
+        assert!(contracts.iter().any(|contract| {
+            contract.identity() == "2222222222222222"
+                && contract.bridge_build() == "3.9.2 (historical)"
+        }));
     }
 }
