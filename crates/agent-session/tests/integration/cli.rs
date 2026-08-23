@@ -65,6 +65,31 @@ fn sha256_hex(value: &str) -> String {
         .collect()
 }
 
+fn projected_provider_identifier(
+    runtime_id: &str,
+    provider: &str,
+    field: &str,
+    value: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.provider-identifier.v1\0");
+    digest.update(runtime_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(provider.as_bytes());
+    digest.update(b"\0");
+    digest.update(field.as_bytes());
+    digest.update(b"\0");
+    digest.update(value.as_bytes());
+    format!(
+        "local:v1:{}",
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
 pub(super) fn fake_tmux(tmp: &Path) -> (PathBuf, PathBuf) {
     let bin = tmp.join("tmux");
     let log = tmp.join("tmux.log");
@@ -1768,6 +1793,294 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
     assert_eq!(
         fs::metadata(replay_path).expect("replay size").len(),
         64 + 4096 * 2 * 32
+    );
+}
+
+#[test]
+fn agent_console_dsh_profile_admits_dsh_activity_for_hermes_transport_only() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let dsh_launcher = fake_agent(tmp.path(), "run-agent-console-dsh");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let dsh_launcher_arg = dsh_launcher.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "hermes",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &dsh_launcher_arg,
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let record_path = state_dir.join("sessions").join(&id).join("session.json");
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("session record"))
+            .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime id")
+        .to_string();
+    record["runtime"]["agent_profile"] = json!("dsh-tui");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("serialize session record"),
+    )
+    .expect("write session record");
+
+    let submit = |provider: &str, event_id: &str, kind: &str| {
+        run_with_stdin(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "event",
+                &id,
+                "--stdin",
+                "--format",
+                "json",
+            ],
+            &[],
+            &json!({
+                "schema_version": "agent-session.turn-event.v1",
+                "event_id": event_id,
+                "runtime_id": runtime_id,
+                "provider": provider,
+                "provider_session_id": "provider-session",
+                "provider_turn_id": "1",
+                "kind": kind,
+                "confidence": "observed"
+            })
+            .to_string(),
+        )
+    };
+
+    let started = submit("dsh", "evt-dsh-start", "turn_started");
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    let started_json = started.stdout_json();
+    let started_state = &data(&started_json)["turn_state"];
+    assert_eq!(started_state["phase"], "working");
+    assert_eq!(started_state["source"]["provider"], "dsh");
+    assert_eq!(
+        started_state["current_turn"]["provider_turn_id"],
+        projected_provider_identifier(&runtime_id, "dsh", "turn", "1")
+    );
+    let activity: Value = serde_json::from_slice(
+        &fs::read(
+            record_path
+                .parent()
+                .expect("session dir")
+                .join("activity.json"),
+        )
+        .expect("activity document"),
+    )
+    .expect("activity JSON");
+    assert_eq!(
+        activity["provider_session_id"],
+        projected_provider_identifier(&runtime_id, "dsh", "session", "provider-session")
+    );
+    assert_ne!(
+        activity["provider_session_id"],
+        projected_provider_identifier(&runtime_id, "hermes", "session", "provider-session")
+    );
+    let pre_dispatch_revision = activity["state"]["revision"]
+        .as_u64()
+        .expect("pre-dispatch revision");
+
+    if let Some(agent_hook) =
+        nils_test_support::bin::sibling_or_skip("agent-hook", "nils-agent-hook")
+    {
+        let home = tmp.path().join("home");
+        let config_home = tmp.path().join("config");
+        let state_home = tmp.path().join("hook-state");
+        let config_dir = config_home.join("agent-hook");
+        let policy_dir = tmp.path().join("policy");
+        let agent_docs_state = state_home.join("dsh-runtime-kit");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&config_dir).expect("agent-hook config dir");
+        fs::create_dir_all(&policy_dir).expect("agent-hook policy dir");
+        fs::create_dir_all(&agent_docs_state).expect("agent-docs state dir");
+        let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "agent-console-dsh-activity-test"
+version = "2026.08.23.1"
+
+[[rules]]
+id = "agent-console.dsh-activity"
+products = ["dsh"]
+events = ["UserPromptSubmit"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "dsh.policy.v1", group = "agent-activity" }
+"#;
+        let policy_path = policy_dir.join("policy.toml");
+        fs::write(&policy_path, policy).expect("agent-hook policy");
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).expect("policy mode");
+        let config_path = config_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "schema_version = \"agent-hook.config.v1\"\n\n[policy]\npath = {}\ndigest = \"sha256:{}\"\n",
+                toml_edit::Value::from(policy_path.to_string_lossy().into_owned()),
+                sha256_hex(policy),
+            ),
+        )
+        .expect("agent-hook config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
+        let secret_prompt = "do not persist sk-issue213-activity-canary";
+        let payload = json!({
+            "schema_version": "agent-hook.dsh-ingress.v3",
+            "event": "agent/pre-step",
+            "cwd": cwd,
+            "subject": {
+                "session_id": "provider-session",
+                "turn": 2,
+                "step": 1,
+                "session_start_source": "startup",
+                "agent_docs_state_home": agent_docs_state
+            },
+            "prompt": secret_prompt
+        })
+        .to_string();
+        let agent_session = nils_test_support::bin::resolve("agent-session");
+        let mut child = Command::new(agent_hook)
+            .args(["dispatch", "--product", "dsh", "--format", "json"])
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("AGENT_SESSION_ID", &id)
+            .env("AGENT_SESSION_RUNTIME_ID", &runtime_id)
+            .env("AGENT_SESSION_STATE_DIR", &state_dir)
+            .env("AGENT_SESSION_BIN", agent_session)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("agent-hook spawn");
+        child
+            .stdin
+            .take()
+            .expect("agent-hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("agent-hook payload");
+        let output = child.wait_with_output().expect("agent-hook output");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dispatch: Value =
+            serde_json::from_slice(&output.stdout).expect("agent-hook dispatch JSON");
+        assert_eq!(dispatch["data"]["action"], "allow");
+        let activity_bytes = fs::read(
+            record_path
+                .parent()
+                .expect("session dir")
+                .join("activity.json"),
+        )
+        .expect("activity after dispatch");
+        assert!(!String::from_utf8_lossy(&activity_bytes).contains(secret_prompt));
+        let activity: Value = serde_json::from_slice(&activity_bytes).expect("activity JSON");
+        assert_eq!(activity["last_provider_event_provider"], "dsh");
+        assert!(
+            activity["state"]["revision"]
+                .as_u64()
+                .expect("post-dispatch revision")
+                > pre_dispatch_revision,
+            "agent-hook dispatch must append a distinct DSH provider event"
+        );
+        assert_eq!(
+            activity["state"]["current_turn"]["provider_turn_id"],
+            projected_provider_identifier(&runtime_id, "dsh", "turn", "2")
+        );
+    }
+
+    let hermes_transport = submit("hermes", "evt-hermes-transport", "progress");
+    assert_eq!(
+        hermes_transport.stdout_json()["error"]["code"],
+        "activity-provider-mismatch"
+    );
+
+    record["agent_bin"] = json!("run-agent-console-dsh");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("serialize relative launcher record"),
+    )
+    .expect("write relative launcher record");
+    let relative_launcher = submit("dsh", "evt-relative-launcher", "progress");
+    assert_eq!(
+        relative_launcher.stdout_json()["error"]["code"],
+        "activity-provider-mismatch"
+    );
+
+    record["agent_bin"] = json!(dsh_launcher_arg);
+    record["runtime"]["agent_profile"] = json!("other-profile");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("serialize other profile record"),
+    )
+    .expect("write other profile record");
+    let other_profile = submit("dsh", "evt-other-profile", "progress");
+    assert_eq!(
+        other_profile.stdout_json()["error"]["code"],
+        "activity-provider-mismatch"
+    );
+
+    record["runtime"]["agent_profile"] = json!("dsh-tui");
+    record["agent_bin"] = json!(fake_agent(tmp.path(), "hermes"));
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("serialize Hermes launcher record"),
+    )
+    .expect("write Hermes launcher record");
+    let hermes_launcher = submit("dsh", "evt-hermes-launcher", "progress");
+    assert_eq!(
+        hermes_launcher.stdout_json()["error"]["code"],
+        "activity-provider-mismatch"
+    );
+
+    record["agent"] = json!("dsh");
+    record["agent_bin"] = Value::Null;
+    record["runtime"]
+        .as_object_mut()
+        .expect("runtime object")
+        .remove("agent_profile");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("serialize external DSH record"),
+    )
+    .expect("write external DSH record");
+    let external_dsh = submit("dsh", "evt-external-dsh", "progress");
+    assert_eq!(
+        external_dsh.stdout_json()["error"]["code"],
+        "activity-provider-mismatch",
+        "external DSH records take activity only from the plugin liveness sidecar"
     );
 }
 

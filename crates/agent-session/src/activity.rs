@@ -57,6 +57,8 @@ const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_UNHEALTHY_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const AGENT_HOOK_DOCTOR_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const AGENT_CONSOLE_DSH_PROFILE: &str = "dsh-tui";
+const AGENT_CONSOLE_DSH_LAUNCHER: &str = "run-agent-console-dsh";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2549,7 +2551,7 @@ fn ingest_event_with_lock(
     };
     let record = load_session_record(context, &observed.id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
-    if event.provider != record.agent {
+    if !session_accepts_activity_provider(&record, &event.provider) {
         return Err(CliError::data(
             "activity-provider-mismatch",
             "activity event provider does not match the session provider",
@@ -2577,7 +2579,7 @@ fn ingest_event_with_lock(
             Some(json!({ "id": record.id })),
         ));
     }
-    let agent = AgentKind::from_name(&record.agent).expect("validated session agent");
+    let agent = AgentKind::from_name(&event.provider).expect("validated activity provider");
     event.provider_session_id = event
         .provider_session_id
         .as_deref()
@@ -2591,7 +2593,7 @@ fn ingest_event_with_lock(
     let expected_provider_session_id = record
         .provider_resume
         .as_ref()
-        .filter(|resume| resume.provider == record.agent)
+        .filter(|resume| resume.provider == event.provider)
         .map(|resume| {
             projected_provider_identifier(active_runtime_id, agent, "session", &resume.session_id)
         })
@@ -2798,6 +2800,26 @@ fn ingest_event_with_lock(
         id: record.id,
         turn_state: state,
         duplicate: false,
+    })
+}
+
+fn session_accepts_activity_provider(record: &SessionRecord, provider: &str) -> bool {
+    if provider == AgentKind::Dsh.as_str() {
+        return agent_console_dsh_transport(record);
+    }
+    !agent_console_dsh_transport(record) && provider == record.agent
+}
+
+fn agent_console_dsh_transport(record: &SessionRecord) -> bool {
+    if record.agent != AgentKind::Hermes.as_str()
+        || crate::session_agent_profile(record) != Some(AGENT_CONSOLE_DSH_PROFILE)
+    {
+        return false;
+    }
+    record.agent_bin.as_deref().is_some_and(|agent_bin| {
+        let path = Path::new(agent_bin);
+        path.is_absolute()
+            && path.file_name().and_then(|name| name.to_str()) == Some(AGENT_CONSOLE_DSH_LAUNCHER)
     })
 }
 
@@ -8395,10 +8417,13 @@ fn validate_event(event: &TurnEvent, admission: EventAdmission) -> Result<(), Cl
             ));
         }
     }
-    if !matches!(event.provider.as_str(), "codex" | "claude" | "hermes") {
+    if !matches!(
+        event.provider.as_str(),
+        "codex" | "claude" | "hermes" | "dsh"
+    ) {
         return Err(CliError::data(
             "activity-provider-unsupported",
-            "activity event provider must be codex, claude, or hermes",
+            "activity event provider must be codex, claude, hermes, or dsh",
             None,
         ));
     }
