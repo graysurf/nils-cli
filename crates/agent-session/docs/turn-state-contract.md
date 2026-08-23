@@ -71,8 +71,11 @@ remain provider mismatches. The matched alias accepts only DSH lifecycle
 events; Hermes remains its terminal transport identity and cannot also mutate
 the activity document. Provider identifiers use the admitted event provider's
 runtime-scoped projection domain. Native external DSH records continue to take
-turn evidence only from their plugin-owned liveness sidecar and reject this
-turn-event ingress.
+turn evidence only from their plugin-owned liveness sidecar. A DSH provider-hook
+event for the exact active runtime generation succeeds only when that sidecar
+already proves a live turn; the result projects the sidecar state and does not
+mutate the activity document. Stale generations, missing or invalid sidecars,
+and every other provider remain fail-closed.
 For the matched alias, `activity hook --agent dsh` maps the DSH bridge's
 `pre_llm_call` and `post_llm_call` callbacks to observed start and authoritative
 completion without enabling Hermes approval callbacks for DSH.

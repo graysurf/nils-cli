@@ -38673,6 +38673,87 @@ fn main_agent_worker_start_dsh_replay_joins_the_pre_attachment_authority_fence()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("liveness epoch")
         .as_secs();
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let submit_external_activity = |event_id: &str, event_runtime_id: &str| {
+        run_resolved(
+            "agent-session",
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "event",
+                "worker-dsh-fence-replay",
+                "--stdin",
+                "--format",
+                "json",
+            ],
+            &CmdOptions::new().with_cwd(&checkout).with_stdin_str(
+                &json!({
+                    "schema_version": "agent-session.turn-event.v1",
+                    "event_id": event_id,
+                    "runtime_id": event_runtime_id,
+                    "provider": "dsh",
+                    "provider_session_id": "provider-session",
+                    "provider_turn_id": "1",
+                    "kind": "turn_started",
+                    "confidence": "observed",
+                    "source_kind": "provider_hook"
+                })
+                .to_string(),
+            ),
+        )
+    };
+    let unavailable_activity = submit_external_activity("external-dsh-missing-sidecar", &launch_id);
+    assert_eq!(
+        unavailable_activity.stdout_json()["error"]["code"],
+        "external-dsh-activity-unavailable",
+        "a missing sidecar cannot be converted into successful hook admission"
+    );
+    write_private_json(
+        Path::new(&liveness_file),
+        &json!({
+            "schema_version": "main-agent.dsh-runtime-liveness.v1",
+            "launch_id": launch_id,
+            "harness": harness_identity_json(),
+            "lane": { "state": "open" },
+            "turn": {
+                "phase": "waiting",
+                "phase_changed_at": liveness_epoch.to_string(),
+                "current_turn": null,
+                "last_turn": null
+            },
+            "updated_at": liveness_epoch
+        }),
+    );
+    let waiting_activity = submit_external_activity("external-dsh-waiting", &launch_id);
+    assert_eq!(
+        waiting_activity.stdout_json()["error"]["code"],
+        "external-dsh-activity-unavailable",
+        "an idle lane does not prove the live turn required by a provider hook"
+    );
+    write_private_json(
+        Path::new(&liveness_file),
+        &json!({
+            "schema_version": "main-agent.dsh-runtime-liveness.v1",
+            "launch_id": launch_id,
+            "harness": harness_identity_json(),
+            "lane": { "state": "open" },
+            "turn": {
+                "phase": "working",
+                "phase_changed_at": liveness_epoch.to_string(),
+                "current_turn": null,
+                "last_turn": null
+            },
+            "updated_at": liveness_epoch
+        }),
+    );
+    let incoherent_activity =
+        submit_external_activity("external-dsh-working-without-turn", &launch_id);
+    assert_eq!(
+        incoherent_activity.stdout_json()["error"]["code"],
+        "external-dsh-activity-unavailable",
+        "working without a current turn is not coherent provider-hook evidence"
+    );
     write_private_json(
         Path::new(&liveness_file),
         &json!({
@@ -38689,6 +38770,31 @@ fn main_agent_worker_start_dsh_replay_joins_the_pre_attachment_authority_fence()
             "updated_at": liveness_epoch
         }),
     );
+    let activity_path = state_dir.join("sessions/worker-dsh-fence-replay/activity.json");
+    let activity_before = fs::read(&activity_path).expect("pre-hook activity document");
+    let stale_activity = submit_external_activity(
+        "external-dsh-stale-hook-pre-step",
+        "stale-runtime-generation",
+    );
+    assert_eq!(
+        stale_activity.stdout_json()["error"]["code"],
+        "runtime-id-mismatch",
+        "a non-mutating external hook still belongs to exactly one runtime generation"
+    );
+    let activity = submit_external_activity("external-dsh-hook-pre-step", &launch_id);
+    assert_eq!(
+        activity.code,
+        0,
+        "the external DSH hook is a non-mutating success because the sidecar owns turn evidence: {}",
+        activity.stdout_text()
+    );
+    assert_eq!(data(&activity)["duplicate"], true);
+    assert_eq!(data(&activity)["turn_state"]["phase"], "working");
+    assert_eq!(
+        fs::read(&activity_path).expect("post-hook activity document"),
+        activity_before,
+        "direct hook activity must not create a competing activity document"
+    );
     let heartbeat_argv = launch["broker_heartbeat_argv"]
         .as_array()
         .expect("heartbeat argv")
@@ -38701,7 +38807,6 @@ fn main_agent_worker_start_dsh_replay_joins_the_pre_attachment_authority_fence()
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn emitted heartbeat argv");
-    let state_arg = state_dir.to_string_lossy().into_owned();
     let ready_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = run(
