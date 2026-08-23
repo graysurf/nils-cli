@@ -28,7 +28,7 @@ Required fields:
 | `schema_version` | exactly `agent-session.turn-event.v1` |
 | `event_id` | opaque id used for idempotency |
 | `runtime_id` | exact active `AGENT_SESSION_RUNTIME_ID` |
-| `provider` | `codex`, `claude`, or `hermes`; must match the session |
+| `provider` | `codex`, `claude`, or `hermes` must match the session; `dsh` is reserved for the bounded Agent Console transport alias below |
 | `kind` | `turn_started`, `attention_requested`, `attention_cleared`, `progress`, `stop_observed`, `turn_completed`, or `turn_failed` |
 | `confidence` | `authoritative`, `observed`, or `inferred` |
 
@@ -60,6 +60,19 @@ must carry exactly 64 hexadecimal digest characters. When exact provider resume
 identity is known it must match; when it is not known, the first non-empty
 projected provider session id binds the runtime; later changes or identity-less
 events are rejected.
+
+An Agent Console launch profile may use Hermes as its terminal transport while
+the provider lifecycle is owned by DSH. A `dsh` event is admitted for that
+alias only when the persisted session has `agent: hermes`, the server-owned
+runtime profile is exactly `dsh-tui`, and the persisted agent binary is an
+absolute path whose filename is exactly `run-agent-console-dsh`. Missing,
+relative, or differently named launchers and every other cross-provider pair
+remain provider mismatches. The matched alias accepts only DSH lifecycle
+events; Hermes remains its terminal transport identity and cannot also mutate
+the activity document. Provider identifiers use the admitted event provider's
+runtime-scoped projection domain. Native external DSH records continue to take
+turn evidence only from their plugin-owned liveness sidecar and reject this
+turn-event ingress.
 
 The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
