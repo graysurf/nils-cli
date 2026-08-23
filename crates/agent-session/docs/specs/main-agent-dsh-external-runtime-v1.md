@@ -22,6 +22,13 @@ that issue.
 | Worker-side bootstrap/checkpoint | worker agent runs the existing `main-agent bootstrap` / `main-agent checkpoint` verbs |
 | Stop/interrupt of a lane runtime | plugin (`worker stop-runtime` returns a typed refusal for dsh) |
 
+The plugin's ordinary DSH provider hooks may still invoke the shared
+`agent-session.activity.v1` policy capability. For an external lane, an event
+for the exact active runtime generation is a non-mutating success only when the
+sidecar already proves the live turn. The returned state is projected from the
+sidecar; no competing activity document is advanced. A stale generation or
+unproven sidecar remains a closed failure.
+
 ## `capabilities --provider dsh`
 
 `main-agent capabilities --provider dsh --format json` returns

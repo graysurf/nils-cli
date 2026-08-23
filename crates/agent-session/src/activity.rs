@@ -2551,6 +2551,46 @@ fn ingest_event_with_lock(
     };
     let record = load_session_record(context, &observed.id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
+    if crate::dsh_external::is_external_record(&record)
+        && event.provider == AgentKind::Dsh.as_str()
+        && event.source_kind == SourceKind::ProviderHook
+    {
+        let active_runtime_id = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .unwrap_or_default();
+        if active_runtime_id.is_empty() || event.runtime_id != active_runtime_id {
+            return Err(CliError::data(
+                "runtime-id-mismatch",
+                "activity event does not belong to the active runtime generation",
+                Some(json!({ "id": record.id })),
+            ));
+        }
+        let turn_state = crate::dsh_external::external_turn_state(&record).ok_or_else(|| {
+            CliError::runtime(
+                "external-dsh-activity-unavailable",
+                "external DSH activity could not be proven by the plugin liveness sidecar",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        if turn_state.phase != TurnPhase::Working || turn_state.current_turn.is_none() {
+            return Err(CliError::runtime(
+                "external-dsh-activity-unavailable",
+                "external DSH activity does not prove a live plugin-owned turn",
+                Some(json!({ "id": record.id })),
+            ));
+        }
+        // The plugin sidecar is the sole activity authority for an external
+        // DSH lane. A provider hook still needs a successful capability result
+        // so policy admission can continue, but it must not create a competing
+        // activity document or advance a second turn-state reducer.
+        return Ok(ActivityResult {
+            id: record.id,
+            turn_state,
+            duplicate: true,
+        });
+    }
     if !session_accepts_activity_provider(&record, &event.provider) {
         return Err(CliError::data(
             "activity-provider-mismatch",

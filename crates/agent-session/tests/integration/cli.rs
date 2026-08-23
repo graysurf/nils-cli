@@ -2150,7 +2150,7 @@ capability = { id = "dsh.policy.v1", group = "agent-activity" }
     assert_eq!(
         external_dsh.stdout_json()["error"]["code"],
         "activity-provider-mismatch",
-        "external DSH records take activity only from the plugin liveness sidecar"
+        "changing the provider field cannot turn an ordinary session into an external DSH lane"
     );
 }
 
