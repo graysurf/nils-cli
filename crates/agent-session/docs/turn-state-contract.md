@@ -73,6 +73,9 @@ the activity document. Provider identifiers use the admitted event provider's
 runtime-scoped projection domain. Native external DSH records continue to take
 turn evidence only from their plugin-owned liveness sidecar and reject this
 turn-event ingress.
+For the matched alias, `activity hook --agent dsh` maps the DSH bridge's
+`pre_llm_call` and `post_llm_call` callbacks to observed start and authoritative
+completion without enabling Hermes approval callbacks for DSH.
 
 The host receive time is canonical. Provider time is accepted only as inert
 metadata in v1 and never advances state ahead of host observation. Runtime id
