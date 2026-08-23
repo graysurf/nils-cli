@@ -2534,6 +2534,9 @@ fn ingest_event_with_lock(
 ) -> Result<ActivityResult, CliError> {
     validate_event(&event, admission)?;
     let observed = load_session_record(context, id)?;
+    if let Some(result) = external_dsh_provider_hook_activity(context, &observed, &event)? {
+        return Ok(result);
+    }
     let record_lock = match lock_mode {
         ActivityLockMode::Blocking => crate::acquire_session_record_lock(context, &observed.id)?,
         ActivityLockMode::NonBlocking => {
@@ -2551,46 +2554,6 @@ fn ingest_event_with_lock(
     };
     let record = load_session_record(context, &observed.id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
-    if crate::dsh_external::is_external_record(&record)
-        && event.provider == AgentKind::Dsh.as_str()
-        && event.source_kind == SourceKind::ProviderHook
-    {
-        let active_runtime_id = record
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.launch_id.as_str())
-            .unwrap_or_default();
-        if active_runtime_id.is_empty() || event.runtime_id != active_runtime_id {
-            return Err(CliError::data(
-                "runtime-id-mismatch",
-                "activity event does not belong to the active runtime generation",
-                Some(json!({ "id": record.id })),
-            ));
-        }
-        let turn_state = crate::dsh_external::external_turn_state(&record).ok_or_else(|| {
-            CliError::runtime(
-                "external-dsh-activity-unavailable",
-                "external DSH activity could not be proven by the plugin liveness sidecar",
-                Some(json!({ "id": record.id })),
-            )
-        })?;
-        if turn_state.phase != TurnPhase::Working || turn_state.current_turn.is_none() {
-            return Err(CliError::runtime(
-                "external-dsh-activity-unavailable",
-                "external DSH activity does not prove a live plugin-owned turn",
-                Some(json!({ "id": record.id })),
-            ));
-        }
-        // The plugin sidecar is the sole activity authority for an external
-        // DSH lane. A provider hook still needs a successful capability result
-        // so policy admission can continue, but it must not create a competing
-        // activity document or advance a second turn-state reducer.
-        return Ok(ActivityResult {
-            id: record.id,
-            turn_state,
-            duplicate: true,
-        });
-    }
     if !session_accepts_activity_provider(&record, &event.provider) {
         return Err(CliError::data(
             "activity-provider-mismatch",
@@ -2841,6 +2804,115 @@ fn ingest_event_with_lock(
         turn_state: state,
         duplicate: false,
     })
+}
+
+fn external_dsh_provider_hook_activity(
+    context: &CliContext,
+    observed: &SessionRecord,
+    event: &TurnEvent,
+) -> Result<Option<ActivityResult>, CliError> {
+    if !crate::dsh_external::is_external_record(observed)
+        || event.provider != AgentKind::Dsh.as_str()
+        || event.source_kind != SourceKind::ProviderHook
+    {
+        return Ok(None);
+    }
+    let active_runtime_id = observed
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if active_runtime_id.is_empty() || event.runtime_id != active_runtime_id {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity event does not belong to the active runtime generation",
+            Some(json!({ "id": observed.id })),
+        ));
+    }
+    let observed_turn = live_external_dsh_turn(observed)?;
+
+    // This path projects the plugin-owned sidecar and never mutates the
+    // activity document, so waiting behind the mutable session-record lock can
+    // only consume the hook admission budget. Re-read after the sidecar read
+    // and require the exact session/runtime identity and validated liveness
+    // binding to remain stable instead.
+    let current = load_session_record(context, &observed.id)?;
+    crate::ensure_same_session_identity(observed, &current)?;
+    if !crate::dsh_external::is_external_record(&current)
+        || !crate::dsh_external::same_liveness_binding(observed, &current)
+    {
+        return Err(CliError::runtime(
+            "session-runtime-changed",
+            "external DSH liveness authority changed during activity admission",
+            Some(json!({ "id": observed.id })),
+        ));
+    }
+    let current_runtime_id = current
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if event.runtime_id != current_runtime_id {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity event does not belong to the active runtime generation",
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    let turn_state = live_external_dsh_turn(&current)?;
+    if turn_state != observed_turn {
+        return Err(CliError::runtime(
+            "external-dsh-activity-unavailable",
+            "external DSH activity changed during sidecar admission",
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    let final_record = load_session_record(context, &current.id)?;
+    crate::ensure_same_session_identity(&current, &final_record)?;
+    if !crate::dsh_external::is_external_record(&final_record)
+        || !crate::dsh_external::same_liveness_binding(&current, &final_record)
+    {
+        return Err(CliError::runtime(
+            "session-runtime-changed",
+            "external DSH liveness authority changed after sidecar admission",
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    let final_runtime_id = final_record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if event.runtime_id != final_runtime_id {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity event does not belong to the active runtime generation",
+            Some(json!({ "id": final_record.id })),
+        ));
+    }
+    Ok(Some(ActivityResult {
+        id: final_record.id,
+        turn_state,
+        duplicate: true,
+    }))
+}
+
+fn live_external_dsh_turn(record: &SessionRecord) -> Result<TurnState, CliError> {
+    let turn_state = crate::dsh_external::external_turn_state(record).ok_or_else(|| {
+        CliError::runtime(
+            "external-dsh-activity-unavailable",
+            "external DSH activity could not be proven by the plugin liveness sidecar",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    if turn_state.phase != TurnPhase::Working || turn_state.current_turn.is_none() {
+        return Err(CliError::runtime(
+            "external-dsh-activity-unavailable",
+            "external DSH activity does not prove a live plugin-owned turn",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    Ok(turn_state)
 }
 
 fn session_accepts_activity_provider(record: &SessionRecord, provider: &str) -> bool {

@@ -216,6 +216,14 @@ fn recorded_liveness_path(record: &SessionRecord) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
+/// Whether two snapshots retain the same validated external-liveness binding.
+/// The activity fast path uses this across its lock-free record re-read so a
+/// concurrent record mutation cannot redirect sidecar authority.
+pub(crate) fn same_liveness_binding(left: &SessionRecord, right: &SessionRecord) -> bool {
+    let left = recorded_liveness_path(left);
+    left.is_some() && left == recorded_liveness_path(right)
+}
+
 /// Whether the record's sidecar path is the exact path this CLI derives for it.
 /// Only a context-bearing caller can check this; the context-free reader keeps
 /// the shape checks above.

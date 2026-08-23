@@ -38781,6 +38781,94 @@ fn main_agent_worker_start_dsh_replay_joins_the_pre_attachment_authority_fence()
         "runtime-id-mismatch",
         "a non-mutating external hook still belongs to exactly one runtime generation"
     );
+    let record_lock_path = state_dir.join("session-locks/worker-dsh-fence-replay.lock");
+    let record_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&record_lock_path)
+        .expect("external DSH record lock");
+    // SAFETY: the test owns this descriptor and releases it before dropping it.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let mut concurrent_activity = Command::new(bin::resolve("agent-session"));
+    concurrent_activity
+        .current_dir(&checkout)
+        .args([
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "event",
+            "worker-dsh-fence-replay",
+            "--stdin",
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut concurrent_activity = concurrent_activity
+        .spawn()
+        .expect("spawn external DSH activity under record contention");
+    let concurrent_event = json!({
+        "schema_version": "agent-session.turn-event.v1",
+        "event_id": "external-dsh-hook-under-record-contention",
+        "runtime_id": launch_id,
+        "provider": "dsh",
+        "provider_session_id": "provider-session",
+        "provider_turn_id": "1",
+        "kind": "turn_started",
+        "confidence": "observed",
+        "source_kind": "provider_hook"
+    })
+    .to_string();
+    concurrent_activity
+        .stdin
+        .take()
+        .expect("external activity stdin")
+        .write_all(concurrent_event.as_bytes())
+        .expect("write external activity event");
+    let contention_deadline = Instant::now() + Duration::from_millis(250);
+    let completed_under_contention = loop {
+        if concurrent_activity
+            .try_wait()
+            .expect("poll external activity under contention")
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= contention_deadline {
+            concurrent_activity
+                .kill()
+                .expect("kill activity blocked behind an irrelevant record lock");
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // SAFETY: the test owns the locked descriptor.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    let concurrent_output = concurrent_activity
+        .wait_with_output()
+        .expect("external activity output under contention");
+    assert!(
+        completed_under_contention,
+        "sidecar-owned external DSH hook activity must not wait on the mutable activity record lock"
+    );
+    assert!(
+        concurrent_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&concurrent_output.stdout),
+        String::from_utf8_lossy(&concurrent_output.stderr)
+    );
+    assert_eq!(
+        fs::read(&activity_path).expect("activity document after contended hook"),
+        activity_before,
+        "contended external hook activity remains non-mutating"
+    );
     let activity = submit_external_activity("external-dsh-hook-pre-step", &launch_id);
     assert_eq!(
         activity.code,
