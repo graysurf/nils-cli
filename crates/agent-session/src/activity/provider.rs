@@ -122,10 +122,10 @@ pub(super) fn normalize_provider_hook(
         (AgentKind::Claude, "Notification", Some("idle_prompt")) => {
             (TurnEventKind::TurnCompleted, None, Confidence::Observed)
         }
-        (AgentKind::Hermes, "pre_llm_call", _) => {
+        (AgentKind::Hermes | AgentKind::Dsh, "pre_llm_call", _) => {
             (TurnEventKind::TurnStarted, None, Confidence::Observed)
         }
-        (AgentKind::Hermes, "post_llm_call", _) => (
+        (AgentKind::Hermes | AgentKind::Dsh, "post_llm_call", _) => (
             TurnEventKind::TurnCompleted,
             None,
             Confidence::Authoritative,

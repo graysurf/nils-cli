@@ -1849,6 +1849,76 @@ fn agent_console_dsh_profile_admits_dsh_activity_for_hermes_transport_only() {
     )
     .expect("write session record");
 
+    let hook_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let bridge_hook = |event: &str| {
+        run_with_stdin(
+            tmp.path(),
+            &["activity", "hook", "--agent", "dsh", "--event", event],
+            &hook_env,
+            &json!({
+                "session_id": "provider-session",
+                "turn_id": "bridge-turn-1"
+            })
+            .to_string(),
+        )
+    };
+    let activity_status = || {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "activity",
+                "status",
+                &id,
+                "--format",
+                "json",
+            ],
+            &[],
+        )
+    };
+
+    let bridge_started = bridge_hook("pre_llm_call");
+    assert_eq!(
+        bridge_started.code,
+        0,
+        "stderr={}",
+        bridge_started.stderr_text()
+    );
+    let bridge_started_status = activity_status().stdout_json();
+    let bridge_started_state = &data(&bridge_started_status)["turn_state"];
+    assert_eq!(bridge_started_state["phase"], "working");
+    assert_eq!(bridge_started_state["source"]["provider"], "dsh");
+    assert_eq!(
+        bridge_started_state["current_turn"]["provider_turn_id"],
+        projected_provider_identifier(&runtime_id, "dsh", "turn", "bridge-turn-1")
+    );
+    let bridge_started_revision = bridge_started_state["revision"]
+        .as_u64()
+        .expect("bridge started revision");
+
+    let bridge_completed = bridge_hook("post_llm_call");
+    assert_eq!(
+        bridge_completed.code,
+        0,
+        "stderr={}",
+        bridge_completed.stderr_text()
+    );
+    let bridge_completed_status = activity_status().stdout_json();
+    let bridge_completed_state = &data(&bridge_completed_status)["turn_state"];
+    assert_eq!(bridge_completed_state["phase"], "waiting");
+    assert_eq!(bridge_completed_state["last_turn"]["outcome"], "completed");
+    assert!(
+        bridge_completed_state["revision"]
+            .as_u64()
+            .expect("bridge completed revision")
+            > bridge_started_revision
+    );
+
     let submit = |provider: &str, event_id: &str, kind: &str| {
         run_with_stdin(
             tmp.path(),
