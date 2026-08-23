@@ -518,6 +518,10 @@ fn dsh_agent_activity_emits_only_metadata_and_partial_identity_fails_closed() {
             ("AGENT_SESSION_ID", "managed-session"),
             ("AGENT_SESSION_RUNTIME_ID", "runtime-1"),
             (
+                "DSH_RUNTIME_KIT_PROVIDER_SESSION_ID",
+                "dsh-provider-session-1",
+            ),
+            (
                 "AGENT_SESSION_BIN",
                 helper.to_str().expect("helper path UTF-8"),
             ),
@@ -532,7 +536,7 @@ fn dsh_agent_activity_emits_only_metadata_and_partial_identity_fails_closed() {
         serde_json::from_slice(&fs::read(&event_log).expect("activity event")).expect("event JSON");
     assert_eq!(event["schema_version"], "agent-session.turn-event.v1");
     assert_eq!(event["provider"], "dsh");
-    assert_eq!(event["provider_session_id"], "dsh-session-1");
+    assert_eq!(event["provider_session_id"], "dsh-provider-session-1");
     assert_eq!(event["provider_turn_id"], "1");
     assert_eq!(event["kind"], "turn_started");
     assert!(!event.to_string().contains(secret_prompt));
