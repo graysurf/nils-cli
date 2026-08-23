@@ -218,6 +218,13 @@ derived only from the normalized DSH subject and canonical event: it sends
 provider/session/turn metadata, event kind, confidence, and digests to
 `agent-session activity event`; prompt and tool arguments are never parsed for
 that event. A managed activity identity requires both session and runtime ID.
+When Main Agent policy replaces the DSH ingress subject with its authenticated
+coordination owner, the runtime transports the original DSH provider session
+only through the private `DSH_RUNTIME_KIT_PROVIDER_SESSION_ID` subprocess
+environment. Activity normalization uses that value for provider correlation
+while every other policy group continues to use the owner subject. The public
+ingress schema is unchanged, and `agent-session` still rejects a value that
+does not match the provider session already bound to the active runtime.
 
 Operation lifecycle is one locked after-policy capability. An unmanaged process
 does not run it. A managed process requires session ID, an absolute capability

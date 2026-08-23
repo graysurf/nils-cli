@@ -20,6 +20,7 @@ const DSH_INGRESS_V1: &str = "agent-hook.dsh-ingress.v1";
 const DSH_INGRESS_V2: &str = "agent-hook.dsh-ingress.v2";
 const DSH_INGRESS_V3: &str = "agent-hook.dsh-ingress.v3";
 const DSH_INGRESS_V4: &str = "agent-hook.dsh-ingress.v4";
+const DSH_RUNTIME_KIT_PROVIDER_SESSION_ID_ENV: &str = "DSH_RUNTIME_KIT_PROVIDER_SESSION_ID";
 const MAX_PROVIDER_ID_CHARS: usize = 256;
 const MAX_MUTATION_TARGETS: usize = 256;
 const MAX_MUTATION_TARGET_BYTES: usize = 4096;
@@ -615,6 +616,11 @@ pub fn normalize_activity_event(
                 "DSH activity event is missing its normalized subject",
             )
         })?;
+        let provider_session_id = std::env::var(DSH_RUNTIME_KIT_PROVIDER_SESSION_ID_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| subject.session_id.clone());
+        validate_provider_id("provider_session_id", &provider_session_id)?;
         let kind = match request.event.as_str() {
             "UserPromptSubmit" => "turn_started",
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "progress",
@@ -632,7 +638,7 @@ pub fn normalize_activity_event(
             ),
             runtime_id: runtime_id.to_string(),
             provider: "dsh",
-            provider_session_id: Some(subject.session_id.clone()),
+            provider_session_id: Some(provider_session_id),
             provider_turn_id: Some(subject.turn.to_string()),
             kind,
             failure_reason: None,
