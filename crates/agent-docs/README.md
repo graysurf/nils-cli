@@ -162,8 +162,10 @@ the no-phase set rather than erroring — so a phase with no dedicated documents
 still works. A malformed `--phase` value is a usage error (exit `64`).
 
 `--phase` is accepted by `preflight`, `session prepare`, `session context`, and
-`session verify` (one phase per call, "the current phase"; `--intent` stays
-repeatable except for `session context`, which requires exactly one intent).
+`session verify` (one phase per call, "the current phase"). The provider-only
+`session prerequisite` command requires the exact `edit` phase. `--intent`
+stays repeatable except for `session context` and `session prerequisite`, which
+require exactly one intent.
 
 ### `when` grammar
 
@@ -499,6 +501,37 @@ callers that know the current workflow phase should pass it to select the
 no-phase plus matching phase documents. A failed context refresh never mutates
 the prior record; the caller repairs the catalog or increases the requested
 budget within the hard cap, then repeats `session context`.
+
+### Transactional DSH prerequisites
+
+`session prerequisite` is the side-effect-free counterpart used by a DSH
+runtime before policy admission. It requires `--phase edit` and accepts the
+same DSH intent, request, and response-budget fields as `session context`, plus
+exact bounded agent, workspace-generation, call, turn/step, tool, and
+visible-definition identifiers. It uses the verifier's default catalog
+selection: `--user-config`, `--integration-fingerprint`, and
+`--worktree-fallback local-only` are rejected. It returns
+`decision.prerequisite.v1`: `reason = pending` includes a bounded opaque
+receipt, while `already-current` omits the receipt. Neither result writes or
+refreshes a session activation. A full activation still covers ordinary phase
+verification, but the first phase prerequisite conservatively returns
+`pending` and materializes a phase activation so its returned content and reuse
+decision come from one resolved fingerprint.
+
+After DSH waterfall, approval, monotonic guards, cancellation, and definition
+revalidation admit the call, the runtime invokes `session commit-prerequisite`
+with the same execution binding and receipt. Commit re-resolves the catalog
+under the session-record lock and writes only when the receipt fingerprint is
+still current. A changed policy returns `prerequisite-stale`; another session,
+state home, repository, agent, workspace generation, call, turn/step, tool, or
+definition returns `prerequisite-receipt-mismatch`. Abandoned receipts require
+no cleanup because begin creates no pending state. Repeating an exact commit is
+idempotent and returns `already-current`.
+
+These commands are a machine-to-machine provider protocol. The receipt grants
+no authority and contains only hashes plus public intent/phase identifiers;
+the policy hook independently revalidates it. Human and explicit agent flows
+may continue to use `session context`.
 
 ### Phase-scoped preparation
 

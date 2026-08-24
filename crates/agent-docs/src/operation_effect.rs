@@ -108,6 +108,18 @@ fn classify(command: &Command) -> (&'static str, Effect, ProviderEffect, Vec<&'s
                 ProviderEffect::None,
                 Vec::new(),
             ),
+            SessionCommand::Prerequisite(_) => (
+                "session.prerequisite",
+                read,
+                local,
+                vec!["session_state", "catalog", "filesystem"],
+            ),
+            SessionCommand::CommitPrerequisite(_) => (
+                "session.commit-prerequisite",
+                mutation,
+                ProviderEffect::None,
+                Vec::new(),
+            ),
         },
         Command::Config(args) => match args.command {
             ConfigCommand::Show(_) => ("config.show", read, local, vec!["user_config"]),
@@ -229,6 +241,41 @@ mod tests {
         assert_eq!(effect, Effect::ReadOnly);
         assert_eq!(reads, vec!["session_state", "catalog", "filesystem"]);
 
+        let (name, effect, provider, reads) = classify_argv(&[
+            "session",
+            "prerequisite",
+            "--session-id",
+            "s1",
+            "--product",
+            "dsh",
+            "--state-home",
+            "/tmp/state",
+            "--intent",
+            "project-dev",
+            "--phase",
+            "edit",
+            "--request-id",
+            "request-1",
+            "--agent-id",
+            "agent-1",
+            "--workspace-generation",
+            "generation-1",
+            "--call-id",
+            "call-1",
+            "--turn",
+            "1",
+            "--step",
+            "1",
+            "--tool-name",
+            "write",
+            "--definition-id",
+            "definition-1",
+        ]);
+        assert_eq!(name, "session.prerequisite");
+        assert_eq!(effect, Effect::ReadOnly);
+        assert_eq!(provider, ProviderEffect::LocalRead);
+        assert_eq!(reads, vec!["session_state", "catalog", "filesystem"]);
+
         // A mutation declares no managed-state reads and no provider effect.
         for (subcommand, expected) in [
             ("activate", "session.activate"),
@@ -251,6 +298,37 @@ mod tests {
             assert_eq!(provider, ProviderEffect::None);
             assert!(reads.is_empty());
         }
+
+        let (name, effect, provider, reads) = classify_argv(&[
+            "session",
+            "commit-prerequisite",
+            "--session-id",
+            "s1",
+            "--product",
+            "dsh",
+            "--state-home",
+            "/tmp/state",
+            "--receipt",
+            "receipt-1",
+            "--agent-id",
+            "agent-1",
+            "--workspace-generation",
+            "generation-1",
+            "--call-id",
+            "call-1",
+            "--turn",
+            "1",
+            "--step",
+            "1",
+            "--tool-name",
+            "write",
+            "--definition-id",
+            "definition-1",
+        ]);
+        assert_eq!(name, "session.commit-prerequisite");
+        assert_eq!(effect, Effect::Mutation);
+        assert_eq!(provider, ProviderEffect::None);
+        assert!(reads.is_empty());
     }
 
     #[test]

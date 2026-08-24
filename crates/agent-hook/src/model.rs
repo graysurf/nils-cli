@@ -277,6 +277,15 @@ pub struct DshSubject {
     pub session_start_source: Option<String>,
     pub agent_docs_state_home: PathBuf,
     pub agent_docs_home: Option<PathBuf>,
+    pub prerequisite: Option<DshPrerequisite>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DshPrerequisite {
+    pub agent_id: String,
+    pub workspace_generation: String,
+    pub definition_id: String,
+    pub receipt: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -54,6 +54,7 @@ fn canonical_spec_names_the_strict_dsh_ingress_and_policy_contracts() {
         "`agent-hook.dsh-ingress.v2`",
         "`agent-hook.dsh-ingress.v3`",
         "`agent-hook.dsh-ingress.v4`",
+        "`agent-hook.dsh-ingress.v5`",
         "`dsh.policy.v1`",
     ] {
         assert!(

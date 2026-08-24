@@ -25,6 +25,86 @@ fn context_args<'a>(state: &'a str, request_id: &'a str) -> Vec<&'a str> {
     ]
 }
 
+fn prerequisite_args<'a>(state: &'a str, request_id: &'a str) -> Vec<&'a str> {
+    vec![
+        "session",
+        "prerequisite",
+        "--session-id",
+        "dsh-session-private-sentinel",
+        "--product",
+        "dsh",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--request-id",
+        request_id,
+        "--agent-id",
+        "dsh-agent-private-sentinel",
+        "--workspace-generation",
+        "workspace-generation-private-sentinel",
+        "--call-id",
+        "dsh-call-private-sentinel",
+        "--turn",
+        "1",
+        "--step",
+        "2",
+        "--tool-name",
+        "write",
+        "--definition-id",
+        "definition-private-sentinel",
+        "--format",
+        "json",
+    ]
+}
+
+fn commit_prerequisite_args<'a>(state: &'a str, receipt: &'a str) -> Vec<&'a str> {
+    vec![
+        "session",
+        "commit-prerequisite",
+        "--session-id",
+        "dsh-session-private-sentinel",
+        "--product",
+        "dsh",
+        "--state-home",
+        state,
+        "--receipt",
+        receipt,
+        "--agent-id",
+        "dsh-agent-private-sentinel",
+        "--workspace-generation",
+        "workspace-generation-private-sentinel",
+        "--call-id",
+        "dsh-call-private-sentinel",
+        "--turn",
+        "1",
+        "--step",
+        "2",
+        "--tool-name",
+        "write",
+        "--definition-id",
+        "definition-private-sentinel",
+        "--format",
+        "json",
+    ]
+}
+
+fn replace_arg(args: Vec<&str>, flag: &str, value: impl Into<String>) -> Vec<String> {
+    let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+    let index = args
+        .iter()
+        .position(|argument| argument == flag)
+        .unwrap_or_else(|| panic!("missing test argument {flag}"));
+    args[index + 1] = value.into();
+    args
+}
+
+fn string_args(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 fn session_records(state_home: &Path) -> Vec<PathBuf> {
     let sessions = state_home.join("agent-docs/sessions");
     if !sessions.exists() {
@@ -53,6 +133,409 @@ fn only_session_record(state_home: &Path) -> PathBuf {
     let records = session_records(state_home);
     assert_eq!(records.len(), 1, "expected one DSH session record");
     records.into_iter().next().unwrap()
+}
+
+#[test]
+fn dsh_prerequisite_begin_is_side_effect_free_and_commit_is_exact_and_idempotent() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "bounded policy\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let begun = env.run(&prerequisite_args(state, "prerequisite-request-1"));
+    assert_eq!(begun.code, 0, "stderr={}", begun.stderr);
+    let json = begun.json();
+    assert_eq!(
+        json["schema_version"],
+        "cli.agent-docs.session.prerequisite.v1"
+    );
+    let decision = &json["data"]["decision"];
+    assert_eq!(decision["schema_version"], "decision.prerequisite.v1");
+    assert_eq!(decision["request_id"], "prerequisite-request-1");
+    assert_eq!(decision["product"], "dsh");
+    assert_eq!(decision["intent"], "project-dev");
+    assert_eq!(decision["phase"], "edit");
+    assert_eq!(decision["reason"], "pending");
+    assert_eq!(decision["verified"], true);
+    assert_eq!(decision["documents"][0]["content"], "bounded policy\n");
+    let receipt = decision["receipt"]
+        .as_str()
+        .expect("pending prerequisite receipt");
+    assert!(receipt.len() <= 4096);
+    assert!(session_records(&state_home).is_empty());
+    for private in [
+        "dsh-session-private-sentinel",
+        "dsh-agent-private-sentinel",
+        "workspace-generation-private-sentinel",
+        "dsh-call-private-sentinel",
+        "definition-private-sentinel",
+        env.project.to_str().unwrap(),
+    ] {
+        assert!(!begun.stdout.contains(private), "leaked {private:?}");
+    }
+
+    let committed = env.run(&commit_prerequisite_args(state, receipt));
+    assert_eq!(committed.code, 0, "stderr={}", committed.stderr);
+    assert_eq!(
+        committed.json()["schema_version"],
+        "cli.agent-docs.session.commit-prerequisite.v1"
+    );
+    assert_eq!(committed.json()["data"]["reason"], "prepared");
+    assert_eq!(session_records(&state_home).len(), 1);
+
+    let replayed = env.run(&commit_prerequisite_args(state, receipt));
+    assert_eq!(replayed.code, 0, "stderr={}", replayed.stderr);
+    assert_eq!(replayed.json()["data"]["reason"], "already-current");
+
+    let reused = env.run(&prerequisite_args(state, "prerequisite-request-2"));
+    assert_eq!(reused.code, 0, "stderr={}", reused.stderr);
+    assert_eq!(
+        reused.json()["data"]["decision"]["reason"],
+        "already-current"
+    );
+    assert!(reused.json()["data"]["decision"]["receipt"].is_string());
+}
+
+#[test]
+fn reused_dsh_prerequisite_is_revalidated_at_the_execution_boundary() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "bounded policy\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let first = env.run(&prerequisite_args(state, "reuse-first"));
+    let first_json = first.json();
+    let first_receipt = first_json["data"]["decision"]["receipt"]
+        .as_str()
+        .expect("first prerequisite receipt");
+    let committed = env.run(&commit_prerequisite_args(state, first_receipt));
+    assert_eq!(committed.code, 0, "stderr={}", committed.stderr);
+
+    let reused = env.run(&prerequisite_args(state, "reuse-second"));
+    assert_eq!(
+        reused.json()["data"]["decision"]["reason"],
+        "already-current"
+    );
+    let reused_json = reused.json();
+    let reused_receipt = reused_json["data"]["decision"]["receipt"]
+        .as_str()
+        .expect("reuse must retain an execution-bound receipt");
+
+    env.write_project_doc("POLICY.md", "changed during approval\n");
+    let stale = env.run(&commit_prerequisite_args(state, reused_receipt));
+    assert_ne!(stale.code, 0, "stdout={}", stale.stdout);
+    assert_eq!(stale.json()["error"]["code"], "prerequisite-stale");
+}
+
+#[test]
+fn concurrent_dsh_prerequisite_commits_converge_without_corrupting_session_state() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "bounded policy\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let first_begin = env.run(&prerequisite_args(state, "concurrent-first"));
+    let second_begin_args = replace_arg(
+        prerequisite_args(state, "concurrent-second"),
+        "--call-id",
+        "dsh-call-concurrent-second",
+    );
+    let second_begin = env.run(&string_args(&second_begin_args));
+    assert_eq!(first_begin.code, 0, "stderr={}", first_begin.stderr);
+    assert_eq!(second_begin.code, 0, "stderr={}", second_begin.stderr);
+    let first_json = first_begin.json();
+    let second_json = second_begin.json();
+    let first_receipt = first_json["data"]["decision"]["receipt"].as_str().unwrap();
+    let second_receipt = second_json["data"]["decision"]["receipt"].as_str().unwrap();
+
+    let first_commit = commit_prerequisite_args(state, first_receipt);
+    let second_commit = replace_arg(
+        commit_prerequisite_args(state, second_receipt),
+        "--call-id",
+        "dsh-call-concurrent-second",
+    );
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| env.run(&first_commit));
+        let second = scope.spawn(|| env.run(&string_args(&second_commit)));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(first.code, 0, "stderr={}", first.stderr);
+    assert_eq!(second.code, 0, "stderr={}", second.stderr);
+    let mut reasons = [
+        first.json()["data"]["reason"].as_str().unwrap().to_string(),
+        second.json()["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+    reasons.sort();
+    assert_eq!(reasons, ["already-current", "prepared"]);
+    assert_eq!(session_records(&state_home).len(), 1);
+
+    let reused = env.run(&prerequisite_args(state, "concurrent-reuse"));
+    assert_eq!(reused.code, 0, "stderr={}", reused.stderr);
+    assert_eq!(
+        reused.json()["data"]["decision"]["reason"],
+        "already-current"
+    );
+}
+
+#[test]
+fn dsh_prerequisite_unsatisfied_policy_is_typed_side_effect_free_and_content_safe() {
+    for content in [None, Some("")] {
+        let env = TestEnv::new();
+        env.write_project_catalog(
+            r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+        );
+        if let Some(content) = content {
+            env.write_project_doc("POLICY.md", content);
+        }
+        let state_home = env.project_path("state");
+        let failed = env.run(&prerequisite_args(
+            state_home.to_str().unwrap(),
+            "unsatisfied-prerequisite",
+        ));
+        assert_eq!(failed.code, 65, "stdout={}", failed.stdout);
+        let failure = failed.json();
+        assert_eq!(
+            failure["schema_version"],
+            "cli.agent-docs.session.prerequisite.v1"
+        );
+        assert_eq!(failure["error"]["code"], "phase-unsatisfied");
+        assert_eq!(failure["error"]["details"]["next_action"], "repair-catalog");
+        assert!(!failed.stdout.contains("\"content\""));
+        assert!(session_records(&state_home).is_empty());
+    }
+}
+
+#[test]
+fn dsh_phase_prerequisite_materializes_a_phase_activation_from_a_full_activation() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "bounded policy\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let full = env.run(&context_args(state, "full-context"));
+    assert_eq!(full.code, 0, "stderr={}", full.stderr);
+
+    let begun = env.run(&prerequisite_args(state, "phase-prerequisite"));
+    assert_eq!(begun.code, 0, "stderr={}", begun.stderr);
+    assert_eq!(begun.json()["data"]["decision"]["reason"], "pending");
+    let begun_json = begun.json();
+    let receipt = begun_json["data"]["decision"]["receipt"]
+        .as_str()
+        .expect("phase prerequisite receipt");
+
+    let committed = env.run(&commit_prerequisite_args(state, receipt));
+    assert_eq!(committed.code, 0, "stderr={}", committed.stderr);
+    assert_eq!(committed.json()["data"]["reason"], "prepared");
+
+    let reused = env.run(&prerequisite_args(state, "phase-prerequisite-reuse"));
+    assert_eq!(reused.code, 0, "stderr={}", reused.stderr);
+    assert_eq!(
+        reused.json()["data"]["decision"]["reason"],
+        "already-current"
+    );
+}
+
+#[test]
+fn dsh_prerequisite_requires_edit_phase_and_the_verifier_catalog_selection() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "bounded policy\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let args = prerequisite_args(state, "missing-phase");
+    let without_phase: Vec<&str> = args
+        .into_iter()
+        .filter(|value| *value != "--phase" && *value != "edit")
+        .collect();
+    let missing = env.run(&without_phase);
+    assert_eq!(missing.code, 64, "stdout={}", missing.stdout);
+
+    let mut unsupported = vec!["--user-config"];
+    unsupported.extend(prerequisite_args(state, "unsupported-selection"));
+    let unsupported = env.run(&unsupported);
+    assert_eq!(unsupported.code, 65, "stdout={}", unsupported.stdout);
+    assert_eq!(
+        unsupported.json()["error"]["code"],
+        "unsupported-prerequisite-selection"
+    );
+
+    let mut local_only = vec!["--worktree-fallback", "local-only"];
+    local_only.extend(prerequisite_args(state, "unsupported-fallback"));
+    let local_only = env.run(&local_only);
+    assert_eq!(local_only.code, 65, "stdout={}", local_only.stdout);
+    assert_eq!(
+        local_only.json()["error"]["code"],
+        "unsupported-prerequisite-selection"
+    );
+}
+
+#[test]
+fn dsh_prerequisite_commit_rejects_stale_and_cross_scope_receipts_without_activation() {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "POLICY.md"
+product = "dsh"
+phase = "edit"
+required = true
+"#,
+    )
+    .write_project_doc("POLICY.md", "policy before change\n");
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+
+    let begun = env.run(&prerequisite_args(state, "prerequisite-stale"));
+    assert_eq!(begun.code, 0, "stderr={}", begun.stderr);
+    let begun_json = begun.json();
+    let receipt = begun_json["data"]["decision"]["receipt"].as_str().unwrap();
+    env.write_project_doc("POLICY.md", "policy after change\n");
+
+    let stale = env.run(&commit_prerequisite_args(state, receipt));
+    assert_eq!(stale.code, 65, "stdout={}", stale.stdout);
+    assert_eq!(stale.json()["error"]["code"], "prerequisite-stale");
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["intents"],
+        serde_json::json!(["project-dev"])
+    );
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["phase"],
+        "edit"
+    );
+    assert!(session_records(&state_home).is_empty());
+
+    let fresh = env.run(&prerequisite_args(state, "prerequisite-cross-scope"));
+    assert_eq!(fresh.code, 0, "stderr={}", fresh.stderr);
+    let fresh_json = fresh.json();
+    let fresh_receipt = fresh_json["data"]["decision"]["receipt"].as_str().unwrap();
+    let other_state = env.project_path("other-state");
+    for (flag, value) in [
+        ("--session-id", "other-session".to_string()),
+        ("--state-home", other_state.to_string_lossy().into_owned()),
+        ("--agent-id", "other-agent".to_string()),
+        (
+            "--workspace-generation",
+            "other-workspace-generation".to_string(),
+        ),
+        ("--call-id", "other-call".to_string()),
+        ("--turn", "2".to_string()),
+        ("--step", "3".to_string()),
+        ("--tool-name", "edit".to_string()),
+        ("--definition-id", "other-definition".to_string()),
+    ] {
+        let foreign_args = replace_arg(commit_prerequisite_args(state, fresh_receipt), flag, value);
+        let foreign = env.run(&string_args(&foreign_args));
+        assert_eq!(foreign.code, 65, "flag={flag} stdout={}", foreign.stdout);
+        assert_eq!(
+            foreign.json()["error"]["code"],
+            "prerequisite-receipt-mismatch",
+            "flag={flag}"
+        );
+    }
+
+    let other_project = env.project_path("other-project");
+    std::fs::create_dir_all(&other_project).expect("other project");
+    let foreign_project = env.run_for_project(
+        &other_project,
+        &commit_prerequisite_args(state, fresh_receipt),
+    );
+    assert_eq!(
+        foreign_project.code, 65,
+        "stdout={}",
+        foreign_project.stdout
+    );
+    assert_eq!(
+        foreign_project.json()["error"]["code"],
+        "prerequisite-receipt-mismatch"
+    );
+    assert!(session_records(&state_home).is_empty());
+}
+
+#[test]
+fn dsh_prerequisite_text_errors_name_the_invoked_command() {
+    let env = TestEnv::new();
+    let state_home = env.project_path("state");
+    let state = state_home.to_str().unwrap();
+    let mut args = commit_prerequisite_args(state, "malformed");
+    args.truncate(args.len() - 2);
+
+    let failed = env.run(&args);
+    assert_eq!(failed.code, 65, "stdout={}", failed.stdout);
+    assert!(
+        failed
+            .stderr
+            .contains("agent-docs session commit-prerequisite:"),
+        "stderr={}",
+        failed.stderr
+    );
 }
 
 #[test]

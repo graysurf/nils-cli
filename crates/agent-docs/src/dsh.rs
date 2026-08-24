@@ -44,6 +44,50 @@ pub fn session_intent_is_current(
     )
 }
 
+/// Exact DSH execution fields bound into a side-effect-free prerequisite
+/// receipt. Callers must source these from the harness runtime, never from
+/// model-authored tool arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct PrerequisiteBinding<'a> {
+    pub receipt: &'a str,
+    pub agent_id: &'a str,
+    pub workspace_generation: &'a str,
+    pub call_id: &'a str,
+    pub turn: u64,
+    pub step: u64,
+    pub tool_name: &'a str,
+    pub definition_id: &'a str,
+}
+
+/// Verify a pending prerequisite receipt against the current catalog and one
+/// exact DSH execution without creating or refreshing activation state.
+pub fn prerequisite_receipt_is_current(
+    roots: &ResolvedRoots,
+    session_id: &str,
+    state_home: &Path,
+    intent: &Context,
+    phase: Option<&Phase>,
+    fallback: FallbackMode,
+    binding: PrerequisiteBinding<'_>,
+) -> bool {
+    crate::session::dsh_prerequisite_receipt_is_current(
+        roots,
+        session_id,
+        state_home,
+        intent,
+        phase,
+        fallback,
+        binding.receipt,
+        binding.agent_id,
+        binding.workspace_generation,
+        binding.call_id,
+        binding.turn,
+        binding.step,
+        binding.tool_name,
+        binding.definition_id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

@@ -13,7 +13,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_docs::dsh::session_intent_is_current;
+use agent_docs::dsh::{
+    PrerequisiteBinding, prerequisite_receipt_is_current, session_intent_is_current,
+};
 use agent_docs::env::{PathOverrides, resolve_roots};
 use agent_docs::model::{Context as DocsContext, FallbackMode, Phase};
 use regex::Regex;
@@ -3222,13 +3224,43 @@ fn pre_edit_intent(
             Ok(roots) => roots,
             Err(_) => return Ok(Outcome::block(group)),
         };
-        if !session_intent_is_current(
+        if session_intent_is_current(
             &roots,
             &subject.session_id,
             &subject.agent_docs_state_home,
             &intent,
             Some(&phase),
             FallbackMode::Auto,
+        ) {
+            continue;
+        }
+        let Some(prerequisite) = subject.prerequisite.as_ref() else {
+            return Ok(Outcome::block(group));
+        };
+        let (Some(call_id), Some(step), Some(tool_name)) = (
+            subject.call_id.as_deref(),
+            subject.step,
+            request.matcher.as_deref(),
+        ) else {
+            return Ok(Outcome::block(group));
+        };
+        if !prerequisite_receipt_is_current(
+            &roots,
+            &subject.session_id,
+            &subject.agent_docs_state_home,
+            &intent,
+            Some(&phase),
+            FallbackMode::Auto,
+            PrerequisiteBinding {
+                receipt: &prerequisite.receipt,
+                agent_id: &prerequisite.agent_id,
+                workspace_generation: &prerequisite.workspace_generation,
+                call_id,
+                turn: subject.turn,
+                step,
+                tool_name,
+                definition_id: &prerequisite.definition_id,
+            },
         ) {
             return Ok(Outcome::block(group));
         }

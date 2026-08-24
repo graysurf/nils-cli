@@ -82,7 +82,7 @@ pub enum Command {
     /// Resolve the typed automatic integration decision for this checkout.
     Integration(IntegrationArgs),
     /// Manage durable selective intent activation scoped to a session, project, and product.
-    Session(SessionArgs),
+    Session(Box<SessionArgs>),
     /// Describe the effect of one exact typed agent-docs invocation.
     #[command(hide = true)]
     OperationEffect(OperationEffectArgs),
@@ -409,6 +409,10 @@ pub enum SessionCommand {
     /// Resolve and prepare exactly one DSH intent, returning only its bounded
     /// satisfied required document content as a replay-bound decision.
     Context(SessionContextArgs),
+    /// Resolve one exact DSH prerequisite without activating it.
+    Prerequisite(SessionPrerequisiteArgs),
+    /// Commit a previously resolved exact DSH prerequisite.
+    CommitPrerequisite(SessionCommitPrerequisiteArgs),
     /// Show active intents for the current session/project/product scope.
     Status(SessionCommonArgs),
     /// Re-resolve the catalog and verify required intents are active and fresh.
@@ -472,6 +476,76 @@ pub struct SessionContextArgs {
         help = "Maximum aggregate UTF-8 bytes of returned policy content (hard cap: 65536)"
     )]
     pub max_bytes: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionPrerequisiteArgs {
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: String,
+    #[arg(long, value_enum)]
+    pub product: ContextProduct,
+    #[arg(long = "state-home", value_name = "DIR")]
+    pub state_home: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    #[arg(long, value_name = "INTENT", required = true)]
+    pub intent: String,
+    #[arg(
+        long,
+        value_name = "PHASE",
+        value_parser = ["edit"],
+        help = "Required prerequisite phase (currently: edit)"
+    )]
+    pub phase: String,
+    #[arg(
+        long = "request-id",
+        value_name = "ID",
+        help = "Bounded caller correlation id echoed by the prerequisite decision"
+    )]
+    pub request_id: String,
+    #[arg(
+        long = "max-bytes",
+        value_name = "BYTES",
+        default_value_t = 20 * 1024,
+        help = "Maximum aggregate UTF-8 bytes of returned policy content (hard cap: 65536)"
+    )]
+    pub max_bytes: usize,
+    #[command(flatten)]
+    pub binding: SessionPrerequisiteBindingArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionCommitPrerequisiteArgs {
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: String,
+    #[arg(long, value_enum)]
+    pub product: ContextProduct,
+    #[arg(long = "state-home", value_name = "DIR")]
+    pub state_home: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    #[arg(long, value_name = "RECEIPT")]
+    pub receipt: String,
+    #[command(flatten)]
+    pub binding: SessionPrerequisiteBindingArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionPrerequisiteBindingArgs {
+    #[arg(long = "agent-id", value_name = "ID")]
+    pub agent_id: String,
+    #[arg(long = "workspace-generation", value_name = "ID")]
+    pub workspace_generation: String,
+    #[arg(long = "call-id", value_name = "ID")]
+    pub call_id: String,
+    #[arg(long, value_name = "NUMBER")]
+    pub turn: u64,
+    #[arg(long, value_name = "NUMBER")]
+    pub step: u64,
+    #[arg(long = "tool-name", value_name = "NAME")]
+    pub tool_name: String,
+    #[arg(long = "definition-id", value_name = "ID")]
+    pub definition_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

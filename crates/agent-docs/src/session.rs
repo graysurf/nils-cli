@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use nils_common::cli_contract::{Envelope, EnvelopeError};
 
 use crate::cli::{
-    SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionContextArgs,
+    SessionActivateArgs, SessionArgs, SessionCommand, SessionCommitPrerequisiteArgs,
+    SessionCommonArgs, SessionContextArgs, SessionPrerequisiteArgs, SessionPrerequisiteBindingArgs,
     SessionVerifyArgs,
 };
 use crate::config::{load_catalog_from_roots, load_dsh_catalog_from_roots};
@@ -41,6 +42,10 @@ const MAX_CONTEXT_REQUEST_ID_BYTES: usize = 128;
 const MAX_CONTEXT_BYTES: usize = 64 * 1024;
 const CONTEXT_DECISION_SCHEMA: &str = "decision.context.v1";
 const CONTEXT_FINGERPRINT_PREFIX: &str = "dsh-context-v1:";
+const PREREQUISITE_DECISION_SCHEMA: &str = "decision.prerequisite.v1";
+const PREREQUISITE_RECEIPT_SCHEMA: &str = "agent-docs.prerequisite-receipt.v1";
+const MAX_PREREQUISITE_BINDING_BYTES: usize = 256;
+const MAX_PREREQUISITE_RECEIPT_BYTES: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
@@ -116,6 +121,59 @@ struct ContextDocument {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct PrerequisiteData {
+    decision: PrerequisiteDecision,
+}
+
+#[derive(Debug, Serialize)]
+struct PrerequisiteDecision {
+    schema_version: &'static str,
+    request_id: String,
+    product: &'static str,
+    intent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    reason: &'static str,
+    verified: bool,
+    documents: Vec<ContextDocument>,
+    document_count: usize,
+    total_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrerequisiteCommitData {
+    product: &'static str,
+    intent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    reason: &'static str,
+    verified: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrerequisiteReceipt {
+    schema_version: String,
+    session_hash: String,
+    state_home_hash: String,
+    project_hash: String,
+    product: String,
+    intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    agent_hash: String,
+    workspace_generation_hash: String,
+    call_hash: String,
+    turn: u64,
+    step: u64,
+    tool_hash: String,
+    definition_hash: String,
+    context_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum NextAction {
@@ -162,6 +220,8 @@ enum RecoveryCommand {
     SessionPrepare,
     #[serde(rename = "session.context")]
     SessionContext,
+    #[serde(rename = "session.prerequisite")]
+    SessionPrerequisite,
     #[serde(rename = "session.status")]
     SessionStatus,
 }
@@ -358,6 +418,20 @@ pub fn run(
             use_user_config,
             expected_integration_fingerprint.as_deref(),
         ),
+        SessionCommand::Prerequisite(args) => prerequisite(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
+        SessionCommand::CommitPrerequisite(args) => commit_prerequisite(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
         SessionCommand::Status(args) => status(
             args,
             overrides,
@@ -536,6 +610,308 @@ fn context(
         })
     })();
     render_context(args.format, result)
+}
+
+/// Resolve one exact DSH prerequisite without mutating activation state. The
+/// returned receipt is a bounded, replay-bound compare-and-swap input; it is
+/// useful only with the same execution binding and current policy fingerprint.
+fn prerequisite(
+    args: SessionPrerequisiteArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
+    let SessionPrerequisiteArgs {
+        session_id,
+        product,
+        state_home,
+        format,
+        intent,
+        phase,
+        request_id,
+        max_bytes,
+        binding,
+    } = args;
+    let context = SessionContextArgs {
+        session_id,
+        product,
+        state_home,
+        format,
+        intent,
+        phase: Some(phase),
+        request_id,
+        max_bytes,
+    };
+    let result = (|| -> Result<PrerequisiteData, SessionFailure> {
+        validate_prerequisite_selection(
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        validate_session_scope(&context.session_id, &context.state_home)?;
+        validate_context_args(&context)?;
+        validate_prerequisite_binding(&binding)?;
+        let phase = parse_phase_arg(context.phase.as_deref())?;
+        let roots = resolve_session_roots(&overrides)?;
+        let path = record_path_for(
+            &context.session_id,
+            &context.state_home,
+            context.product.as_str(),
+            &roots.project_path,
+        )?;
+        let existing = if path.exists() {
+            match decode_record(&path)? {
+                DecodedRecord::Current(record) => {
+                    validate_record_identity(
+                        &context.session_id,
+                        context.product.as_str(),
+                        &roots.project_path,
+                        &record,
+                    )?;
+                    Some(*record)
+                }
+                DecodedRecord::LegacyV1 => None,
+            }
+        } else {
+            None
+        };
+        let (catalog, integration_fingerprint) = load_dsh_session_catalog(
+            &roots,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )
+        .map_err(|failure| failure.for_dsh_context(&context.intent, phase.as_ref()))?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        let intent = Context::parse(&context.intent).map_err(|err| {
+            SessionFailure::data("invalid-intent", err).with_available_intents(&available)
+        })?;
+        if !available.iter().any(|item| item == intent.as_str()) {
+            return Err(SessionFailure::data(
+                "undeclared-intent",
+                format!("intent `{intent}` is not declared"),
+            )
+            .with_available_intents(&available)
+            .for_dsh_context(intent.as_str(), phase.as_ref()));
+        }
+        let report = resolver::resolve_dsh_context_with_effective_catalog_for_scope(
+            &intent,
+            &roots,
+            phase.clone(),
+            true,
+            fallback,
+            context.max_bytes,
+            &catalog,
+        )
+        .map_err(context_resolve_failure)?;
+        if report.has_unsatisfied_required() {
+            return Err(SessionFailure::data(
+                unsatisfied_code(phase.as_ref()),
+                format!("strict preflight failed for `{intent}`"),
+            )
+            .with_preflight_context(&intent, phase.as_ref(), &report)
+            .for_dsh_context(intent.as_str(), phase.as_ref()));
+        }
+        let (documents, total_bytes) = context_documents(&report, context.max_bytes)?;
+        let fingerprint = context_fingerprint(
+            &report,
+            &catalog,
+            fallback,
+            integration_fingerprint.as_deref(),
+        )?;
+        let already_current = existing.as_ref().is_some_and(|record| {
+            record.integration_fingerprint == integration_fingerprint
+                && exact_context_activation_is_current(
+                    &intent,
+                    phase.as_ref(),
+                    record,
+                    &fingerprint,
+                )
+        });
+        // Every call gets an execution-bound receipt, including reuse. A
+        // prerequisite can wait behind downstream approval after this read;
+        // commit-prerequisite must therefore re-resolve the policy immediately
+        // before execution instead of trusting an earlier activation alone.
+        let receipt = Some(encode_prerequisite_receipt(PrerequisiteReceipt {
+            schema_version: PREREQUISITE_RECEIPT_SCHEMA.to_string(),
+            session_hash: digest(context.session_id.trim().as_bytes()),
+            state_home_hash: digest(context.state_home.to_string_lossy().as_bytes()),
+            project_hash: project_hash(&roots.project_path),
+            product: context.product.as_str().to_string(),
+            intent: intent.to_string(),
+            phase: phase.as_ref().map(ToString::to_string),
+            agent_hash: digest(binding.agent_id.as_bytes()),
+            workspace_generation_hash: digest(binding.workspace_generation.as_bytes()),
+            call_hash: digest(binding.call_id.as_bytes()),
+            turn: binding.turn,
+            step: binding.step,
+            tool_hash: digest(binding.tool_name.as_bytes()),
+            definition_hash: digest(binding.definition_id.as_bytes()),
+            context_fingerprint: fingerprint,
+        })?);
+        let document_count = documents.len();
+        Ok(PrerequisiteData {
+            decision: PrerequisiteDecision {
+                schema_version: PREREQUISITE_DECISION_SCHEMA,
+                request_id: context.request_id.clone(),
+                product: context.product.as_str(),
+                intent: intent.to_string(),
+                phase: phase.as_ref().map(ToString::to_string),
+                reason: if already_current {
+                    "already-current"
+                } else {
+                    "pending"
+                },
+                verified: true,
+                documents,
+                document_count,
+                total_bytes,
+                receipt,
+            },
+        })
+    })();
+    render_prerequisite(format, result)
+}
+
+/// Commit an exact prerequisite receipt only if its execution binding and
+/// freshly resolved policy fingerprint still match.
+fn commit_prerequisite(
+    args: SessionCommitPrerequisiteArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
+    let result = (|| -> Result<PrerequisiteCommitData, SessionFailure> {
+        validate_prerequisite_selection(
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        validate_session_scope(&args.session_id, &args.state_home)?;
+        validate_prerequisite_binding(&args.binding)?;
+        let receipt = decode_prerequisite_receipt(&args.receipt)?;
+        let roots = resolve_session_roots(&overrides)?;
+        validate_prerequisite_receipt_scope(
+            &receipt,
+            &args.session_id,
+            &args.state_home,
+            args.product.as_str(),
+            &roots.project_path,
+            &args.binding,
+        )?;
+        let intent =
+            Context::parse(&receipt.intent).map_err(|_| prerequisite_receipt_mismatch())?;
+        let phase = parse_phase_arg(receipt.phase.as_deref())
+            .map_err(|_| prerequisite_receipt_mismatch())?;
+        let path = record_path_for(
+            &args.session_id,
+            &args.state_home,
+            args.product.as_str(),
+            &roots.project_path,
+        )?;
+        let _lock = RecordLock::acquire(&path)?;
+        let (catalog, integration_fingerprint) = load_dsh_session_catalog(
+            &roots,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        if !available.iter().any(|item| item == intent.as_str()) {
+            return Err(SessionFailure::data(
+                "prerequisite-stale",
+                "the prerequisite intent is no longer declared",
+            )
+            .with_prepare_intent(&intent, phase.as_ref()));
+        }
+        let report = resolver::resolve_dsh_context_with_effective_catalog_for_scope(
+            &intent,
+            &roots,
+            phase.clone(),
+            true,
+            fallback,
+            MAX_CONTEXT_BYTES,
+            &catalog,
+        )
+        .map_err(|_| {
+            SessionFailure::data(
+                "prerequisite-stale",
+                "the prerequisite policy can no longer be resolved",
+            )
+            .with_prepare_intent(&intent, phase.as_ref())
+        })?;
+        if report.has_unsatisfied_required() {
+            return Err(SessionFailure::data(
+                "prerequisite-stale",
+                "the prerequisite policy is no longer satisfied",
+            )
+            .with_prepare_intent(&intent, phase.as_ref()));
+        }
+        let current_fingerprint = context_fingerprint(
+            &report,
+            &catalog,
+            fallback,
+            integration_fingerprint.as_deref(),
+        )?;
+        if receipt.context_fingerprint != current_fingerprint {
+            return Err(SessionFailure::data(
+                "prerequisite-stale",
+                "the prerequisite policy changed before commit",
+            )
+            .with_prepare_intent(&intent, phase.as_ref()));
+        }
+
+        let existing = if path.exists() {
+            match decode_record(&path)? {
+                DecodedRecord::Current(record) => {
+                    validate_record_identity(
+                        &args.session_id,
+                        args.product.as_str(),
+                        &roots.project_path,
+                        &record,
+                    )?;
+                    Some(*record)
+                }
+                DecodedRecord::LegacyV1 => None,
+            }
+        } else {
+            None
+        };
+        let had_existing = existing.is_some();
+        let mut record = existing.unwrap_or_else(|| {
+            new_record_for(
+                &args.session_id,
+                args.product.as_str(),
+                &roots.project_path,
+                integration_fingerprint.clone(),
+            )
+        });
+        let mut changed = !had_existing;
+        if record.integration_fingerprint != integration_fingerprint {
+            record.active_intents.clear();
+            record.active_phase_intents.clear();
+            record.integration_fingerprint = integration_fingerprint;
+            changed = true;
+        }
+        changed |= store_activation(&mut record, &intent, phase.as_ref(), current_fingerprint);
+        let reason = if changed {
+            record.activated_at = jiff::Timestamp::now().to_string();
+            write_record(&path, &record)?;
+            "prepared"
+        } else {
+            "already-current"
+        };
+        Ok(PrerequisiteCommitData {
+            product: args.product.as_str(),
+            intent: intent.to_string(),
+            phase: phase.as_ref().map(ToString::to_string),
+            reason,
+            verified: true,
+        })
+    })();
+    render_prerequisite_commit(args.format, result)
 }
 
 fn activate(
@@ -974,6 +1350,78 @@ pub(crate) fn dsh_session_intent_is_current(
     .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsh_prerequisite_receipt_is_current(
+    roots: &ResolvedRoots,
+    session_id: &str,
+    state_home: &Path,
+    intent: &Context,
+    phase: Option<&Phase>,
+    fallback: FallbackMode,
+    receipt_raw: &str,
+    agent_id: &str,
+    workspace_generation: &str,
+    call_id: &str,
+    turn: u64,
+    step: u64,
+    tool_name: &str,
+    definition_id: &str,
+) -> bool {
+    (|| -> Result<bool, SessionFailure> {
+        validate_session_scope(session_id, state_home)?;
+        let binding = SessionPrerequisiteBindingArgs {
+            agent_id: agent_id.to_string(),
+            workspace_generation: workspace_generation.to_string(),
+            call_id: call_id.to_string(),
+            turn,
+            step,
+            tool_name: tool_name.to_string(),
+            definition_id: definition_id.to_string(),
+        };
+        validate_prerequisite_binding(&binding)?;
+        let receipt = decode_prerequisite_receipt(receipt_raw)?;
+        validate_prerequisite_receipt_scope(
+            &receipt,
+            session_id,
+            state_home,
+            "dsh",
+            &roots.project_path,
+            &binding,
+        )?;
+        if receipt.intent != intent.as_str() || receipt.phase.as_deref() != phase.map(Phase::as_str)
+        {
+            return Ok(false);
+        }
+        let (catalog, integration_fingerprint) =
+            load_dsh_session_catalog(roots, fallback, false, None)?;
+        let available = resolver::declared_intents(roots, fallback, &catalog.catalog);
+        if !available.iter().any(|item| item == intent.as_str()) {
+            return Ok(false);
+        }
+        let report = resolver::resolve_dsh_context_with_effective_catalog_for_scope(
+            intent,
+            roots,
+            phase.cloned(),
+            true,
+            fallback,
+            MAX_CONTEXT_BYTES,
+            &catalog,
+        )
+        .map_err(verification_context_failure)?;
+        if report.has_unsatisfied_required() {
+            return Ok(false);
+        }
+        Ok(receipt.context_fingerprint
+            == context_fingerprint(
+                &report,
+                &catalog,
+                fallback,
+                integration_fingerprint.as_deref(),
+            )?)
+    })()
+    .unwrap_or(false)
+}
+
 fn dsh_verify_intent(
     intent: &Context,
     phase: Option<&Phase>,
@@ -1011,6 +1459,30 @@ fn dsh_verify_intent(
     match record.active_intents.get(intent.as_str()) {
         Some(stored) => matches(stored, None),
         None => Ok(false),
+    }
+}
+
+/// Decide prerequisite reuse from the exact report fingerprint already
+/// returned to the caller. A full activation still covers phase verification,
+/// but it cannot prove that separately returned phase-scoped content came from
+/// the same filesystem snapshot. The first phase prerequisite therefore
+/// materializes its own phase activation and later calls reuse it directly.
+fn exact_context_activation_is_current(
+    intent: &Context,
+    phase: Option<&Phase>,
+    record: &SessionRecord,
+    fingerprint: &str,
+) -> bool {
+    match phase {
+        Some(phase) => record
+            .active_phase_intents
+            .get(intent.as_str())
+            .and_then(|phases| phases.get(phase.as_str()))
+            .is_some_and(|stored| stored == fingerprint),
+        None => record
+            .active_intents
+            .get(intent.as_str())
+            .is_some_and(|stored| stored == fingerprint),
     }
 }
 
@@ -1169,6 +1641,150 @@ fn context_resolve_failure(error: resolver::ContextResolveError) -> SessionFailu
     SessionFailure::data(error.code(), error.message())
 }
 
+fn context_documents(
+    report: &PreflightReport,
+    max_bytes: usize,
+) -> Result<(Vec<ContextDocument>, usize), SessionFailure> {
+    let mut total_bytes = 0usize;
+    let mut documents = Vec::with_capacity(report.summary.satisfied_required);
+    for document in report
+        .documents
+        .iter()
+        .filter(|document| document.required && document.satisfied())
+    {
+        let content = document.content.clone().ok_or_else(|| {
+            SessionFailure::runtime(
+                "context-content-missing",
+                "a satisfied required document omitted its content",
+            )
+        })?;
+        total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+            SessionFailure::data(
+                "context-budget-exceeded",
+                "required policy content exceeds the requested response budget",
+            )
+        })?;
+        if total_bytes > max_bytes {
+            return Err(SessionFailure::data(
+                "context-budget-exceeded",
+                "required policy content exceeds the requested response budget",
+            ));
+        }
+        documents.push(ContextDocument {
+            source: document.source.as_str(),
+            scope: document.scope.as_str(),
+            content,
+        });
+    }
+    Ok((documents, total_bytes))
+}
+
+fn encode_prerequisite_receipt(receipt: PrerequisiteReceipt) -> Result<String, SessionFailure> {
+    let encoded = serde_json::to_string(&receipt).map_err(|_| {
+        SessionFailure::runtime(
+            "prerequisite-receipt-render-failed",
+            "the prerequisite receipt could not be serialized",
+        )
+    })?;
+    if encoded.len() > MAX_PREREQUISITE_RECEIPT_BYTES {
+        return Err(SessionFailure::runtime(
+            "prerequisite-receipt-render-failed",
+            "the prerequisite receipt exceeded its bounded contract",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_prerequisite_receipt(raw: &str) -> Result<PrerequisiteReceipt, SessionFailure> {
+    if raw.is_empty() || raw.len() > MAX_PREREQUISITE_RECEIPT_BYTES {
+        return Err(SessionFailure::data(
+            "prerequisite-receipt-invalid",
+            "the prerequisite receipt is missing or oversized",
+        ));
+    }
+    let receipt: PrerequisiteReceipt = serde_json::from_str(raw).map_err(|_| {
+        SessionFailure::data(
+            "prerequisite-receipt-invalid",
+            "the prerequisite receipt is malformed",
+        )
+    })?;
+    let digests = [
+        receipt.session_hash.as_str(),
+        receipt.state_home_hash.as_str(),
+        receipt.project_hash.as_str(),
+        receipt.agent_hash.as_str(),
+        receipt.workspace_generation_hash.as_str(),
+        receipt.call_hash.as_str(),
+        receipt.tool_hash.as_str(),
+        receipt.definition_hash.as_str(),
+    ];
+    if receipt.schema_version != PREREQUISITE_RECEIPT_SCHEMA
+        || receipt.product != "dsh"
+        || Context::parse(&receipt.intent).is_err()
+        || receipt
+            .phase
+            .as_deref()
+            .is_some_and(|phase| Phase::parse(phase).is_err())
+        || receipt.turn == 0
+        || receipt.step == 0
+        || !digests.into_iter().all(valid_sha256_digest)
+        || !receipt
+            .context_fingerprint
+            .starts_with(CONTEXT_FINGERPRINT_PREFIX)
+        || !valid_sha256_digest(
+            receipt
+                .context_fingerprint
+                .strip_prefix(CONTEXT_FINGERPRINT_PREFIX)
+                .unwrap_or_default(),
+        )
+    {
+        return Err(SessionFailure::data(
+            "prerequisite-receipt-invalid",
+            "the prerequisite receipt fields are invalid",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_prerequisite_receipt_scope(
+    receipt: &PrerequisiteReceipt,
+    session_id: &str,
+    state_home: &Path,
+    product: &str,
+    project: &Path,
+    binding: &SessionPrerequisiteBindingArgs,
+) -> Result<(), SessionFailure> {
+    let matches = receipt.session_hash == digest(session_id.trim().as_bytes())
+        && receipt.state_home_hash == digest(state_home.to_string_lossy().as_bytes())
+        && receipt.project_hash == project_hash(project)
+        && receipt.product == product
+        && receipt.agent_hash == digest(binding.agent_id.as_bytes())
+        && receipt.workspace_generation_hash == digest(binding.workspace_generation.as_bytes())
+        && receipt.call_hash == digest(binding.call_id.as_bytes())
+        && receipt.turn == binding.turn
+        && receipt.step == binding.step
+        && receipt.tool_hash == digest(binding.tool_name.as_bytes())
+        && receipt.definition_hash == digest(binding.definition_id.as_bytes());
+    if matches {
+        Ok(())
+    } else {
+        Err(prerequisite_receipt_mismatch())
+    }
+}
+
+fn prerequisite_receipt_mismatch() -> SessionFailure {
+    SessionFailure::data(
+        "prerequisite-receipt-mismatch",
+        "the prerequisite receipt belongs to a different execution scope",
+    )
+}
+
 fn verification_context_failure(_error: resolver::ContextResolveError) -> SessionFailure {
     SessionFailure::data(
         "context-policy-invalid",
@@ -1292,6 +1908,51 @@ fn validate_context_args(args: &SessionContextArgs) -> Result<(), SessionFailure
         ));
     }
     Ok(())
+}
+
+fn validate_prerequisite_binding(
+    binding: &SessionPrerequisiteBindingArgs,
+) -> Result<(), SessionFailure> {
+    let valid = [
+        binding.agent_id.as_str(),
+        binding.workspace_generation.as_str(),
+        binding.call_id.as_str(),
+        binding.tool_name.as_str(),
+        binding.definition_id.as_str(),
+    ]
+    .into_iter()
+    .all(|value| {
+        !value.is_empty()
+            && value.len() <= MAX_PREREQUISITE_BINDING_BYTES
+            && !value.bytes().any(|byte| byte.is_ascii_control())
+    }) && binding.turn > 0
+        && binding.step > 0;
+    if valid {
+        Ok(())
+    } else {
+        Err(SessionFailure::data(
+            "invalid-prerequisite-binding",
+            "the prerequisite execution binding is invalid",
+        ))
+    }
+}
+
+fn validate_prerequisite_selection(
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> Result<(), SessionFailure> {
+    if fallback == FallbackMode::Auto
+        && !use_user_config
+        && expected_integration_fingerprint.is_none()
+    {
+        Ok(())
+    } else {
+        Err(SessionFailure::data(
+            "unsupported-prerequisite-selection",
+            "prerequisites require the verifier's default catalog selection",
+        ))
+    }
 }
 
 fn validate_record_context(
@@ -1682,6 +2343,95 @@ fn render_context(format: OutputFormat, result: Result<ContextData, SessionFailu
     }
 }
 
+fn render_prerequisite(
+    format: OutputFormat,
+    result: Result<PrerequisiteData, SessionFailure>,
+) -> i32 {
+    const SCHEMA: &str = "cli.agent-docs.session.prerequisite.v1";
+    match result {
+        Ok(data) => {
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": SCHEMA,
+                        "ok": true,
+                        "data": data,
+                    }))
+                    .expect("session prerequisite output serializes")
+                );
+            } else {
+                println!(
+                    "agent-docs session prerequisite: product={} intent={} reason={} verified={}",
+                    data.decision.product,
+                    data.decision.intent,
+                    data.decision.reason,
+                    data.decision.verified
+                );
+            }
+            EXIT_OK
+        }
+        Err(failure) => render_prerequisite_failure(SCHEMA, "prerequisite", format, failure),
+    }
+}
+
+fn render_prerequisite_commit(
+    format: OutputFormat,
+    result: Result<PrerequisiteCommitData, SessionFailure>,
+) -> i32 {
+    const SCHEMA: &str = "cli.agent-docs.session.commit-prerequisite.v1";
+    match result {
+        Ok(data) => {
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema_version": SCHEMA,
+                        "ok": true,
+                        "data": data,
+                    }))
+                    .expect("session prerequisite commit output serializes")
+                );
+            } else {
+                println!(
+                    "agent-docs session commit-prerequisite: product={} intent={} reason={} verified={}",
+                    data.product, data.intent, data.reason, data.verified
+                );
+            }
+            EXIT_OK
+        }
+        Err(failure) => render_prerequisite_failure(SCHEMA, "commit-prerequisite", format, failure),
+    }
+}
+
+fn render_prerequisite_failure(
+    schema: &'static str,
+    command: &'static str,
+    format: OutputFormat,
+    failure: SessionFailure,
+) -> i32 {
+    if format == OutputFormat::Json {
+        let details =
+            serde_json::to_value(&failure.details).expect("session failure details serialize");
+        let mut error = EnvelopeError::new(failure.code, &failure.message).with_details(details);
+        if let Some(hint) = &failure.hint {
+            error = error.with_hint(hint);
+        }
+        let envelope: Envelope<serde_json::Value> = Envelope::failure(schema, error);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).expect("session error serializes")
+        );
+    } else {
+        eprintln!(
+            "agent-docs session {command}: {}; next action: {}",
+            failure.message,
+            failure.details.next_action.as_str()
+        );
+    }
+    failure.exit_code
+}
+
 struct SessionFailure {
     code: &'static str,
     message: String,
@@ -1806,6 +2556,10 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
         | "invalid-product"
         | "invalid-request-id"
         | "invalid-max-bytes"
+        | "invalid-prerequisite-binding"
+        | "unsupported-prerequisite-selection"
+        | "prerequisite-receipt-invalid"
+        | "prerequisite-receipt-mismatch"
         | "context-budget-exceeded"
         | "root-resolution-failed" => (
             false,
@@ -1827,6 +2581,21 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
             NextAction::PrepareIntent,
             SessionRecovery {
                 command: Some(RecoveryCommand::SessionPrepare),
+                action: None,
+                reuse_scope: session_reuse_scope(),
+                intents: Vec::new(),
+                phase: None,
+                refresh_integration_fingerprint: Some(false),
+                then: None,
+                retry_original: Some(true),
+                max_attempts: None,
+            },
+        ),
+        "prerequisite-stale" => (
+            true,
+            NextAction::PrepareIntent,
+            SessionRecovery {
+                command: Some(RecoveryCommand::SessionPrerequisite),
                 action: None,
                 reuse_scope: session_reuse_scope(),
                 intents: Vec::new(),
@@ -1873,6 +2642,7 @@ fn failure_details(code: &str) -> Box<SessionFailureDetails> {
         | "context-content-missing"
         | "record-render-failed"
         | "record-path-not-portable"
+        | "prerequisite-receipt-render-failed"
         | "lock-owner-render-failed"
         | "integration-catalog-invariant-failed" => (
             false,
@@ -1909,6 +2679,13 @@ fn failure_message(code: &str) -> &'static str {
         "invalid-product" => "the selected product is not supported for session context",
         "invalid-request-id" => "the context request identifier is invalid",
         "invalid-max-bytes" => "the context response budget is invalid",
+        "invalid-prerequisite-binding" => "the prerequisite execution binding is invalid",
+        "unsupported-prerequisite-selection" => "the prerequisite catalog selection is unsupported",
+        "prerequisite-receipt-invalid" => "the prerequisite receipt is invalid",
+        "prerequisite-receipt-mismatch" => {
+            "the prerequisite receipt belongs to a different execution scope"
+        }
+        "prerequisite-stale" => "the prerequisite policy changed before commit",
         "context-budget-exceeded" => "required policy content exceeds the response budget",
         "context-policy-invalid" => {
             "the prepared DSH context no longer satisfies the bounded policy contract"
@@ -1941,6 +2718,7 @@ fn failure_message(code: &str) -> &'static str {
         }
         "record-render-failed" => "the session record could not be serialized",
         "record-path-not-portable" => "the session record location violated an invariant",
+        "prerequisite-receipt-render-failed" => "the prerequisite receipt could not be serialized",
         "lock-owner-render-failed" => "the session lock owner could not be serialized",
         "integration-catalog-invariant-failed" => {
             "the integration catalog violated an internal invariant"

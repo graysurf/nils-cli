@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::contract::{digest, matcher_input_field, supported_event};
 use crate::error::HookError;
 use crate::model::{
-    DecisionAction, DshSubject, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
+    DecisionAction, DshPrerequisite, DshSubject, NormalizedDecision, NormalizedRequest, Product,
+    REQUEST_VERSION,
 };
 use crate::path_binding::{TargetBinding, resolve_target_bindings};
 use crate::strict_json;
@@ -20,11 +21,19 @@ const DSH_INGRESS_V1: &str = "agent-hook.dsh-ingress.v1";
 const DSH_INGRESS_V2: &str = "agent-hook.dsh-ingress.v2";
 const DSH_INGRESS_V3: &str = "agent-hook.dsh-ingress.v3";
 const DSH_INGRESS_V4: &str = "agent-hook.dsh-ingress.v4";
+const DSH_INGRESS_V5: &str = "agent-hook.dsh-ingress.v5";
 const DSH_RUNTIME_KIT_PROVIDER_SESSION_ID_ENV: &str = "DSH_RUNTIME_KIT_PROVIDER_SESSION_ID";
 const MAX_PROVIDER_ID_CHARS: usize = 256;
 const MAX_MUTATION_TARGETS: usize = 256;
 const MAX_MUTATION_TARGET_BYTES: usize = 4096;
 const MAX_DSH_PROMPT_BYTES: usize = 64 * 1024;
+const MAX_DSH_PREREQUISITE_RECEIPT_BYTES: usize = 4096;
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_PROVIDER_ID_CHARS
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
 
 #[derive(Debug, Serialize)]
 struct ActivityEvent {
@@ -77,6 +86,10 @@ struct DshIngressSubject {
     agent_docs_state_home: PathBuf,
     #[serde(default)]
     agent_docs_home: Option<PathBuf>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    workspace_generation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +97,10 @@ struct DshIngressSubject {
 struct DshToolCall {
     name: String,
     arguments: Value,
+    #[serde(default)]
+    definition_id: Option<String>,
+    #[serde(default)]
+    prerequisite_receipt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,7 +192,7 @@ fn normalize_dsh(
     })?;
     if !matches!(
         ingress.schema_version.as_str(),
-        DSH_INGRESS_V1 | DSH_INGRESS_V2 | DSH_INGRESS_V3 | DSH_INGRESS_V4
+        DSH_INGRESS_V1 | DSH_INGRESS_V2 | DSH_INGRESS_V3 | DSH_INGRESS_V4 | DSH_INGRESS_V5
     ) {
         return Err(HookError::data(
             "dsh-ingress-version-invalid",
@@ -190,6 +207,8 @@ fn normalize_dsh(
                 && subject.turn > 0
                 && subject.step.is_some_and(|step| step > 0)
                 && subject.session_start_source.is_none()
+                && subject.agent_id.is_none()
+                && subject.workspace_generation.is_none()
                 && subject.agent_docs_state_home.is_absolute()
                 && subject
                     .agent_docs_home
@@ -204,6 +223,57 @@ fn normalize_dsh(
                 session_start_source: None,
                 agent_docs_state_home: subject.agent_docs_state_home,
                 agent_docs_home: subject.agent_docs_home,
+                prerequisite: None,
+            })
+        }
+        (DSH_INGRESS_V5, Some(subject))
+            if !subject.session_id.is_empty()
+                && subject.session_id.chars().count() <= MAX_PROVIDER_ID_CHARS
+                && subject.turn > 0
+                && subject.step.is_some_and(|step| step > 0)
+                && subject.session_start_source.is_none()
+                && subject.agent_docs_state_home.is_absolute()
+                && subject
+                    .agent_docs_home
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute())
+                && subject.agent_id.as_deref().is_some_and(valid_provider_id)
+                && subject
+                    .workspace_generation
+                    .as_deref()
+                    .is_some_and(valid_provider_id)
+                && ingress.tool.as_ref().is_some_and(|tool| {
+                    tool.definition_id.as_deref().is_some_and(valid_provider_id)
+                        && tool.prerequisite_receipt.as_deref().is_some_and(|receipt| {
+                            !receipt.is_empty()
+                                && receipt.len() <= MAX_DSH_PREREQUISITE_RECEIPT_BYTES
+                                && !receipt.bytes().any(|byte| byte.is_ascii_control())
+                        })
+                }) =>
+        {
+            let tool = ingress.tool.as_ref().expect("validated DSH v5 tool");
+            Some(DshSubject {
+                session_id: subject.session_id,
+                call_id: ingress.call_id.clone(),
+                turn: subject.turn,
+                step: subject.step,
+                session_start_source: None,
+                agent_docs_state_home: subject.agent_docs_state_home,
+                agent_docs_home: subject.agent_docs_home,
+                prerequisite: Some(DshPrerequisite {
+                    agent_id: subject.agent_id.expect("validated DSH v5 agent id"),
+                    workspace_generation: subject
+                        .workspace_generation
+                        .expect("validated DSH v5 workspace generation"),
+                    definition_id: tool
+                        .definition_id
+                        .clone()
+                        .expect("validated DSH v5 definition id"),
+                    receipt: tool
+                        .prerequisite_receipt
+                        .clone()
+                        .expect("validated DSH v5 prerequisite receipt"),
+                }),
             })
         }
         (DSH_INGRESS_V3, Some(subject))
@@ -220,6 +290,8 @@ fn normalize_dsh(
                             "startup" | "resume" | "clear" | "compact" | "observed"
                         )
                     })
+                && subject.agent_id.is_none()
+                && subject.workspace_generation.is_none()
                 && subject.agent_docs_state_home.is_absolute()
                 && subject
                     .agent_docs_home
@@ -234,6 +306,7 @@ fn normalize_dsh(
                 session_start_source: subject.session_start_source,
                 agent_docs_state_home: subject.agent_docs_state_home,
                 agent_docs_home: subject.agent_docs_home,
+                prerequisite: None,
             })
         }
         _ => {
@@ -288,12 +361,24 @@ fn normalize_dsh(
             !tool.name.is_empty()
                 && tool.name.chars().count() <= MAX_PROVIDER_ID_CHARS
                 && tool.arguments.is_object()
+                && if ingress.schema_version == DSH_INGRESS_V5 {
+                    tool.definition_id.as_deref().is_some_and(valid_provider_id)
+                        && tool.prerequisite_receipt.as_deref().is_some_and(|receipt| {
+                            !receipt.is_empty()
+                                && receipt.len() <= MAX_DSH_PREREQUISITE_RECEIPT_BYTES
+                                && !receipt.bytes().any(|byte| byte.is_ascii_control())
+                        })
+                } else {
+                    tool.definition_id.is_none() && tool.prerequisite_receipt.is_none()
+                }
         })
         && ingress.prompt.is_none()
         && ingress.result.is_none()
-        && dsh_subject
-            .as_ref()
-            .is_none_or(|subject| subject.step.is_some() && subject.session_start_source.is_none());
+        && dsh_subject.as_ref().is_none_or(|subject| {
+            subject.step.is_some()
+                && subject.session_start_source.is_none()
+                && (ingress.schema_version == DSH_INGRESS_V5) == subject.prerequisite.is_some()
+        });
     let prompt_shape = event == "UserPromptSubmit"
         && ingress.schema_version == DSH_INGRESS_V3
         && ingress.call_id.is_none()
@@ -324,6 +409,8 @@ fn normalize_dsh(
             !tool.name.is_empty()
                 && tool.name.chars().count() <= MAX_PROVIDER_ID_CHARS
                 && tool.arguments.is_object()
+                && tool.definition_id.is_none()
+                && tool.prerequisite_receipt.is_none()
         })
         && ingress.prompt.is_none()
         && ingress.result.is_some()
