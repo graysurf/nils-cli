@@ -3149,6 +3149,9 @@ fn checkout_lease(
     run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
 ) -> Result<Outcome, HookError> {
     let group = DshCapabilityGroup::CheckoutLeaseGuard;
+    if crate::liveness::coordination_failure_mode().is_some() {
+        return Ok(Outcome::allow(group));
+    }
     if effect == OperationEffectClass::ReadOnly {
         return Ok(Outcome::allow(group));
     }

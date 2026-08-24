@@ -2014,6 +2014,77 @@ fn checkout_lease_is_session_bound_and_clean_reclaim_is_not_early() {
 }
 
 #[test]
+fn checkout_lease_does_not_contend_in_authenticated_advisory_mode() {
+    let fixture = Fixture::new(&policy("checkout-lease-guard", "dsh"));
+    git(&fixture, &["init", "--quiet"]);
+    git(&fixture, &["config", "user.email", "test@example.com"]);
+    git(&fixture, &["config", "user.name", "Test"]);
+    fs::write(fixture.root.join("tracked.txt"), "base\n").expect("tracked file");
+    git(&fixture, &["add", "--all"]);
+    git(&fixture, &["commit", "--quiet", "-m", "test: initial"]);
+
+    let owner = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_session(
+            &fixture,
+            "lease-owner",
+            "bash",
+            json!({"command": "printf ok"}),
+        )),
+    );
+    assert_eq!(owner.code, 0, "envelope={}", owner.stdout_text());
+
+    let lease_root = fixture
+        .state_home
+        .join("dsh-runtime-kit/agent-hook/dsh-checkout-leases");
+    let checkout_lease_dir = fs::read_dir(&lease_root)
+        .expect("lease root")
+        .next()
+        .expect("checkout lease directory")
+        .expect("checkout lease entry")
+        .path();
+    let lease_path = checkout_lease_dir.join("lease.json");
+    let owner_lease = fs::read(&lease_path).expect("owner lease JSON");
+
+    let session_dir = fixture.session_state.join("sessions/lease-advisory");
+    fs::create_dir_all(&session_dir).expect("session directory");
+    let session_record = session_dir.join("session.json");
+    fs::write(
+        &session_record,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.session.v1",
+            "id": "lease-advisory",
+            "coordination_mode": "advisory",
+            "runtime": {"launch_id": "lease-advisory-incarnation"}
+        }))
+        .expect("session JSON"),
+    )
+    .expect("session record");
+    Fixture::set_private(&session_record);
+
+    let advisory = fixture.run_with_env(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_session(
+            &fixture,
+            "lease-advisory",
+            "bash",
+            json!({"command": "printf ok"}),
+        )),
+        &[
+            ("AGENT_SESSION_ID", "lease-advisory"),
+            ("AGENT_SESSION_RUNTIME_ID", "lease-advisory-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "advisory"),
+        ],
+    );
+    assert_eq!(advisory.code, 0, "envelope={}", advisory.stdout_text());
+    assert_eq!(advisory.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        fs::read(&lease_path).expect("lease JSON after advisory dispatch"),
+        owner_lease,
+    );
+}
+
+#[test]
 fn checkout_lease_applies_to_native_file_tools_without_requiring_a_command() {
     let policy = policy("checkout-lease-guard", "dsh").replace(
         "matcher = \"bash\"",
