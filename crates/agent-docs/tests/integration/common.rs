@@ -91,12 +91,16 @@ impl TestEnv {
 
     /// Run `agent-docs <args>` with explicit `--docs-home` / `--project-path`.
     pub fn run(&self, args: &[&str]) -> CliOutput {
+        self.run_for_project(&self.project, args)
+    }
+
+    pub fn run_for_project(&self, project: &Path, args: &[&str]) -> CliOutput {
         let docs_home = self.docs_home.to_str().expect("utf-8 docs_home");
-        let project = self.project.to_str().expect("utf-8 project");
-        let mut full: Vec<&str> = vec!["--docs-home", docs_home, "--project-path", project];
+        let project_arg = project.to_str().expect("utf-8 project");
+        let mut full: Vec<&str> = vec!["--docs-home", docs_home, "--project-path", project_arg];
         full.extend_from_slice(args);
         let options = cmd::CmdOptions::default()
-            .with_cwd(&self.project)
+            .with_cwd(project)
             .with_env("HOME", self.home.to_str().expect("utf-8 home"))
             .with_env(
                 "XDG_CONFIG_HOME",

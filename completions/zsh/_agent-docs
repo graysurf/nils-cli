@@ -322,6 +322,55 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(prerequisite)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[]:ID:_default' \
+'--product=[]:PRODUCT:(dsh)' \
+'--state-home=[]:DIR:_files' \
+'--format=[]:FORMAT:(text json)' \
+'--intent=[]:INTENT:_default' \
+'--phase=[Required prerequisite phase (currently\: edit)]:PHASE:(edit)' \
+'--request-id=[Bounded caller correlation id echoed by the prerequisite decision]:ID:_default' \
+'--max-bytes=[Maximum aggregate UTF-8 bytes of returned policy content (hard cap\: 65536)]:BYTES:_default' \
+'--agent-id=[]:ID:_default' \
+'--workspace-generation=[]:ID:_default' \
+'--call-id=[]:ID:_default' \
+'--turn=[]:NUMBER:_default' \
+'--step=[]:NUMBER:_default' \
+'--tool-name=[]:NAME:_default' \
+'--definition-id=[]:ID:_default' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(commit-prerequisite)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[]:ID:_default' \
+'--product=[]:PRODUCT:(dsh)' \
+'--state-home=[]:DIR:_files' \
+'--format=[]:FORMAT:(text json)' \
+'--receipt=[]:RECEIPT:_default' \
+'--agent-id=[]:ID:_default' \
+'--workspace-generation=[]:ID:_default' \
+'--call-id=[]:ID:_default' \
+'--turn=[]:NUMBER:_default' \
+'--step=[]:NUMBER:_default' \
+'--tool-name=[]:NAME:_default' \
+'--definition-id=[]:ID:_default' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (status)
 _arguments "${_arguments_options[@]}" : \
 '--session-id=[]:ID:_default' \
@@ -499,6 +548,8 @@ _agent-docs__subcmd__session_commands() {
 'activate:Strictly preflight and atomically activate one or more declared intents' \
 'prepare:Atomically prepare one or more declared intents (activate + strict preflight) and report a stable JSON result usable by a runtime hook' \
 'context:Resolve and prepare exactly one DSH intent, returning only its bounded satisfied required document content as a replay-bound decision' \
+'prerequisite:Resolve one exact DSH prerequisite without activating it' \
+'commit-prerequisite:Commit a previously resolved exact DSH prerequisite' \
 'status:Show active intents for the current session/project/product scope' \
 'verify:Re-resolve the catalog and verify required intents are active and fresh' \
     )
@@ -509,6 +560,11 @@ _agent-docs__subcmd__session__subcmd__activate_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs session activate commands' commands "$@"
 }
+(( $+functions[_agent-docs__subcmd__session__subcmd__commit-prerequisite_commands] )) ||
+_agent-docs__subcmd__session__subcmd__commit-prerequisite_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs session commit-prerequisite commands' commands "$@"
+}
 (( $+functions[_agent-docs__subcmd__session__subcmd__context_commands] )) ||
 _agent-docs__subcmd__session__subcmd__context_commands() {
     local commands; commands=()
@@ -518,6 +574,11 @@ _agent-docs__subcmd__session__subcmd__context_commands() {
 _agent-docs__subcmd__session__subcmd__prepare_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs session prepare commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__session__subcmd__prerequisite_commands] )) ||
+_agent-docs__subcmd__session__subcmd__prerequisite_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs session prerequisite commands' commands "$@"
 }
 (( $+functions[_agent-docs__subcmd__session__subcmd__status_commands] )) ||
 _agent-docs__subcmd__session__subcmd__status_commands() {

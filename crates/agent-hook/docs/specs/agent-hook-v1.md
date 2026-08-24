@@ -86,6 +86,13 @@ above.
   `result.is_error: boolean`. `false` normalizes to `PostToolUse`; `true`
   normalizes to `PostToolUseFailure`. Candidate value, content, error objects,
   stdout, and stderr are neither accepted nor persisted.
+- `agent-hook.dsh-ingress.v5`: the prerequisite-bound DSH pre-tool transport.
+  It retains the strict v2 call, cwd, session, turn/step, tool name, and
+  arguments, and additionally requires bounded `subject.agent_id`,
+  `subject.workspace_generation`, `tool.definition_id`, and
+  `tool.prerequisite_receipt`. The receipt is re-resolved against the current
+  agent-docs catalog and exact execution binding; verification creates no
+  activation. V5 fields are rejected on every older ingress version.
 - `agent-hook.finish-line.{open,begin,run,stop,status}.v1`: strict DSH lifecycle
   requests for the native execution-owned finish line. Their
   command result schemas use the matching
@@ -163,9 +170,10 @@ Supported canonical events are:
 
 The Codex/Claude/Hermes adapter accepts the event from `--event` or the
 provider's documented `hook_event_name`/`event` field and rejects a mismatch.
-The DSH adapter accepts strict `agent-hook.dsh-ingress.v1`, v2, v3, or v4; the
-runtime bundle uses v2 before tools, v4 after tools, and v3 for agent lifecycle
-events. An optional
+The DSH adapter accepts strict `agent-hook.dsh-ingress.v1`, v2, v3, v4, or v5;
+the runtime bundle uses v2 before ordinary tools, v5 when a pending prerequisite
+must cross pre-tool policy, v4 after tools, and v3 for agent lifecycle events.
+An optional
 `--event` must equal its native event string before that string is mapped to
 the canonical policy event. Matcher values are normalized only from documented
 fields:

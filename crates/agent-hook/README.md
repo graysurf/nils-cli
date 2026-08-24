@@ -71,8 +71,8 @@ until Hermes exposes a compatible runner.
 DSH doctor output names `dsh-runtime-kit` as `registration_owner` and reports
 `dispatch_supported: true` even though file-based setup remains unsupported.
 
-DSH sends strict `agent-hook.dsh-ingress.v2` pre-tool JSON, v4 post-tool JSON,
-and v3 lifecycle JSON.
+DSH sends strict `agent-hook.dsh-ingress.v2` ordinary pre-tool JSON, v5
+prerequisite-bound pre-tool JSON, v4 post-tool JSON, and v3 lifecycle JSON.
 V2 extends the retained v1 transport with the adapter-bound session, turn,
 step, and absolute agent-docs state/config roots. V3 adds strict
 `agent/pre-step` and `agent/turn-stopping` shapes, normalized to
@@ -90,6 +90,12 @@ policy boundary. Managed mutations persist hashed correlation and private
 retry material before invoking the same-release `agent-session work-context
 show/admit/complete` commands. Exact retries do not duplicate admission or
 execution; terminal post retries reauthenticate the idempotent completion.
+V5 adds one exact agent, workspace generation, visible tool definition, and
+side-effect-free agent-docs prerequisite receipt to the v2 identity. The
+pre-edit gate re-resolves the receipt against the current catalog and exact
+call/turn/step before allowing it; it does not activate the session. The
+runtime commits the receipt only after DSH waterfall, approval, guards, and
+cancellation have admitted the execution.
 Any partial managed selector set and uncertain operation fails closed. Stop
 uses capability-authenticated `agent-session broker status` and permits exit
 only when authoritative active and uncertain counts are both zero; local

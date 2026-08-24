@@ -422,7 +422,7 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
         Command::Config(args) => user_config::run(args, &overrides),
         Command::Integration(args) => integration::run(args, &overrides, fallback_mode),
         Command::Session(args) => session::run(
-            args,
+            *args,
             overrides,
             fallback_mode,
             use_user_config,

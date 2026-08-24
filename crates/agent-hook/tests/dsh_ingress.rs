@@ -63,11 +63,126 @@ fn dsh_pre_execute_is_normalized_and_evaluated_by_the_shared_policy_engine() {
 }
 
 #[test]
+fn dsh_v5_pre_execute_accepts_only_the_exact_prerequisite_ingress_shape() {
+    let fixture = Fixture::new(POLICY);
+    let value = json!({
+        "schema_version": "agent-hook.dsh-ingress.v5",
+        "event": "tools/pre-execute",
+        "call_id": "dsh-call-1",
+        "cwd": fixture.root,
+        "subject": {
+            "session_id": "session-1",
+            "turn": 1,
+            "step": 2,
+            "agent_id": "agent-1",
+            "workspace_generation": "workspace-generation-1",
+            "agent_docs_state_home": fixture.home.join("state"),
+        },
+        "tool": {
+            "name": "runtime_kit_plus_one",
+            "arguments": {"value": 41},
+            "definition_id": "definition-1",
+            "prerequisite_receipt": "{}",
+        },
+    });
+    let output = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&value.to_string()),
+    );
+    assert_eq!(output.code, 1, "envelope={}", output.stdout_text());
+    assert_eq!(output.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][0]["code"],
+        "plus-one-blocked"
+    );
+
+    for (scope, field) in [
+        ("subject", "agent_id"),
+        ("subject", "workspace_generation"),
+        ("tool", "definition_id"),
+        ("tool", "prerequisite_receipt"),
+    ] {
+        let mut missing = value.clone();
+        missing[scope].as_object_mut().unwrap().remove(field);
+        let rejected = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&missing.to_string()),
+        );
+        assert_eq!(rejected.code, 65, "missing={scope}.{field}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "dsh-ingress-invalid"
+        );
+    }
+
+    for (scope, field, replacement) in [
+        ("subject", "agent_id", json!("")),
+        ("subject", "agent_id", json!("a".repeat(257))),
+        ("subject", "agent_id", json!("agent\n1")),
+        ("subject", "workspace_generation", json!("")),
+        ("subject", "workspace_generation", json!("w".repeat(257))),
+        ("tool", "definition_id", json!("")),
+        ("tool", "definition_id", json!("d".repeat(257))),
+        ("tool", "prerequisite_receipt", json!("")),
+        ("tool", "prerequisite_receipt", json!("r".repeat(4097))),
+        ("tool", "prerequisite_receipt", json!("receipt\nvalue")),
+    ] {
+        let mut invalid = value.clone();
+        invalid[scope][field] = replacement;
+        let rejected = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&invalid.to_string()),
+        );
+        assert_eq!(rejected.code, 65, "invalid={scope}.{field}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "dsh-ingress-invalid"
+        );
+    }
+
+    for (scope, field) in [("subject", "unknown"), ("tool", "unknown")] {
+        let mut unknown = value.clone();
+        unknown[scope][field] = json!(true);
+        let rejected = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&unknown.to_string()),
+        );
+        assert_eq!(rejected.code, 65, "unknown={scope}.{field}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "dsh-ingress-invalid"
+        );
+    }
+
+    let mut wrong_event = value.clone();
+    wrong_event["event"] = json!("tools/post-execute");
+    let rejected = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&wrong_event.to_string()),
+    );
+    assert_eq!(rejected.code, 65, "input={wrong_event}");
+
+    for version in 1..=4 {
+        let mut older = value.clone();
+        older["schema_version"] = json!(format!("agent-hook.dsh-ingress.v{version}"));
+        let rejected = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&older.to_string()),
+        );
+        assert_eq!(rejected.code, 65, "version={version}");
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "dsh-ingress-invalid"
+        );
+    }
+}
+
+#[test]
 fn dsh_ingress_rejects_unknown_versions_and_fields() {
     let fixture = Fixture::new(POLICY);
 
     let wrong_version =
-        request(&fixture).replace("agent-hook.dsh-ingress.v1", "agent-hook.dsh-ingress.v5");
+        request(&fixture).replace("agent-hook.dsh-ingress.v1", "agent-hook.dsh-ingress.v6");
     let output = fixture.run(
         &["dispatch", "--product", "dsh", "--format", "json"],
         Some(&wrong_version),

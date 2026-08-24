@@ -153,6 +153,29 @@ fn git(fixture: &Fixture, args: &[&str]) {
     );
 }
 
+fn session_json_records(state_home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let root = state_home.join("agent-docs/sessions");
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut pending = vec![root];
+    let mut records = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).expect("session state directory") {
+            let path = entry.expect("session state entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                records.push(path);
+            }
+        }
+    }
+    records
+}
+
 fn dispatch_with_release_binary(fixture: &Fixture, binary: &std::path::Path, input: &str) -> Value {
     dispatch_with_release_binary_env(fixture, binary, input, &[])
 }
@@ -2540,6 +2563,153 @@ phase = "edit"
     );
     assert_eq!(output.code, 0, "envelope={}", output.stdout_text());
     assert_eq!(output.stdout_json()["data"]["action"], "allow");
+}
+
+#[test]
+fn dsh_pre_edit_accepts_only_an_exact_current_pending_prerequisite_without_committing_it() {
+    let Some(agent_docs) = nils_test_support::bin::sibling_or_skip("agent-docs", "nils-agent-docs")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&policy("pre-edit-intent-gate", "dsh"));
+    fs::write(
+        fixture.root.join("AGENT_DOCS.toml"),
+        r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "README.md"
+required = true
+phase = "edit"
+"#,
+    )
+    .expect("catalog");
+    fs::write(fixture.root.join("README.md"), "pending DSH policy\n").expect("policy doc");
+    let state_home = fixture.state_home.join("dsh-runtime-kit");
+    let begin = Command::new(&agent_docs)
+        .args([
+            "--docs-home",
+            fixture.home.to_str().unwrap(),
+            "--project-path",
+            fixture.root.to_str().unwrap(),
+            "session",
+            "prerequisite",
+            "--session-id",
+            "dsh-session-1",
+            "--product",
+            "dsh",
+            "--state-home",
+            state_home.to_str().unwrap(),
+            "--intent",
+            "project-dev",
+            "--phase",
+            "edit",
+            "--request-id",
+            "pending-pre-edit-test",
+            "--agent-id",
+            "agent-1",
+            "--workspace-generation",
+            "workspace-generation-1",
+            "--call-id",
+            "dsh-task-3-2-call",
+            "--turn",
+            "1",
+            "--step",
+            "2",
+            "--tool-name",
+            "bash",
+            "--definition-id",
+            "definition-1",
+            "--format",
+            "json",
+        ])
+        .env_clear()
+        .env("HOME", &fixture.home)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("agent-docs prerequisite begin");
+    assert!(
+        begin.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    let begin_json: Value = serde_json::from_slice(&begin.stdout).expect("begin JSON");
+    let receipt = begin_json["data"]["decision"]["receipt"]
+        .as_str()
+        .expect("pending receipt");
+    assert!(session_json_records(&state_home).is_empty());
+
+    let mut input: Value = serde_json::from_str(&request(
+        &fixture,
+        "bash",
+        json!({"command": "printf owned > owned.txt"}),
+    ))
+    .expect("request JSON");
+    input["schema_version"] = json!("agent-hook.dsh-ingress.v5");
+    input["subject"]["agent_docs_home"] =
+        Value::String(fixture.home.to_string_lossy().into_owned());
+    input["subject"]["agent_id"] = json!("agent-1");
+    input["subject"]["workspace_generation"] = json!("workspace-generation-1");
+    input["tool"]["definition_id"] = json!("definition-1");
+    input["tool"]["prerequisite_receipt"] = json!(receipt);
+
+    let accepted = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&input.to_string()),
+    );
+    assert_eq!(accepted.code, 0, "envelope={}", accepted.stdout_text());
+    assert_eq!(accepted.stdout_json()["data"]["action"], "allow");
+    assert!(session_json_records(&state_home).is_empty());
+
+    for (scope, field, replacement) in [
+        ("subject", "agent_id", json!("agent-2")),
+        (
+            "subject",
+            "workspace_generation",
+            json!("workspace-generation-2"),
+        ),
+        ("subject", "turn", json!(2)),
+        ("subject", "step", json!(3)),
+        (
+            "subject",
+            "agent_docs_state_home",
+            json!(fixture.state_home.join("other-runtime")),
+        ),
+        ("tool", "definition_id", json!("definition-2")),
+        ("tool", "prerequisite_receipt", json!("{}")),
+    ] {
+        let mut substituted = input.clone();
+        substituted[scope][field] = replacement;
+        let denied = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&substituted.to_string()),
+        );
+        assert_eq!(denied.code, 1, "substitution={scope}.{field}");
+        assert_eq!(denied.stdout_json()["data"]["action"], "block");
+    }
+
+    let mut other_call = input.clone();
+    other_call["call_id"] = json!("other-call");
+    let denied = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&other_call.to_string()),
+    );
+    assert_eq!(denied.code, 1, "envelope={}", denied.stdout_text());
+    assert_eq!(denied.stdout_json()["data"]["action"], "block");
+
+    let mut cross_intent_receipt: Value =
+        serde_json::from_str(receipt).expect("prerequisite receipt JSON");
+    cross_intent_receipt["intent"] = json!("other-dev");
+    let mut cross_intent = input.clone();
+    cross_intent["tool"]["prerequisite_receipt"] =
+        json!(serde_json::to_string(&cross_intent_receipt).unwrap());
+    let denied = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&cross_intent.to_string()),
+    );
+    assert_eq!(denied.code, 1, "envelope={}", denied.stdout_text());
+    assert_eq!(denied.stdout_json()["data"]["action"], "block");
+    assert!(session_json_records(&state_home).is_empty());
 }
 
 #[test]
