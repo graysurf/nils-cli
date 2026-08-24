@@ -837,6 +837,92 @@ fn dsh_operation_lifecycle_is_optional_when_unmanaged_and_closed_when_partial() 
 
 #[test]
 #[cfg(target_os = "linux")]
+fn dsh_operation_lifecycle_requires_a_claim_only_in_authenticated_enforce_mode() {
+    for (durable_mode, runtime_hint, expected_action, expected_helper_calls) in [
+        (Some("advisory"), "advisory", "allow", 0),
+        (Some("off"), "off", "allow", 0),
+        (Some("enforce"), "enforce", "block", 1),
+        (Some("enforce"), "advisory", "block", 1),
+        (None, "advisory", "block", 1),
+    ] {
+        let fixture = Fixture::new(&operation_policy());
+        git(&fixture, &["init", "--quiet"]);
+        let release = fixture.root.join("release");
+        fs::create_dir_all(&release).expect("release directory");
+        let agent_hook = release.join("agent-hook");
+        install_release_binary(&agent_hook);
+        let helper_log = fixture.root.join("agent-session.log");
+        let agent_session = release.join("agent-session");
+        fs::write(
+            &agent_session,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n",
+                shell_words::quote(helper_log.to_str().expect("helper log UTF-8")),
+            ),
+        )
+        .expect("agent-session fixture");
+        fs::set_permissions(&agent_session, fs::Permissions::from_mode(0o700))
+            .expect("agent-session mode");
+        let capability = fixture.root.join("session.capability");
+        fs::write(&capability, "private-capability\n").expect("capability");
+        Fixture::set_private(&capability);
+        if let Some(durable_mode) = durable_mode {
+            let session_dir = fixture.session_state.join("sessions/managed-session");
+            fs::create_dir_all(&session_dir).expect("session directory");
+            let session_record = session_dir.join("session.json");
+            fs::write(
+                &session_record,
+                serde_json::to_vec(&json!({
+                    "schema_version": "agent-session.session.v1",
+                    "id": "managed-session",
+                    "coordination_mode": durable_mode,
+                    "runtime": {"launch_id": "incarnation-1"}
+                }))
+                .expect("session JSON"),
+            )
+            .expect("session record");
+            Fixture::set_private(&session_record);
+        }
+
+        let decision = dispatch_with_release_binary_env(
+            &fixture,
+            &agent_hook,
+            &request(&fixture, "bash", json!({"command": "pwd"})),
+            &[
+                ("AGENT_SESSION_ID", "managed-session"),
+                ("AGENT_SESSION_RUNTIME_ID", "incarnation-1"),
+                ("AGENT_SESSION_COORDINATION_MODE", runtime_hint),
+                (
+                    "AGENT_SESSION_CAPABILITY_FILE",
+                    capability.to_str().expect("capability UTF-8"),
+                ),
+            ],
+        );
+        assert_eq!(
+            decision["data"]["action"], expected_action,
+            "durable_mode={durable_mode:?} runtime_hint={runtime_hint} decision={decision}"
+        );
+        let helper_calls = fs::read_to_string(&helper_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            helper_calls, expected_helper_calls,
+            "durable_mode={durable_mode:?} runtime_hint={runtime_hint}"
+        );
+        assert_eq!(
+            fixture
+                .state_home
+                .join("dsh-runtime-kit/agent-hook/dsh-operations")
+                .exists(),
+            expected_helper_calls != 0,
+            "durable_mode={durable_mode:?} runtime_hint={runtime_hint}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn dsh_operation_post_without_a_matching_pre_does_not_create_private_state() {
     let fixture = Fixture::new(&operation_policy());
     git(&fixture, &["init", "--quiet"]);

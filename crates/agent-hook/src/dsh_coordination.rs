@@ -144,6 +144,9 @@ pub(crate) fn run(
     let Some(identity) = identity()? else {
         return Ok(Outcome::not_run());
     };
+    if crate::liveness::coordination_failure_mode().is_some() {
+        return Ok(Outcome::not_run());
+    }
     match request.event.as_str() {
         "PreToolUse" => pre_tool(request, effect, &identity, run_child),
         "PostToolUse" | "PostToolUseFailure" => post_tool(request, raw, &identity, run_child),
