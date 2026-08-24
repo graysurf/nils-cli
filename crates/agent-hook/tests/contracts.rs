@@ -394,6 +394,7 @@ fn cli_help_version_and_completion_surface_are_complete() {
         "setup",
         "recovery",
         "finish-line",
+        "workspace-lease",
         "completion",
         "-V, --version",
     ] {
@@ -446,6 +447,28 @@ fn cli_help_version_and_completion_surface_are_complete() {
     assert!(run_help.stdout_text().contains("[default: json]"));
     assert!(!run_help.stdout_text().contains("text output (default)"));
 
+    let workspace_help = fixture.run(&["workspace-lease", "--help"], None);
+    assert_eq!(
+        workspace_help.code,
+        0,
+        "stderr={}",
+        workspace_help.stderr_text()
+    );
+    let workspace_help_text = workspace_help.stdout_text();
+    for required in ["bind", "begin", "complete", "renew", "release"] {
+        assert!(
+            workspace_help_text.contains(required),
+            "workspace-lease help missing {required}: {workspace_help_text}"
+        );
+    }
+    let workspace_bind_help = fixture.run(&["workspace-lease", "bind", "--help"], None);
+    assert_eq!(workspace_bind_help.code, 0);
+    assert!(
+        workspace_bind_help
+            .stdout_text()
+            .contains("[default: json]")
+    );
+
     for shell in ["bash", "zsh"] {
         let completion = fixture.run(&["completion", shell], None);
         assert_eq!(completion.code, 0, "shell={shell}");
@@ -454,11 +477,9 @@ fn cli_help_version_and_completion_surface_are_complete() {
             !script.contains("quiesce"),
             "internal quiesce leaked anywhere in public completion; shell={shell}"
         );
-        assert!(
-            !script.contains("release"),
-            "internal release leaked anywhere in public completion; shell={shell}"
-        );
         assert!(script.contains("dispatch"), "shell={shell}");
+        assert!(script.contains("workspace-lease"), "shell={shell}");
+        assert!(script.contains("renew"), "shell={shell}");
         assert!(script.contains("--expected-plan-digest"), "shell={shell}");
         let (scope_start, scope_end) = if shell == "bash" {
             (

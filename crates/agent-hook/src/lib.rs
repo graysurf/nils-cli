@@ -29,6 +29,7 @@ pub mod recovery;
 pub mod setup;
 mod strict_json;
 mod trace;
+mod workspace_lease;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -43,7 +44,9 @@ use nils_common::cli_contract::{
 use serde::Serialize;
 use serde_json::json;
 
-use cli::{Cli, Command, DispatchFormat, FinishLineCommand, RecoveryCommand};
+use cli::{
+    Cli, Command, DispatchFormat, FinishLineCommand, RecoveryCommand, WorkspaceLeaseCommand,
+};
 use error::HookError;
 use model::{
     Capability, DECISION_VERSION, DecisionAction, DecisionReason, NormalizedDecision,
@@ -155,6 +158,7 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
     match command {
         Command::Completion(args) => completion::run(args.shell),
         Command::FinishLine(args) => run_finish_line(&layout, args.command),
+        Command::WorkspaceLease(args) => run_workspace_lease(&layout, args.command),
         Command::Dispatch(args) => run_dispatch(&layout, policy_override, args),
         Command::Validate(args) => {
             let loaded = match contract::load(&layout, policy_override) {
@@ -325,6 +329,41 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
             }
         }
         Command::Recovery(args) => run_recovery(&layout, policy_override, args.command),
+    }
+}
+
+fn run_workspace_lease(layout: &Layout, command: WorkspaceLeaseCommand) -> i32 {
+    let (name, format, operation) = match command {
+        WorkspaceLeaseCommand::Bind(args) => (
+            "agent-hook workspace-lease bind",
+            args.format,
+            workspace_lease::Operation::Bind,
+        ),
+        WorkspaceLeaseCommand::Begin(args) => (
+            "agent-hook workspace-lease begin",
+            args.format,
+            workspace_lease::Operation::Begin,
+        ),
+        WorkspaceLeaseCommand::Complete(args) => (
+            "agent-hook workspace-lease complete",
+            args.format,
+            workspace_lease::Operation::Complete,
+        ),
+        WorkspaceLeaseCommand::Renew(args) => (
+            "agent-hook workspace-lease renew",
+            args.format,
+            workspace_lease::Operation::Renew,
+        ),
+        WorkspaceLeaseCommand::Release(args) => (
+            "agent-hook workspace-lease release",
+            args.format,
+            workspace_lease::Operation::Release,
+        ),
+    };
+    let format = OutputFormat::from(format);
+    match workspace_lease::run(&layout.state_root, operation) {
+        Ok(outcome) => emit_success(name, format, &outcome.data, || outcome.text),
+        Err(error) => emit_error(name, &error, format == OutputFormat::Json),
     }
 }
 

@@ -49,8 +49,55 @@ pub enum Command {
     Recovery(RecoveryArgs),
     /// Persist edit generations, execute declared validations, and enforce the DSH stop boundary.
     FinishLine(FinishLineArgs),
+    /// Bind canonical workspaces and operate durable cross-process mutation leases.
+    WorkspaceLease(WorkspaceLeaseArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceLeaseArgs {
+    #[command(subcommand)]
+    pub command: WorkspaceLeaseCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceLeaseCommand {
+    /// Resolve canonical workspace identity and acquire one binding generation.
+    Bind(WorkspaceLeaseFormatArgs),
+    /// Classify one tool call and fence it before execution.
+    Begin(WorkspaceLeaseFormatArgs),
+    /// Complete one exact fenced operation.
+    Complete(WorkspaceLeaseFormatArgs),
+    /// Renew one exact binding generation.
+    Renew(WorkspaceLeaseFormatArgs),
+    /// Release one exact binding generation.
+    Release(WorkspaceLeaseFormatArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceLeaseFormatArgs {
+    /// Automation-safe output format. Workspace lease defaults to strict JSON.
+    #[arg(long, value_enum, default_value_t = WorkspaceLeaseOutputFormat::Json)]
+    pub format: WorkspaceLeaseOutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum WorkspaceLeaseOutputFormat {
+    /// Human-readable text output.
+    Text,
+    /// Single-record JSON envelope (snake_case).
+    #[default]
+    Json,
+}
+
+impl From<WorkspaceLeaseOutputFormat> for OutputFormat {
+    fn from(value: WorkspaceLeaseOutputFormat) -> Self {
+        match value {
+            WorkspaceLeaseOutputFormat::Text => Self::Text,
+            WorkspaceLeaseOutputFormat::Json => Self::Json,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

@@ -40,6 +40,8 @@ fn public_completion(shell: Shell, script: &str) -> String {
     let mut skip_until_function_end = false;
     let mut removed_sections = 0_u8;
     let mut removed_entries = 0_u8;
+    let mut zsh_finish_release_case_removed = false;
+    let mut zsh_finish_release_entry_removed = false;
 
     for line in script.split_inclusive('\n') {
         let trimmed = line.trim();
@@ -72,11 +74,14 @@ fn public_completion(shell: Shell, script: &str) -> String {
                 skip_until_case_end = Some(indentation + 4);
                 continue;
             }
-            Shell::Zsh
-                if INTERNAL_COMMANDS
-                    .iter()
-                    .any(|command| trimmed == format!("({command})")) =>
+            Shell::Zsh if trimmed == "(quiesce)" =>
             {
+                removed_sections = removed_sections.saturating_add(1);
+                skip_until_case_end = Some(indentation);
+                continue;
+            }
+            Shell::Zsh if trimmed == "(release)" && !zsh_finish_release_case_removed => {
+                zsh_finish_release_case_removed = true;
                 removed_sections = removed_sections.saturating_add(1);
                 skip_until_case_end = Some(indentation);
                 continue;
@@ -92,11 +97,13 @@ fn public_completion(shell: Shell, script: &str) -> String {
                 skip_until_function_end = true;
                 continue;
             }
-            Shell::Zsh
-                if INTERNAL_COMMANDS
-                    .iter()
-                    .any(|command| trimmed == format!("'{command}:' \\")) =>
+            Shell::Zsh if trimmed == "'quiesce:' \\" =>
             {
+                removed_entries = removed_entries.saturating_add(1);
+                continue;
+            }
+            Shell::Zsh if trimmed == "'release:' \\" && !zsh_finish_release_entry_removed => {
+                zsh_finish_release_entry_removed = true;
                 removed_entries = removed_entries.saturating_add(1);
                 continue;
             }
@@ -140,11 +147,15 @@ fn public_completion(shell: Shell, script: &str) -> String {
         ),
         "clap completion shape changed around internal finish-line commands: {internal_lines:?}"
     );
-    for command in INTERNAL_COMMANDS {
-        assert!(
-            !filtered.contains(command),
-            "internal finish-line {command} survived completion filtering"
-        );
-    }
+    assert!(
+        !filtered.contains("quiesce"),
+        "internal finish-line quiesce survived completion filtering"
+    );
+    assert!(
+        !filtered.contains("finish-line__subcmd__release")
+            && !filtered.contains("finish__line__release")
+            && !filtered.contains("open begin run stop status release"),
+        "internal finish-line release survived completion filtering"
+    );
     filtered
 }

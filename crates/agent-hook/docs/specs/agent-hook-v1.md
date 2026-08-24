@@ -1,6 +1,7 @@
 # agent-hook v1 contract
 
-Status: frozen for `graysurf/agent-runtime-kit#686` Lane A.
+Status: frozen for `graysurf/agent-runtime-kit#686` Lane A and extended with
+the native WorkspaceLease v1 boundary for `sympoies/dsh-runtime-kit#56`.
 
 Ownership: crate-local canonical specification for `nils-agent-hook` and the
 `agent-hook` binary.
@@ -26,6 +27,8 @@ The CLI resolves only absolute XDG roots and rejects relative roots.
 | policy bundle | config-selected absolute path, normally below `${XDG_DATA_HOME:-$HOME/.local/share}/agent-hook/policies/` | 1 MiB, regular file, no symlink |
 | runtime state | `${XDG_STATE_HOME:-$HOME/.local/state}/agent-hook/` | directories `0700`, secret files `0600` |
 | provider payload | standard input | 1 MiB |
+| workspace-lease request | standard input | 256 KiB, strict duplicate-free JSON |
+| workspace-lease state | state-owned per-worktree JSON | 512 KiB, `0600`, keyed private identity |
 | trace | state-owned JSONL | 256 entries, 256 KiB, redacted metadata only |
 | rule inventory | one policy bundle | 512 rules, unique IDs |
 | reason metadata | one aggregate decision | 64 reasons, 256 bytes per code/message |
@@ -92,6 +95,10 @@ above.
   session-retirement requests. Their matching result and service schemas follow
   the same naming rule, but both commands are intentionally absent from public
   help and completion.
+- `agent-hook.workspace-lease.{bind,begin,complete,renew,release}.v1`: strict
+  native WorkspaceLease provider requests. Matching results use
+  `agent-hook.workspace-lease.<command>-result.v1` inside the normal
+  `cli.agent-hook.workspace-lease-<command>.v1` service envelope.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, and config /
   policy digests.
@@ -130,8 +137,9 @@ above.
 Service JSON uses the workspace envelope: `schema_version`, `ok`, then `data`;
 failures contain `error.code`, `error.message`, and
 optional redacted `error.details`. Text is the human default except `dispatch`,
-whose default is provider output, and `finish-line`, whose default is service
-JSON. `--format json` always selects the service envelope.
+whose default is provider output, and `finish-line` plus `workspace-lease`,
+whose default is service JSON. `--format json` always selects the service
+envelope.
 
 ## Provider normalization and rendering
 
@@ -290,6 +298,65 @@ return raw provider content. DSH ingress requires this service JSON form; the
 runtime bundle maps `block` to a `tools/pre-execute` denial, delegates `allow`,
 and fails closed on every malformed, truncated, signaled, exit-mismatched,
 replayed, timed-out, oversized, or unsupported response.
+
+## Native DSH workspace lease
+
+`agent-hook workspace-lease <command> --format json` reads one strict JSON
+object from standard input, capped at 256 KiB. Duplicate keys, unknown fields,
+unsupported versions, non-absolute supplied cwd values, invalid lifecycle
+enums, and oversized or control-bearing identity strings fail with exit `65`.
+The public surface is exactly `bind`, `begin`, `complete`, `renew`, and
+`release`; every command defaults to its versioned service JSON envelope.
+
+`bind` accepts the runtime-owned WorkspaceLease v1 facts: request, session,
+optional parent, optional cwd, and DSH session-start source. The provider
+canonicalizes cwd without inherited Git repository-selection state. A managed
+identity binds the physical Git top-level and its device/inode identity, the
+per-worktree Git directory, and the shared Git directory. Thus nested and
+symlink-equivalent path spellings converge while two linked worktrees remain
+distinct. A missing or non-Git cwd produces an `unmanaged` binding and never a
+mutation lease.
+
+Managed state permits one active binding generation per physical worktree. A
+clean unowned checkout becomes `owned`; a live other owner returns
+`foreign-active`; dirty state returns `dirty`; and an expired binding with an
+active operation returns `uncertain`. An expired or explicitly released clean
+binding with no active operation may be replaced atomically. Replacement mints
+a new binding ID and generation and tombstones the prior generation so delayed
+release cannot affect the new owner. No expired exact bind replay can revive
+old authority.
+
+An explicit `resume` or `compact` may also replace a dirty released or expired
+generation when the host-authenticated session and optional parent lineage are
+exactly the same and every operation is terminal. This is recovery of the same
+owner's work, not reassignment: it still mints a new binding ID and generation.
+A startup, clear, foreign session, changed parent, or unterminated operation
+remains fail-closed.
+
+`begin` binds the exact call/root/tool/arguments/nesting facts to one operation
+ID and unpredictable fence before tool dispatch. Known read-only DSH tools
+return `not-required`; unknown tools are conservatively fenced. `complete`
+requires the exact live binding, generation, operation ID, fence, and
+call/root/tool projection, and records one of `succeeded`, `failed`, or
+`cancelled`. `renew` extends only a still-live exact generation. `release`
+retires only its exact generation and fails unavailable while any operation
+lacks a terminal outcome.
+
+Active bind/begin retries and terminal complete/release retries are idempotent.
+Reusing a request ID for different facts fails closed. State is stored below
+the private `workspace-leases/` state root using bounded owner-only files,
+atomic replacement, and a bounded per-workspace cross-process lock. A clean
+expired owner or the exact explicit same-session recovery above can be
+recovered; foreign dirty state and active-operation, malformed, identity-
+mismatched, untrusted, busy, or unknown state are never guessed through.
+
+Provider-visible results contain opaque IDs, renewal timing, and stable
+`owned`, `unmanaged`, `foreign-active`, `stale-clean`, `dirty`, or `uncertain`
+states with bounded stable codes/reasons. Results and diagnostics never expose
+canonical paths, Git directories, session/parent IDs, tool arguments, command
+output, or persisted digests. Canonical paths exist only in the private state
+needed to revalidate physical identity and run a trusted, hooks-disabled Git
+dirty-state probe.
 
 ## Native DSH finish line
 

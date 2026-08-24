@@ -3209,13 +3209,13 @@ fn sole_git_recovery(invocations: &[Invocation]) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct GitLayout {
-    root: PathBuf,
-    git_dir: PathBuf,
-    common_dir: PathBuf,
+pub(crate) struct GitLayout {
+    pub(crate) root: PathBuf,
+    pub(crate) git_dir: PathBuf,
+    pub(crate) common_dir: PathBuf,
 }
 
-fn git_layout(start: &Path) -> Option<GitLayout> {
+pub(crate) fn git_layout(start: &Path) -> Option<GitLayout> {
     let start = if start.is_file() {
         start.parent()?
     } else {
@@ -3439,7 +3439,7 @@ fn current_branch(layout: &GitLayout) -> Option<String> {
         .map(str::to_string)
 }
 
-fn checkout_dirty(
+pub(crate) fn checkout_dirty(
     layout: &GitLayout,
     run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
 ) -> Result<bool, HookError> {
