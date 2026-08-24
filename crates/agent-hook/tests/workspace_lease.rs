@@ -279,6 +279,92 @@ fn dirty_state_refuses_takeover_and_clean_expiry_recovers_with_a_new_generation(
 }
 
 #[test]
+fn released_same_session_resumes_dirty_work_but_a_foreign_session_cannot_take_it_over() {
+    let fixture = fixture();
+    let owner = bind(&fixture, "session-owner", "bind-owner", &fixture.root);
+    let release = json!({
+        "schema_version": "agent-hook.workspace-lease.release.v1",
+        "version": 1,
+        "request_id": "release-owner",
+        "session_id": "session-owner",
+        "binding_id": owner["binding_id"],
+        "workspace_id": owner["workspace_id"],
+        "generation": owner["generation"],
+        "reason": "agent-disposed"
+    });
+    let (code, released) = invoke(&fixture, "release", release);
+    assert_eq!(code, 0, "envelope={released}");
+
+    fs::write(fixture.root.join("resume.txt"), "owned work\n").expect("dirty work");
+    let mut resume_request = bind_request("session-owner", "bind-owner-resume", &fixture.root);
+    resume_request["source"] = json!("resume");
+    let (code, envelope) = invoke(&fixture, "bind", resume_request);
+    assert_eq!(code, 0, "envelope={envelope}");
+    let resumed = envelope["data"].clone();
+    assert_eq!(resumed["kind"], "bound");
+    assert_ne!(resumed["generation"], owner["generation"]);
+
+    let second_release = json!({
+        "schema_version": "agent-hook.workspace-lease.release.v1",
+        "version": 1,
+        "request_id": "release-owner-resume",
+        "session_id": "session-owner",
+        "binding_id": resumed["binding_id"],
+        "workspace_id": resumed["workspace_id"],
+        "generation": resumed["generation"],
+        "reason": "agent-disposed"
+    });
+    let (code, released) = invoke(&fixture, "release", second_release);
+    assert_eq!(code, 0, "envelope={released}");
+
+    let same_session_startup = bind(
+        &fixture,
+        "session-owner",
+        "bind-owner-startup",
+        &fixture.root,
+    );
+    assert_eq!(same_session_startup["kind"], "denied");
+    assert_eq!(same_session_startup["state"], "dirty");
+    assert_eq!(same_session_startup["code"], "WORKSPACE_DIRTY");
+
+    let foreign = bind(&fixture, "session-foreign", "bind-foreign", &fixture.root);
+    assert_eq!(foreign["kind"], "denied");
+    assert_eq!(foreign["state"], "dirty");
+    assert_eq!(foreign["code"], "WORKSPACE_DIRTY");
+}
+
+#[test]
+fn same_session_resume_cannot_recover_an_expired_active_operation() {
+    let fixture = fixture();
+    let owner = bind(&fixture, "session-owner", "bind-owner", &fixture.root);
+    let mutation = begin_request(&owner, "session-owner", "begin-active", "write");
+    let (code, granted) = invoke(&fixture, "begin", mutation);
+    assert_eq!(code, 0, "envelope={granted}");
+    assert_eq!(granted["data"]["kind"], "granted");
+
+    fs::write(fixture.root.join("active.txt"), "active work\n").expect("dirty work");
+    let state = workspace_state_file(&fixture);
+    let mut persisted: Value =
+        serde_json::from_slice(&fs::read(&state).expect("state bytes")).expect("state JSON");
+    persisted["binding"]["refreshed_at_epoch"] = json!(1);
+    persisted["binding"]["expires_at_epoch"] = json!(1);
+    fs::write(
+        &state,
+        serde_json::to_vec_pretty(&persisted).expect("state render"),
+    )
+    .expect("expire active state");
+    Fixture::set_private(&state);
+
+    let mut resume = bind_request("session-owner", "bind-owner-resume", &fixture.root);
+    resume["source"] = json!("resume");
+    let (code, envelope) = invoke(&fixture, "bind", resume);
+    assert_eq!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["data"]["kind"], "denied");
+    assert_eq!(envelope["data"]["state"], "uncertain");
+    assert_eq!(envelope["data"]["code"], "WORKSPACE_OPERATION_UNCERTAIN");
+}
+
+#[test]
 fn read_only_tools_need_no_operation_and_copied_fences_fail_closed() {
     let fixture = fixture();
     let owner = bind(&fixture, "session-owner", "bind-owner", &fixture.root);

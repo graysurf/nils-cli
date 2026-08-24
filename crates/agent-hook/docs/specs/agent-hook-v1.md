@@ -326,6 +326,13 @@ a new binding ID and generation and tombstones the prior generation so delayed
 release cannot affect the new owner. No expired exact bind replay can revive
 old authority.
 
+An explicit `resume` or `compact` may also replace a dirty released or expired
+generation when the host-authenticated session and optional parent lineage are
+exactly the same and every operation is terminal. This is recovery of the same
+owner's work, not reassignment: it still mints a new binding ID and generation.
+A startup, clear, foreign session, changed parent, or unterminated operation
+remains fail-closed.
+
 `begin` binds the exact call/root/tool/arguments/nesting facts to one operation
 ID and unpredictable fence before tool dispatch. Known read-only DSH tools
 return `not-required`; unknown tools are conservatively fenced. `complete`
@@ -339,8 +346,9 @@ Active bind/begin retries and terminal complete/release retries are idempotent.
 Reusing a request ID for different facts fails closed. State is stored below
 the private `workspace-leases/` state root using bounded owner-only files,
 atomic replacement, and a bounded per-workspace cross-process lock. A clean
-expired owner can be recovered; dirty, active-operation, malformed, identity-
-mismatched, untrusted, busy, or unknown state is never guessed through.
+expired owner or the exact explicit same-session recovery above can be
+recovered; foreign dirty state and active-operation, malformed, identity-
+mismatched, untrusted, busy, or unknown state are never guessed through.
 
 Provider-visible results contain opaque IDs, renewal timing, and stable
 `owned`, `unmanaged`, `foreign-active`, `stale-clean`, `dirty`, or `uncertain`

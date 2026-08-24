@@ -124,6 +124,11 @@ operation ID and fence before execution. `complete` accepts only the exact
 binding, generation, operation, fence, and call identity. `renew` cannot revive
 an expired generation, and `release` refuses an unterminated operation.
 
+An explicit `resume` or `compact` may recover dirty work only when the prior
+generation has no active operation and its session plus optional parent
+lineage exactly match. Recovery mints a fresh binding ID and generation;
+startup, clear, foreign-session, and changed-lineage takeovers remain denied.
+
 Every command reads one strict, duplicate-free WorkspaceLease v1 JSON request
 from standard input and defaults to a versioned service JSON response. Exact
 active requests and terminal lifecycle messages are idempotent; copied or

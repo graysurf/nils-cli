@@ -336,6 +336,17 @@ fn bind(state_root: &Path, request: BindRequest) -> Result<Outcome, HookError> {
     let locked = lock_workspace(state_root, &key, Some(fingerprint_key))?;
     let mut state = read_state(&locked)?;
     let now = now_epoch()?;
+    let same_principal_recovery = state.as_ref().is_some_and(|existing| {
+        matches!(
+            request.source,
+            SessionStartSource::Resume | SessionStartSource::Compact
+        ) && existing.binding.session_digest == session_digest
+            && existing.binding.parent_session_digest == parent_session_digest
+            && existing
+                .operations
+                .iter()
+                .all(|operation| operation.status != OperationStatus::Active)
+    });
     if let Some(existing) = state.as_ref() {
         validate_state(existing, &locked, &identity)?;
         if existing.binding.bind_request_id_digest == request_id_digest {
@@ -377,7 +388,7 @@ fn bind(state_root: &Path, request: BindRequest) -> Result<Outcome, HookError> {
             ));
         }
         let identity = managed_identity(&identity)?;
-        if dirty(identity)? {
+        if !same_principal_recovery && dirty(identity)? {
             return Ok(denied(
                 BIND_RESULT_SCHEMA,
                 "dirty",
