@@ -863,7 +863,6 @@ fn dsh_operation_lifecycle_is_optional_when_unmanaged_and_closed_when_partial() 
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn dsh_operation_lifecycle_requires_a_claim_only_in_authenticated_enforce_mode() {
     for (durable_mode, runtime_hint, expected_action, expected_helper_calls) in [
         (Some("advisory"), "advisory", "allow", 0),
@@ -933,6 +932,11 @@ fn dsh_operation_lifecycle_requires_a_claim_only_in_authenticated_enforce_mode()
             .unwrap_or_default()
             .lines()
             .count();
+        let expected_helper_calls = if cfg!(target_os = "linux") {
+            expected_helper_calls
+        } else {
+            0
+        };
         assert_eq!(
             helper_calls, expected_helper_calls,
             "durable_mode={durable_mode:?} runtime_hint={runtime_hint}"

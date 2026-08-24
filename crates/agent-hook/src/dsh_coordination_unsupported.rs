@@ -27,6 +27,12 @@ pub(crate) fn run(
             message: None,
         });
     }
+    if crate::liveness::coordination_failure_mode().is_some() {
+        return Ok(Outcome {
+            status: Status::NotRun,
+            message: None,
+        });
+    }
     Ok(Outcome {
         status: Status::Unavailable,
         message: Some(
