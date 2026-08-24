@@ -272,6 +272,82 @@ json\:"Single-record JSON envelope (snake_case)"))' \
     ;;
 esac
 ;;
+(workspace-lease)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-hook__subcmd__workspace-lease_commands" \
+"*::: :->workspace-lease" \
+&& ret=0
+
+    case $state in
+    (workspace-lease)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-workspace-lease-command-$line[1]:"
+        case $line[1] in
+            (bind)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(begin)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(complete)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(renew)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(release)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -297,6 +373,7 @@ _agent-hook_commands() {
 'setup:Preview, apply, repair, or remove exact owned provider ingress' \
 'recovery:Create, authorize, inspect, consume, or revoke governed recovery' \
 'finish-line:Persist edit generations, execute declared validations, and enforce the DSH stop boundary' \
+'workspace-lease:Bind canonical workspaces and operate durable cross-process mutation leases' \
 'completion:Print a shell completion script' \
     )
     _describe -t commands 'agent-hook commands' commands "$@"
@@ -402,6 +479,42 @@ _agent-hook__subcmd__setup_commands() {
 _agent-hook__subcmd__validate_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook validate commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease_commands] )) ||
+_agent-hook__subcmd__workspace-lease_commands() {
+    local commands; commands=(
+'bind:Resolve canonical workspace identity and acquire one binding generation' \
+'begin:Classify one tool call and fence it before execution' \
+'complete:Complete one exact fenced operation' \
+'renew:Renew one exact binding generation' \
+'release:Release one exact binding generation' \
+    )
+    _describe -t commands 'agent-hook workspace-lease commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__begin_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__begin_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease begin commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__bind_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__bind_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease bind commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__complete_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__complete_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease complete commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__release_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__release_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease release commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__renew_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__renew_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease renew commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_agent-hook" ]; then
