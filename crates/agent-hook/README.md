@@ -98,14 +98,18 @@ session is unchanged. Post-only lookups create no state; certain denials remove
 their whole provisional directory. Terminal retries compact to 64 by a durable
 monotonic completion sequence behind a private session lock, and a
 128-directory ceiling blocks new admission rather than evicting active or
-uncertain work. The default-delivery
-evaluator pins the primary/default
-branch consensus in owner-private state before admitting Bash or native file
-mutation, rejects later Git metadata drift, and protects Git metadata from
-native write/edit tools. Raw commit-producing rewrites are denied on the
-default branch while exact recovery and owned `git-cli`, `forge-cli`, and
-`semantic-commit` routes remain usable. Path-backed semantic commit messages
-and ambiguous repeated scalar options fail closed.
+uncertain work. The default-delivery evaluator pins the remote-advertised
+default branch in owner-private state before admitting Bash or native file
+mutation. The primary checkout's current branch is independent: it may be an
+integration branch, detached, or absent without redefining the remote default.
+Disagreeing remotes, missing evidence, or later metadata drift fail closed,
+and native write/edit tools cannot target Git metadata. Raw commit-producing
+rewrites are denied on the default branch while exact recovery and owned
+`git-cli`, `forge-cli`, and `semantic-commit` routes remain usable. The
+structured `runtime_kit_governed_commit` path additionally requires the
+authenticated execution root to be that exact linked worktree; it accepts no
+repository retarget. Path-backed semantic commit messages and ambiguous
+repeated scalar options fail closed.
 
 The separate `workspace-lease` service is the native WorkspaceLease v1 policy
 provider for dsh-runtime-kit. `bind` resolves an optional DSH cwd to one

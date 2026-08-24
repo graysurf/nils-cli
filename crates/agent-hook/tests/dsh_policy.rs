@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 use support::{Fixture, now_epoch};
 
 fn policy(group: &str, product: &str) -> String {
+    policy_for_matcher(group, product, "bash")
+}
+
+fn policy_for_matcher(group: &str, product: &str, matcher: &str) -> String {
     format!(
         r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "dsh-runtime-kit-task-3-2"
@@ -20,7 +24,7 @@ version = "2026.08.18.1"
 id = "dsh.task-3-2"
 products = ["{product}"]
 events = ["PreToolUse"]
-matcher = "bash"
+matcher = "{matcher}"
 priority = 10
 mode = "enforce"
 failure_posture = "closed"
@@ -1834,6 +1838,218 @@ fn unsafe_default_delivery_preserves_governed_recovery_and_feature_worktrees() {
     );
     assert_eq!(output.code, 1, "envelope={}", output.stdout_text());
     assert_eq!(output.stdout_json()["data"]["action"], "block");
+}
+
+#[test]
+fn unsafe_default_delivery_accepts_the_absolute_release_semantic_commit_sibling() {
+    let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
+    git(&fixture, &["init", "--quiet", "--initial-branch=main"]);
+    let remote = fixture.root.join(".git/refs/remotes/origin");
+    fs::create_dir_all(&remote).expect("remote refs");
+    fs::write(remote.join("HEAD"), "ref: refs/remotes/origin/main\n").expect("remote HEAD");
+
+    let release = fixture.root.join("release");
+    fs::create_dir(&release).expect("release directory");
+    let agent_hook = release.join("agent-hook");
+    install_release_binary(&agent_hook);
+    let semantic_commit = release.join("semantic-commit");
+    fs::write(&semantic_commit, "#!/bin/sh\nexit 0\n").expect("semantic-commit companion");
+    fs::set_permissions(&semantic_commit, fs::Permissions::from_mode(0o700))
+        .expect("semantic-commit mode");
+
+    let command = format!(
+        "{} default-branch --dry-run --message 'fix: repair' --repo .",
+        shell_words::quote(semantic_commit.to_str().expect("semantic-commit UTF-8")),
+    );
+    let input = request(&fixture, "bash", json!({"command": command}));
+    let allowed = dispatch_with_release_binary(&fixture, &agent_hook, &input);
+    assert_eq!(allowed["data"]["action"], "allow", "envelope={allowed}");
+}
+
+#[test]
+fn unsafe_default_delivery_resolves_remote_default_independently_of_primary_checkout() {
+    for default_branch in ["main", "trunk"] {
+        let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
+        git(
+            &fixture,
+            &["init", "--quiet", "--initial-branch", default_branch],
+        );
+        git(&fixture, &["config", "user.email", "test@example.com"]);
+        git(&fixture, &["config", "user.name", "Test"]);
+        fs::write(fixture.root.join("tracked.txt"), "base\n").expect("tracked file");
+        git(&fixture, &["add", "--all"]);
+        git(&fixture, &["commit", "--quiet", "-m", "test: initial"]);
+        let remote = fixture.root.join(".git/refs/remotes/origin");
+        fs::create_dir_all(&remote).expect("remote refs");
+        fs::write(
+            remote.join("HEAD"),
+            format!("ref: refs/remotes/origin/{default_branch}\n"),
+        )
+        .expect("remote HEAD");
+
+        let feature = fixture
+            .state_home
+            .join(format!("{default_branch}-feature-worktree"));
+        let worktree = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["worktree", "add", "--quiet", "-b", "feature"])
+            .arg(&feature)
+            .output()
+            .expect("feature worktree");
+        assert!(
+            worktree.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&worktree.stderr)
+        );
+        git(&fixture, &["switch", "--quiet", "-c", "integration"]);
+
+        let output = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request_for_path(
+                &fixture,
+                "dsh-session-1",
+                &feature,
+                "bash",
+                json!({
+                    "command": "semantic-commit commit --message 'feat: change\n\nExplain the user-visible contract.'"
+                }),
+            )),
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "default={default_branch} envelope={}",
+            output.stdout_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "allow");
+    }
+}
+
+#[test]
+fn native_governed_commit_requires_the_exact_linked_worktree_and_pinned_remote_default() {
+    for default_branch in ["main", "trunk"] {
+        let fixture = Fixture::new(&policy_for_matcher(
+            "block-unsafe-default-delivery",
+            "dsh",
+            "runtime_kit_governed_commit",
+        ));
+        git(
+            &fixture,
+            &["init", "--quiet", "--initial-branch", default_branch],
+        );
+        git(&fixture, &["config", "user.email", "test@example.com"]);
+        git(&fixture, &["config", "user.name", "Test"]);
+        fs::write(fixture.root.join("tracked.txt"), "base\n").expect("tracked file");
+        git(&fixture, &["add", "--all"]);
+        git(&fixture, &["commit", "--quiet", "-m", "test: initial"]);
+        let head_output = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("resolve HEAD");
+        assert!(head_output.status.success());
+        let head = String::from_utf8(head_output.stdout)
+            .expect("HEAD UTF-8")
+            .trim()
+            .to_string();
+        let remote_head = fixture.root.join(".git/refs/remotes/origin/HEAD");
+        fs::create_dir_all(remote_head.parent().expect("remote directory")).expect("remote refs");
+        fs::write(
+            &remote_head,
+            format!("ref: refs/remotes/origin/{default_branch}\n"),
+        )
+        .expect("remote HEAD");
+
+        let feature = fixture
+            .state_home
+            .join(format!("native-{default_branch}-feature"));
+        let worktree = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["worktree", "add", "--quiet", "-b", "feature"])
+            .arg(&feature)
+            .output()
+            .expect("feature worktree");
+        assert!(
+            worktree.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&worktree.stderr)
+        );
+        git(&fixture, &["switch", "--quiet", "-c", "integration"]);
+
+        let arguments = json!({
+            "type": "feat",
+            "scope": "runtime",
+            "subject": "add native governed commit",
+            "body_bullets": ["Bind the commit to the authenticated session worktree."],
+            "expected_head": head,
+        });
+        let allowed = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request_for_path(
+                &fixture,
+                "dsh-session-1",
+                &feature,
+                "runtime_kit_governed_commit",
+                arguments.clone(),
+            )),
+        );
+        assert_eq!(
+            allowed.code,
+            0,
+            "default={default_branch} envelope={}",
+            allowed.stdout_text()
+        );
+        assert_eq!(allowed.stdout_json()["data"]["action"], "allow");
+
+        let primary_integration = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request(
+                &fixture,
+                "runtime_kit_governed_commit",
+                arguments.clone(),
+            )),
+        );
+        assert_eq!(
+            primary_integration.code,
+            1,
+            "primary integration envelope={}",
+            primary_integration.stdout_text()
+        );
+
+        let retargeted = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request_for_path(
+                &fixture,
+                "dsh-session-1",
+                &feature,
+                "runtime_kit_governed_commit",
+                json!({
+                    "type": "feat",
+                    "subject": "retarget the commit",
+                    "body_bullets": ["This must remain denied."],
+                    "expected_head": head,
+                    "repo": fixture.root,
+                }),
+            )),
+        );
+        assert_eq!(retargeted.code, 1, "envelope={}", retargeted.stdout_text());
+
+        fs::write(&remote_head, "ref: refs/remotes/origin/drifted\n").expect("drift remote HEAD");
+        let drifted = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request_for_path(
+                &fixture,
+                "dsh-session-1",
+                &feature,
+                "runtime_kit_governed_commit",
+                arguments,
+            )),
+        );
+        assert_eq!(drifted.code, 1, "envelope={}", drifted.stdout_text());
+    }
 }
 
 #[test]

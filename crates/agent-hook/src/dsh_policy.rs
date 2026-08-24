@@ -27,8 +27,9 @@ use crate::policy_parity::DshCapabilityGroup;
 
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_PARSE_DEPTH: usize = 5;
+const GOVERNED_COMMIT_TOOL: &str = "runtime_kit_governed_commit";
 const LEASE_SCHEMA: &str = "agent-hook.dsh-checkout-lease.v1";
-const DEFAULT_BRANCH_SCHEMA: &str = "agent-hook.dsh-default-branch.v1";
+const DEFAULT_BRANCH_SCHEMA: &str = "agent-hook.dsh-default-branch.v2";
 const LEASE_TTL_SECONDS: u64 = 8 * 60 * 60;
 
 pub(crate) struct Outcome {
@@ -99,12 +100,18 @@ pub(crate) fn evaluate(
         DshCapabilityGroup::BlockDirectGitWorktree => direct_git_worktree(&invocations),
         DshCapabilityGroup::BlockDirectPrCreate => direct_pr_create(&invocations),
         DshCapabilityGroup::BlockDirectPython => direct_python(&invocations, request),
-        DshCapabilityGroup::SemanticCommitBodyGate => semantic_body_missing(&invocations),
+        DshCapabilityGroup::SemanticCommitBodyGate => {
+            if request.matcher.as_deref() == Some(GOVERNED_COMMIT_TOOL) {
+                !governed_commit_arguments_valid(raw)
+            } else {
+                semantic_body_missing(&invocations)
+            }
+        }
         DshCapabilityGroup::BlockUnsafeDefaultDelivery => {
             if request.matcher.as_deref() == Some("bash") {
                 unsafe_default_delivery(&invocations, request, run_child)?
             } else {
-                unsafe_default_native_mutation(request, effect)?
+                unsafe_default_native_mutation(request, raw, effect)?
             }
         }
         DshCapabilityGroup::PreEditIntentGate => {
@@ -167,15 +174,16 @@ fn command_dependent(group: DshCapabilityGroup, request: &NormalizedRequest) -> 
             | DshCapabilityGroup::BlockDirectGitWorktree
             | DshCapabilityGroup::BlockDirectPrCreate
             | DshCapabilityGroup::BlockDirectPython
-            | DshCapabilityGroup::SemanticCommitBodyGate
             | DshCapabilityGroup::ForgeLabelReminder
-    ) || (matches!(
-        group,
-        DshCapabilityGroup::McpSecretScan
-            | DshCapabilityGroup::BlockProjectMemoryWrite
-            | DshCapabilityGroup::MemoryWritePrincipleReminder
-            | DshCapabilityGroup::PortablePathsScan
-    ) && request.matcher.as_deref() == Some("bash"))
+    ) || (group == DshCapabilityGroup::SemanticCommitBodyGate
+        && request.matcher.as_deref() == Some("bash"))
+        || (matches!(
+            group,
+            DshCapabilityGroup::McpSecretScan
+                | DshCapabilityGroup::BlockProjectMemoryWrite
+                | DshCapabilityGroup::MemoryWritePrincipleReminder
+                | DshCapabilityGroup::PortablePathsScan
+        ) && request.matcher.as_deref() == Some("bash"))
         || (group == DshCapabilityGroup::CheckoutLeaseGuard
             && request.matcher.as_deref() == Some("bash"))
         || (group == DshCapabilityGroup::BlockUnsafeDefaultDelivery
@@ -219,6 +227,87 @@ fn tool_arguments(raw: &[u8]) -> Option<serde_json::Map<String, Value>> {
         .get("arguments")?
         .as_object()
         .cloned()
+}
+
+fn bounded_governed_line(value: &Value, max_bytes: usize) -> bool {
+    value.as_str().is_some_and(|value| {
+        !value.is_empty()
+            && value == value.trim()
+            && !value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+            && value.len() <= max_bytes
+    })
+}
+
+pub(crate) fn governed_commit_arguments_valid(raw: &[u8]) -> bool {
+    let Some(arguments) = tool_arguments(raw) else {
+        return false;
+    };
+    let expected_keys: &[&str] = if arguments.contains_key("scope") {
+        &["body_bullets", "expected_head", "scope", "subject", "type"]
+    } else {
+        &["body_bullets", "expected_head", "subject", "type"]
+    };
+    if arguments.len() != expected_keys.len()
+        || !expected_keys.iter().all(|key| arguments.contains_key(*key))
+    {
+        return false;
+    }
+    let valid_type = arguments
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value,
+                "build"
+                    | "chore"
+                    | "ci"
+                    | "docs"
+                    | "feat"
+                    | "fix"
+                    | "perf"
+                    | "refactor"
+                    | "revert"
+                    | "style"
+                    | "test"
+            )
+        });
+    let valid_scope = arguments.get("scope").is_none_or(|value| {
+        value.as_str().is_some_and(|scope| {
+            !scope.is_empty()
+                && scope.len() <= 49
+                && scope.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || (index > 0 && matches!(byte, b'.' | b'_' | b'/' | b'-'))
+                })
+        })
+    });
+    let valid_bullets = arguments
+        .get("body_bullets")
+        .and_then(Value::as_array)
+        .is_some_and(|bullets| {
+            !bullets.is_empty()
+                && bullets.len() <= 20
+                && bullets
+                    .iter()
+                    .all(|bullet| bounded_governed_line(bullet, 500))
+        });
+    let valid_head = arguments
+        .get("expected_head")
+        .and_then(Value::as_str)
+        .is_some_and(|head| {
+            matches!(head.len(), 40 | 64)
+                && head
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    valid_type
+        && valid_scope
+        && bounded_governed_line(arguments.get("subject").unwrap_or(&Value::Null), 100)
+        && valid_bullets
+        && valid_head
 }
 
 fn prompt(raw: &[u8]) -> Option<String> {
@@ -2581,10 +2670,14 @@ fn branch_name_is_default(value: &str, default: &str) -> bool {
 
 fn unsafe_default_native_mutation(
     request: &NormalizedRequest,
+    raw: &[u8],
     effect: OperationEffectClass,
 ) -> Result<bool, HookError> {
     if effect == OperationEffectClass::ReadOnly {
         return Ok(false);
+    }
+    if request.matcher.as_deref() == Some(GOVERNED_COMMIT_TOOL) {
+        return governed_commit_delivery_blocked(request, raw);
     }
     if request.target_paths.is_empty() {
         return Ok(true);
@@ -2610,6 +2703,43 @@ fn unsafe_default_native_mutation(
         }
     }
     Ok(false)
+}
+
+fn governed_commit_delivery_blocked(
+    request: &NormalizedRequest,
+    raw: &[u8],
+) -> Result<bool, HookError> {
+    if !governed_commit_arguments_valid(raw) {
+        return Ok(true);
+    }
+    let Some(state_home) = request
+        .dsh_subject
+        .as_ref()
+        .map(|subject| subject.agent_docs_state_home.as_path())
+    else {
+        return Ok(true);
+    };
+    let Some(execution) = request.execution_path.as_ref() else {
+        return Ok(true);
+    };
+    let Some(layout) = git_layout(execution) else {
+        return Ok(true);
+    };
+    if layout.git_dir == layout.common_dir
+        || !request.binding_roots.iter().any(|root| {
+            git_layout(root).is_some_and(|bound| {
+                bound.root == layout.root
+                    && bound.git_dir == layout.git_dir
+                    && bound.common_dir == layout.common_dir
+            })
+        })
+    {
+        return Ok(true);
+    }
+    let Some(default) = protected_default_branch(&layout, state_home)? else {
+        return Ok(true);
+    };
+    Ok(current_branch(&layout).is_none_or(|current| current == default))
 }
 
 fn target_is_git_metadata(target: &Path, layout: &GitLayout) -> bool {
@@ -2640,7 +2770,23 @@ fn semantic_delivery_blocked(
     base: Option<&Path>,
     state_home: &Path,
 ) -> Result<bool, HookError> {
-    if words.first().map(String::as_str) != Some("semantic-commit") {
+    let Some(program) = words.first().map(String::as_str) else {
+        return Ok(true);
+    };
+    if basename(program) != "semantic-commit" {
+        return Ok(true);
+    }
+    if Path::new(program).components().count() > 1 {
+        let Some(candidate) = fs::canonicalize(program).ok() else {
+            return Ok(true);
+        };
+        let Some(companion) = trusted_sibling("semantic-commit").ok() else {
+            return Ok(true);
+        };
+        if candidate != companion {
+            return Ok(true);
+        }
+    } else if program != "semantic-commit" {
         return Ok(true);
     }
     if semantic_options_ambiguous(words) || message_file_option(words) {
@@ -3289,16 +3435,7 @@ fn protected_default_branch(
     layout: &GitLayout,
     state_home: &Path,
 ) -> Result<Option<String>, HookError> {
-    let observed_remote = default_branch(layout);
-    let Some(observed_primary) = fs::read_to_string(layout.common_dir.join("HEAD"))
-        .ok()
-        .and_then(|value| {
-            value
-                .trim()
-                .strip_prefix("ref: refs/heads/")
-                .map(str::to_string)
-        })
-        .filter(|branch| safe_branch_name(branch))
+    let Some(observed_remote) = default_branch(layout).filter(|branch| safe_branch_name(branch))
     else {
         return Ok(None);
     };
@@ -3335,18 +3472,19 @@ fn protected_default_branch(
             "default-branch repository identity is unavailable",
         )
     })?;
-    let path = directory.join("projection.json");
+    // v1 incorrectly projected the primary checkout's current branch and
+    // required it to equal the remote-advertised default. Keep v2 state
+    // separate so an old, integration-branch projection cannot be treated as
+    // authenticated default-branch evidence after upgrade.
+    let path = directory.join("projection-v2.json");
     if let Some(existing) = read_default_branch_projection(&path)? {
         let identity_matches = existing.common_dir == layout.common_dir.to_string_lossy()
             && existing.common_dev == metadata.dev()
             && existing.common_ino == metadata.ino();
-        if !identity_matches || existing.branch != observed_primary {
+        if !identity_matches || existing.branch != observed_remote {
             return Ok(None);
         }
-        return Ok(
-            (observed_remote.as_deref() == Some(existing.branch.as_str()))
-                .then_some(existing.branch),
-        );
+        return Ok(Some(existing.branch));
     }
 
     let projection = DefaultBranchProjection {
@@ -3354,7 +3492,7 @@ fn protected_default_branch(
         common_dir: layout.common_dir.to_string_lossy().into_owned(),
         common_dev: metadata.dev(),
         common_ino: metadata.ino(),
-        branch: observed_primary.clone(),
+        branch: observed_remote.clone(),
     };
     let bytes = serde_json::to_vec(&projection).map_err(|_| {
         HookError::runtime(
@@ -3368,7 +3506,7 @@ fn protected_default_branch(
             "default-branch projection could not be published",
         )
     })?;
-    Ok((observed_remote.as_deref() == Some(observed_primary.as_str())).then_some(observed_primary))
+    Ok(Some(observed_remote))
 }
 
 fn safe_branch_name(branch: &str) -> bool {
