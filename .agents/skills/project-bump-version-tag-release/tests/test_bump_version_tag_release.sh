@@ -1255,7 +1255,9 @@ test_pr_mode_default_opens_pr_and_tags_merge_commit() {
   assert_contains "$log_file" 'review-specialists:bundle'
   assert_contains "$log_file" '--mode delivery'
   assert_contains "$log_file" 'forge-cli:pr review-loop observe 999'
-  assert_precedes "$log_file" 'pr review-loop observe 999' 'pr merge 999'
+  assert_contains "$log_file" 'forge-cli:pr ready 999'
+  assert_precedes "$log_file" 'pr review-loop observe 999' 'pr ready 999'
+  assert_precedes "$log_file" 'pr ready 999' 'pr merge 999'
   # Genesis is validated before it is written: a live observe appends durable
   # provider-visible state, so it is not a probe.
   assert_precedes "$log_file" '--dry-run' 'pr merge 999'

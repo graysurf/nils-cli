@@ -1636,6 +1636,10 @@ PY
   release_pr_head="$(record_release_review_genesis "$release_pr_number")" ||
     die "could not record the release review-loop genesis; branch ${release_branch} left in place for recovery"
 
+  note "marking release PR #${release_pr_number} ready"
+  forge-cli pr ready "$release_pr_number" ||
+    die "release PR #${release_pr_number} could not be marked ready; branch ${release_branch} left in place for recovery"
+
   note "merging release PR #${release_pr_number} at ${release_pr_head}"
   forge-cli pr merge "$release_pr_number" \
     --method squash \
