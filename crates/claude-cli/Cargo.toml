@@ -1,6 +1,6 @@
 [package]
 name = "nils-claude-cli"
-version = "1.27.8"
+version = "1.27.9"
 edition.workspace = true
 license.workspace = true
 
@@ -21,10 +21,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = "0.2"
-nils-build-info = { version = "1.27.8", path = "../nils-build-info" }
-nils-common = { version = "1.27.8", path = "../nils-common", package = "nils-common" }
-nils-provider-resume = { version = "1.27.8", path = "../nils-provider-resume", package = "nils-provider-resume" }
-nils-scrub = { version = "1.27.8", path = "../nils-scrub" }
+nils-build-info = { version = "1.27.9", path = "../nils-build-info" }
+nils-common = { version = "1.27.9", path = "../nils-common", package = "nils-common" }
+nils-provider-resume = { version = "1.27.9", path = "../nils-provider-resume", package = "nils-provider-resume" }
+nils-scrub = { version = "1.27.9", path = "../nils-scrub" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,5 +32,5 @@ tempfile = "3"
 
 [dev-dependencies]
 libc = "0.2"
-nils-test-support = { version = "1.27.8", path = "../nils-test-support" }
+nils-test-support = { version = "1.27.9", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }

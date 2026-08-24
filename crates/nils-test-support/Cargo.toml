@@ -1,6 +1,6 @@
 [package]
 name = "nils-test-support"
-version = "1.27.8"
+version = "1.27.9"
 edition.workspace = true
 license.workspace = true
 
