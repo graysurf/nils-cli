@@ -714,11 +714,15 @@ generic `token`, `authorization`, or `private_key` labels, and rendered only as 
 untrusted container.
 
 For `block-unsafe-default-delivery`, the engine records an owner-private
-projection of the canonical common Git directory identity and the primary
-branch before admitting Bash or native file mutation. A usable default branch
-requires that pinned branch and the cached remote HEAD agree; drift is
-fail-closed and native write/edit/str-replace targets inside Git metadata are
-denied. Raw merge, pull, cherry-pick, rebase, revert, am, reset, update-ref,
+projection of the canonical common Git directory identity and the unambiguous
+cached remote HEAD before admitting Bash or native file mutation. The primary
+checkout's current branch is not default-branch evidence and may differ from
+the remote default. Multiple remotes must advertise the same default; missing,
+contradictory, or drifted evidence is fail-closed, and native
+write/edit/str-replace targets inside Git metadata are denied. The structured
+`runtime_kit_governed_commit` tool is admissible only from its exact linked
+worktree binding and has no repository-routing argument. Raw merge, pull,
+cherry-pick, rebase, revert, am, reset, update-ref,
 branch, push, and fetch shapes are classified against the resolved `git -C` or
 semantic `--repo` target. `fetch --update-head-ok`, protected fetch
 destinations, and stdin/server-driven ref-update plumbing are denied. A shell

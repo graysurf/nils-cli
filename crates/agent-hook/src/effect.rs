@@ -43,7 +43,29 @@ pub(crate) fn classify(raw: &[u8], request: &NormalizedRequest) -> OperationEffe
         }
         Some("Read" | "Glob" | "Grep") => OperationEffectClass::ReadOnly,
         Some("Bash" | "bash") => classify_bash(raw, request),
+        Some("runtime_kit_governed_commit") => classify_governed_commit(raw, request),
         _ => OperationEffectClass::Unknown,
+    }
+}
+
+fn classify_governed_commit(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClass {
+    if !crate::dsh_policy::governed_commit_arguments_valid(raw) {
+        return OperationEffectClass::Unknown;
+    }
+    let Some(execution) = request
+        .execution_path
+        .as_ref()
+        .and_then(|path| fs::canonicalize(path).ok())
+    else {
+        return OperationEffectClass::Unknown;
+    };
+    let Some((git_dir, common_dir)) = git_directories(&execution) else {
+        return OperationEffectClass::Unknown;
+    };
+    if git_dir == common_dir {
+        OperationEffectClass::Unknown
+    } else {
+        OperationEffectClass::LocalReversible
     }
 }
 
