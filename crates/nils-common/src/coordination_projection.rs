@@ -243,8 +243,16 @@ pub fn worktree_fingerprint(epoch: u64, key: &str, checkout: &Path) -> Option<St
         return None;
     }
     let canonical = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
-    let digest = hmac_sha256(key.as_bytes(), canonical.as_os_str().as_encoded_bytes());
-    Some(format!("hmac-sha256:{epoch}:{}", hex(&digest)))
+    let digest = keyed_digest(key.as_bytes(), canonical.as_os_str().as_encoded_bytes())?;
+    Some(format!("hmac-sha256:{epoch}:{digest}"))
+}
+
+/// Return a lowercase HMAC-SHA256 digest for private identity indexing.
+///
+/// The key must carry at least 256 bits of caller-owned entropy. This keeps
+/// canonical paths and other low-entropy host facts out of public opaque IDs.
+pub fn keyed_digest(key: &[u8], message: &[u8]) -> Option<String> {
+    (key.len() >= 32).then(|| hex(&hmac_sha256(key, message)))
 }
 
 fn read_private(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
@@ -308,6 +316,21 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_digest_requires_private_entropy_and_is_key_bound() {
+        assert_eq!(
+            keyed_digest(&[0x0b; 20], b"Hi There"),
+            None,
+            "short keys are not valid durable identity keys"
+        );
+        let first = keyed_digest(&[0x0b; 32], b"Hi There").expect("keyed digest");
+        let replay = keyed_digest(&[0x0b; 32], b"Hi There").expect("keyed digest replay");
+        let another = keyed_digest(&[0x0c; 32], b"Hi There").expect("other key");
+        assert_eq!(first, replay);
+        assert_ne!(first, another);
+        assert_eq!(first.len(), 64);
+    }
 
     #[test]
     fn projection_reader_accepts_legacy_and_fence_aware_registry_markers() {

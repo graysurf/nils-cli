@@ -49,6 +49,11 @@ printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line begin --format json
 printf '%s' "$FINISH_LINE_RUN_JSON" | agent-hook finish-line run --format json
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line stop --format json
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line status --format json
+printf '%s' "$WORKSPACE_BIND_JSON" | agent-hook workspace-lease bind
+printf '%s' "$WORKSPACE_BEGIN_JSON" | agent-hook workspace-lease begin
+printf '%s' "$WORKSPACE_COMPLETE_JSON" | agent-hook workspace-lease complete
+printf '%s' "$WORKSPACE_RENEW_JSON" | agent-hook workspace-lease renew
+printf '%s' "$WORKSPACE_RELEASE_JSON" | agent-hook workspace-lease release
 agent-hook completion zsh
 ```
 
@@ -101,6 +106,34 @@ native write/edit tools. Raw commit-producing rewrites are denied on the
 default branch while exact recovery and owned `git-cli`, `forge-cli`, and
 `semantic-commit` routes remain usable. Path-backed semantic commit messages
 and ambiguous repeated scalar options fail closed.
+
+The separate `workspace-lease` service is the native WorkspaceLease v1 policy
+provider for dsh-runtime-kit. `bind` resolves an optional DSH cwd to one
+physical Git worktree using canonical root, filesystem identity, per-worktree
+Git directory, and shared Git directory facts. Equivalent path spellings
+therefore converge while linked worktrees remain distinct. A non-Git cwd is
+bound as `unmanaged` and needs no mutation operation.
+
+For a managed worktree, `bind` acquires one durable owner generation only when
+the checkout is clean. A live foreign generation returns `foreign-active`; a
+dirty checkout returns `dirty`; and an expired generation with an unterminated
+operation returns `uncertain`. An expired clean generation with no active
+operation is fenced and replaced atomically. `begin` classifies known
+read-only tools as `not-required` and gives every other tool call a unique
+operation ID and fence before execution. `complete` accepts only the exact
+binding, generation, operation, fence, and call identity. `renew` cannot revive
+an expired generation, and `release` refuses an unterminated operation.
+
+Every command reads one strict, duplicate-free WorkspaceLease v1 JSON request
+from standard input and defaults to a versioned service JSON response. Exact
+active requests and terminal lifecycle messages are idempotent; copied or
+stale authority fails closed. Provider-visible results contain only opaque
+IDs, stable state/code/reason values, and renewal timing. Canonical paths,
+session IDs, parent IDs, tool arguments, and command output are never emitted.
+Private state lives below
+`${XDG_STATE_HOME:-$HOME/.local/state}/agent-hook/workspace-leases/` (or the
+global `--state-dir` override) behind owner-only directories, bounded files,
+and per-workspace cross-process locks.
 
 The separate `finish-line` service exposes only five public operations: `open`,
 `begin`, `run`, `stop`, and `status`. On a supported Linux containment host,
