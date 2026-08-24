@@ -1,6 +1,6 @@
 [package]
 name = "nils-plan-issue"
-version = "1.27.4"
+version = "1.27.5"
 edition.workspace = true
 license.workspace = true
 default-run = "plan-issue"
@@ -25,17 +25,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 libc = "0.2"
-nils-build-info = { version = "1.27.4", path = "../nils-build-info" }
+nils-build-info = { version = "1.27.5", path = "../nils-build-info" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = { workspace = true }
-nils-common = { version = "1.27.4", path = "../nils-common", package = "nils-common" }
-nils-markdown = { version = "1.27.4", path = "../nils-markdown", package = "nils-markdown" }
-plan-tooling = { version = "1.27.4", path = "../plan-tooling", package = "nils-plan-tooling" }
+nils-common = { version = "1.27.5", path = "../nils-common", package = "nils-common" }
+nils-markdown = { version = "1.27.5", path = "../nils-markdown", package = "nils-markdown" }
+plan-tooling = { version = "1.27.5", path = "../plan-tooling", package = "nils-plan-tooling" }
 pulldown-cmark = { workspace = true }
 
 [dev-dependencies]
-nils-markdown = { version = "1.27.4", path = "../nils-markdown", package = "nils-markdown", features = ["test-support"] }
-nils-test-support = { version = "1.27.4", path = "../nils-test-support" }
+nils-markdown = { version = "1.27.5", path = "../nils-markdown", package = "nils-markdown", features = ["test-support"] }
+nils-test-support = { version = "1.27.5", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"

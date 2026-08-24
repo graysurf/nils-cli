@@ -1,6 +1,6 @@
 [package]
 name = "nils-docker-tools"
-version = "1.27.4"
+version = "1.27.5"
 edition.workspace = true
 license.workspace = true
 
@@ -18,11 +18,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.27.4", path = "../nils-build-info" }
-nils-common = { version = "1.27.4", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.27.5", path = "../nils-build-info" }
+nils-common = { version = "1.27.5", path = "../nils-common", package = "nils-common" }
 shell-words = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.27.4", path = "../nils-test-support" }
+nils-test-support = { version = "1.27.5", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
