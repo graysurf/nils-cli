@@ -511,9 +511,10 @@ exact bounded agent, workspace-generation, call, turn/step, tool, and
 visible-definition identifiers. It uses the verifier's default catalog
 selection: `--user-config`, `--integration-fingerprint`, and
 `--worktree-fallback local-only` are rejected. It returns
-`decision.prerequisite.v1`: `reason = pending` includes a bounded opaque
-receipt, while `already-current` omits the receipt. Neither result writes or
-refreshes a session activation. A full activation still covers ordinary phase
+`decision.prerequisite.v1`: both `reason = pending` and `already-current`
+include a bounded opaque receipt so every admitted execution can be freshly
+revalidated after approval and guard waits. Neither result writes or refreshes
+a session activation. A full activation still covers ordinary phase
 verification, but the first phase prerequisite conservatively returns
 `pending` and materializes a phase activation so its returned content and reuse
 decision come from one resolved fingerprint.
