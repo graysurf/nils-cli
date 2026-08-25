@@ -246,6 +246,50 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(register)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(admit)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(observe)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(verdict)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (stop)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Automation-safe output format. Finish-line defaults to its service JSON contract]:FORMAT:((text\:"Human-readable text output"
@@ -399,20 +443,39 @@ _agent-hook__subcmd__finish-line_commands() {
 'open:Mint one private DSH runner capability for this repository session' \
 'begin:Durably advance the edit generation before an authoritative mutation' \
 'run:Probe or supervise one foreground DSH Bash command and classify exact validation targets' \
+'register:Register one immutable named acceptance contract for a DSH session' \
+'admit:Admit one exact structured mutation or validator before its body runs' \
+'observe:Record one authenticated terminal observation for an admitted operation' \
+'verdict:Return the detached authoritative acceptance verdict' \
 'stop:Decide whether every current validation target is satisfied' \
 'status:Inspect bounded redacted finish-line state' \
     )
     _describe -t commands 'agent-hook finish-line commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__admit_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__admit_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line admit commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__finish-line__subcmd__begin_commands] )) ||
 _agent-hook__subcmd__finish-line__subcmd__begin_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook finish-line begin commands' commands "$@"
 }
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__observe_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line observe commands' commands "$@"
+}
 (( $+functions[_agent-hook__subcmd__finish-line__subcmd__open_commands] )) ||
 _agent-hook__subcmd__finish-line__subcmd__open_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook finish-line open commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__register_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__register_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line register commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__finish-line__subcmd__run_commands] )) ||
 _agent-hook__subcmd__finish-line__subcmd__run_commands() {
@@ -428,6 +491,11 @@ _agent-hook__subcmd__finish-line__subcmd__status_commands() {
 _agent-hook__subcmd__finish-line__subcmd__stop_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook finish-line stop commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__finish-line__subcmd__verdict_commands] )) ||
+_agent-hook__subcmd__finish-line__subcmd__verdict_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook finish-line verdict commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__inventory_commands] )) ||
 _agent-hook__subcmd__inventory_commands() {

@@ -418,7 +418,9 @@ fn cli_help_version_and_completion_surface_are_complete() {
     let finish_line_help_text = finish_line_help.stdout_text();
     assert!(finish_line_help_text.contains("Probe or supervise one foreground DSH Bash command"));
     assert!(finish_line_help_text.contains("classify exact validation targets"));
-    for required in ["open", "begin", "run", "stop", "status"] {
+    for required in [
+        "open", "begin", "run", "register", "admit", "observe", "verdict", "stop", "status",
+    ] {
         assert!(
             finish_line_help_text.contains(required),
             "finish-line help missing {required}: {finish_line_help_text}"
@@ -499,7 +501,9 @@ fn cli_help_version_and_completion_surface_are_complete() {
             .find(scope_end)
             .expect("finish-line completion end");
         let finish_line_scope = &script[start..start + scope_start.len() + relative_end];
-        for required in ["open", "begin", "run", "stop", "status"] {
+        for required in [
+            "open", "begin", "run", "register", "admit", "observe", "verdict", "stop", "status",
+        ] {
             assert!(
                 finish_line_scope.contains(required),
                 "missing {required}; shell={shell}"
@@ -526,5 +530,35 @@ fn cli_help_version_and_completion_surface_are_complete() {
             );
         }
         assert!(!finish_line_scope.contains("text output (default)"));
+    }
+}
+
+#[test]
+fn finish_line_public_docs_freeze_the_same_acceptance_rpc_surface() {
+    let contract = include_str!("../docs/specs/agent-hook-v1.md");
+    let acceptance = include_str!("../docs/specs/finish-line-acceptance-v1.md");
+    let public_surface = "The public CLI surface is exactly `open`, `begin`, `run`, `register`, `admit`,\n`observe`, `verdict`, `stop`, and `status`.";
+    assert!(
+        contract.contains(public_surface),
+        "normative public finish-line inventory drifted"
+    );
+    for command in ["register", "admit", "observe", "verdict"] {
+        let request_schema = format!("`agent-hook.finish-line.{command}.v1`");
+        let result_schema = format!("`agent-hook.finish-line.{command}-result.v1`");
+        assert!(
+            acceptance.contains(&request_schema),
+            "missing documented request schema {request_schema}"
+        );
+        assert!(
+            acceptance.contains(&result_schema)
+                || acceptance.contains("`agent-hook.finish-line.<command>-result.v1`"),
+            "missing documented result schema {result_schema}"
+        );
+    }
+    for hidden in ["Hidden `quiesce`", "`release`"] {
+        assert!(
+            contract.contains(hidden),
+            "missing hidden RPC boundary {hidden}"
+        );
     }
 }
