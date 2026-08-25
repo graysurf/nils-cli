@@ -682,6 +682,14 @@ fn repository_wide_mutation_barrier_covers_other_sessions_and_ordinary_shell() {
     );
     assert_eq!(mutation.0, 0, "envelope={}", mutation.1);
 
+    let (cross_session_verdict_code, cross_session_verdict) =
+        verdict(&fixture, "session-barrier-b", &capability_b, contract_b);
+    assert_eq!(cross_session_verdict_code, 1);
+    assert_eq!(
+        cross_session_verdict["data"]["aggregate"], "active",
+        "a live repository mutation must remain retryable from another session: {cross_session_verdict}"
+    );
+
     let blocked_validator = admit_validator(
         &fixture,
         "session-barrier-b",

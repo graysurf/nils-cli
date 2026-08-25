@@ -827,7 +827,12 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
         matches!(operation.kind, AcceptanceOperationKind::Mutation)
             && mutation_relevant(operation, generation)
     }) {
-        let status = mutation_verdict(operation, session, generation, &capability_digest);
+        let owner_capability_digest = store
+            .state
+            .sessions
+            .get(&operation.session_key)
+            .and_then(|session| session.runner_capability_digest.as_deref());
+        let status = mutation_verdict(operation, session, generation, owner_capability_digest);
         if status.priority() > aggregate.priority() {
             aggregate = status;
         }
@@ -1488,14 +1493,14 @@ fn mutation_verdict(
     operation: &AcceptanceOperation,
     session: &AcceptanceSession,
     generation: u64,
-    capability_digest: &str,
+    owner_capability_digest: Option<&str>,
 ) -> VerdictStatus {
     let Some(terminal) = operation.terminal.as_ref() else {
         if operation.admission == AdmissionStatus::Admitted
-            && constant_time_eq(
-                operation.capability_digest.as_bytes(),
-                capability_digest.as_bytes(),
-            )
+            && operation.generation == generation
+            && owner_capability_digest.is_some_and(|expected| {
+                constant_time_eq(operation.capability_digest.as_bytes(), expected.as_bytes())
+            })
         {
             return VerdictStatus::Active;
         }
@@ -1809,7 +1814,23 @@ mod tests {
 
         assert!(mutation_relevant(&reserved, 7));
         assert_eq!(
-            mutation_verdict(&reserved, &session(1), 7, "capability"),
+            mutation_verdict(&reserved, &session(1), 7, Some("capability")),
+            VerdictStatus::InfrastructureBlocked
+        );
+    }
+
+    #[test]
+    fn a_live_mutation_is_active_only_at_its_exact_generation() {
+        let mut admitted = operation(1, false);
+        admitted.kind = AcceptanceOperationKind::Mutation;
+        admitted.generation = 8;
+
+        assert_eq!(
+            mutation_verdict(&admitted, &session(1), 8, Some("capability")),
+            VerdictStatus::Active
+        );
+        assert_eq!(
+            mutation_verdict(&admitted, &session(1), 9, Some("capability")),
             VerdictStatus::InfrastructureBlocked
         );
     }
