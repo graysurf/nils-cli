@@ -448,14 +448,7 @@ fn trusted_git_executable() -> Result<PathBuf, CliError> {
         let Ok(canonical) = fs::canonicalize(&candidate) else {
             continue;
         };
-        let Ok(metadata) = fs::metadata(&canonical) else {
-            continue;
-        };
-        if metadata.is_file()
-            && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
-            && metadata.permissions().mode() & 0o022 == 0
-            && metadata.permissions().mode() & 0o111 != 0
-        {
+        if trusted_git_path(&canonical) {
             return Ok(canonical);
         }
     }
@@ -464,6 +457,90 @@ fn trusted_git_executable() -> Result<PathBuf, CliError> {
         "a trusted system Git executable is unavailable",
         None,
     ))
+}
+
+fn trusted_git_path(path: &Path) -> bool {
+    let effective_uid = unsafe { libc::geteuid() };
+    let overflow_uid = fs::read_to_string("/proc/sys/kernel/overflowuid").ok();
+    let uid_map = fs::read_to_string("/proc/self/uid_map").ok();
+
+    for (index, component) in path.ancestors().enumerate() {
+        let Ok(metadata) = fs::symlink_metadata(component) else {
+            return false;
+        };
+        let expected_type = if index == 0 {
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        } else {
+            metadata.is_dir()
+        };
+        if !expected_type
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o022 != 0
+            || !trusted_system_owner_for_namespace(
+                metadata.uid(),
+                effective_uid,
+                overflow_uid.as_deref(),
+                uid_map.as_deref(),
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn trusted_system_owner_for_namespace(
+    owner_uid: u32,
+    effective_uid: u32,
+    overflow_uid: Option<&str>,
+    uid_map: Option<&str>,
+) -> bool {
+    if owner_uid == 0 {
+        return true;
+    }
+
+    let parsed_overflow_uid = overflow_uid.and_then(|value| value.trim().parse::<u32>().ok());
+    if owner_uid == effective_uid {
+        return parsed_overflow_uid != Some(owner_uid);
+    }
+
+    let Some(overflow_uid) =
+        parsed_overflow_uid.filter(|value| *value == owner_uid && *value != effective_uid)
+    else {
+        return false;
+    };
+    let Some(uid_map) = uid_map else {
+        return false;
+    };
+
+    let mut rows = 0usize;
+    for line in uid_map.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 3 {
+            return false;
+        }
+        let Ok(inner) = fields[0].parse::<u64>() else {
+            return false;
+        };
+        let Ok(_outer) = fields[1].parse::<u64>() else {
+            return false;
+        };
+        let Ok(length) = fields[2].parse::<u64>() else {
+            return false;
+        };
+        let Some(end) = inner.checked_add(length) else {
+            return false;
+        };
+        if length == 0 {
+            return false;
+        }
+        rows += 1;
+        let overflow_uid = u64::from(overflow_uid);
+        if inner <= overflow_uid && overflow_uid < end {
+            return false;
+        }
+    }
+    rows > 0
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
@@ -742,7 +819,10 @@ struct ErrorBody<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_path, normalize_absolute_path, repo_relative_path};
+    use super::{
+        is_allowed_path, normalize_absolute_path, repo_relative_path,
+        trusted_system_owner_for_namespace,
+    };
     use std::path::Path;
 
     #[test]
@@ -771,5 +851,49 @@ mod tests {
     #[test]
     fn empty_repo_relative_path_becomes_dot() {
         assert_eq!(repo_relative_path(Path::new("")).expect("path"), ".");
+    }
+
+    #[test]
+    fn trusted_system_owner_accepts_only_genuinely_unmapped_overflow_uid() {
+        assert!(trusted_system_owner_for_namespace(
+            65_534,
+            1_000,
+            Some("65534\n"),
+            Some("0 1000 1\n"),
+        ));
+        assert!(!trusted_system_owner_for_namespace(
+            65_534,
+            1_000,
+            Some("65534\n"),
+            Some("0 1000 1\n65534 65534 1\n"),
+        ));
+        assert!(!trusted_system_owner_for_namespace(
+            65_534,
+            65_534,
+            Some("65534\n"),
+            Some("0 1000 1\n"),
+        ));
+    }
+
+    #[test]
+    fn trusted_system_owner_rejects_invalid_namespace_evidence() {
+        assert!(!trusted_system_owner_for_namespace(
+            65_534,
+            1_000,
+            Some("not-a-uid\n"),
+            Some("0 1000 1\n"),
+        ));
+        assert!(!trusted_system_owner_for_namespace(
+            65_534,
+            1_000,
+            Some("65534\n"),
+            Some("0 1000 0\n"),
+        ));
+        assert!(!trusted_system_owner_for_namespace(
+            65_534,
+            1_000,
+            Some("65534\n"),
+            Some("0 1000 1 extra\n"),
+        ));
     }
 }
