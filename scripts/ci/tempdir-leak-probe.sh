@@ -20,10 +20,10 @@
 # before/after diff reports their entries as leaks. It also hides the real ones
 # — temp directories are dotfiles, and a plain `ls` does not list them.
 #
-# Do NOT point TMPDIR inside the repository work tree. Many tests assert that a
+# Do NOT point TMPDIR inside any repository work tree. Many tests assert that a
 # path is outside a git repository (`*_outside_git_repo`, `not_a_repo`), and a
-# TMPDIR under the checkout fails 131 of them across ~25 crates. The probe root
-# therefore defaults to the system temp directory.
+# TMPDIR with Git marker ancestry invalidates those fixtures. The probe therefore
+# selects the first writable system temp root outside Git marker ancestry.
 #
 # Compatibility: must run on macOS (system bash 3.2) and Linux runners. Avoid
 # associative arrays, mapfile, and `${var,,}` lowercasing.
@@ -43,8 +43,9 @@ nextest arguments are given.
   --runs <n>         repeat the run <n> times before checking (default: 1).
                      Several leaks are races that only lose sometimes; repeat
                      to raise the odds of catching one.
-  --probe-root <dir> where to create the private TMPDIR (default: the system
-                     temp directory). Must not be inside the repository.
+  --probe-root <dir> where to create the private TMPDIR (default: the first
+                     writable system temp root outside Git marker ancestry).
+                     Must not have Git marker ancestry.
   --allow <glob>     tolerate a surviving entry whose name matches <glob>.
                      Repeatable. Only for state a test deliberately reuses
                      across runs under a fixed name — such state is bounded, so
@@ -57,7 +58,8 @@ USAGE
 }
 
 runs=1
-probe_root="${TMPDIR:-/tmp}"
+probe_root=""
+probe_root_explicit=0
 allow_globs=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -90,6 +92,7 @@ while [ $# -gt 0 ]; do
         exit 2
       fi
       probe_root="$1"
+      probe_root_explicit=1
       shift
       ;;
     --)
@@ -115,20 +118,56 @@ if [ "$runs" -lt 1 ]; then
   echo "tempdir-leak-probe: --runs must be at least 1" >&2
   exit 2
 fi
+
+has_git_marker_ancestry() {
+  local cursor="$1"
+  local parent
+  while :; do
+    if [ -e "$cursor/.git" ] || [ -L "$cursor/.git" ]; then
+      return 0
+    fi
+    parent="$(dirname "$cursor")"
+    if [ "$parent" = "$cursor" ]; then
+      return 1
+    fi
+    cursor="$parent"
+  done
+}
+
+select_default_probe_root() {
+  local candidate
+  local candidate_abs
+  for candidate in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" /var/tmp /dev/shm /tmp; do
+    [ -n "$candidate" ] || continue
+    [ -d "$candidate" ] || continue
+    [ -w "$candidate" ] || continue
+    candidate_abs="$(cd "$candidate" && pwd -P)" || continue
+    if ! has_git_marker_ancestry "$candidate_abs"; then
+      printf '%s\n' "$candidate_abs"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "$probe_root_explicit" -eq 0 ]; then
+  if ! probe_root="$(select_default_probe_root)"; then
+    echo "tempdir-leak-probe: no writable system temp root outside Git marker ancestry" >&2
+    exit 2
+  fi
+fi
 if [ ! -d "$probe_root" ]; then
   echo "tempdir-leak-probe: not a directory: $probe_root" >&2
   exit 2
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-probe_root_abs="$(cd "$probe_root" && pwd)"
-case "$probe_root_abs/" in
-  "$repo_root"/*)
-    echo "tempdir-leak-probe: --probe-root must be outside the repository;" >&2
-    echo "  tests that assert a path is outside a git repo fail under it." >&2
-    exit 2
-    ;;
-esac
+probe_root_abs="$(cd "$probe_root" && pwd -P)"
+if has_git_marker_ancestry "$probe_root_abs"; then
+  echo "tempdir-leak-probe: --probe-root must be outside Git marker ancestry;" >&2
+  echo "  tests that assert a path is outside a git repo fail under it." >&2
+  exit 2
+fi
 
 if [ $# -eq 0 ]; then
   set -- --workspace
@@ -141,6 +180,16 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$repo_root"
+
+# Build before entering the disposable TMPDIR. Persistent compiler helpers such
+# as sccache retain the environment from their first request; starting one under
+# the probe directory would leave it pointing at a path cleanup removes before
+# later Rust commands run. The selected tests still execute under the private
+# directory below, which is the behavior this probe owns.
+if ! cargo nextest run --no-run "$@"; then
+  echo "tempdir-leak-probe: the test build failed" >&2
+  exit 1
+fi
 
 run_status=0
 i=1

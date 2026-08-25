@@ -283,7 +283,7 @@ pub fn write_file(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nils_test_support::{EnvGuard, GlobalStateLock};
+    use nils_test_support::{EnvGuard, GlobalStateLock, tempdir::ScopedTempDir};
 
     use tempfile::TempDir;
 
@@ -302,7 +302,7 @@ mod tests {
         let found = find_repo_root(&root.join("a/b/c")).unwrap();
         assert_eq!(found, root);
 
-        let tmp2 = TempDir::new().unwrap();
+        let tmp2 = ScopedTempDir::outside_git_ancestry("api-testing-core-non-git-");
         let err = find_repo_root(tmp2.path()).unwrap_err();
         assert!(format!("{err:#}").contains("Must run inside a git work tree"));
     }
