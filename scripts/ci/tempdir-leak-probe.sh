@@ -181,6 +181,16 @@ trap cleanup EXIT
 
 cd "$repo_root"
 
+# Build before entering the disposable TMPDIR. Persistent compiler helpers such
+# as sccache retain the environment from their first request; starting one under
+# the probe directory would leave it pointing at a path cleanup removes before
+# later Rust commands run. The selected tests still execute under the private
+# directory below, which is the behavior this probe owns.
+if ! cargo nextest run --no-run "$@"; then
+  echo "tempdir-leak-probe: the test build failed" >&2
+  exit 1
+fi
+
 run_status=0
 i=1
 while [ "$i" -le "$runs" ]; do

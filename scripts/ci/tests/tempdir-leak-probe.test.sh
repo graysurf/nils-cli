@@ -14,9 +14,11 @@ set -euo pipefail
 #   (c) a failing test run fails the probe even with no leak
 #   (d) a default temp root with Git ancestry is skipped without losing leak
 #       visibility
-#   (e) --probe-root with any Git ancestry is refused, because tests that
+#   (e) a cold persistent compiler helper does not retain the disposable probe
+#       TMPDIR after the run
+#   (f) --probe-root with any Git ancestry is refused, because tests that
 #       assert a path is outside a git repo break under it
-#   (f) usage errors exit 2
+#   (g) usage errors exit 2
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
@@ -69,6 +71,12 @@ write_cargo_stub() {
   local body="$1"
   {
     printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'if [ -n "${CARGO_STUB_PERSISTENT_TMPDIR_FILE:-}" ] && [ ! -e "$CARGO_STUB_PERSISTENT_TMPDIR_FILE" ]; then'
+    printf '%s\n' '  printf "%s\n" "${TMPDIR:-}" >"$CARGO_STUB_PERSISTENT_TMPDIR_FILE"'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'for arg in "$@"; do'
+    printf '%s\n' '  [ "$arg" = "--no-run" ] && exit 0'
+    printf '%s\n' 'done'
     printf '%s\n' "$body"
   } >"$work/bin/cargo"
   chmod +x "$work/bin/cargo"
@@ -185,6 +193,31 @@ if ! grep -q '.tmpDEFAULT_LEAK' "$work/out.txt"; then
   exit 1
 fi
 echo "ok: a safe fallback remains visible to the leak detector"
+
+echo "== a cold persistent helper keeps a stable TMPDIR after probe cleanup =="
+mkdir -p "$work/build-tmp"
+# The stub records the TMPDIR seen by its first invocation, like a persistent
+# compiler-cache server. Its actual test invocation and the follow-on compile
+# both require that retained directory to remain present.
+write_cargo_stub '[ -d "$(cat "$CARGO_STUB_PERSISTENT_TMPDIR_FILE")" ]'
+TMPDIR="$work/build-tmp" \
+  CARGO_STUB_PERSISTENT_TMPDIR_FILE="$work/persistent-tmpdir.txt" \
+  expect_status 0 "the probe prebuild starts persistent helpers outside its disposable TMPDIR"
+if [[ "$(cat "$work/persistent-tmpdir.txt")" != "$work/build-tmp" ]]; then
+  echo "FAIL: the persistent helper inherited the disposable probe TMPDIR"
+  cat "$work/persistent-tmpdir.txt"
+  exit 1
+fi
+status=0
+TMPDIR="$work/build-tmp" \
+  CARGO_STUB_PERSISTENT_TMPDIR_FILE="$work/persistent-tmpdir.txt" \
+  PATH="$work/bin:$PATH" \
+  cargo nextest run --workspace >/dev/null 2>&1 || status=$?
+if [[ "$status" -ne 0 ]]; then
+  echo "FAIL: a follow-on compile could not use the retained persistent-helper TMPDIR"
+  exit 1
+fi
+echo "ok: the persistent helper and follow-on compile retain a stable TMPDIR"
 
 echo "== --probe-root with Git ancestry is refused =="
 write_cargo_stub 'exit 0'
