@@ -461,8 +461,14 @@ fn trusted_git_executable() -> Result<PathBuf, CliError> {
 
 fn trusted_git_path(path: &Path) -> bool {
     let effective_uid = unsafe { libc::geteuid() };
-    let overflow_uid = fs::read_to_string("/proc/sys/kernel/overflowuid").ok();
-    let uid_map = fs::read_to_string("/proc/self/uid_map").ok();
+    let (overflow_uid, uid_map) = if allows_namespace_overflow_for_git_path(path) {
+        (
+            fs::read_to_string("/proc/sys/kernel/overflowuid").ok(),
+            fs::read_to_string("/proc/self/uid_map").ok(),
+        )
+    } else {
+        (None, None)
+    };
 
     for (index, component) in path.ancestors().enumerate() {
         let Ok(metadata) = fs::symlink_metadata(component) else {
@@ -487,6 +493,10 @@ fn trusted_git_path(path: &Path) -> bool {
         }
     }
     true
+}
+
+fn allows_namespace_overflow_for_git_path(path: &Path) -> bool {
+    path == Path::new("/usr/bin/git") || path == Path::new("/bin/git")
 }
 
 fn trusted_system_owner_for_namespace(
@@ -820,8 +830,8 @@ struct ErrorBody<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_path, normalize_absolute_path, repo_relative_path,
-        trusted_system_owner_for_namespace,
+        allows_namespace_overflow_for_git_path, is_allowed_path, normalize_absolute_path,
+        repo_relative_path, trusted_system_owner_for_namespace,
     };
     use std::path::Path;
 
@@ -895,5 +905,24 @@ mod tests {
             Some("65534\n"),
             Some("0 1000 1 extra\n"),
         ));
+    }
+
+    #[test]
+    fn namespace_overflow_is_limited_to_the_fixed_system_git_family() {
+        assert!(allows_namespace_overflow_for_git_path(Path::new(
+            "/usr/bin/git"
+        )));
+        assert!(allows_namespace_overflow_for_git_path(Path::new(
+            "/bin/git"
+        )));
+        assert!(!allows_namespace_overflow_for_git_path(Path::new(
+            "/usr/local/bin/git"
+        )));
+        assert!(!allows_namespace_overflow_for_git_path(Path::new(
+            "/opt/homebrew/bin/git"
+        )));
+        assert!(!allows_namespace_overflow_for_git_path(Path::new(
+            "/usr/bin/git-wrapper"
+        )));
     }
 }
