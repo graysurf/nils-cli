@@ -12,9 +12,11 @@ set -euo pipefail
 #   (b) a run that leaves a directory behind fails, and names its contents —
 #       the contents are what identifies the writer
 #   (c) a failing test run fails the probe even with no leak
-#   (d) --probe-root inside the repository is refused, because tests that
+#   (d) a default temp root with Git ancestry is skipped without losing leak
+#       visibility
+#   (e) --probe-root with any Git ancestry is refused, because tests that
 #       assert a path is outside a git repo break under it
-#   (e) usage errors exit 2
+#   (f) usage errors exit 2
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
@@ -28,7 +30,36 @@ if [[ ! -f "$probe_script" ]]; then
   exit 2
 fi
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/tempdir-leak-probe-test.XXXXXX")"
+has_git_marker_ancestry() {
+  local cursor="$1"
+  local parent
+  while :; do
+    if [[ -e "$cursor/.git" || -L "$cursor/.git" ]]; then
+      return 0
+    fi
+    parent="$(dirname "$cursor")"
+    if [[ "$parent" == "$cursor" ]]; then
+      return 1
+    fi
+    cursor="$parent"
+  done
+}
+
+test_root=""
+for candidate in /var/tmp /dev/shm "${TMPDIR:-}" /tmp; do
+  [[ -n "$candidate" && -d "$candidate" && -w "$candidate" ]] || continue
+  candidate="$(cd "$candidate" && pwd -P)"
+  if ! has_git_marker_ancestry "$candidate"; then
+    test_root="$candidate"
+    break
+  fi
+done
+if [[ -z "$test_root" ]]; then
+  echo "error: no writable test root outside Git marker ancestry" >&2
+  exit 2
+fi
+
+work="$(mktemp -d "$test_root/tempdir-leak-probe-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/root"
 
@@ -126,7 +157,36 @@ if [[ "$(wc -l <"$work/runs.log" | tr -d ' ')" != "3" ]]; then
 fi
 echo "ok: --runs repeats the run"
 
-echo "== --probe-root inside the repository is refused =="
+echo "== a polluted default root falls back without losing leak visibility =="
+mkdir -p "$work/contaminated/.git"
+# shellcheck disable=SC2016 # the stub expands both variables at run time
+write_cargo_stub 'printf "%s\n" "$TMPDIR" >"$CARGO_STUB_LOG"; : >"$TMPDIR/.tmpDEFAULT_LEAK"'
+status=0
+CARGO_STUB_LOG="$work/selected-root.log" \
+  PATH="$work/bin:$PATH" \
+  TMPDIR="$work/contaminated" \
+  XDG_RUNTIME_DIR="$work/contaminated" \
+  bash "$probe_script" >"$work/out.txt" 2>&1 || status=$?
+if [[ "$status" -ne 1 ]]; then
+  echo "FAIL: a leak under the safe default fallback should exit 1, got $status"
+  cat "$work/out.txt"
+  exit 1
+fi
+selected_root="$(cat "$work/selected-root.log")"
+case "$selected_root/" in
+  "$work/contaminated"/*)
+    echo "FAIL: the default probe used a root with Git ancestry: $selected_root"
+    exit 1
+    ;;
+esac
+if ! grep -q '.tmpDEFAULT_LEAK' "$work/out.txt"; then
+  echo "FAIL: the fallback probe did not report the leaked entry"
+  cat "$work/out.txt"
+  exit 1
+fi
+echo "ok: a safe fallback remains visible to the leak detector"
+
+echo "== --probe-root with Git ancestry is refused =="
 write_cargo_stub 'exit 0'
 status=0
 PATH="$work/bin:$PATH" bash "$probe_script" --probe-root "$repo_root" >/dev/null 2>&1 || status=$?
@@ -134,7 +194,13 @@ if [[ "$status" -ne 2 ]]; then
   echo "FAIL: an in-repo probe root should exit 2, got $status"
   exit 1
 fi
-echo "ok: an in-repo probe root is refused"
+status=0
+PATH="$work/bin:$PATH" bash "$probe_script" --probe-root "$work/contaminated" >/dev/null 2>&1 || status=$?
+if [[ "$status" -ne 2 ]]; then
+  echo "FAIL: a probe root below an unrelated Git marker should exit 2, got $status"
+  exit 1
+fi
+echo "ok: probe roots with Git ancestry are refused"
 
 echo "== usage =="
 status=0

@@ -7,6 +7,7 @@ use std::process::Command;
 use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::{Value, json};
 
+use nils_test_support::tempdir::ScopedTempDir;
 use support::Fixture;
 
 const POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
@@ -393,7 +394,7 @@ fn read_only_tools_need_no_operation_and_copied_fences_fail_closed() {
 #[test]
 fn renew_is_exact_and_non_git_directories_remain_unmanaged() {
     let fixture = fixture();
-    let non_git = tempfile::TempDir::new().expect("non-Git cwd");
+    let non_git = ScopedTempDir::outside_git_ancestry("agent-hook-non-git-");
     let binding = bind(
         &fixture,
         "unmanaged-session",

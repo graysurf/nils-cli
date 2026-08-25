@@ -10,6 +10,7 @@
 //! `ScopedTempDir` uses `TempDir::close`, which surfaces that error, and fails
 //! the test that produced it.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -37,6 +38,28 @@ impl ScopedTempDir {
         }
     }
 
+    /// Create a temporary directory whose canonical ancestry contains no Git
+    /// marker. Use this only when the fixture contract specifically requires a
+    /// non-repository path: the process temp root may itself be a Git checkout.
+    pub fn outside_git_ancestry(prefix: &str) -> Self {
+        // Keep the process temp root first. The full test gate points TMPDIR at
+        // a private leak-probe directory and must retain visibility into every
+        // fixture that can safely live there. Fall back only when that root is
+        // itself inside Git ancestry or cannot create the fixture.
+        let mut candidates = vec![std::env::temp_dir()];
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            candidates.push(PathBuf::from(runtime_dir));
+        }
+        #[cfg(unix)]
+        candidates.extend([PathBuf::from("/dev/shm"), PathBuf::from("/var/tmp")]);
+
+        let tempdir = tempdir_outside_git_ancestry(prefix, candidates)
+            .unwrap_or_else(|| panic!("no writable temporary root outside Git ancestry"));
+        Self {
+            inner: Some(tempdir),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         self.inner
             .as_ref()
@@ -56,6 +79,35 @@ impl ScopedTempDir {
             None => Ok(()),
         }
     }
+}
+
+fn tempdir_outside_git_ancestry(
+    prefix: &str,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<TempDir> {
+    for candidate in candidates {
+        let Ok(candidate) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        if has_git_ancestry(&candidate) {
+            continue;
+        }
+        let Ok(tempdir) = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(candidate)
+        else {
+            continue;
+        };
+        if !has_git_ancestry(tempdir.path()) {
+            return Some(tempdir);
+        }
+    }
+    None
+}
+
+fn has_git_ancestry(path: &Path) -> bool {
+    path.ancestors()
+        .any(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
 }
 
 impl Default for ScopedTempDir {
@@ -182,7 +234,30 @@ impl Drop for RestoredMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{RestoredMode, ScopedTempDir};
+    use super::{RestoredMode, ScopedTempDir, has_git_ancestry, tempdir_outside_git_ancestry};
+
+    #[test]
+    fn outside_git_ancestry_never_inherits_a_repository_marker() {
+        let dir = ScopedTempDir::outside_git_ancestry("nils-test-support-non-git-");
+        assert!(!has_git_ancestry(dir.path()));
+    }
+
+    #[test]
+    fn outside_git_ancestry_skips_a_contaminated_candidate() {
+        let root = ScopedTempDir::outside_git_ancestry("nils-test-support-candidates-");
+        let contaminated = root.path().join("contaminated");
+        let clean = root.path().join("clean");
+        std::fs::create_dir_all(contaminated.join(".git")).expect("create Git marker");
+        std::fs::create_dir_all(&clean).expect("create clean candidate");
+
+        let selected = tempdir_outside_git_ancestry(
+            "nils-test-support-selected-",
+            [contaminated, clean.clone()],
+        )
+        .expect("clean fallback candidate");
+
+        assert!(selected.path().starts_with(clean));
+    }
 
     #[test]
     fn close_removes_the_directory() {

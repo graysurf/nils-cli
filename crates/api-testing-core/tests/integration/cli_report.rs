@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use api_testing_core::cli_report::{ReportMetadataConfig, build_report_metadata, endpoint_note};
-use nils_test_support::{EnvGuard, GlobalStateLock};
+use nils_test_support::{EnvGuard, GlobalStateLock, tempdir::ScopedTempDir};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -34,7 +34,7 @@ fn assert_stamp_prefix(name: &str) {
 fn build_report_metadata_defaults_to_docs_dir() {
     let lock = GlobalStateLock::new();
     let _guard = EnvGuard::remove(&lock, "TEST_REPORT_DIR");
-    let tmp = TempDir::new().unwrap();
+    let tmp = ScopedTempDir::outside_git_ancestry("api-testing-core-report-non-git-");
     let metadata = build_report_metadata(report_config(
         "Hello World",
         None,
