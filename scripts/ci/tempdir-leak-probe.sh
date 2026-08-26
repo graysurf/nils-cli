@@ -137,15 +137,19 @@ has_git_marker_ancestry() {
   done
 }
 
+SANDBOX_MASKED_ROOTS="/run /proc /dev"
+
 has_sandbox_masked_ancestry() {
-  case "$1/" in
-    /run/* | /dev/*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  local path="$1"
+  local root
+  for root in $SANDBOX_MASKED_ROOTS; do
+    case "$path/" in
+      "$root"/*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
 }
 
 select_default_probe_root() {

@@ -34,6 +34,49 @@ if [[ ! -f "$probe_script" ]]; then
   exit 2
 fi
 
+echo "== sandbox-masked root policy matches the Rust sandbox owner =="
+rust_sandbox_source="$repo_root/crates/agent-workflow-primitives/src/agent_run/inspect.rs"
+shell_masked_roots="$(sed -n 's/^SANDBOX_MASKED_ROOTS="\([^"]*\)"$/\1/p' "$probe_script")"
+if [[ -z "$shell_masked_roots" ]]; then
+  echo "FAIL: the probe does not declare SANDBOX_MASKED_ROOTS" >&2
+  exit 1
+fi
+rust_masked_roots="$({
+  sed -n '/^fn is_private_mount(/,/^}/p' "$rust_sandbox_source" |
+    awk '
+      {
+        line = $0
+        while (match(line, /Path::new\("[^"]+"\)/)) {
+          root = substr(line, RSTART, RLENGTH)
+          sub(/^Path::new\("/, "", root)
+          sub(/"\)$/, "", root)
+          print root
+          line = substr(line, RSTART + RLENGTH)
+        }
+      }
+    '
+} | sort)"
+normalized_shell_masked_roots="$(printf '%s\n' $shell_masked_roots | sort)"
+if [[ "$normalized_shell_masked_roots" != "$rust_masked_roots" ]]; then
+  echo "FAIL: shell sandbox-masked roots differ from the Rust sandbox owner" >&2
+  printf 'shell:\n%s\nrust:\n%s\n' "$normalized_shell_masked_roots" "$rust_masked_roots" >&2
+  exit 1
+fi
+echo "ok: shell and Rust sandbox-masked roots match"
+
+has_sandbox_masked_ancestry() {
+  local path="$1"
+  local root
+  for root in $shell_masked_roots; do
+    case "$path/" in
+      "$root"/*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 has_git_marker_ancestry() {
   local cursor="$1"
   local parent
@@ -239,17 +282,14 @@ echo "ok: probe roots with Git ancestry are refused"
 
 echo "== sandbox-masked probe roots are refused and skipped =="
 masked_root=""
-for candidate in "${XDG_RUNTIME_DIR:-}" /dev/shm /run; do
+for candidate in "${XDG_RUNTIME_DIR:-}" $shell_masked_roots; do
   [[ -n "$candidate" && -d "$candidate" && -w "$candidate" ]] || continue
   candidate="$(cd "$candidate" && pwd -P)"
-  case "$candidate/" in
-    /run/* | /dev/*)
-      if ! has_git_marker_ancestry "$candidate"; then
-        masked_root="$candidate"
-        break
-      fi
-      ;;
-  esac
+  if has_sandbox_masked_ancestry "$candidate" &&
+    ! has_git_marker_ancestry "$candidate"; then
+    masked_root="$candidate"
+    break
+  fi
 done
 if [[ -n "$masked_root" ]]; then
   write_cargo_stub 'printf "%s\n" "$TMPDIR" >"$CARGO_STUB_LOG"'
@@ -259,12 +299,10 @@ if [[ -n "$masked_root" ]]; then
     XDG_RUNTIME_DIR="$masked_root" \
     bash "$probe_script" >/dev/null 2>&1
   selected_root="$(cat "$work/sandbox-visible-root.log")"
-  case "$selected_root/" in
-    /run/* | /dev/*)
-      echo "FAIL: the default probe used a sandbox-masked root: $selected_root"
-      exit 1
-      ;;
-  esac
+  if has_sandbox_masked_ancestry "$selected_root"; then
+    echo "FAIL: the default probe used a sandbox-masked root: $selected_root"
+    exit 1
+  fi
   status=0
   PATH="$work/bin:$PATH" bash "$probe_script" --probe-root "$masked_root" >/dev/null 2>&1 || status=$?
   if [[ "$status" -ne 2 ]]; then
