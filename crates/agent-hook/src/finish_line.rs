@@ -68,6 +68,36 @@ const CONTAINED_RUNNER_MAX_BYTES: u64 = 256 * 1024;
 const CONTAINED_RUNNER_CONTROL_MAX_BYTES: usize = 4 * 1024;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
+/// Fixed containment properties for one transient validation unit.
+///
+/// `TimeoutStopSec` must stay a positive bounded duration. Systemd reads `0` as
+/// a stop deadline that has already expired, not as "no stop timeout", so a
+/// teardown that still has to `SIGKILL` a live descendant can be recorded as
+/// `Result=timeout` with `ActiveState=failed` even though the main process
+/// exited cleanly and the cgroup drained. That made the `systemd-run --wait`
+/// client exit non-zero and turned a correct containment into
+/// `finish-line-containment-failed`, most often when the unit stopped within a
+/// few milliseconds of starting.
+///
+/// The bound does not soften containment. Descendants are still killed
+/// immediately by `KillMode=control-group` with `SIGKILL` as both the kill and
+/// final-kill signal; the bound only limits how long the manager waits for the
+/// cgroup to empty before reporting a genuine teardown failure.
+#[cfg(target_os = "linux")]
+const CONTAINED_UNIT_PROPERTIES: [&str; 11] = [
+    "--property=Type=exec",
+    "--property=KillMode=control-group",
+    "--property=KillSignal=SIGKILL",
+    "--property=FinalKillSignal=SIGKILL",
+    "--property=TimeoutStopSec=2s",
+    "--property=SendSIGKILL=yes",
+    "--property=Delegate=no",
+    "--property=PrivateUsers=yes",
+    "--property=RestrictSUIDSGID=yes",
+    "--property=RestrictAddressFamilies=AF_INET AF_INET6",
+    "--property=IPAddressDeny=localhost",
+];
+
 static VALIDATION_CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -1906,19 +1936,7 @@ fn execute_validation_command_platform(
     process
         .args(["--user", "--quiet", "--wait", "--pipe"])
         .arg(format!("--unit={unit}"))
-        .args([
-            "--property=Type=exec",
-            "--property=KillMode=control-group",
-            "--property=KillSignal=SIGKILL",
-            "--property=FinalKillSignal=SIGKILL",
-            "--property=TimeoutStopSec=0",
-            "--property=SendSIGKILL=yes",
-            "--property=Delegate=no",
-            "--property=PrivateUsers=yes",
-            "--property=RestrictSUIDSGID=yes",
-            "--property=RestrictAddressFamilies=AF_INET AF_INET6",
-            "--property=IPAddressDeny=localhost",
-        ])
+        .args(CONTAINED_UNIT_PROPERTIES)
         .arg(format!(
             "--property=OpenFile={executable_source}:nils-runner:read-only"
         ))
@@ -2038,6 +2056,7 @@ fn execute_validation_command_platform(
     })?;
     let _ = reset_contained_unit(unit);
     let reported = control.receive()?;
+    let runner_record = contained_runner_record_name(reported.as_ref());
     let (exit_code, observed_signal) = match reported {
         Some(ContainedRunnerOutcome::Exited { exit_code })
             if status.success()
@@ -2063,7 +2082,7 @@ fn execute_validation_command_platform(
         _ => {
             return Err(finish_line_unavailable(
                 "finish-line-containment-failed",
-                "finish-line contained runner did not reach an authenticated execution boundary",
+                &contained_boundary_disagreement(runner_record, status.success(), &unit_status),
             ));
         }
     };
@@ -2118,6 +2137,51 @@ fn execute_validation_command_platform(
 struct ContainedUnitStatus {
     exit_code: Option<i32>,
     signal: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+fn contained_runner_record_name(reported: Option<&ContainedRunnerOutcome>) -> &'static str {
+    match reported {
+        None => "absent",
+        Some(ContainedRunnerOutcome::Ready) => "ready",
+        Some(ContainedRunnerOutcome::Acknowledged) => "acknowledged",
+        Some(ContainedRunnerOutcome::Exited { .. }) => "exited",
+        Some(ContainedRunnerOutcome::Signaled { .. }) => "signaled",
+        Some(ContainedRunnerOutcome::InfrastructureFailure { .. }) => "infrastructure-failure",
+    }
+}
+
+/// Name the three independent teardown observers and what each of them saw.
+///
+/// An outcome is trusted only when the sealed runner record, the
+/// `systemd-run --wait` client status, and the manager's own accounting of the
+/// unit main process all agree. Reporting only that they disagreed makes an
+/// unavailable containment substrate, a manager that recorded a teardown
+/// failure, and a real containment regression render identically, so a reader
+/// cannot tell an environment problem from a lost security property. The
+/// rendered facts are the same bounded classifications a successful envelope
+/// already carries; no unit name, path, command, or caller identity appears.
+#[cfg(target_os = "linux")]
+fn contained_boundary_disagreement(
+    runner_record: &str,
+    client_reported_success: bool,
+    unit_status: &ContainedUnitStatus,
+) -> String {
+    let unit = match (unit_status.exit_code, unit_status.signal) {
+        (Some(code), _) => format!("exit:{code}"),
+        (None, Some(signal)) => format!("signal:{signal}"),
+        (None, None) => "indeterminate".to_string(),
+    };
+    let client = if client_reported_success {
+        "ok"
+    } else {
+        "failed"
+    };
+    format!(
+        "finish-line contained runner did not reach an authenticated execution boundary \
+         (sealed runner record={runner_record}; systemd-run client={client}; \
+         unit main={unit}); all three must agree before an outcome is trusted"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3497,6 +3561,71 @@ mod tests {
             lease_expires_at_epoch: 0,
             operations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn contained_unit_teardown_is_bounded_without_an_already_expired_stop_deadline() {
+        let stop = CONTAINED_UNIT_PROPERTIES
+            .iter()
+            .find_map(|property| property.strip_prefix("--property=TimeoutStopSec="))
+            .expect("a contained unit must declare its stop timeout");
+        // Systemd reads `0` as a stop deadline that already expired, so a
+        // teardown that has to kill a live descendant is recorded as
+        // `Result=timeout` and the waiting client exits non-zero even though
+        // containment succeeded. `infinity` would remove the bound entirely.
+        assert_ne!(stop, "0", "an immediate stop deadline fabricates a timeout");
+        assert_ne!(stop, "infinity", "unit teardown must stay bounded");
+        let seconds = stop
+            .strip_suffix('s')
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("stop timeout must be a bounded second count, got {stop}"));
+        assert!(
+            (1..=10).contains(&seconds),
+            "stop timeout must stay a small positive bound, got {stop}",
+        );
+        // The bound never replaces the immediate kill; that stays with the
+        // cgroup kill properties.
+        for required in [
+            "--property=KillMode=control-group",
+            "--property=KillSignal=SIGKILL",
+            "--property=FinalKillSignal=SIGKILL",
+            "--property=SendSIGKILL=yes",
+        ] {
+            assert!(
+                CONTAINED_UNIT_PROPERTIES.contains(&required),
+                "missing containment property {required}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_disagreeing_teardown_boundary_names_every_observer() {
+        let rendered = contained_boundary_disagreement(
+            contained_runner_record_name(Some(&ContainedRunnerOutcome::Exited { exit_code: 0 })),
+            false,
+            &ContainedUnitStatus {
+                exit_code: Some(0),
+                signal: None,
+            },
+        );
+        assert!(
+            rendered.contains("sealed runner record=exited"),
+            "{rendered}",
+        );
+        assert!(rendered.contains("systemd-run client=failed"), "{rendered}");
+        assert!(rendered.contains("unit main=exit:0"), "{rendered}");
+
+        let absent = contained_boundary_disagreement(
+            contained_runner_record_name(None),
+            true,
+            &ContainedUnitStatus {
+                exit_code: None,
+                signal: Some(libc::SIGKILL),
+            },
+        );
+        assert!(absent.contains("sealed runner record=absent"), "{absent}");
+        assert!(absent.contains("systemd-run client=ok"), "{absent}");
+        assert!(absent.contains("unit main=signal:9"), "{absent}");
     }
 
     #[test]
