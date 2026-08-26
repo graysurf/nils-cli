@@ -760,6 +760,8 @@ fn execute_inner(
         return Err(stale_preview_error(&record));
     }
 
+    crate::ensure_session_lifecycle_mutation_allowed(context, &record)?;
+
     if matches!(
         request.action,
         MaintenanceActionId::RetryResume | MaintenanceActionId::TerminateRuntimeThenResume

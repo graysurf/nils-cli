@@ -25592,6 +25592,8 @@ exit 0
         )
         .expect("clear active operation");
         let lock_probe_context = state.context.clone();
+        let lifecycle_context = state.context.clone();
+        let lifecycle_tmux = state.tmux_bin.clone();
         let responder = tokio::spawn(async move {
             let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
@@ -25619,6 +25621,18 @@ exit 0
                 .await
                 .expect("checkpoint must release the record lock before provider I/O")
                 .expect("record-lock probe worker");
+            let lifecycle = tokio::task::spawn_blocking(move || {
+                crate::resume_session_by_id(&lifecycle_context, "beta", &lifecycle_tmux)
+            });
+            let error = tokio::time::timeout(Duration::from_millis(250), lifecycle)
+                .await
+                .expect("lifecycle admission must remain bounded during checkpoint provider I/O")
+                .expect("lifecycle probe worker")
+                .expect_err("lifecycle mutation must be fenced while checkpoint steer is pending");
+            assert_eq!(
+                error.code(),
+                "coordination-notification-submission-in-progress"
+            );
             response
                 .send(Ok(expected_turn_id))
                 .expect("acknowledge checkpoint");

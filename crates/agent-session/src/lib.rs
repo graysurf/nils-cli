@@ -2581,6 +2581,25 @@ fn persist_initial_profile_context(
     Ok(())
 }
 
+pub(crate) fn ensure_session_lifecycle_mutation_allowed(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    let Some(incarnation) = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|incarnation| !incarnation.is_empty())
+    else {
+        return Ok(());
+    };
+    coordination::ensure_notification_submission_not_in_progress_for_session(
+        context,
+        &record.id,
+        incarnation,
+    )
+}
+
 struct CreatedRecord {
     record: SessionRecord,
     prompt_file: Option<PathBuf>,
@@ -9740,6 +9759,7 @@ fn resume_session_locked(
     mut record: SessionRecord,
     tmux_bin: &Path,
 ) -> Result<ResumeSessionOutcome, CliError> {
+    ensure_session_lifecycle_mutation_allowed(context, &record)?;
     orchestration::ensure_session_not_quarantined(context, &record)?;
     match session_status(context, tmux_bin, &record).as_str() {
         "running" => {
@@ -12207,6 +12227,7 @@ fn delete_session_locked_with_timeouts(
     kill_timeout: Duration,
     verify_timeout: Duration,
 ) -> Result<DeleteResult, CliError> {
+    ensure_session_lifecycle_mutation_allowed(context, &record)?;
     if dsh_external::is_external_record(&record) {
         // There is no tmux runtime to terminate, so deletion is admitted only
         // on positive evidence: the external runtime never attached, or the
@@ -12276,6 +12297,7 @@ fn delete_session_locked_after_failed_canary_proof(
     tmux_bin: &Path,
     proof: ProviderStopCanaryFailedStartupQuiescenceProof,
 ) -> Result<DeleteResult, CliError> {
+    ensure_session_lifecycle_mutation_allowed(context, &record)?;
     if !proof.matches(&record) || session_status(context, tmux_bin, &record) != "stopped" {
         return Err(session_termination_error(
             &record,
@@ -12293,6 +12315,7 @@ fn finish_session_delete(
     session_dir: PathBuf,
     registry_fence: SessionRegistryFence,
 ) -> Result<DeleteResult, CliError> {
+    ensure_session_lifecycle_mutation_allowed(context, &record)?;
     coordination::revoke(context, &record)?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
     let cleanup_pending = commit_session_directory_delete(context, &record.id, &session_dir)?;
@@ -12449,6 +12472,7 @@ pub(crate) fn stop_session_runtime_locked(
     record: &mut SessionRecord,
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
+    ensure_session_lifecycle_mutation_allowed(context, record)?;
     if dsh_external::is_external_record(record) {
         return Err(CliError::usage(
             "dsh-runtime-plugin-owned",

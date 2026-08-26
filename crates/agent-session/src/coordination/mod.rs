@@ -1950,7 +1950,7 @@ pub(crate) fn ensure_notification_submission_not_in_progress(
     if notification::submission_fences_session(registry, session_id, incarnation) {
         return Err(CliError::unavailable(
             "coordination-notification-submission-in-progress",
-            "claim or operation admission is fenced during exact terminal notification submission",
+            "claim, operation, or session lifecycle admission is fenced during exact notification submission",
             Some(serde_json::json!({
                 "retryable": true,
                 "next_action": "wait-for-notification-outcome",
@@ -1963,6 +1963,15 @@ pub(crate) fn ensure_notification_submission_not_in_progress(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn ensure_notification_submission_not_in_progress_for_session(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<(), CliError> {
+    let locked = lock_registry(context)?;
+    ensure_notification_submission_not_in_progress(&locked.registry, session_id, incarnation)
 }
 
 pub(crate) fn mark_notification_submitted(

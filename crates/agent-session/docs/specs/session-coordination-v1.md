@@ -648,8 +648,10 @@ authoritative-idle, detached, live-runtime, authoritative-broker, no-claim, and
 no-operation checks. The short `queued -> attempting` CAS is a per-session
 submission fence: claim and operation admission returns
 `coordination-notification-submission-in-progress` with typed retry guidance
-until the terminal submission boundary completes, while unrelated coordination
-registry work remains available. Claude additionally requires a `Stop` hook
+until the submission boundary completes. Stop, delete, resume, runtime
+replacement, and maintenance mutations for the exact incarnation share this
+admission fence, while account refresh and unrelated coordination registry
+work remain available. Claude additionally requires a `Stop` hook
 that survived a no-reactivation debounce. Terminal acceptance requires the
 byte-exact prompt as the content of a newer transcript-observed turn. A later
 provider observation reconciles `attempting` or `attempt_unknown`: an exact prompt proves
