@@ -25594,6 +25594,16 @@ exit 0
         let lock_probe_context = state.context.clone();
         let lifecycle_context = state.context.clone();
         let lifecycle_tmux = state.tmux_bin.clone();
+        let maintenance_context = state.context.clone();
+        let maintenance_tmux = state.tmux_bin.clone();
+        let maintenance_preview = crate::maintenance::preview(
+            &maintenance_context,
+            "beta",
+            &maintenance_tmux,
+            crate::maintenance::MaintenanceOperation::Delete,
+            crate::maintenance::MaintenanceContract::V1,
+        )
+        .expect("maintenance preview before notification submission");
         let responder = tokio::spawn(async move {
             let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
@@ -25632,6 +25642,43 @@ exit 0
             assert_eq!(
                 error.code(),
                 "coordination-notification-submission-in-progress"
+            );
+            let maintenance = tokio::task::spawn_blocking(move || {
+                crate::maintenance::execute_with_resume_guard(
+                    &maintenance_context,
+                    "beta",
+                    &maintenance_tmux,
+                    crate::maintenance::MaintenanceActionRequest {
+                        schema_version: crate::maintenance::MaintenanceContract::V1,
+                        operation: crate::maintenance::MaintenanceOperation::Delete,
+                        action: crate::maintenance::MaintenanceActionId::RetryDelete,
+                        expected_session_incarnation: maintenance_preview
+                            .session_incarnation
+                            .clone(),
+                        expected_session_generation: maintenance_preview.session_generation,
+                        expected_preview_digest: maintenance_preview.preview_digest.clone(),
+                        confirmed: true,
+                    },
+                    |_| Ok(()),
+                )
+            });
+            let maintenance_error = tokio::time::timeout(Duration::from_millis(250), maintenance)
+                .await
+                .expect("maintenance admission must remain bounded during checkpoint provider I/O")
+                .expect("maintenance probe worker")
+                .expect_err("maintenance mutation must preserve the checkpoint retry contract");
+            assert_eq!(
+                maintenance_error.code(),
+                "coordination-notification-submission-in-progress"
+            );
+            let maintenance_details = maintenance_error
+                .0
+                .details
+                .expect("notification submission retry details");
+            assert_eq!(maintenance_details["retryable"], true);
+            assert_eq!(
+                maintenance_details["next_action"],
+                "wait-for-notification-outcome"
             );
             response
                 .send(Ok(expected_turn_id))

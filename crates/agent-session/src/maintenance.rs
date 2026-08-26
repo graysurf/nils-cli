@@ -1055,6 +1055,7 @@ fn sanitize_maintenance_error(
             | "invalid-maintenance-preview-digest"
             | "maintenance-confirmation-required"
             | "session-maintenance-failed"
+            | "coordination-notification-submission-in-progress"
             | "agent-profile-unavailable"
             | "worker-quarantined"
     ) {
