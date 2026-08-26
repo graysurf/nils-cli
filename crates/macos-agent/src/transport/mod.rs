@@ -1574,6 +1574,77 @@ mod tests {
     }
 
     #[test]
+    fn merged_artifact_rows_follow_their_step_to_its_new_id() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+
+        // A second transfer carries an artifact produced by its own step-000001,
+        // which becomes step-000002 locally.
+        let payload = b"{\"sanitized\":true}";
+        let mut bundle = remote_exec_bundle("run-b", "second", "sha256:fixture");
+        let index = crate::journal::ArtifactIndex {
+            schema_version: "macos-agent.artifact-index.v1".into(),
+            artifacts: vec![crate::journal::ArtifactRecord {
+                sha256: format!("sha256:{}", super::hex(&sha2::Sha256::digest(payload))),
+                mime: "application/json".into(),
+                kind: "upstream_result".into(),
+                producing_step: "step-000001".into(),
+                sensitivity: "private".into(),
+                redaction: "sanitized".into(),
+                retention: "debug".into(),
+                relative_path: "artifacts/result.json".into(),
+            }],
+        };
+        bundle.push(transferred(
+            "artifacts/index.json",
+            &serde_json::to_vec(&index).expect("index"),
+        ));
+        bundle.push(transferred("artifacts/result.json", payload));
+        install_transferred_journal(&out, &bundle).expect("second transfer");
+
+        let merged: crate::journal::ArtifactIndex =
+            serde_json::from_slice(&fs::read(out.join("artifacts/index.json")).expect("index"))
+                .expect("parse index");
+        let row = merged
+            .artifacts
+            .iter()
+            .find(|row| row.relative_path == "artifacts/result.json")
+            .expect("merged row");
+        assert_eq!(
+            row.producing_step, "step-000002",
+            "an artifact must follow its step to the id the local journal assigned"
+        );
+        assert_eq!(
+            fs::read(out.join("artifacts/result.json")).expect("payload"),
+            payload,
+            "the artifact payload still installs directly"
+        );
+    }
+
+    #[test]
+    fn a_bundle_without_a_journal_installs_verbatim_as_before() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        let body = b"{\"collected\":true}";
+        let assigned = install_transferred_journal(&out, &[transferred("summary.json", body)])
+            .expect("install");
+        assert_eq!(
+            assigned, None,
+            "a response with no journal to merge assigns no step"
+        );
+        assert_eq!(
+            fs::read(out.join("summary.json")).expect("summary"),
+            body,
+            "a bundle this path does not recognize keeps the prior behavior"
+        );
+    }
+
+    #[test]
     fn ssh_transfers_append_to_one_journal_instead_of_replacing_it() {
         let root = TempDir::new().expect("root");
         let out = root.path().join("journal");
