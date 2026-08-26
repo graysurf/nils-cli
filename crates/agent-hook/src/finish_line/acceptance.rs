@@ -22,6 +22,7 @@ const MAX_REQUIREMENTS: usize = 128;
 const MAX_VALIDATORS_PER_REQUIREMENT: usize = 16;
 const MAX_INVALIDATORS: usize = 128;
 const MAX_OPERATIONS: usize = 512;
+const MAX_CLAIMED_SOURCES: usize = 512;
 const COMPACTION_TRIGGER_OPERATIONS: usize = 256;
 const COMPACTED_OPERATION_COUNT: usize = 192;
 
@@ -236,6 +237,8 @@ struct AcceptanceSession {
     evidence: BTreeMap<String, RequirementEvidence>,
     #[serde(default)]
     claimed_sources: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claimed_sources_generation: Option<u64>,
     sequence: u64,
 }
 
@@ -406,6 +409,7 @@ pub(super) fn register(state_root: &Path, input: &[u8]) -> Result<Outcome, HookE
     if terminalize_inactive_completion_reservations(&store, &mut state) {
         save_state(&store, &state)?;
     }
+    compact_claimed_sources(&mut state, store.state.generation);
     if let Some(existing) = state.sessions.get(&identity.session_key) {
         if existing.contract_digest == contract_digest && existing.contract == contract {
             let requirement_count = existing.contract.requirements.len();
@@ -415,6 +419,7 @@ pub(super) fn register(state_root: &Path, input: &[u8]) -> Result<Outcome, HookE
                 .get_mut(&identity.session_key)
                 .expect("acceptance session checked")
                 .sequence = sequence;
+            compact_released_sessions(&mut state, &store.state.sessions)?;
             save_state(&store, &state)?;
             return Ok(success_outcome(
                 json!({
@@ -432,13 +437,6 @@ pub(super) fn register(state_root: &Path, input: &[u8]) -> Result<Outcome, HookE
             "finish-line acceptance contract is immutable for the active DSH session",
         ));
     }
-    compact_released_sessions(&mut state, &store.state.sessions);
-    if state.sessions.len() >= super::MAX_SESSIONS {
-        return Err(HookError::data(
-            "finish-line-state-limit",
-            "finish-line acceptance session limit is reached",
-        ));
-    }
     let requirement_count = contract.requirements.len();
     let sequence = state.next_sequence()?;
     state.sessions.insert(
@@ -448,9 +446,17 @@ pub(super) fn register(state_root: &Path, input: &[u8]) -> Result<Outcome, HookE
             contract,
             evidence: BTreeMap::new(),
             claimed_sources: BTreeSet::new(),
+            claimed_sources_generation: Some(store.state.generation),
             sequence,
         },
     );
+    compact_released_sessions(&mut state, &store.state.sessions)?;
+    if state.sessions.len() > super::MAX_SESSIONS {
+        return Err(HookError::data(
+            "finish-line-state-limit",
+            "finish-line acceptance session limit is reached",
+        ));
+    }
     save_state(&store, &state)?;
     Ok(success_outcome(
         json!({
@@ -486,6 +492,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
     if terminalize_inactive_completion_reservations(&store, &mut state) {
         save_state(&store, &state)?;
     }
+    compact_state(&mut state, store.state.generation);
     let session = acceptance_session(&state, &identity, &request.contract_digest)?;
     let source_operation_key = validate_admission_binding(
         session,
@@ -540,7 +547,6 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
         ));
     }
 
-    compact_state(&mut state, store.state.generation);
     if state.operations.len() >= MAX_OPERATIONS {
         return Err(HookError::data(
             "finish-line-state-limit",
@@ -599,6 +605,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
                 .get_mut(&operation_key)
                 .expect("inserted acceptance mutation")
                 .admission = AdmissionStatus::Admitted;
+            compact_claimed_sources(&mut state, generation);
             save_state(&store, &state)?;
             Ok(admit_outcome(&identity, &request, "mutation", generation))
         }
@@ -618,18 +625,23 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
                 ));
             }
             let sequence = state.next_sequence()?;
-            if let Some(source) = source_operation_key.as_ref()
-                && state
+            if let Some(source) = source_operation_key.as_ref() {
+                let session = state
                     .sessions
                     .get(&identity.session_key)
-                    .expect("validated acceptance session")
-                    .claimed_sources
-                    .contains(source)
-            {
-                return Err(HookError::data(
-                    "finish-line-acceptance-source-operation-claimed",
-                    "the contained validation source operation is already claimed",
-                ));
+                    .expect("validated acceptance session");
+                if session.claimed_sources.contains(source) {
+                    return Err(HookError::data(
+                        "finish-line-acceptance-source-operation-claimed",
+                        "the contained validation source operation is already claimed",
+                    ));
+                }
+                if session.claimed_sources.len() >= MAX_CLAIMED_SOURCES {
+                    return Err(HookError::data(
+                        "finish-line-state-limit",
+                        "finish-line acceptance contained source claim limit is reached",
+                    ));
+                }
             }
             state.operations.insert(
                 operation_key,
@@ -654,6 +666,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
                 .expect("validated acceptance session");
             if let Some(source) = source_operation_key {
                 session.claimed_sources.insert(source);
+                session.claimed_sources_generation = Some(generation);
             }
             session.evidence.insert(
                 requirement.clone(),
@@ -824,6 +837,9 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
     validate_runner_capability(&store, &identity, &request.runner_capability)?;
     let mut state = read_state(&store, &identity)?;
     if terminalize_inactive_completion_reservations(&store, &mut state) {
+        save_state(&store, &state)?;
+    }
+    if compact_claimed_sources(&mut state, store.state.generation) {
         save_state(&store, &state)?;
     }
     let session = acceptance_session(&state, &identity, &request.contract_digest)?;
@@ -1434,6 +1450,7 @@ fn reconcile_reserved_mutation(
         .get_mut(operation_key)
         .expect("reserved acceptance operation")
         .admission = AdmissionStatus::Admitted;
+    compact_claimed_sources(state, operation.generation);
     save_state(store, state)
 }
 
@@ -1826,13 +1843,17 @@ fn read_state(store: &Store, identity: &RequestIdentity) -> Result<AcceptanceSta
     Ok(state)
 }
 
-fn save_state(store: &Store, state: &AcceptanceState) -> Result<(), HookError> {
-    let bytes = serde_json::to_vec(state).map_err(|_| {
+fn serialized_state(state: &AcceptanceState) -> Result<Vec<u8>, HookError> {
+    serde_json::to_vec(state).map_err(|_| {
         HookError::runtime(
             "finish-line-acceptance-state-serialize-failed",
             "finish-line acceptance state could not be serialized",
         )
-    })?;
+    })
+}
+
+fn save_state(store: &Store, state: &AcceptanceState) -> Result<(), HookError> {
+    let bytes = serialized_state(state)?;
     if bytes.len() as u64 > STATE_MAX_BYTES {
         return Err(HookError::data(
             "finish-line-state-limit",
@@ -1843,6 +1864,7 @@ fn save_state(store: &Store, state: &AcceptanceState) -> Result<(), HookError> {
 }
 
 fn compact_state(state: &mut AcceptanceState, current_generation: u64) {
+    compact_claimed_sources(state, current_generation);
     if state.operations.len() < COMPACTION_TRIGGER_OPERATIONS {
         return;
     }
@@ -1866,14 +1888,38 @@ fn compact_state(state: &mut AcceptanceState, current_generation: u64) {
     }
 }
 
+fn compact_claimed_sources(state: &mut AcceptanceState, current_generation: u64) -> bool {
+    let mut changed = false;
+    for session in state.sessions.values_mut() {
+        match session.claimed_sources_generation {
+            Some(generation) if generation != current_generation => {
+                session.claimed_sources.clear();
+                session.claimed_sources_generation = Some(current_generation);
+                changed = true;
+            }
+            None => {
+                // Preserve pre-field claims fail closed for the generation in which they are
+                // first observed. A confirmed later generation advance can then discard them.
+                session.claimed_sources_generation = Some(current_generation);
+                changed = true;
+            }
+            Some(_) => {}
+        }
+    }
+    changed
+}
+
 fn compact_released_sessions(
     state: &mut AcceptanceState,
     active_sessions: &BTreeMap<String, super::SessionState>,
-) {
-    if state.sessions.len() < super::MAX_SESSIONS {
-        return;
+) -> Result<(), HookError> {
+    let over_limit = |state: &AcceptanceState| -> Result<bool, HookError> {
+        Ok(state.sessions.len() > super::MAX_SESSIONS
+            || serialized_state(state)?.len() as u64 > STATE_MAX_BYTES)
+    };
+    if !over_limit(state)? {
+        return Ok(());
     }
-    let remove_count = state.sessions.len().saturating_sub(super::MAX_SESSIONS - 1);
     let mut released = state
         .sessions
         .iter()
@@ -1886,12 +1932,16 @@ fn compact_released_sessions(
         .map(|(session_key, session)| (session.sequence, session_key.clone()))
         .collect::<Vec<_>>();
     released.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    for (_, session_key) in released.into_iter().take(remove_count) {
+    for (_, session_key) in released {
         state.sessions.remove(&session_key);
         state
             .operations
             .retain(|_, operation| operation.session_key != session_key);
+        if !over_limit(state)? {
+            break;
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1931,6 +1981,44 @@ mod tests {
             },
             evidence: BTreeMap::new(),
             claimed_sources: BTreeSet::new(),
+            claimed_sources_generation: Some(1),
+            sequence,
+        }
+    }
+
+    fn large_legal_session(sequence: u64) -> AcceptanceSession {
+        let mut requirements = BTreeMap::new();
+        for requirement_index in 0..24 {
+            let requirement_name =
+                format!("requirement-{requirement_index:02}-{}", "r".repeat(220));
+            assert!(requirement_name.len() <= super::super::MAX_ID_BYTES);
+            let mut validators = BTreeMap::new();
+            for validator_index in 0..8 {
+                let validator_id = format!("validator-{validator_index:02}-{}", "v".repeat(220));
+                assert!(validator_id.len() <= super::super::MAX_ID_BYTES);
+                validators.insert(
+                    validator_id,
+                    ValidatorContract {
+                        binding_digest:
+                            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        execution: ValidatorExecution::HostObserved,
+                    },
+                );
+            }
+            requirements.insert(requirement_name, RequirementContract { validators });
+        }
+        AcceptanceSession {
+            contract_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            contract: AcceptanceContract {
+                requirements,
+                invalidators: BTreeSet::new(),
+            },
+            evidence: BTreeMap::new(),
+            claimed_sources: BTreeSet::new(),
+            claimed_sources_generation: Some(1),
             sequence,
         }
     }
@@ -1958,7 +2046,7 @@ mod tests {
     #[test]
     fn session_pressure_evicts_only_the_oldest_released_acceptance_session() {
         let mut state = AcceptanceState::new("repo");
-        for sequence in 0..super::super::MAX_SESSIONS as u64 {
+        for sequence in 0..=super::super::MAX_SESSIONS as u64 {
             let key = format!("session-{sequence:03}");
             state.sessions.insert(key.clone(), session(sequence));
             let mut session_operation = operation(sequence, true);
@@ -1971,9 +2059,9 @@ mod tests {
             super::super::SessionState::default(),
         );
 
-        compact_released_sessions(&mut state, &active);
+        compact_released_sessions(&mut state, &active).expect("compact released sessions");
 
-        assert_eq!(state.sessions.len(), super::super::MAX_SESSIONS - 1);
+        assert_eq!(state.sessions.len(), super::super::MAX_SESSIONS);
         assert!(state.sessions.contains_key("session-000"));
         assert!(!state.sessions.contains_key("session-001"));
         assert!(!state.operations.contains_key("session-001"));
@@ -1982,7 +2070,7 @@ mod tests {
     #[test]
     fn session_pressure_never_evicts_an_unresolved_older_incarnation() {
         let mut state = AcceptanceState::new("repo");
-        for sequence in 0..super::super::MAX_SESSIONS as u64 {
+        for sequence in 0..=super::super::MAX_SESSIONS as u64 {
             let key = format!("session-{sequence:03}");
             state.sessions.insert(key.clone(), session(sequence));
             let mut session_operation = operation(sequence, true);
@@ -1995,12 +2083,35 @@ mod tests {
             .expect("oldest operation")
             .terminal = None;
 
-        compact_released_sessions(&mut state, &BTreeMap::new());
+        compact_released_sessions(&mut state, &BTreeMap::new()).expect("compact released sessions");
 
-        assert_eq!(state.sessions.len(), super::super::MAX_SESSIONS - 1);
+        assert_eq!(state.sessions.len(), super::super::MAX_SESSIONS);
         assert!(state.sessions.contains_key("session-000"));
         assert!(state.operations.contains_key("session-000"));
         assert!(!state.sessions.contains_key("session-001"));
+    }
+
+    #[test]
+    fn session_byte_pressure_evicts_released_sessions_below_the_count_limit() {
+        let mut state = AcceptanceState::new("repo");
+        for sequence in 0..6_u64 {
+            state.sessions.insert(
+                format!("session-{sequence:03}"),
+                large_legal_session(sequence),
+            );
+        }
+        assert!(state.sessions.len() < super::super::MAX_SESSIONS);
+        assert!(
+            serde_json::to_vec(&state).expect("serialize state").len() as u64 > STATE_MAX_BYTES
+        );
+
+        compact_released_sessions(&mut state, &BTreeMap::new()).expect("compact released sessions");
+
+        assert!(
+            serde_json::to_vec(&state).expect("serialize state").len() as u64 <= STATE_MAX_BYTES
+        );
+        assert!(!state.sessions.contains_key("session-000"));
+        assert!(state.sessions.contains_key("session-005"));
     }
 
     #[test]

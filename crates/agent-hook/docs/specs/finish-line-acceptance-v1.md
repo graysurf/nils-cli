@@ -219,8 +219,14 @@ validation contracts are satisfied.
 Every invocation reconstructs the verdict from durable state. Terminal
 operations are compacted oldest-first while active operations and completion
 reservations,
-current-generation mutation blockers, current requirement evidence, claimed
-contained sources, and a bounded recent idempotency window remain. Session
+current-generation mutation blockers, current requirement evidence, and a
+bounded recent idempotency window remain. Contained-source claims are bound to
+the repository generation in which they were admitted, remain exact and
+single-use within that generation, fail closed at 512 claims per session and
+generation, and are discarded only after a confirmed generation advance.
+An untagged claim set is first preserved as current-generation claims.
+Released sessions are evicted oldest-first whenever either the 64-session
+limit or the prospective serialized 384 KiB limit requires space. Session
 pressure never evicts a session with a non-terminal acceptance operation.
 Session release refuses any non-terminal mutation or validator operation
 regardless of capability incarnation, and terminalizes its own completion
