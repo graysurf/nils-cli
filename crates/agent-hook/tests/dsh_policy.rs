@@ -1672,6 +1672,8 @@ fn unsafe_default_delivery_blocks_default_branch_and_allows_feature_refs() {
         ),
         ("git fetch origin feature:refs/heads/feature", 0, "allow"),
         ("git push origin feature", 0, "allow"),
+        ("git --version", 0, "allow"),
+        ("git --version unexpected", 1, "block"),
         ("git log HEAD~1", 0, "allow"),
         ("git for-each-ref --format='%(refname)'", 0, "allow"),
         ("git grep 'foo.*'", 0, "allow"),

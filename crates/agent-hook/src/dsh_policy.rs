@@ -2833,6 +2833,9 @@ fn semantic_delivery_blocked(
 }
 
 fn git_delivery_context(words: &[String], base: &Path) -> Result<Option<(PathBuf, usize)>, ()> {
+    if matches!(words, [executable, flag] if basename(executable) == "git" && flag == "--version") {
+        return Ok(None);
+    }
     let mut target = base.to_path_buf();
     let mut index = 1;
     while index < words.len() {
