@@ -282,7 +282,22 @@ struct AgentLaunchProfile {
     provider_config_dir: Option<PathBuf>,
     readiness_args: Vec<String>,
     auto_resume_supported: bool,
+    graceful_shutdown: Option<AgentLaunchProfileGracefulShutdown>,
     codex_usage_account: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum AgentLaunchProfileGracefulShutdown {
+    DoubleCtrlC,
+}
+
+impl AgentLaunchProfileGracefulShutdown {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DoubleCtrlC => "double-ctrl-c",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,6 +312,8 @@ struct AgentLaunchProfileConfig {
     readiness_args: Vec<String>,
     #[serde(default)]
     auto_resume_supported: bool,
+    #[serde(default)]
+    graceful_shutdown: Option<AgentLaunchProfileGracefulShutdown>,
     /// Optional authoritative Codex usage account nickname for a `claude`
     /// profile that runs on a Codex/GPT backend. Absent leaves behavior
     /// unchanged (auto-resume keys off native Claude usage).
@@ -395,6 +412,7 @@ impl AgentLaunchProfiles {
                 provider_config_dir: config.provider_config_dir,
                 readiness_args: config.readiness_args,
                 auto_resume_supported: config.auto_resume_supported,
+                graceful_shutdown: config.graceful_shutdown,
                 codex_usage_account: config
                     .codex_usage_account
                     .map(|nick| nick.trim().to_string()),
@@ -3914,6 +3932,10 @@ async fn create_handler(
             profile_auto_resume_supported: launch_profile
                 .as_ref()
                 .map(|profile| profile.auto_resume_supported),
+            profile_graceful_shutdown: launch_profile
+                .as_ref()
+                .and_then(|profile| profile.graceful_shutdown)
+                .map(|mode| mode.as_str().to_string()),
             codex_usage_account: launch_profile
                 .as_ref()
                 .and_then(|profile| profile.codex_usage_account.clone()),
@@ -3952,6 +3974,10 @@ async fn create_handler(
         initial_profile_auto_resume_supported: launch_profile
             .as_ref()
             .map(|profile| profile.auto_resume_supported),
+        initial_profile_graceful_shutdown: launch_profile
+            .as_ref()
+            .and_then(|profile| profile.graceful_shutdown)
+            .map(|mode| mode.as_str().to_string()),
         initial_codex_usage_account: launch_profile
             .as_ref()
             .and_then(|profile| profile.codex_usage_account.clone()),
@@ -8416,6 +8442,52 @@ mod tests {
 
         fs::write(&launcher, "#!/usr/bin/env sh\nexit 1\n").unwrap();
         assert!(profiles.probe_ready_summaries().is_empty());
+    }
+
+    #[test]
+    fn launch_profiles_accept_a_bounded_double_ctrl_c_graceful_shutdown_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launcher = executable(
+            &tmp.path().join("dsh-tui-launcher"),
+            "#!/usr/bin/env sh\nexit 0\n",
+        );
+
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id": "dsh-tui",
+                "label": "DSH TUI",
+                "agent": "hermes",
+                "agent_bin": launcher,
+                "graceful_shutdown": "double-ctrl-c",
+            }])
+            .to_string(),
+        )
+        .expect("the fixed graceful-shutdown mode is valid server-owned profile metadata");
+
+        assert_eq!(profiles.entries.len(), 1);
+    }
+
+    #[test]
+    fn launch_profiles_reject_unknown_graceful_shutdown_contracts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launcher = executable(
+            &tmp.path().join("dsh-tui-launcher"),
+            "#!/usr/bin/env sh\nexit 0\n",
+        );
+
+        let error = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id": "dsh-tui",
+                "label": "DSH TUI",
+                "agent": "hermes",
+                "agent_bin": launcher,
+                "graceful_shutdown": "force-kill",
+            }])
+            .to_string(),
+        )
+        .expect_err("unknown shutdown behavior must fail the server-owned profile parser closed");
+
+        assert_eq!(error.code(), "invalid-agent-launch-profiles");
     }
 
     #[test]
@@ -14710,6 +14782,7 @@ esac
                 "provider_config_dir":config_dir,
                 "readiness_args":["--check"],
                 "auto_resume_supported":false,
+                "graceful_shutdown":"double-ctrl-c",
             }])
             .to_string(),
         )
@@ -14773,6 +14846,14 @@ esac
             Some(config_dir)
         );
         assert!(!crate::session_profile_auto_resume_supported(&record));
+        assert_eq!(
+            record
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.extra.get("agent_profile_graceful_shutdown"))
+                .and_then(Value::as_str),
+            Some("double-ctrl-c")
+        );
     }
 
     #[tokio::test]

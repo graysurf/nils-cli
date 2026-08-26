@@ -4268,6 +4268,7 @@ fn run_worker_start_single_input(
                 initial_agent_profile: None,
                 initial_provider_config_dir: launch_provider_config_dir.clone(),
                 initial_profile_auto_resume_supported: None,
+                initial_profile_graceful_shutdown: None,
                 initial_codex_usage_account: None,
                 agent,
                 cwd: Some(PathBuf::from(&launch_input.launch.cwd)),
