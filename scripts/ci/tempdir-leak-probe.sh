@@ -23,7 +23,8 @@
 # Do NOT point TMPDIR inside any repository work tree. Many tests assert that a
 # path is outside a git repository (`*_outside_git_repo`, `not_a_repo`), and a
 # TMPDIR with Git marker ancestry invalidates those fixtures. The probe therefore
-# selects the first writable system temp root outside Git marker ancestry.
+# selects the first writable system temp root outside Git marker ancestry and
+# outside host paths hidden by workspace sandbox mount plans.
 #
 # Compatibility: must run on macOS (system bash 3.2) and Linux runners. Avoid
 # associative arrays, mapfile, and `${var,,}` lowercasing.
@@ -45,7 +46,9 @@ nextest arguments are given.
                      to raise the odds of catching one.
   --probe-root <dir> where to create the private TMPDIR (default: the first
                      writable system temp root outside Git marker ancestry).
-                     Must not have Git marker ancestry.
+                     Must not have Git marker ancestry or live below `/run` or
+                     `/dev`, which workspace sandboxes replace with private
+                     mounts.
   --allow <glob>     tolerate a surviving entry whose name matches <glob>.
                      Repeatable. Only for state a test deliberately reuses
                      across runs under a fixed name — such state is bounded, so
@@ -134,6 +137,21 @@ has_git_marker_ancestry() {
   done
 }
 
+SANDBOX_MASKED_ROOTS="/run /proc /dev"
+
+has_sandbox_masked_ancestry() {
+  local path="$1"
+  local root
+  for root in $SANDBOX_MASKED_ROOTS; do
+    case "$path/" in
+      "$root"/*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 select_default_probe_root() {
   local candidate
   local candidate_abs
@@ -142,7 +160,8 @@ select_default_probe_root() {
     [ -d "$candidate" ] || continue
     [ -w "$candidate" ] || continue
     candidate_abs="$(cd "$candidate" && pwd -P)" || continue
-    if ! has_git_marker_ancestry "$candidate_abs"; then
+    if ! has_git_marker_ancestry "$candidate_abs" &&
+      ! has_sandbox_masked_ancestry "$candidate_abs"; then
       printf '%s\n' "$candidate_abs"
       return 0
     fi
@@ -166,6 +185,11 @@ probe_root_abs="$(cd "$probe_root" && pwd -P)"
 if has_git_marker_ancestry "$probe_root_abs"; then
   echo "tempdir-leak-probe: --probe-root must be outside Git marker ancestry;" >&2
   echo "  tests that assert a path is outside a git repo fail under it." >&2
+  exit 2
+fi
+if has_sandbox_masked_ancestry "$probe_root_abs"; then
+  echo "tempdir-leak-probe: --probe-root must remain visible to sandboxed tests;" >&2
+  echo "  /run and /dev are replaced by private mounts." >&2
   exit 2
 fi
 
