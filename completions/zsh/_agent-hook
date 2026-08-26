@@ -446,7 +446,7 @@ _agent-hook__subcmd__finish-line_commands() {
 'register:Register one immutable named acceptance contract for a DSH session' \
 'admit:Admit one exact structured mutation or validator before its body runs' \
 'observe:Record one authenticated terminal observation for an admitted operation' \
-'verdict:Return the detached authoritative acceptance verdict' \
+'verdict:Return the authoritative verdict and optionally reserve completion' \
 'stop:Decide whether every current validation target is satisfied' \
 'status:Inspect bounded redacted finish-line state' \
     )
