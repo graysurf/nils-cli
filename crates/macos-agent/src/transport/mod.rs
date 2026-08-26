@@ -896,16 +896,21 @@ fn install_transferred_journal(
     let mut manifest_body = Vec::new();
     let mut steps_body = Vec::new();
     let mut index_body = None;
+    // Control files are decoded here rather than installed, so their bytes must
+    // still be charged against the one transfer budget the payload install
+    // enforces. Charging them separately would multiply the bound by the number
+    // of parts the bundle was split into.
+    let mut spent = 0usize;
     for file in files {
         match file.relative_path.as_str() {
-            "manifest.json" => manifest_body = decode_transferred(file)?,
-            "steps.jsonl" => steps_body = decode_transferred(file)?,
-            "artifacts/index.json" => index_body = Some(decode_transferred(file)?),
+            "manifest.json" => manifest_body = decode_transferred(file, &mut spent)?,
+            "steps.jsonl" => steps_body = decode_transferred(file, &mut spent)?,
+            "artifacts/index.json" => index_body = Some(decode_transferred(file, &mut spent)?),
             other if JOURNAL_CONTROL_FILES.contains(&other) => {}
             _ => payload.push(file.clone()),
         }
     }
-    install_transferred_files(root, &payload)?;
+    install_transferred_files_within(root, &payload, spent)?;
 
     let manifest = serde_json::from_slice(&manifest_body)
         .map_err(|_| transport_error("remote journal manifest is malformed"))?;
@@ -927,11 +932,12 @@ fn install_transferred_journal(
     Ok(assigned.last().cloned())
 }
 
-fn decode_transferred(file: &TransferredFile) -> Result<Vec<u8>, CliError> {
+fn decode_transferred(file: &TransferredFile, spent: &mut usize) -> Result<Vec<u8>, CliError> {
     let body = base64::engine::general_purpose::STANDARD
         .decode(&file.data_base64)
         .map_err(|_| transport_error("remote artifact encoding is malformed"))?;
-    if body.len() > MAX_TRANSFER_BYTES || hex(&Sha256::digest(&body)) != file.sha256 {
+    *spent = spent.saturating_add(body.len());
+    if *spent > MAX_TRANSFER_BYTES || hex(&Sha256::digest(&body)) != file.sha256 {
         return Err(transport_error(
             "remote artifact digest or bundle size is invalid",
         ));
@@ -964,6 +970,16 @@ fn rebind_journal_step(result: &mut Option<serde_json::Value>, step: Option<Stri
 }
 
 fn install_transferred_files(root: &Path, files: &[TransferredFile]) -> Result<(), CliError> {
+    install_transferred_files_within(root, files, 0)
+}
+
+/// Install transferred payload files against a shared transfer budget, so a
+/// bundle split into separately decoded parts still respects one size bound.
+fn install_transferred_files_within(
+    root: &Path,
+    files: &[TransferredFile],
+    spent: usize,
+) -> Result<(), CliError> {
     if files.len() > MAX_TRANSFER_FILES {
         return Err(transport_error(
             "remote artifact response exceeds its file bound",
@@ -977,7 +993,7 @@ fn install_transferred_files(root: &Path, files: &[TransferredFile]) -> Result<(
         ));
     }
     create_private_dir(root)?;
-    let mut total = 0usize;
+    let mut total = spent;
     for file in files {
         validate_relative(&file.relative_path)?;
         let body = base64::engine::general_purpose::STANDARD
@@ -1300,8 +1316,9 @@ mod tests {
 
     use super::{
         MAX_REMOTE_SESSION_ROOTS, ProcessGroupChild, TransferredFile, collect_files,
-        create_bounded_remote_session, install_transferred_files, install_transferred_journal,
-        read_bounded_line, remove_session, validate_host, validate_relative,
+        create_bounded_remote_session, decode_transferred, install_transferred_files,
+        install_transferred_journal, read_bounded_line, remove_session, validate_host,
+        validate_relative,
     };
 
     #[test]
@@ -1480,6 +1497,80 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("step"))
             .collect()
+    }
+
+    #[test]
+    fn control_bytes_and_payload_share_one_transfer_budget() {
+        // Splitting a bundle into separately decoded parts must not multiply
+        // the size bound by the number of parts.
+        let mut spent = 0usize;
+        let first = transferred("manifest.json", b"0123456789");
+        let second = transferred("steps.jsonl", b"01234");
+        decode_transferred(&first, &mut spent).expect("first");
+        assert_eq!(spent, 10);
+        decode_transferred(&second, &mut spent).expect("second");
+        assert_eq!(spent, 15, "each decoded part charges the shared budget");
+
+        let mut exhausted = super::MAX_TRANSFER_BYTES;
+        assert!(
+            decode_transferred(&second, &mut exhausted).is_err(),
+            "a decoded control file must respect an already spent budget"
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_cannot_fit_the_rotation_bound_is_refused_whole() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        fs::create_dir_all(&out).expect("out");
+
+        // Seed a journal that is already at the bound. Appending until the
+        // bound is hit would leave a partially merged transfer behind an error.
+        let bundle = remote_exec_bundle("run-a", "seed", "sha256:fixture");
+        let manifest = bundle
+            .iter()
+            .find(|file| file.relative_path == "manifest.json")
+            .expect("manifest");
+        let mut spent = 0usize;
+        fs::write(
+            out.join("manifest.json"),
+            decode_transferred(manifest, &mut spent).expect("manifest body"),
+        )
+        .expect("write manifest");
+        let template: crate::journal::StepRecord = serde_json::from_slice(
+            &decode_transferred(
+                bundle
+                    .iter()
+                    .find(|file| file.relative_path == "steps.jsonl")
+                    .expect("steps"),
+                &mut spent,
+            )
+            .expect("steps body"),
+        )
+        .expect("template");
+        let mut seeded = Vec::new();
+        for sequence in 1..=512u64 {
+            let mut step = template.clone();
+            step.sequence = sequence;
+            step.id = format!("step-{sequence:06}");
+            seeded.extend(serde_json::to_vec(&step).expect("step"));
+            seeded.push(b'\n');
+        }
+        fs::write(out.join("steps.jsonl"), &seeded).expect("write steps");
+
+        assert!(
+            install_transferred_journal(
+                &out,
+                &remote_exec_bundle("run-b", "overflow", "sha256:fixture")
+            )
+            .is_err(),
+            "a transfer past the rotation bound must be refused"
+        );
+        assert_eq!(
+            journal_steps(&out).len(),
+            512,
+            "the refused transfer must not have partially merged"
+        );
     }
 
     #[test]

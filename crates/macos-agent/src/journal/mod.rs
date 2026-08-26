@@ -616,18 +616,21 @@ pub fn ingest_transfer(root: &Path, transfer: TransferredJournal) -> Result<Vec<
     ensure_index(root)?;
 
     recover_sequence_transaction(root)?;
-    let (existing, recovered_tail) = read_steps_recover(root)?;
-    write_sequence(root, existing.len() as u64)?;
+    let (mut merged, recovered_tail) = read_steps_recover(root)?;
+    write_sequence(root, merged.len() as u64)?;
+
+    // Refuse a transfer that cannot fit whole. Appending until the bound is hit
+    // would leave a partially merged transfer behind an error.
+    if merged.len().saturating_add(transfer.steps.len()) as u64 > MAX_JOURNAL_STEPS {
+        return Err(journal_error(
+            "journal rotation is required at the 512-step bound; use a new output directory",
+        ));
+    }
 
     let mut assigned = Vec::new();
     let mut remapped = BTreeMap::<String, String>::new();
     for step in transfer.steps {
         let committed = read_sequence(root)?;
-        if committed >= MAX_JOURNAL_STEPS {
-            return Err(journal_error(
-                "journal rotation is required at the 512-step bound; use a new output directory",
-            ));
-        }
         let sequence = committed + 1;
         let id = format!("step-{sequence:06}");
         let remote_id = step.id.clone();
@@ -660,6 +663,7 @@ pub fn ingest_transfer(root: &Path, transfer: TransferredJournal) -> Result<Vec<
         remove_sequence_transaction(root)?;
         remapped.insert(remote_id, id.clone());
         assigned.push(id);
+        merged.push(record);
     }
 
     if let Some(remote_index) = transfer.index {
@@ -686,8 +690,9 @@ pub fn ingest_transfer(root: &Path, transfer: TransferredJournal) -> Result<Vec<
         write_json(&root.join("artifacts/index.json"), &index)?;
     }
 
-    let (merged, recovered) = read_steps_recover(root)?;
-    let summary = build_summary(&merged, recovered_tail || recovered);
+    // The merged log is already in hand, so the summary is rebuilt without a
+    // second full rescan of the journal on every transfer.
+    let summary = build_summary(&merged, recovered_tail);
     write_json(&root.join("summary.json"), &summary)?;
     write_redaction_report(root)?;
     Ok(assigned)
