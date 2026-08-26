@@ -1563,6 +1563,12 @@ fn derive_contained_observation(
             "finish-line acceptance contained source has a host-observed contract",
         ));
     };
+    if acceptance_operation.generation < store.state.generation {
+        // The authenticated validator reservation can no longer contribute evidence after a
+        // confirmed generation advance. Terminalize it without deriving success from a newer
+        // source run so release cannot be blocked by an impossible exact-generation result.
+        return Ok(ObservationStatus::Uncertain);
+    }
     let operation = store.state.operations.get(operation_key).ok_or_else(|| {
         HookError::data(
             "finish-line-acceptance-contained-operation-missing",
@@ -1838,6 +1844,16 @@ fn read_state(store: &Store, identity: &RequestIdentity) -> Result<AcceptanceSta
         return Err(HookError::data(
             "finish-line-acceptance-state-invalid",
             "finish-line acceptance state schema or repository binding is invalid",
+        ));
+    }
+    if state.sessions.values().any(|session| {
+        session
+            .claimed_sources_generation
+            .is_some_and(|generation| generation > store.state.generation)
+    }) {
+        return Err(HookError::data(
+            "finish-line-acceptance-state-invalid",
+            "finish-line acceptance contained source claims have a future generation",
         ));
     }
     Ok(state)

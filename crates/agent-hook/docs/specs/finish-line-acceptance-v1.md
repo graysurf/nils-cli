@@ -119,7 +119,10 @@ A validator admission records `active` evidence at the current generation. A
 new attempt for the same requirement supersedes the earlier attempt. A
 mutation may race an active validator by advancing the generation; the older
 validator completion then becomes `stale` and cannot satisfy the new
-generation. Mutation serialization is repository-wide, not session-local:
+generation. An authenticated contained observation for such an obsolete
+reservation terminalizes it as non-success `uncertain`/`stale` without deriving
+success from a source run in the newer generation, so it cannot block release
+indefinitely. Mutation serialization is repository-wide, not session-local:
 acceptance mutations, ordinary supervised Bash, and earlier validation
 admission cannot cross an active mutation boundary. A validator or another
 mutation cannot start while any acceptance mutation or ordinary supervised
@@ -224,7 +227,9 @@ bounded recent idempotency window remain. Contained-source claims are bound to
 the repository generation in which they were admitted, remain exact and
 single-use within that generation, fail closed at 512 claims per session and
 generation, and are discarded only after a confirmed generation advance.
-An untagged claim set is first preserved as current-generation claims.
+An untagged claim set is first preserved as current-generation claims. A claim
+set tagged with a future generation is corrupt state and fails closed without
+rewriting the sidecar.
 Released sessions are evicted oldest-first whenever either the 64-session
 limit or the prospective serialized 384 KiB limit requires space. Session
 pressure never evicts a session with a non-terminal acceptance operation.

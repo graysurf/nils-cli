@@ -804,12 +804,20 @@ fn persisted_mutation_admission_crash_boundaries_reconcile_once_and_drift_blocks
             .next()
             .expect("mutation operation");
         operation["admission"] = json!("reserved");
-        write_json(&acceptance_path, &acceptance_state);
+        for session in acceptance_state["sessions"]
+            .as_object_mut()
+            .expect("acceptance sessions")
+            .values_mut()
+        {
+            session["claimed_sources"] = json!([support::sha256(b"pre-mutation-contained-source")]);
+            session["claimed_sources_generation"] = json!(expected_generation - 1);
+        }
         if !main_generation_already_advanced {
             let mut main_state = read_json(&main_path);
             main_state["generation"] = json!(expected_generation - 1);
             write_json(&main_path, &main_state);
         }
+        write_json(&acceptance_path, &acceptance_state);
 
         let retried = admit_mutation(
             &fixture,
@@ -822,12 +830,24 @@ fn persisted_mutation_admission_crash_boundaries_reconcile_once_and_drift_blocks
         assert_eq!(retried.1["data"]["status"], "duplicate");
         assert_eq!(retried.1["data"]["generation"], expected_generation);
         assert_eq!(read_json(&main_path)["generation"], expected_generation);
+        let reconciled_state = read_json(&acceptance_path);
         assert!(
-            read_json(&acceptance_path)["operations"]
+            reconciled_state["operations"]
                 .as_object()
                 .expect("acceptance operations")
                 .values()
                 .all(|operation| operation["admission"] == "admitted")
+        );
+        assert!(
+            reconciled_state["sessions"]
+                .as_object()
+                .expect("acceptance sessions")
+                .values()
+                .all(|session| session["claimed_sources"]
+                    .as_array()
+                    .expect("claimed sources")
+                    .is_empty()),
+            "reconciliation must discard claims from the prior generation"
         );
         let duplicate = admit_mutation(
             &fixture,
@@ -1026,6 +1046,48 @@ fn generation_advance_prunes_contained_source_claim_history() {
     assert!(
         claimed_sources.is_empty(),
         "a confirmed generation advance must discard prior-generation claims"
+    );
+}
+
+#[test]
+fn future_claim_generation_is_corrupt_and_never_pruned() {
+    let fixture = fixture();
+    let capability = open(&fixture, "session-future-claim-generation");
+    let registered = register(&fixture, "session-future-claim-generation", &capability).1;
+    let contract_digest = registered["data"]["contract_digest"]
+        .as_str()
+        .expect("contract digest");
+    let (main_path, acceptance_path) = finish_line_state_paths(&fixture);
+    let current_generation = read_json(&main_path)["generation"]
+        .as_u64()
+        .expect("main generation");
+    let mut state = read_json(&acceptance_path);
+    let session = state["sessions"]
+        .as_object_mut()
+        .expect("acceptance sessions")
+        .values_mut()
+        .next()
+        .expect("acceptance session");
+    session["claimed_sources"] = json!([support::sha256(b"reserved-future-source")]);
+    session["claimed_sources_generation"] = json!(current_generation + 1);
+    write_json(&acceptance_path, &state);
+    let before = std::fs::read(&acceptance_path).expect("read corrupt acceptance state");
+
+    let rejected = verdict(
+        &fixture,
+        "session-future-claim-generation",
+        &capability,
+        contract_digest,
+    );
+    assert_eq!(rejected.0, 65, "envelope={}", rejected.1);
+    assert_eq!(
+        rejected.1["error"]["code"],
+        "finish-line-acceptance-state-invalid"
+    );
+    assert_eq!(
+        std::fs::read(&acceptance_path).expect("reread corrupt acceptance state"),
+        before,
+        "future-generation corruption must not erase single-use claim evidence"
     );
 }
 
@@ -1502,6 +1564,100 @@ fn contained_bash_success_is_derived_only_from_the_exact_nils_run() {
         verdict(&fixture, "session-contained", &capability, contract_digest,).0,
         0
     );
+}
+
+#[test]
+fn contained_validator_terminalizes_stale_after_a_generation_race() {
+    let fixture = fixture();
+    let command = ":";
+    install_bash_contract(&fixture, command);
+    let capability = open(&fixture, "session-contained-stale");
+    let mut registration = common(&fixture, "session-contained-stale", "turn-register");
+    registration["schema_version"] = json!("agent-hook.finish-line.register.v1");
+    registration["runner_capability"] = json!(capability);
+    registration["requirements"] = json!([{
+        "name": "contained",
+        "validators": [{
+            "id": "contained-validator",
+            "tool_name": "Bash",
+            "definition_digest": VALIDATOR_DEFINITION,
+            "execution": {
+                "kind": "contained-bash",
+                "intent": "project-dev",
+                "command": command,
+            },
+        }],
+    }]);
+    registration["invalidators"] = json!([{
+        "tool_name": "edit",
+        "definition_digest": MUTATION_DEFINITION,
+    }]);
+    let registered = call(&fixture, "register", &registration).1;
+    let contract_digest = registered["data"]["contract_digest"]
+        .as_str()
+        .expect("contract digest");
+    let admitted = admit_validator_binding(
+        &fixture,
+        "session-contained-stale",
+        &capability,
+        contract_digest,
+        "acceptance-contained-stale",
+        "contained",
+        "contained-validator",
+        "Bash",
+        VALIDATOR_DEFINITION,
+        Some("nils-contained-stale-run"),
+    );
+    assert_eq!(admitted.0, 0, "envelope={}", admitted.1);
+    let mutation = admit_mutation(
+        &fixture,
+        "session-contained-stale",
+        &capability,
+        contract_digest,
+        "mutation-after-contained-admission",
+    );
+    assert_eq!(mutation.0, 0, "envelope={}", mutation.1);
+    let mutation_terminal = observe(
+        &fixture,
+        "session-contained-stale",
+        &capability,
+        "mutation-after-contained-admission",
+        "succeeded",
+    );
+    assert_eq!(mutation_terminal.0, 0, "envelope={}", mutation_terminal.1);
+
+    let mut run = common(
+        &fixture,
+        "session-contained-stale",
+        "turn-contained-stale-run",
+    );
+    run["schema_version"] = json!("agent-hook.finish-line.run.v1");
+    run["operation_id"] = json!("nils-contained-stale-run");
+    run["intent"] = json!("project-dev");
+    run["command"] = json!(command);
+    run["runner_capability"] = json!(capability);
+    run["timeout_ms"] = json!(5_000);
+    run["execution"] = json!({
+        "kind": "bash-v1",
+        "workdir": fixture.root,
+        "output_max_bytes": 64 * 1024,
+        "runner": {"kind": "danger-full-access"},
+    });
+    let executed = call(&fixture, "run", &run);
+    assert_eq!(executed.0, 0, "envelope={}", executed.1);
+
+    let observed = observe_contained(
+        &fixture,
+        "session-contained-stale",
+        &capability,
+        "acceptance-contained-stale",
+        "nils-contained-stale-run",
+    );
+    assert_eq!(observed.0, 0, "envelope={}", observed.1);
+    assert_eq!(observed.1["data"]["status"], "stale");
+    assert_eq!(observed.1["data"]["observation"], "uncertain");
+    let released = release(&fixture, "session-contained-stale", &capability);
+    assert_eq!(released.0, 0, "envelope={}", released.1);
 }
 
 #[test]
