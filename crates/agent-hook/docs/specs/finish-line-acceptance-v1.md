@@ -127,7 +127,7 @@ Bash operation remains active in the repository.
 
 An all-satisfied `verdict` may atomically reserve goal completion under the
 same repository lock. While that operation remains non-terminal, every
-generation-changing acceptance mutation, legacy edit, and ordinary supervised
+generation-changing acceptance mutation, pre-acceptance edit, and ordinary supervised
 Bash admission is denied with `finish-line-completion-reserved`. Validators
 remain eligible because they cannot advance the generation. The exact owning
 capability consumes or cancels the reservation through the existing
