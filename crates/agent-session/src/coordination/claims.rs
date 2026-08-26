@@ -641,6 +641,7 @@ pub(crate) fn set_declared(
     incarnation: &str,
     candidate: WorkContextInput,
     reject_conflict: bool,
+    if_absent: bool,
 ) -> Result<Value, CliError> {
     let _session_authority = lock_claim_session_authority(context, record, incarnation)?;
     let mut candidate = candidate.validate_and_canonicalize()?;
@@ -673,6 +674,25 @@ pub(crate) fn set_declared(
             && claim.session_incarnation == incarnation
             && claim.state == "active"
     });
+    if if_absent && let Some(index) = existing_index {
+        let existing = &locked.registry.claims[index];
+        let existing_input = input_from_record(existing);
+        let complete =
+            complete_relevant_universe(context, &locked.registry, Some((&record.id, incarnation)));
+        let evaluation = evaluate(
+            Some((&record.id, incarnation)),
+            &existing_input,
+            &locked.registry.claims,
+            complete,
+            !reject_conflict,
+        );
+        return Ok(json!({
+            "schema_version": "agent-session.work-context-set-result.v1",
+            "changed": false,
+            "context": public_context(existing)?,
+            "evaluation": evaluation,
+        }));
+    }
     let complete =
         complete_relevant_universe(context, &locked.registry, Some((&record.id, incarnation)));
     let evaluation = evaluate(

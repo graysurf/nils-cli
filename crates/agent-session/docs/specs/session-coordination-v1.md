@@ -504,6 +504,11 @@ caller-supplied file, revision, claim ID, or idempotency key. In advisory/off
 mode a definite overlap is returned but does not reject the declaration. In
 enforce mode it retains raw claim conflict rejection. High-level `clear` is
 idempotent and still refuses to orphan a nonterminal enforce operation.
+`set --if-absent` is the atomic integration form: while holding the registry
+lock it returns an existing active declaration unchanged, including its tier,
+references, scopes, summary, claim identity, and revision; only a session with
+no active declaration creates the supplied context. It never replaces or
+downgrades a concurrently established declaration.
 
 Acknowledgement is keyed to the exact session incarnation and the most recent
 canonical advisory observation, and expires after a caller-selected duration
@@ -747,7 +752,7 @@ Every leaf command has its own CLI envelope identity, for example
 
 ```text
 agent-session work-context status
-agent-session work-context set [--summary TEXT] [--intent NAME] [--tier L0|L1|L2|L3] [--repository OWNER/REPO] [--path PATH]... [--issue N]... [--pr N]... [--plan-ref REF]...
+agent-session work-context set [--if-absent] [--summary TEXT] [--intent NAME] [--tier L0|L1|L2|L3] [--repository OWNER/REPO] [--path PATH]... [--issue N]... [--pr N]... [--plan-ref REF]...
 agent-session work-context clear
 agent-session work-context advise [--targets-file JSON]
 agent-session work-context acknowledge [--for DURATION]

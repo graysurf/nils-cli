@@ -49,6 +49,10 @@ agent-session work-context clear
 
 Declared context is optional in `advisory` mode. Presence and the optional
 context are renewed while the broker is live and released with the broker.
+Runtime integrations that need a baseline declaration without overwriting a
+user- or workflow-owned claim use `work-context set --if-absent`. The check and
+conditional creation are one registry-locked transaction; composing `status`
+and `set` is not an equivalent race-free substitute.
 
 ### Path scope syntax
 
