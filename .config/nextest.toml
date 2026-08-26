@@ -8,10 +8,15 @@
 [profile.ci]
 # Retry a test that fails then passes, instead of failing the whole run. The
 # workspace has a few tests that are reliable in isolation but flake under
-# full-workspace parallelism (see issue #934); without retries a single such
-# flake spuriously reds the `test` / `test_macos` gate and blocks merge.
-# nextest still reports flaky-passes distinctly, so flakes stay visible. This
-# is mitigation; the root-cause isolation fix is tracked in #934.
+# full-workspace parallelism; without retries a single such flake spuriously
+# reds the `test` / `test_macos` gate and blocks merge.
+#
+# A retried pass is recorded as `<flakyFailure>` in `junit.xml` and printed as
+# `FLAKY n/m` in the job log, but the published JUnit check does not surface it
+# while `flaky_summary` stays at its default, so a masked flake is easy to miss.
+#
+# This is mitigation. Root-causing the masked flakes and lowering `retries` is
+# tracked in #1524 (the follow-up #934 planned but did not open).
 retries = 2
 
 # Process-containment fixtures own kernel tracking resources that cannot be
