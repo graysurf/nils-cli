@@ -225,7 +225,13 @@ recorded in `sympoies/nils-cli#1409`.
   and it exposes no mailbox body, receipt key, capability, incarnation, or
   provider turn identifier. The full state, adapter, and privacy contract is in
   [Session coordination v1](session-coordination-v1.md#notification-ownership).
-  Codex app-server runtimes use acknowledged structured submission.
+  Codex app-server runtimes use acknowledged structured submission: idle turns
+  use `turn/start`, while an authoritative active turn uses `turn/steer` with
+  its exact `expectedTurnId`. The control connection transiently maps the
+  durable projected turn fence back to the matching raw active turn id; raw
+  ids never enter session documents or API projections. Long-running work observes the body-free prompt
+  at the provider's next model checkpoint. Both paths retain the exact
+  incarnation and no-claim/no-operation generation fence.
   Terminal-backed Codex and Claude runtimes use the same notification-generation CAS
   plus exact incarnation, idle-turn, live-runtime, and detached-session
   rechecks before one fixed body-free prompt and a single Enter. The terminal

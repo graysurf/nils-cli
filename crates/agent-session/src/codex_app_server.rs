@@ -1464,6 +1464,7 @@ pub(crate) struct StructuredFailure {
 #[derive(Debug)]
 pub(crate) struct FailureReducer {
     thread_id: String,
+    active_turn_id: Option<String>,
     pending_turns: BTreeMap<String, Option<StructuredFailureKind>>,
     pending_order: VecDeque<String>,
     completed_turns: BTreeSet<String>,
@@ -1474,6 +1475,7 @@ impl FailureReducer {
     pub(crate) fn new(thread_id: impl Into<String>) -> Self {
         Self {
             thread_id: thread_id.into(),
+            active_turn_id: None,
             pending_turns: BTreeMap::new(),
             pending_order: VecDeque::new(),
             completed_turns: BTreeSet::new(),
@@ -1482,6 +1484,7 @@ impl FailureReducer {
     }
 
     pub(crate) fn ingest(&mut self, message: &Value) -> Option<StructuredFailure> {
+        self.observe_turn_lifecycle(message);
         match message.get("method").and_then(Value::as_str) {
             Some("error") => {
                 let params = message.get("params")?;
@@ -1543,6 +1546,50 @@ impl FailureReducer {
             }
             _ => None,
         }
+    }
+
+    fn observe_turn_lifecycle(&mut self, message: &Value) {
+        let method = message.get("method").and_then(Value::as_str);
+        let thread_id = message.pointer("/params/threadId").and_then(Value::as_str);
+        let turn_id = message
+            .pointer("/params/turn/id")
+            .and_then(Value::as_str)
+            .filter(|turn_id| protocol_id_is_valid(turn_id));
+        if thread_id != Some(self.thread_id.as_str()) {
+            return;
+        }
+        match (method, turn_id) {
+            (Some("turn/started"), Some(turn_id)) => self.note_started(turn_id),
+            (Some("turn/completed"), Some(turn_id))
+                if self.active_turn_id.as_deref() == Some(turn_id) =>
+            {
+                self.active_turn_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn note_started(&mut self, turn_id: &str) {
+        if protocol_id_is_valid(turn_id) {
+            self.active_turn_id = Some(turn_id.to_string());
+        }
+    }
+
+    fn raw_turn_for_projection(
+        &self,
+        runtime_id: &str,
+        expected_projected_turn_id: &str,
+    ) -> Result<String, String> {
+        let raw_turn_id = self
+            .active_turn_id
+            .as_deref()
+            .ok_or_else(|| "Codex active turn identity is unavailable".to_string())?;
+        let projected = crate::activity::projected_codex_turn_identifier(runtime_id, raw_turn_id)
+            .map_err(|_| "Codex active turn identity is invalid".to_string())?;
+        if projected != expected_projected_turn_id {
+            return Err("Codex active turn changed before steering".to_string());
+        }
+        Ok(raw_turn_id.to_string())
     }
 }
 
@@ -1676,6 +1723,47 @@ pub(crate) fn continuation_request(id: u64, thread_id: &str, message: &str) -> V
     })
 }
 
+pub(crate) fn steering_request(
+    id: u64,
+    thread_id: &str,
+    expected_turn_id: &str,
+    message: &str,
+) -> Value {
+    json!({
+        "id": id,
+        "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": expected_turn_id,
+            "input": [{ "type": "text", "text": message, "text_elements": [] }]
+        }
+    })
+}
+
+pub(crate) fn latest_turn_request(id: u64, thread_id: &str) -> Value {
+    json!({
+        "id": id,
+        "method": "thread/turns/list",
+        "params": {
+            "threadId": thread_id,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded"
+        }
+    })
+}
+
+fn latest_in_progress_turn_id(result: &Value) -> Option<&str> {
+    let turn = result.get("data")?.as_array()?.first()?;
+    (turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+        .then(|| {
+            turn.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| protocol_id_is_valid(id))
+        })
+        .flatten()
+}
+
 pub(crate) fn loaded_thread_ids(result: &Value) -> Option<Vec<String>> {
     let data = result.get("data")?.as_array()?;
     data.iter()
@@ -1768,6 +1856,11 @@ pub(crate) enum ControlCommand {
         message: String,
         response: oneshot::Sender<Result<String, String>>,
     },
+    Steer {
+        message: String,
+        expected_turn_id: String,
+        response: oneshot::Sender<Result<String, String>>,
+    },
     Continue {
         message: String,
         response: oneshot::Sender<Result<String, String>>,
@@ -1834,6 +1927,32 @@ impl ControlHandle {
         })
         .await
         .map_err(|_| "codex turn submission timed out".to_string())?
+    }
+
+    pub(crate) async fn steer_prompt(
+        &self,
+        message: &str,
+        expected_turn_id: &str,
+    ) -> Result<String, String> {
+        let (response, receive) = oneshot::channel();
+        tokio::time::timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            self.sender.send(ControlCommand::Steer {
+                message: message.to_string(),
+                expected_turn_id: expected_turn_id.to_string(),
+                response,
+            }),
+        )
+        .await
+        .map_err(|_| "codex turn steering enqueue timed out".to_string())?
+        .map_err(|_| "codex control connection unavailable".to_string())?;
+        // Once the command is queued, the caller's durable notification fence
+        // must remain held until the bounded control handler answers or the
+        // connection closes. Timing out here would let a late provider write
+        // outlive that fence and overlap a newly admitted atomic operation.
+        receive
+            .await
+            .map_err(|_| "codex control connection closed".to_string())?
     }
 
     pub(crate) async fn bind_account(
@@ -2065,6 +2184,23 @@ async fn control_account_ready(
     record: &SessionRecord,
     external_auth_account: Option<&str>,
 ) -> Result<(), String> {
+    control_account_ready_with(context, record, external_auth_account, false).await
+}
+
+async fn control_terminal_account_ready(
+    context: &CliContext,
+    record: &SessionRecord,
+    external_auth_account: Option<&str>,
+) -> Result<(), String> {
+    control_account_ready_with(context, record, external_auth_account, true).await
+}
+
+async fn control_account_ready_with(
+    context: &CliContext,
+    record: &SessionRecord,
+    external_auth_account: Option<&str>,
+    allow_pending_next: bool,
+) -> Result<(), String> {
     let check_context = context.clone();
     let id = record.id.clone();
     let launch_id = record
@@ -2085,7 +2221,11 @@ async fn control_account_ready(
                 Some(json!({ "id": current.id })),
             ));
         }
-        crate::codex_account::ensure_input_allowed(&current)?;
+        if allow_pending_next {
+            crate::codex_account::ensure_terminal_input_allowed(&current)?;
+        } else {
+            crate::codex_account::ensure_input_allowed(&current)?;
+        }
         Ok::<_, CliError>(crate::codex_account::selected_account(&current))
     })
     .await
@@ -2194,6 +2334,7 @@ pub(crate) async fn run_control(
                     ));
                 }
                 ControlCommand::Prompt { response, .. }
+                | ControlCommand::Steer { response, .. }
                 | ControlCommand::Continue { response, .. } => {
                     let _ = response.send(Err(
                         "Codex account binding is not ready; retry the account switch".to_string(),
@@ -2355,6 +2496,117 @@ pub(crate) async fn run_control(
                                 .map(str::to_string)
                                 .ok_or_else(|| "Codex turn/start response omitted the acknowledged turn id".to_string())
                         });
+                        if let Ok(turn_id) = result.as_deref() {
+                            reducer.note_started(turn_id);
+                        }
+                        let _ = response.send(result);
+                    }
+                    ControlCommand::Steer {
+                        message,
+                        expected_turn_id,
+                        response,
+                    } => {
+                        if let Err(error) = control_terminal_account_ready(
+                            &context,
+                            &record,
+                            external_auth_account.as_deref(),
+                        )
+                        .await
+                        {
+                            let _ = response.send(Err(error));
+                            continue;
+                        }
+                        if reducer.active_turn_id.is_none() {
+                            request_id = request_id.saturating_add(1);
+                            if let Err(error) = send_json(
+                                &mut websocket,
+                                latest_turn_request(request_id, &thread_id),
+                            )
+                            .await
+                            {
+                                let _ = response.send(Err(error));
+                                return Err("Codex active turn recovery write failed".to_string());
+                            }
+                            let recovered = receive_response_with_timeout(
+                                &mut websocket,
+                                request_id,
+                                Some((&context, &record, &mut reducer)),
+                                external_auth_account
+                                    .as_deref()
+                                    .map(|account| (&context, &record, account)),
+                                CONTROL_RESPONSE_TIMEOUT,
+                            )
+                            .await
+                            .and_then(|value| {
+                                latest_in_progress_turn_id(&value)
+                                    .map(str::to_string)
+                                    .ok_or_else(|| {
+                                        "Codex active turn identity is unavailable".to_string()
+                                    })
+                            });
+                            match recovered {
+                                Ok(turn_id) => reducer.note_started(&turn_id),
+                                Err(error) => {
+                                    let _ = response.send(Err(error));
+                                    continue;
+                                }
+                            }
+                        }
+                        let runtime_id = record
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| runtime.launch_id.as_str())
+                            .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+                        let raw_turn_id = match reducer
+                            .raw_turn_for_projection(runtime_id, &expected_turn_id)
+                        {
+                            Ok(turn_id) => turn_id,
+                            Err(error) => {
+                                let _ = response.send(Err(error));
+                                continue;
+                            }
+                        };
+                        request_id = request_id.saturating_add(1);
+                        if let Err(err) = send_json(
+                            &mut websocket,
+                            steering_request(
+                                request_id,
+                                &thread_id,
+                                &raw_turn_id,
+                                &message,
+                            ),
+                        )
+                        .await
+                        {
+                            let _ = response.send(Err(err));
+                            return Err("Codex turn steering request write failed".to_string());
+                        }
+                        let result = receive_response_with_timeout(
+                            &mut websocket,
+                            request_id,
+                            Some((&context, &record, &mut reducer)),
+                            external_auth_account
+                                .as_deref()
+                                .map(|account| (&context, &record, account)),
+                            CONTROL_SUBMISSION_TIMEOUT,
+                        )
+                        .await
+                        .and_then(|value| {
+                            let acknowledged = value
+                                .get("turnId")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    "Codex turn/steer response omitted the acknowledged turn id"
+                                        .to_string()
+                                })?;
+                            if acknowledged != raw_turn_id {
+                                return Err(
+                                    "Codex turn/steer response acknowledged a different turn id"
+                                        .to_string(),
+                                );
+                            }
+                            Ok(expected_turn_id)
+                        });
                         let _ = response.send(result);
                     }
                     ControlCommand::Continue { message, response } => {
@@ -2413,6 +2665,9 @@ pub(crate) async fn run_control(
                                 .map(str::to_string)
                                 .ok_or_else(|| "Codex turn/start response omitted the acknowledged turn id".to_string())
                         });
+                        if let Ok(turn_id) = result.as_deref() {
+                            reducer.note_started(turn_id);
+                        }
                         let _ = response.send(result);
                     }
                     ControlCommand::BindAccount { account, revision, response } => {
@@ -4258,6 +4513,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn steering_request_fences_the_exact_active_turn() {
+        assert_eq!(
+            steering_request(9, "thread-fixture", "turn-fixture", "mailbox checkpoint"),
+            json!({
+                "id": 9,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": "thread-fixture",
+                    "expectedTurnId": "turn-fixture",
+                    "input": [{
+                        "type": "text",
+                        "text": "mailbox checkpoint",
+                        "text_elements": []
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn latest_turn_recovery_requests_metadata_only_and_accepts_only_in_progress() {
+        assert_eq!(
+            latest_turn_request(10, "thread-fixture"),
+            json!({
+                "id": 10,
+                "method": "thread/turns/list",
+                "params": {
+                    "threadId": "thread-fixture",
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded"
+                }
+            })
+        );
+        assert_eq!(
+            latest_in_progress_turn_id(&json!({
+                "data": [{"id": "raw-active-turn", "status": "inProgress", "items": []}],
+                "nextCursor": null
+            })),
+            Some("raw-active-turn")
+        );
+        assert_eq!(
+            latest_in_progress_turn_id(&json!({
+                "data": [{"id": "raw-completed-turn", "status": "completed", "items": []}],
+                "nextCursor": null
+            })),
+            None
+        );
+    }
+
     struct PendingMessageSink;
 
     impl futures_util::Sink<Message> for PendingMessageSink {
@@ -5651,6 +5957,30 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queued_steer_waits_for_handler_so_its_durable_fence_cannot_expire_early() {
+        let (handle, mut commands) = control_channel();
+        let task = tokio::spawn(async move {
+            handle
+                .steer_prompt("mailbox checkpoint", "projected-active-turn")
+                .await
+        });
+        let command = commands.recv().await.expect("queued steer");
+        let ControlCommand::Steer { response, .. } = command else {
+            panic!("expected steer command");
+        };
+
+        tokio::time::advance(CONTROL_SUBMIT_TOTAL_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            !task.is_finished(),
+            "an enqueued steer must keep its caller-side fence until the handler answers"
+        );
+        response
+            .send(Ok("projected-active-turn".to_string()))
+            .expect("complete steer");
+        assert_eq!(task.await.unwrap().unwrap(), "projected-active-turn");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn submit_timeout_covers_resume_plus_turn_acknowledgement_budget() {
         let (handle, mut commands) = control_channel();
         let responder = tokio::spawn(async move {
@@ -5710,6 +6040,45 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             reducer.ingest(&error),
             None,
             "a completed turn cannot be re-armed"
+        );
+    }
+
+    #[test]
+    fn reducer_keeps_raw_active_turn_transient_and_matches_only_its_projection() {
+        let mut reducer = FailureReducer::new("thread-a");
+        reducer.ingest(&json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-a",
+                "turn": { "id": "raw-turn-a", "status": "inProgress" }
+            }
+        }));
+        let projected = crate::activity::projected_codex_turn_identifier("runtime-a", "raw-turn-a")
+            .expect("project raw active turn");
+        assert_eq!(
+            reducer
+                .raw_turn_for_projection("runtime-a", &projected)
+                .expect("match exact projection"),
+            "raw-turn-a"
+        );
+        assert!(
+            reducer
+                .raw_turn_for_projection("runtime-a", "local:v1:stale")
+                .is_err()
+        );
+
+        reducer.ingest(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-a",
+                "turn": { "id": "raw-turn-a", "status": "completed" }
+            }
+        }));
+        assert!(
+            reducer
+                .raw_turn_for_projection("runtime-a", &projected)
+                .is_err(),
+            "completed turns must no longer accept steering"
         );
     }
 
@@ -10271,6 +10640,105 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
     }
 
     #[tokio::test]
+    async fn unix_control_recovers_raw_active_turn_after_reconnect_before_steering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("reconnect.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("reconnect-control", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize = receive_json(&mut socket).await;
+            respond(&mut socket, &initialize, json!({})).await;
+            assert_eq!(receive_json(&mut socket).await["method"], "initialized");
+            let loaded = receive_json(&mut socket).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            respond(
+                &mut socket,
+                &loaded,
+                json!({"data": ["raw-reconnect-thread"], "nextCursor": null}),
+            )
+            .await;
+            let usage = receive_json(&mut socket).await;
+            assert_eq!(usage["method"], "account/rateLimits/read");
+            respond(
+                &mut socket,
+                &usage,
+                json!({
+                    "rateLimits": {
+                        "primary": {"usedPercent": 0.0, "resetsAt": null},
+                        "secondary": null
+                    }
+                }),
+            )
+            .await;
+
+            let recovery = receive_json(&mut socket).await;
+            assert_eq!(recovery["method"], "thread/turns/list");
+            assert_eq!(recovery["params"]["threadId"], "raw-reconnect-thread");
+            assert_eq!(recovery["params"]["itemsView"], "notLoaded");
+            respond(
+                &mut socket,
+                &recovery,
+                json!({
+                    "data": [{
+                        "id": "raw-recovered-active-turn",
+                        "status": "inProgress",
+                        "items": []
+                    }],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }),
+            )
+            .await;
+            let steering = receive_json(&mut socket).await;
+            assert_eq!(steering["method"], "turn/steer");
+            assert_eq!(
+                steering["params"]["expectedTurnId"],
+                "raw-recovered-active-turn"
+            );
+            respond(
+                &mut socket,
+                &steering,
+                json!({"turnId": "raw-recovered-active-turn"}),
+            )
+            .await;
+        });
+
+        let (handle, commands) = control_channel();
+        let control_context = context.clone();
+        let control_record = record.clone();
+        let control =
+            tokio::spawn(
+                async move { run_control(control_context, control_record, commands).await },
+            );
+        let projected_turn_id = crate::activity::projected_codex_turn_identifier(
+            "runtime-reconnect-control",
+            "raw-recovered-active-turn",
+        )
+        .expect("project recovered active turn");
+        assert_eq!(
+            handle
+                .steer_prompt("mailbox checkpoint", &projected_turn_id)
+                .await
+                .unwrap(),
+            projected_turn_id
+        );
+        server.await.unwrap();
+        drop(handle);
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
     async fn unix_control_projects_live_failure_and_acknowledges_exact_turn_without_content() {
         let tmp = tempfile::TempDir::new().unwrap();
         let socket = tmp.path().join("codex.sock");
@@ -10423,6 +10891,17 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
                 json!({ "turn": { "id": "acknowledged-turn", "status": "inProgress" } }),
             )
             .await;
+            let steering = receive_json(&mut socket).await;
+            assert_eq!(steering["method"], "turn/steer");
+            assert_eq!(steering["params"]["threadId"], "raw-thread-a");
+            assert_eq!(steering["params"]["expectedTurnId"], "acknowledged-turn");
+            assert_eq!(steering["params"]["input"][0]["text"], "mailbox checkpoint");
+            respond(
+                &mut socket,
+                &steering,
+                json!({ "turnId": "acknowledged-turn" }),
+            )
+            .await;
         });
 
         let (handle, commands) = control_channel();
@@ -10439,6 +10918,31 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         assert_eq!(
             handle.submit("private continuation").await.unwrap(),
             "acknowledged-turn"
+        );
+        assert_eq!(
+            crate::auto_resume::pending_sessions(&context, 1_893_456_000)
+                .unwrap()
+                .usage_ids,
+            vec![id.to_string()]
+        );
+        crate::codex_account::queue_next_account_with_unbound(
+            &context,
+            id,
+            "runtime-control",
+            "sym",
+        )
+        .expect("queue the next account during the active turn");
+        let projected_turn_id = crate::activity::projected_codex_turn_identifier(
+            "runtime-control",
+            "acknowledged-turn",
+        )
+        .expect("project active turn id");
+        assert_eq!(
+            handle
+                .steer_prompt("mailbox checkpoint", &projected_turn_id)
+                .await
+                .unwrap(),
+            projected_turn_id
         );
         server.await.unwrap();
         drop(handle);
@@ -10461,11 +10965,5 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         ] {
             assert!(!activity.contains(secret));
         }
-        assert_eq!(
-            crate::auto_resume::pending_sessions(&context, 1_893_456_000)
-                .unwrap()
-                .usage_ids,
-            vec![id.to_string()]
-        );
     }
 }

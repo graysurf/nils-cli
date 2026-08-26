@@ -631,8 +631,18 @@ restores the encoded generation and state; an acknowledged generation remains
 submitted, while an in-flight generation becomes `attempt_unknown` rather than
 being retried.
 
-App-server Codex uses prompt-v2 control and counts only an acknowledged turn
-submission. Terminal-backed Codex and Claude use the controller-owned
+App-server Codex uses prompt-v2 control. An authoritatively idle turn receives
+one acknowledged `turn/start`; an authoritative `working` or `needs_input`
+turn with an exact active provider turn id receives `turn/steer` fenced by
+`expectedTurnId`. Durable activity keeps only the runtime-scoped projection;
+the matching control incarnation retains the raw id transiently, proves its
+projection still equals that durable fence, and sends only the raw id back to
+Codex. The latter queues the body-free prompt for the provider's
+next in-turn model checkpoint instead of waiting for the whole task to become
+idle. Both paths count only the matching acknowledged turn id and require the
+same exact incarnation, authoritative broker, no active claim, and no active
+or uncertain operation before their generation CAS. Terminal-backed Codex and
+Claude use the controller-owned
 private-buffer paste plus a separate Enter after exact-incarnation,
 authoritative-idle, detached, live-runtime, authoritative-broker, no-claim, and
 no-operation checks. The short `queued -> attempting` CAS is a per-session
@@ -646,8 +656,11 @@ provider observation reconciles `attempting` or `attempt_unknown`: an exact prom
 `prompt_submitted`, a current transcript without it safely requeues, and
 unavailable observation leaves the attempt parked.
 
-Busy, attached, rate-limited, controller-unavailable, and provider-not-ready
-targets remain queued with a bounded safe reason. Replaced incarnations,
+Busy app-server Codex without an authoritative steerable turn, attached or
+busy terminal runtimes, rate-limited, controller-unavailable, and
+provider-not-ready targets remain queued with a bounded safe reason. A
+rejected or outcome-unknown `turn/steer` is retained as `attempt_unknown` for
+the same transcript-based reconciliation used by idle submission. Replaced incarnations,
 coordination-off sessions, Hermes, unmanaged sessions, and other unsupported
 providers are explicitly undeliverable. A non-app-server Codex generation
 previously marked `undeliverable` only for `provider-unsupported` may be re-queued by the

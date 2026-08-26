@@ -5118,8 +5118,28 @@ async fn dispatch_coordination_notification(
             .await;
         return;
     }
-    let waiting = activity::state_for_view(&state.context, &record)
+    let turn = activity::state_for_view(&state.context, &record);
+    let waiting = turn
+        .as_ref()
         .is_some_and(|turn| turn.phase == activity::TurnPhase::Waiting);
+    if codex_app_server::runtime_is_supported(&record)
+        && let Some(active_turn_id) = turn.as_ref().and_then(|turn| {
+            (matches!(
+                turn.phase,
+                activity::TurnPhase::Working | activity::TurnPhase::NeedsInput
+            ) && turn.source.confidence == activity::Confidence::Authoritative)
+                .then(|| {
+                    turn.current_turn
+                        .as_ref()
+                        .and_then(|current| current.provider_turn_id.clone())
+                })
+                .flatten()
+        })
+    {
+        dispatch_codex_in_turn_coordination_checkpoint(state, record, candidate, active_turn_id)
+            .await;
+        return;
+    }
     if !waiting {
         update_notification_deferred(
             &state,
@@ -5169,6 +5189,138 @@ async fn dispatch_coordination_notification(
             "provider-not-ready",
             COORDINATION_NOTIFICATION_RETRY,
         )
+        .await;
+    }
+}
+
+async fn dispatch_codex_in_turn_coordination_checkpoint(
+    state: Arc<ServeState>,
+    record: SessionRecord,
+    candidate: crate::coordination::NotificationCandidate,
+    expected_turn_id: String,
+) {
+    let launch_id = candidate.target_incarnation.clone();
+    let handle = match wait_for_structured_prompt_control(
+        &state,
+        &record.id,
+        &launch_id,
+        Some(&launch_id),
+        STRUCTURED_PROMPT_CONTROL_WAIT,
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(_) => {
+            update_notification_deferred(
+                &state,
+                &candidate,
+                "provider-not-ready",
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .await;
+            return;
+        }
+    };
+    let prompt = crate::coordination::notification_prompt("", &candidate.target_session_id);
+    let lock_context = state.context.clone();
+    let lock_id = record.id.clone();
+    let lock_launch_id = launch_id.clone();
+    let lock_turn_id = expected_turn_id.clone();
+    let fence = candidate.clone();
+    let locked = tokio::task::spawn_blocking(move || {
+        let record_lock = crate::acquire_session_record_lock(&lock_context, &lock_id)?;
+        let mut current = load_session_record(&lock_context, &lock_id)?;
+        if current
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            != Some(lock_launch_id.as_str())
+            || !codex_app_server::runtime_is_supported(&current)
+        {
+            return Err(structured_prompt_incarnation_conflict(
+                &current.id,
+                &lock_launch_id,
+                current
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str()),
+            ));
+        }
+        let eligible = activity::state_for_view(&lock_context, &current).is_some_and(|turn| {
+            matches!(
+                turn.phase,
+                activity::TurnPhase::Working | activity::TurnPhase::NeedsInput
+            ) && turn.source.confidence == activity::Confidence::Authoritative
+                && turn
+                    .current_turn
+                    .as_ref()
+                    .and_then(|active| active.provider_turn_id.as_deref())
+                    == Some(lock_turn_id.as_str())
+        });
+        if !eligible {
+            return Err(CliError::unavailable(
+                "coordination-checkpoint-turn-changed",
+                "the active turn changed before the coordination checkpoint",
+                None,
+            ));
+        }
+        crate::codex_account::authorize_terminal_input_locked(&lock_context, &mut current)?;
+        crate::codex_account::ensure_terminal_input_allowed(&current)?;
+        let mut quiescence = crate::coordination::lock_session_quiescence(
+            &lock_context,
+            &fence.target_session_id,
+            &fence.target_incarnation,
+        )?;
+        if !quiescence.begin_notification_attempt(&fence)? {
+            return Err(CliError::unavailable(
+                "coordination-checkpoint-not-quiescent",
+                "the recipient has an active claim or operation",
+                None,
+            ));
+        }
+        Ok::<_, CliError>(record_lock)
+    })
+    .await;
+    let record_lock = match locked {
+        Ok(Ok(record_lock)) => record_lock,
+        Ok(Err(err)) if err.code() == "coordination-checkpoint-not-quiescent" => {
+            update_notification_deferred(
+                &state,
+                &candidate,
+                "recipient-coordination-not-quiescent",
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .await;
+            return;
+        }
+        Ok(Err(_)) | Err(_) => {
+            update_notification_deferred(
+                &state,
+                &candidate,
+                "recipient-working",
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let response = handle.steer_prompt(&prompt, &expected_turn_id).await;
+    drop(record_lock);
+    let context = state.context.clone();
+    if response.as_deref() == Ok(expected_turn_id.as_str()) {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::coordination::mark_notification_submitted(&context, &candidate)
+        })
+        .await;
+    } else {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::coordination::mark_notification_unknown(
+                &context,
+                &candidate,
+                "submission-outcome-unknown",
+            )
+        })
         .await;
     }
 }
@@ -25284,6 +25436,289 @@ exit 0
             "untrusted_peer_data"
         );
         assert_eq!(shown["data"]["coordination"]["body"]["text"], canary);
+    }
+
+    #[tokio::test]
+    async fn coordination_notification_working_codex_uses_safe_in_turn_checkpoint() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2030/01/active.jsonl");
+        fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "notification-active-provider";
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let launch_id = seed_codex_app_server_session(tmp.path(), "beta");
+        let record_path = tmp.path().join("sessions/beta/session.json");
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("beta record"))
+                .expect("beta json");
+        record["provider_resume"] = json!({
+            "provider": "codex",
+            "session_id": provider_id,
+            "captured_at": "2030-01-01T00:00:00Z",
+            "capture_method": "fixture",
+            "resume_args": []
+        });
+        fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&record).expect("beta record json"),
+        )
+        .expect("write beta provider resume");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+        crate::activity::activate_runtime(&state.context, &beta).expect("activate beta");
+        let turn = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "notification-active-turn-start",
+            "runtime_id": launch_id,
+            "provider": "codex",
+            "provider_session_id": provider_id,
+            "provider_turn_id": "notification-active-turn",
+            "kind": "turn_started",
+            "confidence": "authoritative"
+        }))
+        .expect("activity event");
+        crate::activity::ingest_event(&state.context, &beta.id, turn).expect("ingest");
+        let projected_turn_id = crate::activity::state_for_view(&state.context, &beta)
+            .and_then(|turn| turn.current_turn)
+            .and_then(|turn| turn.provider_turn_id)
+            .expect("projected active turn id");
+        assert_ne!(projected_turn_id, "notification-active-turn");
+        crate::codex_account::queue_next_account_with_unbound(
+            &state.context,
+            &beta.id,
+            &launch_id,
+            "sym",
+        )
+        .expect("queue next account during the active turn");
+
+        let canary = "ACTIVE-TURN-MAILBOX-BODY-MUST-NOT-REACH-CHECKPOINT";
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": canary,
+                    "idempotency_key": "notification-active-turn-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        state.codex_controls.lock().unwrap().insert(
+            beta.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+
+        let registry_path = tmp.path().join("coordination/registry.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "active-turn-checkpoint-operation",
+                "session_id": "beta",
+                "session_incarnation": launch_id,
+                "claim_id": "active-turn-checkpoint-claim",
+                "claim_revision": 1,
+                "operation": "atomic mutation",
+                "targets": [],
+                "provider_targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": null,
+                "execution_token_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "activity_revision": 1,
+                "activity_identity_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "runtime_identity_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "descendant": null,
+                "reconcile_observed_at_epoch": null,
+                "outcome": null
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("write active operation");
+        drain_coordination_notifications(state.clone()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commands.recv())
+                .await
+                .is_err(),
+            "an active atomic operation must defer the in-turn checkpoint"
+        );
+        assert_eq!(
+            notification_fixture(tmp.path())["last_reason"],
+            "recipient-coordination-not-quiescent"
+        );
+
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                .expect("registry json");
+        registry["operations"] = json!([]);
+        registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification")["next_attempt_at_epoch"] = json!(0);
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("clear active operation");
+        let responder = tokio::spawn(async move {
+            let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+                .await
+                .expect("working Codex notification must reach an in-turn checkpoint")
+                .expect("Codex control command");
+            let codex_app_server::ControlCommand::Steer {
+                message,
+                expected_turn_id,
+                response,
+            } = command
+            else {
+                panic!("working Codex notification must use turn/steer");
+            };
+            assert_eq!(expected_turn_id, projected_turn_id);
+            assert_eq!(
+                message,
+                crate::coordination::notification_prompt("", "beta")
+            );
+            assert!(!message.contains(canary));
+            response
+                .send(Ok(expected_turn_id))
+                .expect("acknowledge checkpoint");
+        });
+
+        drain_coordination_notifications(state.clone()).await;
+        responder.await.expect("checkpoint responder");
+
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "prompt_submitted");
+        assert_eq!(notification["generation"], 1);
+        assert_eq!(notification["notified_generation"], 1);
+        let registry: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("coordination/registry.json")).expect("registry"),
+        )
+        .expect("registry json");
+        assert_eq!(registry["messages"][0]["state"], "unread");
+
+        send_notification_fixture(
+            &state,
+            &alpha_capability,
+            "notification-active-turn-unknown-0002",
+        )
+        .await;
+        let (handle, mut commands) = codex_app_server::control_channel();
+        state.codex_controls.lock().unwrap().insert(
+            beta.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+
+        let drain = tokio::spawn(drain_coordination_notifications(state.clone()));
+        let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .expect("unknown steer attempt")
+            .expect("steer command");
+        let codex_app_server::ControlCommand::Steer {
+            expected_turn_id,
+            response,
+            ..
+        } = command
+        else {
+            panic!("active notification retry must use turn/steer");
+        };
+        assert_eq!(
+            expected_turn_id,
+            crate::activity::state_for_view(&state.context, &beta)
+                .and_then(|turn| turn.current_turn)
+                .and_then(|turn| turn.provider_turn_id)
+                .expect("same projected active turn")
+        );
+        response
+            .send(Err("provider rejected stale turn".to_string()))
+            .expect("reject steer");
+        drain.await.expect("unknown steer drain");
+        assert_eq!(notification_fixture(tmp.path())["state"], "attempt_unknown");
+
+        assert!(
+            crate::coordination::pending_notifications(&state.context)
+                .expect("pending notifications")
+                .is_empty(),
+            "an unresolved steer must not become a pending retry"
+        );
+        let duplicate_drain = tokio::spawn(drain_coordination_notifications(state.clone()));
+        match tokio::time::timeout(Duration::from_millis(100), commands.recv()).await {
+            Err(_) => {
+                tokio::time::timeout(Duration::from_secs(2), duplicate_drain)
+                    .await
+                    .expect("empty notification drain must finish")
+                    .expect("empty notification drain");
+            }
+            Ok(Some(codex_app_server::ControlCommand::Steer { response, .. })) => {
+                let _ = response.send(Err("duplicate test steer".to_string()));
+                let _ = duplicate_drain.await;
+                panic!("an unresolved steer must not be submitted twice");
+            }
+            Ok(Some(_)) => panic!("an unresolved steer emitted another control command"),
+            Ok(None) => panic!("the active control channel closed unexpectedly"),
+        }
+        write_codex_notification_transcript(&transcript, provider_id, &[]);
+        reconcile_coordination_notifications(state.clone()).await;
+        assert_eq!(
+            notification_fixture(tmp.path())["state"],
+            "queued",
+            "an absent transcript observation permits a bounded retry"
+        );
+
+        let drain = tokio::spawn(drain_coordination_notifications(state.clone()));
+        let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .expect("reconciled steer retry")
+            .expect("steer retry command");
+        let codex_app_server::ControlCommand::Steer { response, .. } = command else {
+            panic!("reconciled active notification must use turn/steer");
+        };
+        response
+            .send(Err("steer acknowledgement lost".to_string()))
+            .expect("lose steer acknowledgement");
+        drain.await.expect("ambiguous steer drain");
+        assert_eq!(notification_fixture(tmp.path())["state"], "attempt_unknown");
+        write_codex_notification_transcript(
+            &transcript,
+            provider_id,
+            &[(
+                "9999-01-01T00:00:00Z",
+                crate::coordination::notification_prompt("", "beta"),
+            )],
+        );
+        reconcile_coordination_notifications(state.clone()).await;
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "prompt_submitted");
+        assert_eq!(notification["notified_generation"], 2);
     }
 
     #[tokio::test]

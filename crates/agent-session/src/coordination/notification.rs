@@ -725,6 +725,7 @@ fn safe_reason(reason: &str) -> String {
         | "prompt-accepted"
         | "recipient-working"
         | "recipient-attached"
+        | "recipient-coordination-not-quiescent"
         | "provider-not-ready"
         | "controller-unavailable"
         | "rate-limited"
@@ -1121,6 +1122,21 @@ mod tests {
         assert!(serialized.contains("notification-state-invalid"));
         assert!(!serialized.contains("target"));
         assert!(!serialized.contains("incarnation"));
+    }
+
+    #[test]
+    fn notification_projection_preserves_safe_checkpoint_quiescence_reason() {
+        let mut registry = Registry::default();
+        schedule(&mut registry, "target", "incarnation", 100);
+        let receipt = registry.notifications.values_mut().next().expect("receipt");
+        receipt.last_reason = Some("recipient-coordination-not-quiescent".to_string());
+
+        let projection =
+            projection_for(&mut registry, "target", "incarnation", false).expect("projection");
+        assert_eq!(
+            projection.last_reason.as_deref(),
+            Some("recipient-coordination-not-quiescent")
+        );
     }
 
     #[test]

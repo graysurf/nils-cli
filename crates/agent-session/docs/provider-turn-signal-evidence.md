@@ -41,7 +41,7 @@ created.
   structured turn failures and server requests. The audited 0.144.1/0.144.3
   schemas and live Unix
   WebSocket probe expose `Turn.status`, `Turn.error.codexErrorInfo`, the
-  `error` notification, `account/rateLimits/read`, `turn/start`, typed
+  `error` notification, `account/rateLimits/read`, `turn/start`, `turn/steer`, typed
   `RequestId` (`string | int64`), five admitted blocking request methods, and
   `serverRequest/resolved`.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
@@ -139,8 +139,11 @@ terminal failed Turn carrying the same structured error, maps
 `usageLimitExceeded` to `usage_exhausted`. Wrong threads, wrong turns,
 non-terminal statuses, retrying errors, reordered partial envelopes, unknown
 values, malformed usage snapshots, and monitor gaps cannot arm or submit. Raw
-thread/turn ids are runtime-scoped SHA-256 projections before persistence;
-human error text, prompts, output, and auth/account payloads are discarded.
+thread/turn ids are runtime-scoped SHA-256 projections before persistence. For
+same-turn mailbox steering, the exact control incarnation retains the raw
+active turn id only in memory and sends it back to Codex after its projection
+matches durable activity; human error text, prompts, output, and auth/account
+payloads are discarded.
 
 The persisted rollout history is not used to recover failures because the live
 probe demonstrated that a failed quota turn can later appear as completed with
