@@ -19,7 +19,7 @@ use crate::backend;
 use crate::cli::{EvidenceMode, ExecArgs, McpArgs, OutputFormat, RuntimeMode, ToolProfile};
 use crate::commands;
 use crate::error::{CliError, ErrorClass};
-use crate::journal::ArtifactIndex;
+use crate::journal::{ArtifactIndex, StepRecord};
 use crate::lock::PeekabooLock;
 use crate::model::SuccessEnvelope;
 use crate::{process, test_mode};
@@ -162,7 +162,7 @@ pub fn run_remote_exec(args: &ExecArgs, format: OutputFormat) -> Result<u8, CliE
         .host
         .as_deref()
         .ok_or_else(|| transport_error("SSH host is required"))?;
-    let response = request(
+    let mut response = request(
         host,
         RemoteCommand::Exec {
             argv: args.argv.clone(),
@@ -174,7 +174,8 @@ pub fn run_remote_exec(args: &ExecArgs, format: OutputFormat) -> Result<u8, CliE
         },
         Duration::from_secs(args.timeout_seconds.clamp(1, 3600) + 30),
     )?;
-    install_transferred_files(&args.out_dir, &response.artifacts)?;
+    let assigned = install_transferred_journal(&args.out_dir, &response.artifacts)?;
+    rebind_journal_step(&mut response.result, assigned);
     emit_remote(format, "exec", response)
 }
 
@@ -287,7 +288,7 @@ pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
         Duration::from_secs(30),
     );
     let collect_result = collected.and_then(|response| {
-        install_transferred_files(&args.out_dir, &response.artifacts)?;
+        install_transferred_journal(&args.out_dir, &response.artifacts)?;
         if response.ok {
             Ok(())
         } else {
@@ -862,7 +863,123 @@ fn collect_files(root: &Path) -> Result<Vec<TransferredFile>, CliError> {
     Ok(files)
 }
 
+/// Journal-control files a remote session emits. They describe the scratch
+/// session rather than the durable local journal, so they are merged rather
+/// than installed.
+const JOURNAL_CONTROL_FILES: [&str; 6] = [
+    "manifest.json",
+    "steps.jsonl",
+    "summary.json",
+    "redaction.json",
+    "review.json",
+    "artifacts/index.json",
+];
+
+/// Install one transferred bundle into the durable local journal.
+///
+/// Writing the control files verbatim would replace every step already
+/// recorded in this output directory, because the endpoint allocates a fresh
+/// session root per request and its journal always restarts at sequence 1.
+/// Artifact payloads still install directly. Returns the local step id
+/// assigned to the last ingested step.
+fn install_transferred_journal(
+    root: &Path,
+    files: &[TransferredFile],
+) -> Result<Option<String>, CliError> {
+    let has = |name: &str| files.iter().any(|file| file.relative_path == name);
+    if !has("manifest.json") || !has("steps.jsonl") {
+        install_transferred_files(root, files)?;
+        return Ok(None);
+    }
+
+    let mut payload = Vec::new();
+    let mut manifest_body = Vec::new();
+    let mut steps_body = Vec::new();
+    let mut index_body = None;
+    // Control files are decoded here rather than installed, so their bytes must
+    // still be charged against the one transfer budget the payload install
+    // enforces. Charging them separately would multiply the bound by the number
+    // of parts the bundle was split into.
+    let mut spent = 0usize;
+    for file in files {
+        match file.relative_path.as_str() {
+            "manifest.json" => manifest_body = decode_transferred(file, &mut spent)?,
+            "steps.jsonl" => steps_body = decode_transferred(file, &mut spent)?,
+            "artifacts/index.json" => index_body = Some(decode_transferred(file, &mut spent)?),
+            other if JOURNAL_CONTROL_FILES.contains(&other) => {}
+            _ => payload.push(file.clone()),
+        }
+    }
+    install_transferred_files_within(root, &payload, spent)?;
+
+    let manifest = serde_json::from_slice(&manifest_body)
+        .map_err(|_| transport_error("remote journal manifest is malformed"))?;
+    let steps = parse_transferred_steps(&steps_body)?;
+    let index = index_body
+        .map(|body| {
+            serde_json::from_slice::<ArtifactIndex>(&body)
+                .map_err(|_| transport_error("remote artifact index is malformed"))
+        })
+        .transpose()?;
+    let assigned = crate::journal::ingest_transfer(
+        root,
+        crate::journal::TransferredJournal {
+            manifest,
+            steps,
+            index,
+        },
+    )?;
+    Ok(assigned.last().cloned())
+}
+
+fn decode_transferred(file: &TransferredFile, spent: &mut usize) -> Result<Vec<u8>, CliError> {
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(&file.data_base64)
+        .map_err(|_| transport_error("remote artifact encoding is malformed"))?;
+    *spent = spent.saturating_add(body.len());
+    if *spent > MAX_TRANSFER_BYTES || hex(&Sha256::digest(&body)) != file.sha256 {
+        return Err(transport_error(
+            "remote artifact digest or bundle size is invalid",
+        ));
+    }
+    Ok(body)
+}
+
+fn parse_transferred_steps(body: &[u8]) -> Result<Vec<StepRecord>, CliError> {
+    let mut steps = Vec::new();
+    for line in body.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        steps.push(
+            serde_json::from_slice(line)
+                .map_err(|_| transport_error("remote journal step is malformed"))?,
+        );
+    }
+    Ok(steps)
+}
+
+/// Rebind an emitted exec result to the step id the local journal assigned.
+fn rebind_journal_step(result: &mut Option<serde_json::Value>, step: Option<String>) {
+    let (Some(value), Some(step)) = (result.as_mut(), step) else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("journal_step".into(), serde_json::Value::String(step));
+    }
+}
+
 fn install_transferred_files(root: &Path, files: &[TransferredFile]) -> Result<(), CliError> {
+    install_transferred_files_within(root, files, 0)
+}
+
+/// Install transferred payload files against a shared transfer budget, so a
+/// bundle split into separately decoded parts still respects one size bound.
+fn install_transferred_files_within(
+    root: &Path,
+    files: &[TransferredFile],
+    spent: usize,
+) -> Result<(), CliError> {
     if files.len() > MAX_TRANSFER_FILES {
         return Err(transport_error(
             "remote artifact response exceeds its file bound",
@@ -876,7 +993,7 @@ fn install_transferred_files(root: &Path, files: &[TransferredFile]) -> Result<(
         ));
     }
     create_private_dir(root)?;
-    let mut total = 0usize;
+    let mut total = spent;
     for file in files {
         validate_relative(&file.relative_path)?;
         let body = base64::engine::general_purpose::STANDARD
@@ -1184,10 +1301,12 @@ fn transport_error(message: impl Into<String>) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::{EvidenceMode, RuntimeMode};
     use std::fs;
     use std::io::Cursor;
     use std::os::unix::fs::symlink;
     use std::os::unix::process::CommandExt;
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
@@ -1197,8 +1316,9 @@ mod tests {
 
     use super::{
         MAX_REMOTE_SESSION_ROOTS, ProcessGroupChild, TransferredFile, collect_files,
-        create_bounded_remote_session, install_transferred_files, read_bounded_line,
-        remove_session, validate_host, validate_relative,
+        create_bounded_remote_session, decode_transferred, install_transferred_files,
+        install_transferred_journal, read_bounded_line, remove_session, validate_host,
+        validate_relative,
     };
 
     #[test]
@@ -1304,6 +1424,290 @@ mod tests {
             "allocation lock escaped the fixture into {}",
             stray.display()
         );
+    }
+
+    fn transferred(relative: &str, body: &[u8]) -> TransferredFile {
+        TransferredFile {
+            relative_path: relative.into(),
+            sha256: super::hex(&sha2::Sha256::digest(body)),
+            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body),
+        }
+    }
+
+    /// One remote exec bundle. The endpoint allocates a fresh session per
+    /// request, so every bundle restarts at sequence 1 with its own run id.
+    fn remote_exec_bundle(run: &str, intent: &str, digest: &str) -> Vec<TransferredFile> {
+        let manifest = crate::journal::Manifest {
+            schema_version: crate::journal::JOURNAL_SCHEMA.into(),
+            run_id: run.into(),
+            adapter_version: env!("CARGO_PKG_VERSION").into(),
+            peekaboo_tag: "v4.2.2".into(),
+            peekaboo_commit: "0".repeat(40),
+            backend_digest: digest.into(),
+            runtime: RuntimeMode::App,
+            transport: "ssh".into(),
+            evidence_mode: EvidenceMode::Minimal,
+            tool_profile: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: Some("2026-01-01T00:00:02Z".into()),
+            state: "closed".into(),
+        };
+        let step = crate::journal::StepRecord {
+            schema_version: "macos-agent.journal-step.v2".into(),
+            sequence: 1,
+            id: "step-000001".into(),
+            correlation_id: format!("{run}-step-000001"),
+            parent_id: None,
+            recorded_at: "2026-01-01T00:00:01Z".into(),
+            intent: Some(intent.into()),
+            expected: None,
+            command: "see".into(),
+            mcp_method: None,
+            mcp_tool: None,
+            argv_shape: vec!["see".into()],
+            replay_argv: Some(vec!["see".into()]),
+            backend_digest: digest.into(),
+            runtime: RuntimeMode::App,
+            transport: "ssh".into(),
+            status: crate::journal::StepStatus::Passed,
+            failure_class: None,
+            duration_ms: 1,
+            retries: 0,
+            precondition_refs: Vec::new(),
+            postcondition_refs: Vec::new(),
+            snapshot_lineage: None,
+            replay_class: crate::journal::ReplayClass::Safe,
+            artifact_refs: Vec::new(),
+        };
+        let mut steps = serde_json::to_vec(&step).expect("step");
+        steps.push(b'\n');
+        vec![
+            transferred(
+                "manifest.json",
+                &serde_json::to_vec(&manifest).expect("manifest"),
+            ),
+            transferred("steps.jsonl", &steps),
+            transferred("summary.json", b"{\"stale\":true}"),
+        ]
+    }
+
+    fn journal_steps(root: &Path) -> Vec<crate::journal::StepRecord> {
+        fs::read_to_string(root.join("steps.jsonl"))
+            .expect("steps")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("step"))
+            .collect()
+    }
+
+    #[test]
+    fn control_bytes_and_payload_share_one_transfer_budget() {
+        // Splitting a bundle into separately decoded parts must not multiply
+        // the size bound by the number of parts.
+        let mut spent = 0usize;
+        let first = transferred("manifest.json", b"0123456789");
+        let second = transferred("steps.jsonl", b"01234");
+        decode_transferred(&first, &mut spent).expect("first");
+        assert_eq!(spent, 10);
+        decode_transferred(&second, &mut spent).expect("second");
+        assert_eq!(spent, 15, "each decoded part charges the shared budget");
+
+        let mut exhausted = super::MAX_TRANSFER_BYTES;
+        assert!(
+            decode_transferred(&second, &mut exhausted).is_err(),
+            "a decoded control file must respect an already spent budget"
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_cannot_fit_the_rotation_bound_is_refused_whole() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        fs::create_dir_all(&out).expect("out");
+
+        // Seed a journal that is already at the bound. Appending until the
+        // bound is hit would leave a partially merged transfer behind an error.
+        let bundle = remote_exec_bundle("run-a", "seed", "sha256:fixture");
+        let manifest = bundle
+            .iter()
+            .find(|file| file.relative_path == "manifest.json")
+            .expect("manifest");
+        let mut spent = 0usize;
+        fs::write(
+            out.join("manifest.json"),
+            decode_transferred(manifest, &mut spent).expect("manifest body"),
+        )
+        .expect("write manifest");
+        let template: crate::journal::StepRecord = serde_json::from_slice(
+            &decode_transferred(
+                bundle
+                    .iter()
+                    .find(|file| file.relative_path == "steps.jsonl")
+                    .expect("steps"),
+                &mut spent,
+            )
+            .expect("steps body"),
+        )
+        .expect("template");
+        let mut seeded = Vec::new();
+        for sequence in 1..=512u64 {
+            let mut step = template.clone();
+            step.sequence = sequence;
+            step.id = format!("step-{sequence:06}");
+            seeded.extend(serde_json::to_vec(&step).expect("step"));
+            seeded.push(b'\n');
+        }
+        fs::write(out.join("steps.jsonl"), &seeded).expect("write steps");
+
+        assert!(
+            install_transferred_journal(
+                &out,
+                &remote_exec_bundle("run-b", "overflow", "sha256:fixture")
+            )
+            .is_err(),
+            "a transfer past the rotation bound must be refused"
+        );
+        assert_eq!(
+            journal_steps(&out).len(),
+            512,
+            "the refused transfer must not have partially merged"
+        );
+    }
+
+    #[test]
+    fn merged_artifact_rows_follow_their_step_to_its_new_id() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+
+        // A second transfer carries an artifact produced by its own step-000001,
+        // which becomes step-000002 locally.
+        let payload = b"{\"sanitized\":true}";
+        let mut bundle = remote_exec_bundle("run-b", "second", "sha256:fixture");
+        let index = crate::journal::ArtifactIndex {
+            schema_version: "macos-agent.artifact-index.v1".into(),
+            artifacts: vec![crate::journal::ArtifactRecord {
+                sha256: format!("sha256:{}", super::hex(&sha2::Sha256::digest(payload))),
+                mime: "application/json".into(),
+                kind: "upstream_result".into(),
+                producing_step: "step-000001".into(),
+                sensitivity: "private".into(),
+                redaction: "sanitized".into(),
+                retention: "debug".into(),
+                relative_path: "artifacts/result.json".into(),
+            }],
+        };
+        bundle.push(transferred(
+            "artifacts/index.json",
+            &serde_json::to_vec(&index).expect("index"),
+        ));
+        bundle.push(transferred("artifacts/result.json", payload));
+        install_transferred_journal(&out, &bundle).expect("second transfer");
+
+        let merged: crate::journal::ArtifactIndex =
+            serde_json::from_slice(&fs::read(out.join("artifacts/index.json")).expect("index"))
+                .expect("parse index");
+        let row = merged
+            .artifacts
+            .iter()
+            .find(|row| row.relative_path == "artifacts/result.json")
+            .expect("merged row");
+        assert_eq!(
+            row.producing_step, "step-000002",
+            "an artifact must follow its step to the id the local journal assigned"
+        );
+        assert_eq!(
+            fs::read(out.join("artifacts/result.json")).expect("payload"),
+            payload,
+            "the artifact payload still installs directly"
+        );
+    }
+
+    #[test]
+    fn a_bundle_without_a_journal_installs_verbatim_as_before() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        let body = b"{\"collected\":true}";
+        let assigned = install_transferred_journal(&out, &[transferred("summary.json", body)])
+            .expect("install");
+        assert_eq!(
+            assigned, None,
+            "a response with no journal to merge assigns no step"
+        );
+        assert_eq!(
+            fs::read(out.join("summary.json")).expect("summary"),
+            body,
+            "a bundle this path does not recognize keeps the prior behavior"
+        );
+    }
+
+    #[test]
+    fn ssh_transfers_append_to_one_journal_instead_of_replacing_it() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+
+        let first = install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+        let second = install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-b", "second", "sha256:fixture"),
+        )
+        .expect("second transfer");
+        assert_eq!(first.as_deref(), Some("step-000001"));
+        assert_eq!(second.as_deref(), Some("step-000002"));
+
+        let steps = journal_steps(&out);
+        assert_eq!(steps.len(), 2, "second transfer replaced the first");
+        assert_eq!(steps[0].sequence, 1);
+        assert_eq!(steps[1].sequence, 2);
+        assert_eq!(steps[0].intent.as_deref(), Some("first"));
+        assert_eq!(steps[1].intent.as_deref(), Some("second"));
+        assert_eq!(steps[1].id, "step-000002");
+
+        // The local journal owns run identity and its derived views; a later
+        // transfer joins the session rather than rebranding it.
+        let manifest: crate::journal::Manifest =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).expect("manifest"))
+                .expect("parse manifest");
+        assert_eq!(manifest.run_id, "run-a");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.correlation_id.starts_with("run-a-"))
+        );
+        let summary: crate::journal::Summary =
+            serde_json::from_slice(&fs::read(out.join("summary.json")).expect("summary"))
+                .expect("parse summary");
+        assert_eq!(summary.total_steps, 2);
+    }
+
+    #[test]
+    fn a_transfer_from_a_different_execution_tuple_is_refused_without_loss() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+
+        assert!(
+            install_transferred_journal(
+                &out,
+                &remote_exec_bundle("run-b", "second", "sha256:replaced-backend")
+            )
+            .is_err(),
+            "a drifted backend digest must not silently join the journal"
+        );
+        let steps = journal_steps(&out);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].intent.as_deref(), Some("first"));
     }
 
     #[test]

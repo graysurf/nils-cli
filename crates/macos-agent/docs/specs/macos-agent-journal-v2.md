@@ -67,6 +67,25 @@ from validated steps under the journal lock before appending. Summary
 generation validates the full log at session close or on an explicit
 summarize/review operation.
 
+## Remote transfer merge
+
+A remote session journal is per-call scratch. The endpoint allocates a fresh
+session root for every request, so a transferred `steps.jsonl` always restarts
+at sequence 1 with its own `run_id`. The controller therefore merges a transfer
+into the durable journal in `--out-dir` instead of installing it: artifact
+payloads are written directly, while `manifest.json`, `steps.jsonl`,
+`summary.json`, `redaction.json`, `review.json`, and `artifacts/index.json` are
+verified, parsed, and merged under the journal lock.
+
+Merging reassigns each transferred step a local sequence, id, and correlation
+id, remaps a parent named inside the same transfer, rewrites the producing step
+of each merged artifact row, and rebuilds the summary and redaction report from
+the merged log. The local manifest keeps its own `run_id` and `started_at`; a
+transfer may only continue a session whose `schema_version`, `backend_digest`,
+`runtime`, `transport`, `evidence_mode`, and `tool_profile` are unchanged, and
+a drifted tuple fails closed without losing the steps already recorded. The
+512-step rotation bound applies to the merged log.
+
 ## Replay
 
 - `safe`: read-only observation/setup with retained sanitized argv.
@@ -91,9 +110,16 @@ so both planning and execution fail closed.
 
 Repeated normalized failures and mandatory significant classes become review
 candidates. Significant classes include privacy/redaction, wrong target, false
-success, unknown mutation, held input, remote cleanup, journal/replay integrity,
-backend drift, and permission drift. Proposed ownership is one of adapter,
-Peekaboo/adapter, runtime skill policy, or the TCC environment. Review does not
-create a provider issue by itself.
+success, unknown mutation, refused mutation, held input, remote cleanup,
+journal/replay integrity, backend drift, and permission drift. Proposed
+ownership is one of adapter, Peekaboo/adapter, runtime skill policy, or the TCC
+environment. Review does not create a provider issue by itself.
+
+When the upstream result publishes a v4 outcome envelope, classification reads
+it rather than inferring from the process exit code alone. A refusal becomes
+`upstream_refused` and is always significant; an upstream that reports its own
+failure at exit zero becomes `false_success`; and an envelope proving no
+mutation dispatched resolves an otherwise unknown mutation. An upstream result
+without an envelope keeps the exit-code rules unchanged.
 
 Raw upstream payloads and screenshots are never promoted automatically.

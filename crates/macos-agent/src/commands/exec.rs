@@ -136,6 +136,25 @@ pub fn run_local(
         status = StepStatus::Failed;
         failure_class = Some("upstream_malformed_json".into());
     }
+    // Peekaboo v4 publishes a structured outcome envelope beside its data.
+    // Classify from it when present: a refusal is not a generic upstream
+    // failure, and an upstream that reports its own failure at exit zero is a
+    // false success rather than a pass.
+    if let Some(outcome) = parsed.as_ref().and_then(upstream_outcome) {
+        // An envelope proving nothing dispatched resolves the conservative
+        // unknown-mutation classification into an ordinary failure.
+        let resolved_unknown = unknown_mutation && outcome.mutation_dispatched == Some(false);
+        if outcome.refused {
+            status = StepStatus::Failed;
+            failure_class = Some("upstream_refused".into());
+        } else if resolved_unknown {
+            status = StepStatus::Failed;
+            failure_class = Some("upstream".into());
+        } else if outcome.success == Some(false) && status == StepStatus::Passed {
+            status = StepStatus::Failed;
+            failure_class = Some("false_success".into());
+        }
+    }
     let debug_artifact = if args.evidence_mode == crate::cli::EvidenceMode::Debug {
         Some(write_debug_artifact(
             &args.out_dir,
@@ -216,6 +235,35 @@ pub fn run_local(
     })
 }
 
+/// The parts of the Peekaboo v4 result envelope the adapter classifies on.
+/// Every field is optional, so an upstream result without an envelope keeps the
+/// exit-code rules unchanged.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpstreamOutcome {
+    success: Option<bool>,
+    refused: bool,
+    mutation_dispatched: Option<bool>,
+}
+
+fn upstream_outcome(value: &serde_json::Value) -> Option<UpstreamOutcome> {
+    let object = value.as_object()?;
+    let outcome = object.get("outcome").and_then(|value| value.as_object());
+    let refusal_reason = outcome
+        .and_then(|outcome| outcome.get("refusal_reason"))
+        .is_some_and(|reason| !reason.is_null());
+    let refused_effect = outcome
+        .and_then(|outcome| outcome.get("effect"))
+        .and_then(|effect| effect.as_str())
+        == Some("refused");
+    Some(UpstreamOutcome {
+        success: object.get("success").and_then(|value| value.as_bool()),
+        refused: refusal_reason || refused_effect,
+        mutation_dispatched: outcome
+            .and_then(|outcome| outcome.get("mutation_dispatched"))
+            .and_then(|value| value.as_bool()),
+    })
+}
+
 fn validate(args: &ExecArgs) -> Result<(), CliError> {
     policy::validate_exec_argv(&args.argv)?;
     if policy::mutating_invocation(&args.argv)
@@ -260,4 +308,52 @@ fn write_debug_artifact(
     write_atomic(&root.join(&filename), &body, SECRET_FILE_MODE)
         .map_err(|_| CliError::journal("failed to write debug upstream artifact"))?;
     Ok(filename)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpstreamOutcome, upstream_outcome};
+
+    #[test]
+    fn the_v4_outcome_envelope_is_read_instead_of_guessed_from_the_exit_code() {
+        let refused = serde_json::json!({
+            "success": false,
+            "outcome": {
+                "effect": "refused",
+                "refusal_reason": "target_unavailable",
+                "mutation_dispatched": false
+            }
+        });
+        assert_eq!(
+            upstream_outcome(&refused),
+            Some(UpstreamOutcome {
+                success: Some(false),
+                refused: true,
+                mutation_dispatched: Some(false),
+            })
+        );
+
+        // A dispatched but unverifiable delivery is the ordinary background
+        // accessibility-action result; it must never read as a refusal.
+        let unverifiable = serde_json::json!({
+            "success": true,
+            "outcome": {"effect": "unverifiable", "mutation_dispatched": true}
+        });
+        assert_eq!(
+            upstream_outcome(&unverifiable),
+            Some(UpstreamOutcome {
+                success: Some(true),
+                refused: false,
+                mutation_dispatched: Some(true),
+            })
+        );
+
+        // An upstream result without an envelope leaves classification to the
+        // existing exit-code rules.
+        assert_eq!(
+            upstream_outcome(&serde_json::json!({"data": {"ok": true}})),
+            Some(UpstreamOutcome::default())
+        );
+        assert_eq!(upstream_outcome(&serde_json::json!([])), None);
+    }
 }
