@@ -50,9 +50,12 @@ operation before that run exists. The source cannot predate admission, be
 shared by two acceptance operations, or be reused after a terminal result.
 
 `observe.observation` is exactly
-`{"kind":"host-observed","status":"..."}` or
-`{"kind":"contained-bash","operation_id":"..."}`. The contained form has
-no caller-controlled status.
+`{"kind":"host-observed","status":"..."}`,
+`{"kind":"contained-bash","operation_id":"..."}`, or the fail-closed
+contained terminal
+`{"kind":"contained-bash","operation_id":"...","status":"infrastructure-blocked"}`.
+The contained form cannot carry success, failure, cancellation, timeout,
+signal, or uncertain status from the caller.
 
 Successful command data uses the matching
 `agent-hook.finish-line.<command>-result.v1` schema inside
@@ -143,8 +146,10 @@ synchronous goal-state mutation.
 `observe` is accepted only from the current session capability and only for an
 operation admitted by that same capability incarnation. Its strict source is
 either `host-observed` with one normalized status, or `contained-bash` with the
-operation ID of an exact authoritative `finish-line run`. Supported normalized
-statuses are:
+operation ID of an exact authoritative `finish-line run`. A contained caller
+may additionally terminalize only that exact admitted operation as
+`infrastructure-blocked`; it cannot claim any execution outcome or success.
+Supported normalized statuses are:
 
 - `succeeded`;
 - `failed`;
@@ -166,13 +171,15 @@ For declared Bash validation, admission first reserves one exact future
 the same operation without a caller status. Nils verifies the single-use
 reservation, exact session, generation, target digest, validation-contract
 digest, applied disposition, and stored execution facts, then derives success,
-failure, timeout, signal, or cancellation itself. A returned provider failure
-or authenticated quiescence after supervisor loss durably terminalizes that
-exact acceptance operation as `infrastructure-blocked`. A host-observed result
-cannot satisfy a contained validator. Ordinary Bash continues to advance the
-shared generation and never creates validation evidence. Non-shell tools use
-the host-observed terminal path after the runtime has bound the exact visible
-DSH ToolDefinition and terminal lifecycle result.
+failure, timeout, signal, or cancellation itself. A returned provider failure,
+authenticated quiescence after supervisor loss, or the owning capability's
+explicit fail-closed contained terminal durably marks that exact acceptance
+operation as `infrastructure-blocked`. This exception cannot create evidence:
+every other caller-supplied contained status is rejected. A host-observed
+result cannot satisfy a contained validator. Ordinary Bash continues to
+advance the shared generation and never creates validation evidence. Non-shell
+tools use the host-observed terminal path after the runtime has bound the exact
+visible DSH ToolDefinition and terminal lifecycle result.
 
 ## Detached verdict and completion reservation
 

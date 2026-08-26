@@ -1523,12 +1523,18 @@ fn observation_binding(
             Ok(("host-observed".to_string(), Some(status), None))
         }
         (Some(ValidatorExecution::ContainedBash { .. }), ObservationKind::ContainedBash) => {
-            if observation.status.is_some() {
-                return Err(HookError::data(
-                    "finish-line-acceptance-observation-invalid",
-                    "contained Bash acceptance terminals are derived by nils and reject caller status",
-                ));
-            }
+            let explicit_observation = match observation.status {
+                None => None,
+                Some(ObservationStatus::InfrastructureBlocked) => {
+                    Some(ObservationStatus::InfrastructureBlocked)
+                }
+                Some(_) => {
+                    return Err(HookError::data(
+                        "finish-line-acceptance-observation-invalid",
+                        "contained Bash acceptance terminals reject caller success and execution status",
+                    ));
+                }
+            };
             let operation_id = observation.operation_id.as_deref().ok_or_else(|| {
                 HookError::data(
                     "finish-line-acceptance-observation-invalid",
@@ -1537,7 +1543,11 @@ fn observation_binding(
             })?;
             validate_identifier(operation_id)?;
             let source_digest = operation_key(&identity.session_key, operation_id);
-            Ok((source_digest.clone(), None, Some(source_digest)))
+            Ok((
+                source_digest.clone(),
+                explicit_observation,
+                Some(source_digest),
+            ))
         }
         _ => Err(HookError::data(
             "finish-line-acceptance-observation-source-invalid",

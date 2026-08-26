@@ -260,6 +260,26 @@ fn observe_contained(
     call(fixture, "observe", &request)
 }
 
+fn observe_contained_status(
+    fixture: &Fixture,
+    session_id: &str,
+    capability: &str,
+    operation_id: &str,
+    contained_operation_id: &str,
+    status: &str,
+) -> (i32, Value) {
+    let mut request = common(fixture, session_id, "turn-observe-contained-status");
+    request["schema_version"] = json!("agent-hook.finish-line.observe.v1");
+    request["runner_capability"] = json!(capability);
+    request["operation_id"] = json!(operation_id);
+    request["observation"] = json!({
+        "kind": "contained-bash",
+        "operation_id": contained_operation_id,
+        "status": status,
+    });
+    call(fixture, "observe", &request)
+}
+
 fn verdict(
     fixture: &Fixture,
     session_id: &str,
@@ -1564,6 +1584,93 @@ fn contained_bash_success_is_derived_only_from_the_exact_nils_run() {
         verdict(&fixture, "session-contained", &capability, contract_digest,).0,
         0
     );
+}
+
+#[test]
+fn contained_bash_accepts_only_authenticated_infrastructure_terminalization() {
+    let fixture = fixture();
+    let command = ":";
+    install_bash_contract(&fixture, command);
+    let capability = open(&fixture, "session-contained-infrastructure");
+    let mut registration = common(
+        &fixture,
+        "session-contained-infrastructure",
+        "turn-register",
+    );
+    registration["schema_version"] = json!("agent-hook.finish-line.register.v1");
+    registration["runner_capability"] = json!(capability);
+    registration["requirements"] = json!([{
+        "name": "contained",
+        "validators": [{
+            "id": "contained-validator",
+            "tool_name": "Bash",
+            "definition_digest": VALIDATOR_DEFINITION,
+            "execution": {
+                "kind": "contained-bash",
+                "intent": "project-dev",
+                "command": command,
+            },
+        }],
+    }]);
+    registration["invalidators"] = json!([]);
+    let registered = call(&fixture, "register", &registration).1;
+    let contract_digest = registered["data"]["contract_digest"]
+        .as_str()
+        .expect("contract digest");
+    let admitted = admit_validator_binding(
+        &fixture,
+        "session-contained-infrastructure",
+        &capability,
+        contract_digest,
+        "acceptance-contained-infrastructure",
+        "contained",
+        "contained-validator",
+        "Bash",
+        VALIDATOR_DEFINITION,
+        Some("nils-contained-infrastructure"),
+    );
+    assert_eq!(admitted.0, 0, "envelope={}", admitted.1);
+
+    let manufactured_success = observe_contained_status(
+        &fixture,
+        "session-contained-infrastructure",
+        &capability,
+        "acceptance-contained-infrastructure",
+        "nils-contained-infrastructure",
+        "succeeded",
+    );
+    assert_eq!(
+        manufactured_success.0, 65,
+        "envelope={}",
+        manufactured_success.1
+    );
+    assert_eq!(
+        manufactured_success.1["error"]["code"],
+        "finish-line-acceptance-observation-invalid"
+    );
+
+    let terminal = observe_contained_status(
+        &fixture,
+        "session-contained-infrastructure",
+        &capability,
+        "acceptance-contained-infrastructure",
+        "nils-contained-infrastructure",
+        "infrastructure-blocked",
+    );
+    assert_eq!(terminal.0, 0, "envelope={}", terminal.1);
+    assert_eq!(terminal.1["data"]["observation"], "infrastructure-blocked");
+    assert_eq!(
+        verdict(
+            &fixture,
+            "session-contained-infrastructure",
+            &capability,
+            contract_digest,
+        )
+        .1["data"]["aggregate"],
+        "infrastructure-blocked"
+    );
+    let released = release(&fixture, "session-contained-infrastructure", &capability);
+    assert_eq!(released.0, 0, "envelope={}", released.1);
 }
 
 #[test]
