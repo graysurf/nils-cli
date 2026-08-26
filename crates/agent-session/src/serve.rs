@@ -5278,11 +5278,12 @@ async fn dispatch_codex_in_turn_coordination_checkpoint(
                 None,
             ));
         }
-        Ok::<_, CliError>(record_lock)
+        drop(record_lock);
+        Ok::<_, CliError>(())
     })
     .await;
-    let record_lock = match locked {
-        Ok(Ok(record_lock)) => record_lock,
+    match locked {
+        Ok(Ok(())) => {}
         Ok(Err(err)) if err.code() == "coordination-checkpoint-not-quiescent" => {
             update_notification_deferred(
                 &state,
@@ -5306,7 +5307,6 @@ async fn dispatch_codex_in_turn_coordination_checkpoint(
     };
 
     let response = handle.steer_prompt(&prompt, &expected_turn_id).await;
-    drop(record_lock);
     let context = state.context.clone();
     if response.as_deref() == Ok(expected_turn_id.as_str()) {
         let _ = tokio::task::spawn_blocking(move || {
@@ -25591,6 +25591,7 @@ exit 0
             serde_json::to_vec_pretty(&registry).expect("registry json"),
         )
         .expect("clear active operation");
+        let lock_probe_context = state.context.clone();
         let responder = tokio::spawn(async move {
             let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
@@ -25610,6 +25611,14 @@ exit 0
                 crate::coordination::notification_prompt("", "beta")
             );
             assert!(!message.contains(canary));
+            let lock_probe = tokio::task::spawn_blocking(move || {
+                let _record_lock = crate::acquire_session_record_lock(&lock_probe_context, "beta")
+                    .expect("checkpoint record lock must be reacquirable");
+            });
+            tokio::time::timeout(Duration::from_millis(250), lock_probe)
+                .await
+                .expect("checkpoint must release the record lock before provider I/O")
+                .expect("record-lock probe worker");
             response
                 .send(Ok(expected_turn_id))
                 .expect("acknowledge checkpoint");
