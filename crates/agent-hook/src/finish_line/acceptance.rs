@@ -123,6 +123,14 @@ struct VerdictRequest {
     cwd: PathBuf,
     runner_capability: String,
     contract_digest: String,
+    #[serde(default)]
+    completion_reservation: Option<CompletionReservationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionReservationRequest {
+    operation_id: String,
 }
 
 macro_rules! identity_input {
@@ -278,6 +286,7 @@ enum AcceptanceOperationKind {
         requirement: String,
         validator_id: String,
     },
+    Completion,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -394,6 +403,9 @@ pub(super) fn register(state_root: &Path, input: &[u8]) -> Result<Outcome, HookE
     let store = Store::open(state_root, &identity)?;
     validate_runner_capability(&store, &identity, &request.runner_capability)?;
     let mut state = read_state(&store, &identity)?;
+    if terminalize_inactive_completion_reservations(&store, &mut state) {
+        save_state(&store, &state)?;
+    }
     if let Some(existing) = state.sessions.get(&identity.session_key) {
         if existing.contract_digest == contract_digest && existing.contract == contract {
             let requirement_count = existing.contract.requirements.len();
@@ -471,6 +483,9 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
     let mut store = Store::open(state_root, &identity)?;
     validate_runner_capability(&store, &identity, &request.runner_capability)?;
     let mut state = read_state(&store, &identity)?;
+    if terminalize_inactive_completion_reservations(&store, &mut state) {
+        save_state(&store, &state)?;
+    }
     let session = acceptance_session(&state, &identity, &request.contract_digest)?;
     let source_operation_key = validate_admission_binding(
         session,
@@ -535,14 +550,20 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
 
     match &kind {
         AcceptanceOperationKind::Mutation => {
+            let completion_reserved = completion_reservation_active(&store, &state);
             if state.operations.values().any(|operation| {
                 matches!(operation.kind, AcceptanceOperationKind::Mutation)
                     && operation.terminal.is_none()
             }) || main_shell_active(&store)
+                || completion_reserved
             {
                 return Err(finish_line_temporary(
-                    "finish-line-acceptance-mutation-active",
-                    "a prior repository mutation is still active",
+                    if completion_reserved {
+                        "finish-line-completion-reserved"
+                    } else {
+                        "finish-line-acceptance-mutation-active"
+                    },
+                    "the repository is reserved by an authoritative completion or mutation",
                 ));
             }
             let generation = store.state.generation.checked_add(1).ok_or_else(|| {
@@ -647,6 +668,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
             save_state(&store, &state)?;
             Ok(admit_outcome(&identity, &request, "validator", generation))
         }
+        AcceptanceOperationKind::Completion => unreachable!("completion is reserved by verdict"),
     }
 }
 
@@ -760,6 +782,13 @@ pub(super) fn observe(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
                 }
             }
         }
+        AcceptanceOperationKind::Completion => {
+            if existing.generation == store.state.generation {
+                CompletionDisposition::Applied
+            } else {
+                CompletionDisposition::Stale
+            }
+        }
     };
     state
         .operations
@@ -785,12 +814,18 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
     let identity = validate_identity(&request, "agent-hook.finish-line.verdict.v1")?;
     validate_identifier(&request.runner_capability)?;
     validate_digest(&request.contract_digest)?;
+    if let Some(reservation) = &request.completion_reservation {
+        validate_identifier(&reservation.operation_id)?;
+    }
     let capability_digest = runner_capability_digest(&identity, &request.runner_capability);
     let snapshot = resolve_contracts(&identity)?;
 
     let store = Store::open(state_root, &identity)?;
     validate_runner_capability(&store, &identity, &request.runner_capability)?;
-    let state = read_state(&store, &identity)?;
+    let mut state = read_state(&store, &identity)?;
+    if terminalize_inactive_completion_reservations(&store, &mut state) {
+        save_state(&store, &state)?;
+    }
     let session = acceptance_session(&state, &identity, &request.contract_digest)?;
     let generation = store.state.generation;
     let mut aggregate = VerdictStatus::Satisfied;
@@ -860,6 +895,72 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
     } else {
         "block"
     };
+    let completion_reservation = if aggregate == VerdictStatus::Satisfied {
+        if let Some(reservation) = &request.completion_reservation {
+            compact_state(&mut state, generation);
+            let key = operation_key(&identity.session_key, &reservation.operation_id);
+            let status = if let Some(existing) = state.operations.get(&key) {
+                let exact = matches!(existing.kind, AcceptanceOperationKind::Completion)
+                    && existing.session_key == identity.session_key
+                    && existing.turn_key == identity.turn_key
+                    && existing.contract_digest == request.contract_digest
+                    && existing.generation == generation
+                    && existing.terminal.is_none()
+                    && constant_time_eq(
+                        existing.capability_digest.as_bytes(),
+                        capability_digest.as_bytes(),
+                    );
+                if !exact {
+                    return Err(HookError::data(
+                        "finish-line-operation-exists",
+                        "finish-line completion reservation already has a different binding",
+                    ));
+                }
+                "duplicate"
+            } else {
+                if state.operations.len() >= MAX_OPERATIONS {
+                    return Err(HookError::data(
+                        "finish-line-state-limit",
+                        "finish-line acceptance operation limit is reached",
+                    ));
+                }
+                let sequence = state.next_sequence()?;
+                state.operations.insert(
+                    key,
+                    AcceptanceOperation {
+                        session_key: identity.session_key.clone(),
+                        turn_key: identity.turn_key.clone(),
+                        token_digest: digest_parts(
+                            "agent-hook.finish-line.completion-reservation.v1",
+                            &[reservation.operation_id.as_bytes()],
+                        ),
+                        capability_digest: capability_digest.clone(),
+                        contract_digest: request.contract_digest.clone(),
+                        generation,
+                        sequence,
+                        binding_digest: digest_parts(
+                            "agent-hook.finish-line.completion-binding.v1",
+                            &[request.contract_digest.as_bytes()],
+                        ),
+                        source_operation_key: None,
+                        kind: AcceptanceOperationKind::Completion,
+                        admission: AdmissionStatus::Admitted,
+                        terminal: None,
+                    },
+                );
+                save_state(&store, &state)?;
+                "reserved"
+            };
+            Some(json!({
+                "operation_id": reservation.operation_id,
+                "status": status,
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(Outcome {
         data: json!({
             "schema_version": "agent-hook.finish-line.verdict-result.v1",
@@ -870,6 +971,7 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
             "correlation_id": identity.correlation_id,
             "reason_codes": reason_codes.into_iter().collect::<Vec<_>>(),
             "requirements": requirements,
+            "completion_reservation": completion_reservation,
         }),
         text: format!("finish-line acceptance verdict: {}\n", aggregate.as_str()),
         exit_code: if aggregate == VerdictStatus::Satisfied {
@@ -883,8 +985,51 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
 pub(super) fn session_busy(store: &Store, identity: &RequestIdentity) -> Result<bool, HookError> {
     let state = read_state(store, identity)?;
     Ok(state.operations.values().any(|operation| {
-        operation.session_key == identity.session_key && operation.terminal.is_none()
+        operation.session_key == identity.session_key
+            && !matches!(operation.kind, AcceptanceOperationKind::Completion)
+            && operation.terminal.is_none()
     }))
+}
+
+pub(super) fn repository_completion_reserved(
+    store: &Store,
+    identity: &RequestIdentity,
+) -> Result<bool, HookError> {
+    let mut state = read_state(store, identity)?;
+    if terminalize_inactive_completion_reservations(store, &mut state) {
+        save_state(store, &state)?;
+    }
+    Ok(completion_reservation_active(store, &state))
+}
+
+pub(super) fn release_session(
+    store: &Store,
+    identity: &RequestIdentity,
+    capability_digest: &str,
+) -> Result<(), HookError> {
+    let mut state = read_state(store, identity)?;
+    let mut changed = false;
+    for operation in state.operations.values_mut() {
+        if operation.session_key == identity.session_key
+            && matches!(operation.kind, AcceptanceOperationKind::Completion)
+            && operation.terminal.is_none()
+            && constant_time_eq(
+                operation.capability_digest.as_bytes(),
+                capability_digest.as_bytes(),
+            )
+        {
+            operation.terminal = Some(AcceptanceTerminal {
+                observation: ObservationStatus::InfrastructureBlocked,
+                source_digest: "session-release".to_string(),
+                disposition: CompletionDisposition::Applied,
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        save_state(store, &state)?;
+    }
+    Ok(())
 }
 
 pub(super) fn repository_mutation_active(
@@ -901,6 +1046,58 @@ fn main_shell_active(store: &Store) -> bool {
     store.state.operations.values().any(|operation| {
         operation.kind == StoredOperationKind::Shell && operation.terminal.is_none()
     })
+}
+
+fn completion_reservation_active(store: &Store, state: &AcceptanceState) -> bool {
+    state.operations.values().any(|operation| {
+        matches!(operation.kind, AcceptanceOperationKind::Completion)
+            && operation.terminal.is_none()
+            && store
+                .state
+                .sessions
+                .get(&operation.session_key)
+                .and_then(|session| session.runner_capability_digest.as_deref())
+                .is_some_and(|capability| {
+                    constant_time_eq(
+                        capability.as_bytes(),
+                        operation.capability_digest.as_bytes(),
+                    )
+                })
+    })
+}
+
+fn terminalize_inactive_completion_reservations(
+    store: &Store,
+    state: &mut AcceptanceState,
+) -> bool {
+    let mut changed = false;
+    for operation in state.operations.values_mut() {
+        if !matches!(operation.kind, AcceptanceOperationKind::Completion)
+            || operation.terminal.is_some()
+        {
+            continue;
+        }
+        let capability_is_live = store
+            .state
+            .sessions
+            .get(&operation.session_key)
+            .and_then(|session| session.runner_capability_digest.as_deref())
+            .is_some_and(|capability| {
+                constant_time_eq(
+                    capability.as_bytes(),
+                    operation.capability_digest.as_bytes(),
+                )
+            });
+        if !capability_is_live {
+            operation.terminal = Some(AcceptanceTerminal {
+                observation: ObservationStatus::InfrastructureBlocked,
+                source_digest: "session-orphaned".to_string(),
+                disposition: CompletionDisposition::Applied,
+            });
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub(super) fn record_contained_infrastructure_failure(
@@ -1423,6 +1620,7 @@ fn operation_kind_name(kind: &AcceptanceOperationKind) -> &'static str {
     match kind {
         AcceptanceOperationKind::Mutation => "mutation",
         AcceptanceOperationKind::Validator { .. } => "validator",
+        AcceptanceOperationKind::Completion => "completion",
     }
 }
 

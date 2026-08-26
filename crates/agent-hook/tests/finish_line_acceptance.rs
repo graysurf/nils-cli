@@ -273,6 +273,21 @@ fn verdict(
     call(fixture, "verdict", &request)
 }
 
+fn reserve_completion(
+    fixture: &Fixture,
+    session_id: &str,
+    capability: &str,
+    contract_digest: &str,
+    operation_id: &str,
+) -> (i32, Value) {
+    let mut request = common(fixture, session_id, "turn-completion-reservation");
+    request["schema_version"] = json!("agent-hook.finish-line.verdict.v1");
+    request["runner_capability"] = json!(capability);
+    request["contract_digest"] = json!(contract_digest);
+    request["completion_reservation"] = json!({"operation_id": operation_id});
+    call(fixture, "verdict", &request)
+}
+
 #[test]
 fn named_host_validator_satisfies_only_its_exact_current_requirement() {
     let fixture = fixture();
@@ -338,6 +353,314 @@ fn named_host_validator_satisfies_only_its_exact_current_requirement() {
     assert_eq!(accepted["data"]["aggregate"], "satisfied");
     assert_eq!(accepted["data"]["requirements"][0]["name"], "unit");
     assert_eq!(accepted["data"]["requirements"][0]["status"], "satisfied");
+}
+
+#[test]
+fn completion_reservation_atomically_blocks_repository_mutation_until_consumed() {
+    let fixture = fixture();
+    let capability_a = open(&fixture, "session-completion-a");
+    let capability_b = open(&fixture, "session-completion-b");
+    let registered_a = register(&fixture, "session-completion-a", &capability_a).1;
+    let registered_b = register(&fixture, "session-completion-b", &capability_b).1;
+    let contract_a = registered_a["data"]["contract_digest"]
+        .as_str()
+        .expect("contract A");
+    let contract_b = registered_b["data"]["contract_digest"]
+        .as_str()
+        .expect("contract B");
+    admit_validator(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        contract_a,
+        "validator-completion-a",
+    );
+    observe(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        "validator-completion-a",
+        "succeeded",
+    );
+
+    let (reserved_code, reserved) = reserve_completion(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        contract_a,
+        "goal-completion-a",
+    );
+    assert_eq!(reserved_code, 0, "envelope={reserved}");
+    assert_eq!(reserved["data"]["action"], "allow");
+    assert_eq!(
+        reserved["data"]["completion_reservation"],
+        json!({"operation_id": "goal-completion-a", "status": "reserved"})
+    );
+    let duplicate = reserve_completion(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        contract_a,
+        "goal-completion-a",
+    );
+    assert_eq!(duplicate.0, 0, "envelope={}", duplicate.1);
+    assert_eq!(
+        duplicate.1["data"]["completion_reservation"]["status"],
+        "duplicate"
+    );
+
+    let blocked_mutation = admit_mutation(
+        &fixture,
+        "session-completion-b",
+        &capability_b,
+        contract_b,
+        "mutation-blocked-by-completion",
+    );
+    assert_eq!(blocked_mutation.0, 75, "envelope={}", blocked_mutation.1);
+    assert_eq!(
+        blocked_mutation.1["error"]["code"],
+        "finish-line-completion-reserved"
+    );
+
+    let mut shell = common(&fixture, "session-completion-b", "turn-shell-blocked");
+    shell["schema_version"] = json!("agent-hook.finish-line.run.v1");
+    shell["operation_id"] = json!("shell-blocked-by-completion");
+    shell["intent"] = json!("project-dev");
+    shell["command"] = json!("printf must-not-run > completion-race");
+    shell["runner_capability"] = json!(capability_b);
+    shell["timeout_ms"] = json!(5_000);
+    shell["execution"] = json!({
+        "kind": "bash-v1",
+        "workdir": fixture.root,
+        "output_max_bytes": 64 * 1024,
+        "runner": {"kind": "danger-full-access"},
+    });
+    let blocked_shell = call(&fixture, "run", &shell);
+    assert_eq!(blocked_shell.0, 75, "envelope={}", blocked_shell.1);
+    assert_eq!(
+        blocked_shell.1["error"]["code"],
+        "finish-line-completion-reserved"
+    );
+    assert!(!fixture.root.join("completion-race").exists());
+
+    let consumed = observe(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        "goal-completion-a",
+        "succeeded",
+    );
+    assert_eq!(consumed.0, 0, "envelope={}", consumed.1);
+    assert_eq!(consumed.1["data"]["status"], "applied");
+    let admitted = admit_mutation(
+        &fixture,
+        "session-completion-b",
+        &capability_b,
+        contract_b,
+        "mutation-after-completion",
+    );
+    assert_eq!(admitted.0, 0, "envelope={}", admitted.1);
+
+    observe(
+        &fixture,
+        "session-completion-b",
+        &capability_b,
+        "mutation-after-completion",
+        "succeeded",
+    );
+    admit_validator(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        contract_a,
+        "validator-before-release",
+    );
+    observe(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        "validator-before-release",
+        "succeeded",
+    );
+    let reserved_for_release = reserve_completion(
+        &fixture,
+        "session-completion-a",
+        &capability_a,
+        contract_a,
+        "goal-completion-release",
+    );
+    assert_eq!(
+        reserved_for_release.0, 0,
+        "envelope={}",
+        reserved_for_release.1
+    );
+    let released = release(&fixture, "session-completion-a", &capability_a);
+    assert_eq!(released.0, 0, "envelope={}", released.1);
+    let after_release = admit_mutation(
+        &fixture,
+        "session-completion-b",
+        &capability_b,
+        contract_b,
+        "mutation-after-reservation-release",
+    );
+    assert_eq!(after_release.0, 0, "envelope={}", after_release.1);
+}
+
+#[test]
+fn completion_reservation_and_repository_mutation_are_serialized_by_one_lock() {
+    let fixture = fixture();
+    let capability_a = open(&fixture, "session-race-a");
+    let capability_b = open(&fixture, "session-race-b");
+    let registered_a = register(&fixture, "session-race-a", &capability_a).1;
+    let registered_b = register(&fixture, "session-race-b", &capability_b).1;
+    let contract_a = registered_a["data"]["contract_digest"]
+        .as_str()
+        .expect("contract A");
+    let contract_b = registered_b["data"]["contract_digest"]
+        .as_str()
+        .expect("contract B");
+    admit_validator(
+        &fixture,
+        "session-race-a",
+        &capability_a,
+        contract_a,
+        "validator-race-a",
+    );
+    observe(
+        &fixture,
+        "session-race-a",
+        &capability_a,
+        "validator-race-a",
+        "succeeded",
+    );
+
+    let barrier = Arc::new(Barrier::new(3));
+    let (reserved, mutation) = thread::scope(|scope| {
+        let reserve_barrier = Arc::clone(&barrier);
+        let reserve_fixture = &fixture;
+        let reserve_capability = &capability_a;
+        let reserve = scope.spawn(move || {
+            reserve_barrier.wait();
+            reserve_completion(
+                reserve_fixture,
+                "session-race-a",
+                reserve_capability,
+                contract_a,
+                "goal-completion-race",
+            )
+        });
+        let mutation_barrier = Arc::clone(&barrier);
+        let mutation_fixture = &fixture;
+        let mutation_capability = &capability_b;
+        let mutation = scope.spawn(move || {
+            mutation_barrier.wait();
+            admit_mutation(
+                mutation_fixture,
+                "session-race-b",
+                mutation_capability,
+                contract_b,
+                "mutation-race-b",
+            )
+        });
+        barrier.wait();
+        (
+            reserve.join().expect("reservation thread"),
+            mutation.join().expect("mutation thread"),
+        )
+    });
+
+    assert_ne!(
+        reserved.0 == 0,
+        mutation.0 == 0,
+        "reserved={}; mutation={}",
+        reserved.1,
+        mutation.1
+    );
+    if reserved.0 == 0 {
+        assert_eq!(mutation.0, 75, "envelope={}", mutation.1);
+        assert_eq!(
+            mutation.1["error"]["code"],
+            "finish-line-completion-reserved"
+        );
+    } else {
+        assert_eq!(mutation.0, 0, "envelope={}", mutation.1);
+        assert_eq!(reserved.0, 1, "envelope={}", reserved.1);
+        assert_eq!(reserved.1["data"]["aggregate"], "active");
+        assert_eq!(reserved.1["data"]["completion_reservation"], Value::Null);
+    }
+}
+
+#[test]
+fn orphaned_completion_reservation_terminalizes_before_repository_mutation() {
+    let fixture = fixture();
+    let capability_a = open(&fixture, "session-orphaned-completion-a");
+    let capability_b = open(&fixture, "session-orphaned-completion-b");
+    let registered_a = register(&fixture, "session-orphaned-completion-a", &capability_a).1;
+    let registered_b = register(&fixture, "session-orphaned-completion-b", &capability_b).1;
+    let contract_a = registered_a["data"]["contract_digest"]
+        .as_str()
+        .expect("contract A");
+    let contract_b = registered_b["data"]["contract_digest"]
+        .as_str()
+        .expect("contract B");
+    admit_validator(
+        &fixture,
+        "session-orphaned-completion-a",
+        &capability_a,
+        contract_a,
+        "validator-orphaned-completion",
+    );
+    observe(
+        &fixture,
+        "session-orphaned-completion-a",
+        &capability_a,
+        "validator-orphaned-completion",
+        "succeeded",
+    );
+    let reserved = reserve_completion(
+        &fixture,
+        "session-orphaned-completion-a",
+        &capability_a,
+        contract_a,
+        "goal-orphaned-completion",
+    );
+    assert_eq!(reserved.0, 0, "envelope={}", reserved.1);
+
+    let (main_path, acceptance_path) = finish_line_state_paths(&fixture);
+    let acceptance_before_orphan = read_json(&acceptance_path);
+    let orphaned_session_key = acceptance_before_orphan["operations"]
+        .as_object()
+        .expect("acceptance operations")
+        .values()
+        .find(|operation| operation["kind"]["kind"] == "completion")
+        .and_then(|operation| operation["session_key"].as_str())
+        .expect("orphaned session key")
+        .to_string();
+    let mut main_state = read_json(&main_path);
+    main_state["sessions"]
+        .as_object_mut()
+        .expect("main sessions")
+        .remove(&orphaned_session_key);
+    write_json(&main_path, &main_state);
+
+    let admitted = admit_mutation(
+        &fixture,
+        "session-orphaned-completion-b",
+        &capability_b,
+        contract_b,
+        "mutation-after-orphaned-completion",
+    );
+    assert_eq!(admitted.0, 0, "envelope={}", admitted.1);
+    let acceptance_state = read_json(&acceptance_path);
+    let terminal = acceptance_state["operations"]
+        .as_object()
+        .expect("acceptance operations")
+        .values()
+        .find(|operation| operation["kind"]["kind"] == "completion")
+        .and_then(|operation| operation["terminal"].as_object())
+        .expect("orphaned completion terminal");
+    assert_eq!(terminal["observation"], "infrastructure-blocked");
+    assert_eq!(terminal["source_digest"], "session-orphaned");
 }
 
 #[test]

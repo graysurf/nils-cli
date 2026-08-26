@@ -120,7 +120,7 @@ pub enum FinishLineCommand {
     Admit(FinishLineFormatArgs),
     /// Record one authenticated terminal observation for an admitted operation.
     Observe(FinishLineFormatArgs),
-    /// Return the detached authoritative acceptance verdict.
+    /// Return the authoritative verdict and optionally reserve completion.
     Verdict(FinishLineFormatArgs),
     /// Decide whether every current validation target is satisfied.
     Stop(FinishLineFormatArgs),

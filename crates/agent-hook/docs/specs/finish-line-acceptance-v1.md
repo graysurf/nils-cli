@@ -26,7 +26,7 @@ are:
 | `register` | `agent-hook.finish-line.register.v1` | `requirements` and `invalidators` arrays described below |
 | `admit` | `agent-hook.finish-line.admit.v1` | `contract_digest`, `operation_id`, private `attempt_token`, and strict tagged `operation` |
 | `observe` | `agent-hook.finish-line.observe.v1` | `operation_id` and strict tagged `observation` |
-| `verdict` | `agent-hook.finish-line.verdict.v1` | `contract_digest` |
+| `verdict` | `agent-hook.finish-line.verdict.v1` | `contract_digest` and optional `completion_reservation = {operation_id}` |
 
 `register.requirements[]` is exactly `{name, validators}`. Each validator is
 exactly `{id, tool_name, definition_digest, execution}`. `execution` is either
@@ -64,6 +64,9 @@ Successful command data uses the matching
 `contract_digest`, ordered `reason_codes`, and lexically ordered requirement
 records. Every result also carries the opaque repository/session
 `correlation_id`. Unknown or cross-variant fields are rejected.
+When requested, `verdict.completion_reservation` is `null` for a blocking
+verdict or exactly `{operation_id,status}` for an all-satisfied reservation;
+status is `reserved` or `duplicate`.
 
 ## Registration
 
@@ -122,6 +125,16 @@ admission cannot cross an active mutation boundary. A validator or another
 mutation cannot start while any acceptance mutation or ordinary supervised
 Bash operation remains active in the repository.
 
+An all-satisfied `verdict` may atomically reserve goal completion under the
+same repository lock. While that operation remains non-terminal, every
+generation-changing acceptance mutation, legacy edit, and ordinary supervised
+Bash admission is denied with `finish-line-completion-reserved`. Validators
+remain eligible because they cannot advance the generation. The exact owning
+capability consumes or cancels the reservation through the existing
+host-observed `observe` operation. This keeps the four public RPCs unchanged
+while closing the gap between an asynchronous verdict read and DSH's
+synchronous goal-state mutation.
+
 ## Terminal observation
 
 `observe` is accepted only from the current session capability and only for an
@@ -158,7 +171,7 @@ shared generation and never creates validation evidence. Non-shell tools use
 the host-observed terminal path after the runtime has bound the exact visible
 DSH ToolDefinition and terminal lifecycle result.
 
-## Detached verdict
+## Detached verdict and completion reservation
 
 `verdict` returns every requirement in lexical name order plus an aggregate and
 `allow` or `block`. The only statuses are:
@@ -184,6 +197,16 @@ pending ordinary supervised Bash operation, including operations owned by a
 different DSH session. A current pending operation is `active`; an older or
 unreconciled authority boundary is `infrastructure-blocked`.
 
+A detached all-satisfied read is diagnostic and stop-eligible but is not by
+itself goal-completion authority. When `completion_reservation` is requested,
+the provider evaluates the same verdict and persists the reservation before it
+returns `allow`, all under the existing repository lock. A competing mutation
+therefore either wins first and makes the verdict block, or loses to the
+reservation and is denied; both cannot succeed. Exact reservation retries are
+idempotent. Runtime disposal and session release terminalize an unconsumed
+reservation as infrastructure-blocked, while a successful synchronous goal
+assertion consumes it as a host-observed terminal.
+
 The sidecar state is strict, owner-only, symlink-resistant, bounded to 384 KiB,
 and serialized under the existing per-repository finish-line lock. It lives
 beside, rather than inside, the released finish-line V1 state file. This keeps
@@ -194,14 +217,18 @@ validation contracts are satisfied.
 ## Recovery and compaction
 
 Every invocation reconstructs the verdict from durable state. Terminal
-operations are compacted oldest-first while active operations,
+operations are compacted oldest-first while active operations and completion
+reservations,
 current-generation mutation blockers, current requirement evidence, claimed
 contained sources, and a bounded recent idempotency window remain. Session
 pressure never evicts a session with a non-terminal acceptance operation.
-Session release refuses any non-terminal acceptance operation regardless of
-capability incarnation. Reopening a cleanly released session with a new
-capability preserves terminal evidence; if recovery encounters active evidence
-bound to an older capability incarnation, it reports
+Session release refuses any non-terminal mutation or validator operation
+regardless of capability incarnation, and terminalizes its own completion
+reservation before returning. If crash-orphan recovery removes or replaces the
+owning capability, the next locked provider operation terminalizes the orphaned
+reservation as infrastructure-blocked before permitting mutation. Reopening a
+cleanly released session with a new capability preserves terminal evidence; if
+recovery encounters active evidence bound to an older capability incarnation, it reports
 `infrastructure-blocked` and release remains blocked. Neither session
 projection nor model text is an authority source.
 

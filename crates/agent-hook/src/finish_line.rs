@@ -779,6 +779,12 @@ fn begin(state_root: &Path, request: BeginRequest) -> Result<Outcome, HookError>
         }
 
         ensure_state_capacity(&store.state, &identity.session_key)?;
+        if acceptance::repository_completion_reserved(&store, &identity)? {
+            return Err(finish_line_temporary(
+                "finish-line-completion-reserved",
+                "the repository is reserved by an authoritative completion",
+            ));
+        }
         if acceptance::repository_mutation_active(&store, &identity)?
             || store.state.operations.values().any(|operation| {
                 operation.kind == StoredOperationKind::Shell && operation.terminal.is_none()
@@ -1219,6 +1225,12 @@ fn run_ordinary_shell(
 
         compact_state(&mut store.state);
         ensure_state_capacity(&store.state, &identity.session_key)?;
+        if acceptance::repository_completion_reserved(&store, &identity)? {
+            return Err(finish_line_temporary(
+                "finish-line-completion-reserved",
+                "the repository is reserved by an authoritative completion",
+            ));
+        }
         if acceptance::repository_mutation_active(&store, &identity)?
             || store.state.operations.values().any(|operation| {
                 operation.kind == StoredOperationKind::Shell && operation.terminal.is_none()
@@ -1461,6 +1473,7 @@ fn release(state_root: &Path, request: ReleaseRequest) -> Result<Outcome, HookEr
             )
         })
     {
+        acceptance::release_session(&store, &identity, &supplied_digest)?;
         return Ok(success_outcome(
             json!({
                 "schema_version": "agent-hook.finish-line.release-result.v1",
@@ -1493,13 +1506,14 @@ fn release(state_root: &Path, request: ReleaseRequest) -> Result<Outcome, HookEr
     store.state.released_sessions.insert(
         released_key,
         ReleasedSession {
-            capability_digest: supplied_digest,
+            capability_digest: supplied_digest.clone(),
             session_key: Some(identity.session_key.clone()),
             sequence,
         },
     );
     compact_release_tombstones(&mut store.state);
     store.save()?;
+    acceptance::release_session(&store, &identity, &supplied_digest)?;
     Ok(success_outcome(
         json!({
             "schema_version": "agent-hook.finish-line.release-result.v1",
