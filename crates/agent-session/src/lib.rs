@@ -23055,7 +23055,7 @@ fi
             serde_json::json!("double-ctrl-c"),
         );
         write_session_record(&context, &record).unwrap();
-        let mut pane = TestProcessGroup::spawn();
+        let mut pane = ReapedTestProcessGroup::spawn();
         let tmux = tmp.path().join("tmux-profiled-graceful-delete-success");
         let calls = tmp
             .path()
