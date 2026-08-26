@@ -19,7 +19,7 @@ use crate::backend;
 use crate::cli::{EvidenceMode, ExecArgs, McpArgs, OutputFormat, RuntimeMode, ToolProfile};
 use crate::commands;
 use crate::error::{CliError, ErrorClass};
-use crate::journal::ArtifactIndex;
+use crate::journal::{ArtifactIndex, StepRecord};
 use crate::lock::PeekabooLock;
 use crate::model::SuccessEnvelope;
 use crate::{process, test_mode};
@@ -162,7 +162,7 @@ pub fn run_remote_exec(args: &ExecArgs, format: OutputFormat) -> Result<u8, CliE
         .host
         .as_deref()
         .ok_or_else(|| transport_error("SSH host is required"))?;
-    let response = request(
+    let mut response = request(
         host,
         RemoteCommand::Exec {
             argv: args.argv.clone(),
@@ -174,7 +174,8 @@ pub fn run_remote_exec(args: &ExecArgs, format: OutputFormat) -> Result<u8, CliE
         },
         Duration::from_secs(args.timeout_seconds.clamp(1, 3600) + 30),
     )?;
-    install_transferred_files(&args.out_dir, &response.artifacts)?;
+    let assigned = install_transferred_journal(&args.out_dir, &response.artifacts)?;
+    rebind_journal_step(&mut response.result, assigned);
     emit_remote(format, "exec", response)
 }
 
@@ -287,7 +288,7 @@ pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
         Duration::from_secs(30),
     );
     let collect_result = collected.and_then(|response| {
-        install_transferred_files(&args.out_dir, &response.artifacts)?;
+        install_transferred_journal(&args.out_dir, &response.artifacts)?;
         if response.ok {
             Ok(())
         } else {
@@ -862,6 +863,106 @@ fn collect_files(root: &Path) -> Result<Vec<TransferredFile>, CliError> {
     Ok(files)
 }
 
+/// Journal-control files a remote session emits. They describe the scratch
+/// session rather than the durable local journal, so they are merged rather
+/// than installed.
+const JOURNAL_CONTROL_FILES: [&str; 6] = [
+    "manifest.json",
+    "steps.jsonl",
+    "summary.json",
+    "redaction.json",
+    "review.json",
+    "artifacts/index.json",
+];
+
+/// Install one transferred bundle into the durable local journal.
+///
+/// Writing the control files verbatim would replace every step already
+/// recorded in this output directory, because the endpoint allocates a fresh
+/// session root per request and its journal always restarts at sequence 1.
+/// Artifact payloads still install directly. Returns the local step id
+/// assigned to the last ingested step.
+fn install_transferred_journal(
+    root: &Path,
+    files: &[TransferredFile],
+) -> Result<Option<String>, CliError> {
+    let has = |name: &str| files.iter().any(|file| file.relative_path == name);
+    if !has("manifest.json") || !has("steps.jsonl") {
+        install_transferred_files(root, files)?;
+        return Ok(None);
+    }
+
+    let mut payload = Vec::new();
+    let mut manifest_body = Vec::new();
+    let mut steps_body = Vec::new();
+    let mut index_body = None;
+    for file in files {
+        match file.relative_path.as_str() {
+            "manifest.json" => manifest_body = decode_transferred(file)?,
+            "steps.jsonl" => steps_body = decode_transferred(file)?,
+            "artifacts/index.json" => index_body = Some(decode_transferred(file)?),
+            other if JOURNAL_CONTROL_FILES.contains(&other) => {}
+            _ => payload.push(file.clone()),
+        }
+    }
+    install_transferred_files(root, &payload)?;
+
+    let manifest = serde_json::from_slice(&manifest_body)
+        .map_err(|_| transport_error("remote journal manifest is malformed"))?;
+    let steps = parse_transferred_steps(&steps_body)?;
+    let index = index_body
+        .map(|body| {
+            serde_json::from_slice::<ArtifactIndex>(&body)
+                .map_err(|_| transport_error("remote artifact index is malformed"))
+        })
+        .transpose()?;
+    let assigned = crate::journal::ingest_transfer(
+        root,
+        crate::journal::TransferredJournal {
+            manifest,
+            steps,
+            index,
+        },
+    )?;
+    Ok(assigned.last().cloned())
+}
+
+fn decode_transferred(file: &TransferredFile) -> Result<Vec<u8>, CliError> {
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(&file.data_base64)
+        .map_err(|_| transport_error("remote artifact encoding is malformed"))?;
+    if body.len() > MAX_TRANSFER_BYTES || hex(&Sha256::digest(&body)) != file.sha256 {
+        return Err(transport_error(
+            "remote artifact digest or bundle size is invalid",
+        ));
+    }
+    Ok(body)
+}
+
+fn parse_transferred_steps(body: &[u8]) -> Result<Vec<StepRecord>, CliError> {
+    let mut steps = Vec::new();
+    for line in body.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        steps.push(
+            serde_json::from_slice(line)
+                .map_err(|_| transport_error("remote journal step is malformed"))?,
+        );
+    }
+    Ok(steps)
+}
+
+/// Rebind an emitted exec result to the step id the local journal assigned.
+fn rebind_journal_step(result: &mut Option<serde_json::Value>, step: Option<String>) {
+    let (Some(value), Some(step)) = (result.as_mut(), step) else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("journal_step".into(), serde_json::Value::String(step));
+    }
+}
+
 fn install_transferred_files(root: &Path, files: &[TransferredFile]) -> Result<(), CliError> {
     if files.len() > MAX_TRANSFER_FILES {
         return Err(transport_error(
@@ -1184,10 +1285,12 @@ fn transport_error(message: impl Into<String>) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::{EvidenceMode, RuntimeMode};
     use std::fs;
     use std::io::Cursor;
     use std::os::unix::fs::symlink;
     use std::os::unix::process::CommandExt;
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
@@ -1197,8 +1300,8 @@ mod tests {
 
     use super::{
         MAX_REMOTE_SESSION_ROOTS, ProcessGroupChild, TransferredFile, collect_files,
-        create_bounded_remote_session, install_transferred_files, read_bounded_line,
-        remove_session, validate_host, validate_relative,
+        create_bounded_remote_session, install_transferred_files, install_transferred_journal,
+        read_bounded_line, remove_session, validate_host, validate_relative,
     };
 
     #[test]
@@ -1304,6 +1407,145 @@ mod tests {
             "allocation lock escaped the fixture into {}",
             stray.display()
         );
+    }
+
+    fn transferred(relative: &str, body: &[u8]) -> TransferredFile {
+        TransferredFile {
+            relative_path: relative.into(),
+            sha256: super::hex(&sha2::Sha256::digest(body)),
+            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body),
+        }
+    }
+
+    /// One remote exec bundle. The endpoint allocates a fresh session per
+    /// request, so every bundle restarts at sequence 1 with its own run id.
+    fn remote_exec_bundle(run: &str, intent: &str, digest: &str) -> Vec<TransferredFile> {
+        let manifest = crate::journal::Manifest {
+            schema_version: crate::journal::JOURNAL_SCHEMA.into(),
+            run_id: run.into(),
+            adapter_version: env!("CARGO_PKG_VERSION").into(),
+            peekaboo_tag: "v4.2.2".into(),
+            peekaboo_commit: "0".repeat(40),
+            backend_digest: digest.into(),
+            runtime: RuntimeMode::App,
+            transport: "ssh".into(),
+            evidence_mode: EvidenceMode::Minimal,
+            tool_profile: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: Some("2026-01-01T00:00:02Z".into()),
+            state: "closed".into(),
+        };
+        let step = crate::journal::StepRecord {
+            schema_version: "macos-agent.journal-step.v2".into(),
+            sequence: 1,
+            id: "step-000001".into(),
+            correlation_id: format!("{run}-step-000001"),
+            parent_id: None,
+            recorded_at: "2026-01-01T00:00:01Z".into(),
+            intent: Some(intent.into()),
+            expected: None,
+            command: "see".into(),
+            mcp_method: None,
+            mcp_tool: None,
+            argv_shape: vec!["see".into()],
+            replay_argv: Some(vec!["see".into()]),
+            backend_digest: digest.into(),
+            runtime: RuntimeMode::App,
+            transport: "ssh".into(),
+            status: crate::journal::StepStatus::Passed,
+            failure_class: None,
+            duration_ms: 1,
+            retries: 0,
+            precondition_refs: Vec::new(),
+            postcondition_refs: Vec::new(),
+            snapshot_lineage: None,
+            replay_class: crate::journal::ReplayClass::Safe,
+            artifact_refs: Vec::new(),
+        };
+        let mut steps = serde_json::to_vec(&step).expect("step");
+        steps.push(b'\n');
+        vec![
+            transferred(
+                "manifest.json",
+                &serde_json::to_vec(&manifest).expect("manifest"),
+            ),
+            transferred("steps.jsonl", &steps),
+            transferred("summary.json", b"{\"stale\":true}"),
+        ]
+    }
+
+    fn journal_steps(root: &Path) -> Vec<crate::journal::StepRecord> {
+        fs::read_to_string(root.join("steps.jsonl"))
+            .expect("steps")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("step"))
+            .collect()
+    }
+
+    #[test]
+    fn ssh_transfers_append_to_one_journal_instead_of_replacing_it() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+
+        let first = install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+        let second = install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-b", "second", "sha256:fixture"),
+        )
+        .expect("second transfer");
+        assert_eq!(first.as_deref(), Some("step-000001"));
+        assert_eq!(second.as_deref(), Some("step-000002"));
+
+        let steps = journal_steps(&out);
+        assert_eq!(steps.len(), 2, "second transfer replaced the first");
+        assert_eq!(steps[0].sequence, 1);
+        assert_eq!(steps[1].sequence, 2);
+        assert_eq!(steps[0].intent.as_deref(), Some("first"));
+        assert_eq!(steps[1].intent.as_deref(), Some("second"));
+        assert_eq!(steps[1].id, "step-000002");
+
+        // The local journal owns run identity and its derived views; a later
+        // transfer joins the session rather than rebranding it.
+        let manifest: crate::journal::Manifest =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).expect("manifest"))
+                .expect("parse manifest");
+        assert_eq!(manifest.run_id, "run-a");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.correlation_id.starts_with("run-a-"))
+        );
+        let summary: crate::journal::Summary =
+            serde_json::from_slice(&fs::read(out.join("summary.json")).expect("summary"))
+                .expect("parse summary");
+        assert_eq!(summary.total_steps, 2);
+    }
+
+    #[test]
+    fn a_transfer_from_a_different_execution_tuple_is_refused_without_loss() {
+        let root = TempDir::new().expect("root");
+        let out = root.path().join("journal");
+        install_transferred_journal(
+            &out,
+            &remote_exec_bundle("run-a", "first", "sha256:fixture"),
+        )
+        .expect("first transfer");
+
+        assert!(
+            install_transferred_journal(
+                &out,
+                &remote_exec_bundle("run-b", "second", "sha256:replaced-backend")
+            )
+            .is_err(),
+            "a drifted backend digest must not silently join the journal"
+        );
+        let steps = journal_steps(&out);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].intent.as_deref(), Some("first"));
     }
 
     #[test]

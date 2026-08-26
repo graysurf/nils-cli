@@ -563,6 +563,136 @@ pub fn record_system_failure(root: &Path, class: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// One remote exec or MCP journal transferred back from an SSH target.
+pub struct TransferredJournal {
+    pub manifest: Manifest,
+    pub steps: Vec<StepRecord>,
+    pub index: Option<ArtifactIndex>,
+}
+
+/// Merge a transferred remote journal into the durable local journal.
+///
+/// A remote session journal is per-call scratch: the endpoint allocates a fresh
+/// session root for every request, so the transferred log always restarts at
+/// sequence 1. Installing it verbatim would replace every step already recorded
+/// in this output directory. Merge it instead, reassigning local sequences and
+/// identifiers, and return the assigned ids in transferred order.
+pub fn ingest_transfer(root: &Path, transfer: TransferredJournal) -> Result<Vec<String>, CliError> {
+    validate_root(root)?;
+    create_private_dir(root)?;
+    let _lock = JournalLock::acquire(root)?;
+    create_private_dir(&root.join("artifacts"))?;
+
+    if transfer.manifest.schema_version != JOURNAL_SCHEMA {
+        return Err(journal_error("unsupported journal schema"));
+    }
+
+    // The local manifest owns run identity. A transferred manifest may only
+    // continue a session whose execution tuple is unchanged, matching the
+    // homogeneity rule `open_with_digest` enforces for local runs.
+    let manifest_path = root.join("manifest.json");
+    let manifest = if manifest_path.exists() {
+        let local: Manifest = read_json(&manifest_path)?;
+        if local.schema_version != transfer.manifest.schema_version
+            || local.backend_digest != transfer.manifest.backend_digest
+            || local.runtime != transfer.manifest.runtime
+            || local.transport != transfer.manifest.transport
+            || local.evidence_mode != transfer.manifest.evidence_mode
+            || local.tool_profile != transfer.manifest.tool_profile
+        {
+            return Err(journal_error(
+                "journal manifest does not match this execution session",
+            ));
+        }
+        local
+    } else {
+        Manifest {
+            state: "open".into(),
+            closed_at: None,
+            ..transfer.manifest
+        }
+    };
+    write_json(&manifest_path, &manifest)?;
+    ensure_index(root)?;
+
+    recover_sequence_transaction(root)?;
+    let (existing, recovered_tail) = read_steps_recover(root)?;
+    write_sequence(root, existing.len() as u64)?;
+
+    let mut assigned = Vec::new();
+    let mut remapped = BTreeMap::<String, String>::new();
+    for step in transfer.steps {
+        let committed = read_sequence(root)?;
+        if committed >= MAX_JOURNAL_STEPS {
+            return Err(journal_error(
+                "journal rotation is required at the 512-step bound; use a new output directory",
+            ));
+        }
+        let sequence = committed + 1;
+        let id = format!("step-{sequence:06}");
+        let remote_id = step.id.clone();
+        // A parent inside this same transfer follows it to its new id; one that
+        // named an earlier local step is kept as an opaque reference.
+        let parent_id = step.parent_id.as_ref().map(|parent| {
+            remapped
+                .get(parent)
+                .cloned()
+                .unwrap_or_else(|| safe_reference(parent))
+        });
+        let record = StepRecord {
+            sequence,
+            id: id.clone(),
+            correlation_id: format!("{}-{id}", manifest.run_id),
+            parent_id,
+            ..step
+        };
+        write_atomic(
+            &root.join(SEQUENCE_TRANSACTION_FILE),
+            sequence.to_string().as_bytes(),
+            SECRET_FILE_MODE,
+        )
+        .map_err(|_| journal_error("failed to begin journal sequence transaction"))?;
+        if let Err(error) = append_step(root, &record) {
+            let _ = remove_sequence_transaction(root);
+            return Err(error);
+        }
+        write_sequence(root, sequence)?;
+        remove_sequence_transaction(root)?;
+        remapped.insert(remote_id, id.clone());
+        assigned.push(id);
+    }
+
+    if let Some(remote_index) = transfer.index {
+        if remote_index.schema_version != "macos-agent.artifact-index.v1" {
+            return Err(journal_error("unsupported artifact index schema"));
+        }
+        let mut index: ArtifactIndex = read_json(&root.join("artifacts/index.json"))?;
+        for mut row in remote_index.artifacts {
+            row.producing_step = remapped
+                .get(&row.producing_step)
+                .cloned()
+                .unwrap_or_else(|| safe_reference(&row.producing_step));
+            if !index
+                .artifacts
+                .iter()
+                .any(|present| present.relative_path == row.relative_path)
+            {
+                index.artifacts.push(row);
+            }
+        }
+        index
+            .artifacts
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        write_json(&root.join("artifacts/index.json"), &index)?;
+    }
+
+    let (merged, recovered) = read_steps_recover(root)?;
+    let summary = build_summary(&merged, recovered_tail || recovered);
+    write_json(&root.join("summary.json"), &summary)?;
+    write_redaction_report(root)?;
+    Ok(assigned)
+}
+
 pub fn replay_plan(root: &Path, selected: Option<&str>) -> Result<ReplayPlan, CliError> {
     let _lock = JournalLock::acquire(root)?;
     let manifest: Manifest = read_json(&root.join("manifest.json"))?;
@@ -1023,6 +1153,7 @@ fn significant_failure(step: &StepRecord) -> bool {
             | "wrong_target"
             | "false_success"
             | "unknown_mutation"
+            | "upstream_refused"
             | "held_input"
             | "remote_cleanup"
             | "journal_integrity"
@@ -1066,6 +1197,7 @@ fn normalize_failure(value: &str) -> String {
         | "permission_drift"
         | "upstream"
         | "upstream_malformed_json"
+        | "upstream_refused"
         | "upstream_mcp"
         | "upstream_signal"
         | "upstream_timeout"
@@ -1370,6 +1502,46 @@ mod tests {
 
     fn open(root: &std::path::Path, mode: EvidenceMode) -> Journal {
         Journal::open(root, RuntimeMode::App, "local", mode, None).expect("journal")
+    }
+
+    #[test]
+    fn a_refused_mutation_is_a_significant_review_candidate() {
+        let root = TempDir::new().expect("root");
+        let mut journal = open(root.path(), EvidenceMode::Minimal);
+        journal
+            .record_step(StepInput {
+                parent_id: None,
+                intent: Some("return the fixture to its baseline".into()),
+                expected: Some("the fixture is no longer running".into()),
+                argv: vec![
+                    "app".into(),
+                    "quit".into(),
+                    "--app".into(),
+                    "Fixture".into(),
+                ],
+                status: StepStatus::Failed,
+                failure_class: Some("upstream_refused".into()),
+                duration_ms: 1,
+                retries: 0,
+                precondition_refs: Vec::new(),
+                postcondition_refs: Vec::new(),
+                snapshot_lineage: None,
+                artifact_refs: Vec::new(),
+            })
+            .expect("step");
+
+        let review = review(root.path()).expect("review");
+        assert!(
+            !review.clean,
+            "a mutation the backend refused must not review as clean"
+        );
+        let candidate = review
+            .candidates
+            .iter()
+            .find(|candidate| candidate.signature == "app:upstream_refused")
+            .expect("refusal keeps its own signature instead of collapsing to other");
+        assert!(candidate.significant);
+        assert_eq!(candidate.proposed_owner, "peekaboo_or_adapter");
     }
 
     #[test]
