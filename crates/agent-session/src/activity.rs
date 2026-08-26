@@ -1116,6 +1116,13 @@ fn projected_provider_identifier(
     Ok(format!("local:v1:{}", hex_digest(digest.finalize())))
 }
 
+pub(crate) fn projected_codex_turn_identifier(
+    runtime_id: &str,
+    value: &str,
+) -> Result<String, CliError> {
+    projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", value)
+}
+
 fn hermes_approval_correlation_id(runtime_id: &str, raw: &Value) -> Result<String, CliError> {
     fn required_string<'a>(raw: &'a Value, field: &str) -> Result<&'a str, CliError> {
         raw.get(field).and_then(Value::as_str).ok_or_else(|| {
