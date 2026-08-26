@@ -11928,6 +11928,13 @@ struct TmuxSessionSnapshots {
     sessions: BTreeMap<String, TmuxSessionSnapshot>,
 }
 
+// tmux sanitizes control characters in format output under a C locale. Keep
+// the bulk snapshot delimiter printable, parse it from the right so even an
+// unusual pre-existing session name containing the delimiter remains intact,
+// and continue accepting prior tab-delimited fixture or wrapper output.
+const TMUX_SESSION_SNAPSHOT_FORMAT: &str = "#{session_name}|#{window_activity}";
+const TMUX_SESSION_SNAPSHOT_SEPARATOR: char = '|';
+
 impl TmuxSessionSnapshots {
     fn contains_key(&self, tmux_session: &str) -> bool {
         self.sessions.contains_key(tmux_session)
@@ -11965,7 +11972,7 @@ fn tmux_session_snapshots(tmux_bin: &Path) -> Option<TmuxSessionSnapshots> {
         .arg("list-windows")
         .arg("-a")
         .arg("-F")
-        .arg("#{session_name}\t#{window_activity}")
+        .arg(TMUX_SESSION_SNAPSHOT_FORMAT)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -11974,7 +11981,10 @@ fn tmux_session_snapshots(tmux_bin: &Path) -> Option<TmuxSessionSnapshots> {
     let raw = String::from_utf8_lossy(&output.stdout);
     let mut activity_by_session: BTreeMap<String, Option<i64>> = BTreeMap::new();
     for line in raw.lines() {
-        let Some((session, activity)) = line.split_once('\t') else {
+        let Some((session, activity)) = line
+            .rsplit_once(TMUX_SESSION_SNAPSHOT_SEPARATOR)
+            .or_else(|| line.split_once('\t'))
+        else {
             continue;
         };
         if session.is_empty() {
@@ -22638,6 +22648,48 @@ fi
         let views = super::list_sessions(&context, Some(&tmux)).unwrap();
         assert_eq!(views.len(), 2);
         assert_eq!(fs::read_to_string(calls).unwrap(), "list-windows\n");
+    }
+
+    #[test]
+    fn list_bulk_tmux_probe_survives_c_locale_control_character_sanitization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
+            title: None,
+            title_state: None,
+            explicit_id: Some("bulk_locale_with_underscores"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = list-windows ]; then\n  case \"$4\" in\n    *'|'*) printf '%s|100\\n' {} ;;\n    *) printf '%s_100\\n' {} ;;\n  esac\n  exit 0\nfi\nif [ \"$1\" = has-session ]; then exit 0; fi\nexit 1\n",
+                shell_words::quote(&created.record.tmux_session),
+                shell_words::quote(&created.record.tmux_session),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let views = super::list_sessions(&context, Some(&tmux)).unwrap();
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].status, "running");
+        assert_eq!(
+            views[0].last_terminal_activity_at.as_deref(),
+            Some("1970-01-01T00:01:40Z")
+        );
     }
 
     #[test]
