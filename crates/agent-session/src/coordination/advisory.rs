@@ -238,6 +238,7 @@ pub(crate) fn set(context: &CliContext, args: WorkContextSetArgs) -> Result<Valu
         &incarnation,
         candidate,
         record.coordination_mode == CoordinationMode::Enforce,
+        args.if_absent,
     )?;
     value
         .as_object_mut()

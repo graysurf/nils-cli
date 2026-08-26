@@ -321,6 +321,7 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--if-absent[Preserve an existing active declaration and create this context only when none exists]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0

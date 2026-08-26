@@ -2753,6 +2753,213 @@ fn self_targeting_context_set_clear_and_acknowledge_hide_mechanical_inputs() {
 }
 
 #[test]
+fn self_targeting_context_set_if_absent_preserves_an_existing_declaration() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let existing = run_with_env(
+        &checkout,
+        &[
+            "work-context",
+            "set",
+            "--tier",
+            "L3",
+            "--summary",
+            "tracked delivery",
+            "--issue",
+            "213",
+            "--path",
+            "src/",
+            "--format",
+            "json",
+        ],
+        &env,
+    );
+    assert_eq!(existing.code, 0, "stderr={}", existing.stderr_text());
+
+    let ensured = run_with_env(
+        &checkout,
+        &[
+            "work-context",
+            "set",
+            "--if-absent",
+            "--tier",
+            "L2",
+            "--summary",
+            "generic DSH context",
+            "--format",
+            "json",
+        ],
+        &env,
+    );
+
+    assert_eq!(ensured.code, 0, "stderr={}", ensured.stderr_text());
+    assert_eq!(data(&ensured)["changed"], false);
+    assert_eq!(data(&ensured)["mode"], "advisory");
+    assert_eq!(data(&ensured)["context"], data(&existing)["context"]);
+
+    let beta_cap = capability(&state_dir, "beta");
+    let beta_env = [
+        ("AGENT_SESSION_ID", "beta"),
+        ("AGENT_SESSION_CAPABILITY_FILE", beta_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let created = run_with_env(
+        &checkout,
+        &[
+            "work-context",
+            "set",
+            "--if-absent",
+            "--tier",
+            "L2",
+            "--summary",
+            "fresh DSH context",
+            "--format",
+            "json",
+        ],
+        &beta_env,
+    );
+    assert_eq!(created.code, 0, "stderr={}", created.stderr_text());
+    assert_eq!(data(&created)["changed"], true);
+    assert_eq!(data(&created)["context"]["tier"], "L2");
+    assert_eq!(data(&created)["context"]["summary"], "fresh DSH context");
+}
+
+#[test]
+fn concurrent_context_set_if_absent_has_one_winner_without_overwrite() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            checkout.as_path(),
+            Some("advisory"),
+        )],
+    );
+    let state = state_dir.to_string_lossy().into_owned();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_str()),
+    ];
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            run_with_env(
+                &checkout,
+                &[
+                    "work-context",
+                    "set",
+                    "--if-absent",
+                    "--tier",
+                    "L2",
+                    "--summary",
+                    "first contender",
+                    "--format",
+                    "json",
+                ],
+                &env,
+            )
+        });
+        let second = scope.spawn(|| {
+            run_with_env(
+                &checkout,
+                &[
+                    "work-context",
+                    "set",
+                    "--if-absent",
+                    "--tier",
+                    "L3",
+                    "--summary",
+                    "second contender",
+                    "--format",
+                    "json",
+                ],
+                &env,
+            )
+        });
+        (
+            first.join().expect("first contender"),
+            second.join().expect("second contender"),
+        )
+    });
+
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    let results = [data(&first), data(&second)];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result["changed"] == true)
+            .count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find(|result| result["changed"] == true)
+        .expect("one winner");
+    let preserved = results
+        .iter()
+        .find(|result| result["changed"] == false)
+        .expect("one preserved result");
+    assert_eq!(preserved["context"], winner["context"]);
+    assert!(matches!(
+        winner["context"]["summary"].as_str(),
+        Some("first contender" | "second contender")
+    ));
+
+    let registry = load_coordination_registry(&state_dir);
+    let claims = registry["claims"].as_array().expect("claims");
+    let active = claims
+        .iter()
+        .filter(|claim| {
+            claim["session_id"] == "alpha"
+                && claim["session_incarnation"] == "incarnation-alpha"
+                && claim["state"] == "active"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["claim_id"], winner["context"]["claim_id"]);
+    assert_eq!(active[0]["revision"], winner["context"]["revision"]);
+    assert_eq!(active[0]["summary"], winner["context"]["summary"]);
+}
+
+#[test]
 fn advisory_lifecycle_skips_stopped_and_off_peers_but_preserves_known_overlap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

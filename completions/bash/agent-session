@@ -2579,7 +2579,7 @@ _agent__session() {
             return 0
             ;;
         agent__session__work__context__set)
-            opts="-h --summary --intent --tier --repository --path --issue --pr --plan-ref --format --state-dir --host --help"
+            opts="-h --if-absent --summary --intent --tier --repository --path --issue --pr --plan-ref --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

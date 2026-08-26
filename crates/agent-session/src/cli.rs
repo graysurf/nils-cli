@@ -337,6 +337,9 @@ pub struct WorkContextStatusArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextSetArgs {
+    /// Preserve an existing active declaration and create this context only when none exists.
+    #[arg(long)]
+    pub if_absent: bool,
     /// Short public description of the current work.
     #[arg(long, value_name = "TEXT")]
     pub summary: Option<String>,
