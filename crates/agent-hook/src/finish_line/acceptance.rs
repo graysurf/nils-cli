@@ -596,6 +596,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
                     terminal: None,
                 },
             );
+            compact_released_sessions(&mut state, &store.state.sessions)?;
             save_state(&store, &state)?;
             store.state.generation = generation;
             compact_obsolete_sessions(&mut store.state);
@@ -678,6 +679,7 @@ pub(super) fn admit(state_root: &Path, input: &[u8]) -> Result<Outcome, HookErro
                     status: RequirementStatus::Active,
                 },
             );
+            compact_released_sessions(&mut state, &store.state.sessions)?;
             save_state(&store, &state)?;
             Ok(admit_outcome(&identity, &request, "validator", generation))
         }
@@ -964,6 +966,7 @@ pub(super) fn verdict(state_root: &Path, input: &[u8]) -> Result<Outcome, HookEr
                         terminal: None,
                     },
                 );
+                compact_released_sessions(&mut state, &store.state.sessions)?;
                 save_state(&store, &state)?;
                 "reserved"
             };
@@ -1878,12 +1881,95 @@ fn serialized_state(state: &AcceptanceState) -> Result<Vec<u8>, HookError> {
     })
 }
 
+fn terminal_headroom_bytes() -> Result<usize, HookError> {
+    let terminal = AcceptanceTerminal {
+        observation: ObservationStatus::InfrastructureBlocked,
+        source_digest: format!("sha256:{}", "f".repeat(64)),
+        disposition: CompletionDisposition::Superseded,
+    };
+    let bytes = serde_json::to_vec(&terminal).map_err(|_| {
+        HookError::runtime(
+            "finish-line-acceptance-state-serialize-failed",
+            "finish-line acceptance terminal could not be serialized",
+        )
+    })?;
+    bytes.len().checked_sub(b"null".len()).ok_or_else(|| {
+        HookError::runtime(
+            "finish-line-acceptance-state-serialize-failed",
+            "finish-line acceptance terminal headroom is invalid",
+        )
+    })
+}
+
+fn evidence_status_headroom_bytes() -> Result<usize, HookError> {
+    let active = serde_json::to_vec(&RequirementStatus::Active).map_err(|_| {
+        HookError::runtime(
+            "finish-line-acceptance-state-serialize-failed",
+            "finish-line acceptance evidence status could not be serialized",
+        )
+    })?;
+    let terminal = serde_json::to_vec(&RequirementStatus::InfrastructureBlocked).map_err(|_| {
+        HookError::runtime(
+            "finish-line-acceptance-state-serialize-failed",
+            "finish-line acceptance evidence status could not be serialized",
+        )
+    })?;
+    terminal.len().checked_sub(active.len()).ok_or_else(|| {
+        HookError::runtime(
+            "finish-line-acceptance-state-serialize-failed",
+            "finish-line acceptance evidence headroom is invalid",
+        )
+    })
+}
+
+fn projected_terminal_state_bytes(
+    state: &AcceptanceState,
+    current_bytes: usize,
+) -> Result<usize, HookError> {
+    let active_operations = state
+        .operations
+        .values()
+        .filter(|operation| operation.terminal.is_none())
+        .count();
+    let terminal_headroom = active_operations
+        .checked_mul(terminal_headroom_bytes()?)
+        .ok_or_else(|| {
+            HookError::data(
+                "finish-line-state-limit",
+                "finish-line acceptance terminal headroom exceeds 384 KiB",
+            )
+        })?;
+    let active_evidence = state
+        .sessions
+        .values()
+        .flat_map(|session| session.evidence.values())
+        .filter(|evidence| evidence.status == RequirementStatus::Active)
+        .count();
+    let evidence_headroom = active_evidence
+        .checked_mul(evidence_status_headroom_bytes()?)
+        .ok_or_else(|| {
+            HookError::data(
+                "finish-line-state-limit",
+                "finish-line acceptance evidence headroom exceeds 384 KiB",
+            )
+        })?;
+    current_bytes
+        .checked_add(terminal_headroom)
+        .and_then(|bytes| bytes.checked_add(evidence_headroom))
+        .ok_or_else(|| {
+            HookError::data(
+                "finish-line-state-limit",
+                "finish-line acceptance terminal headroom exceeds 384 KiB",
+            )
+        })
+}
+
 fn save_state(store: &Store, state: &AcceptanceState) -> Result<(), HookError> {
     let bytes = serialized_state(state)?;
-    if bytes.len() as u64 > STATE_MAX_BYTES {
+    if projected_terminal_state_bytes(state, bytes.len())? as u64 > STATE_MAX_BYTES {
         return Err(HookError::data(
             "finish-line-state-limit",
-            "finish-line acceptance state exceeds 384 KiB",
+            "finish-line acceptance state cannot reserve terminal evidence within 384 KiB",
         ));
     }
     write_state_atomic(&state_path(store), &bytes)
@@ -1940,8 +2026,9 @@ fn compact_released_sessions(
     active_sessions: &BTreeMap<String, super::SessionState>,
 ) -> Result<(), HookError> {
     let over_limit = |state: &AcceptanceState| -> Result<bool, HookError> {
+        let bytes = serialized_state(state)?;
         Ok(state.sessions.len() > super::MAX_SESSIONS
-            || serialized_state(state)?.len() as u64 > STATE_MAX_BYTES)
+            || projected_terminal_state_bytes(state, bytes.len())? as u64 > STATE_MAX_BYTES)
     };
     if !over_limit(state)? {
         return Ok(());
@@ -2067,6 +2154,129 @@ mod tests {
         assert!(state.operations.contains_key("active"));
         assert!(!state.operations.contains_key("terminal-001"));
         assert!(state.operations.contains_key("terminal-256"));
+    }
+
+    #[test]
+    fn terminal_projection_covers_active_evidence_status_growth() {
+        let mut state = AcceptanceState::new("repo");
+        let mut active_session = session(1);
+        active_session.evidence.insert(
+            "requirement".to_string(),
+            RequirementEvidence {
+                contract_digest: "contract".to_string(),
+                generation: 1,
+                attempt_sequence: 1,
+                validator_id: "validator".to_string(),
+                status: RequirementStatus::Active,
+            },
+        );
+        state.sessions.insert("session".to_string(), active_session);
+        state
+            .operations
+            .insert("active".to_string(), operation(1, false));
+
+        let current_bytes = serialized_state(&state)
+            .expect("serialize active state")
+            .len();
+        let projected =
+            projected_terminal_state_bytes(&state, current_bytes).expect("project terminal state");
+        state
+            .sessions
+            .get_mut("session")
+            .expect("active session")
+            .evidence
+            .get_mut("requirement")
+            .expect("active evidence")
+            .status = RequirementStatus::InfrastructureBlocked;
+        state
+            .operations
+            .get_mut("active")
+            .expect("active operation")
+            .terminal = Some(AcceptanceTerminal {
+            observation: ObservationStatus::InfrastructureBlocked,
+            source_digest: format!("sha256:{}", "f".repeat(64)),
+            disposition: CompletionDisposition::Superseded,
+        });
+
+        let terminal_bytes = serialized_state(&state)
+            .expect("serialize terminal state")
+            .len();
+        assert!(
+            projected >= terminal_bytes,
+            "projected={projected}; terminal={terminal_bytes}"
+        );
+    }
+
+    #[test]
+    fn released_session_compaction_uses_projected_terminal_capacity() {
+        let mut state = AcceptanceState::new("repo");
+        state.sessions.insert("active".to_string(), session(1));
+        let mut active_sessions = BTreeMap::new();
+        active_sessions.insert("active".to_string(), super::super::SessionState::default());
+
+        let mut released_count = 0_u64;
+        for sequence in 2..10_u64 {
+            let key = format!("released-{sequence:03}");
+            state
+                .sessions
+                .insert(key.clone(), large_legal_session(sequence));
+            if serialized_state(&state)
+                .expect("serialize released history")
+                .len() as u64
+                > STATE_MAX_BYTES
+            {
+                state.sessions.remove(&key);
+                break;
+            }
+            released_count += 1;
+        }
+        assert!(
+            released_count > 0,
+            "test needs reclaimable released history"
+        );
+
+        for sequence in 1..=MAX_OPERATIONS as u64 {
+            let mut active = operation(sequence, false);
+            active.session_key = "active".to_string();
+            let key = format!("active-{sequence:03}");
+            state.operations.insert(key.clone(), active);
+            let raw = serialized_state(&state)
+                .expect("serialize active pressure")
+                .len();
+            if raw as u64 > STATE_MAX_BYTES {
+                state.operations.remove(&key);
+                panic!("raw state reached its limit before projected terminal capacity");
+            }
+            if projected_terminal_state_bytes(&state, raw).expect("project terminal pressure")
+                as u64
+                > STATE_MAX_BYTES
+            {
+                break;
+            }
+        }
+        let raw = serialized_state(&state)
+            .expect("serialize pressure state")
+            .len();
+        assert!(raw as u64 <= STATE_MAX_BYTES);
+        assert!(
+            projected_terminal_state_bytes(&state, raw).expect("project pressure state") as u64
+                > STATE_MAX_BYTES,
+            "test must exceed only the projected terminal capacity"
+        );
+
+        compact_released_sessions(&mut state, &active_sessions)
+            .expect("compact reclaimable released history");
+
+        let compacted = serialized_state(&state)
+            .expect("serialize compacted state")
+            .len();
+        assert!(
+            projected_terminal_state_bytes(&state, compacted).expect("project compacted state")
+                as u64
+                <= STATE_MAX_BYTES
+        );
+        assert!(state.sessions.len() < released_count as usize + 1);
+        assert!(state.sessions.contains_key("active"));
     }
 
     #[test]

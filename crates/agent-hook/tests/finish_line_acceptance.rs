@@ -1023,6 +1023,88 @@ fn compaction_and_restart_preserve_current_generation_mutation_blocker() {
 }
 
 #[test]
+fn sidecar_admission_reserves_terminal_headroom_for_every_active_validator() {
+    let fixture = fixture();
+    let session_id = "session-terminal-headroom";
+    let capability = open(&fixture, session_id);
+    let requirement = format!("requirement-{}", "r".repeat(244));
+    let validator_id = format!("validator-{}", "v".repeat(246));
+    assert_eq!(requirement.len(), 256);
+    assert_eq!(validator_id.len(), 256);
+
+    let mut registration = common(&fixture, session_id, "turn-register");
+    registration["schema_version"] = json!("agent-hook.finish-line.register.v1");
+    registration["runner_capability"] = json!(capability);
+    registration["requirements"] = json!([{
+        "name": requirement,
+        "validators": [{
+            "id": validator_id,
+            "tool_name": "runtime_kit_plus_one",
+            "definition_digest": VALIDATOR_DEFINITION,
+            "execution": {"kind": "host-observed"},
+        }],
+    }]);
+    registration["invalidators"] = json!([]);
+    let (register_code, registered) = call(&fixture, "register", &registration);
+    assert_eq!(register_code, 0, "envelope={registered}");
+    let contract_digest = registered["data"]["contract_digest"]
+        .as_str()
+        .expect("contract digest");
+
+    let mut admitted = Vec::new();
+    let mut hit_state_limit = false;
+    for index in 0..512_u64 {
+        let operation_id = format!("op-{index:03}-{}", "o".repeat(230));
+        let (code, envelope) = admit_validator_binding(
+            &fixture,
+            session_id,
+            &capability,
+            contract_digest,
+            &operation_id,
+            &requirement,
+            &validator_id,
+            "runtime_kit_plus_one",
+            VALIDATOR_DEFINITION,
+            None,
+        );
+        if code == 0 {
+            admitted.push(operation_id);
+            continue;
+        }
+        assert_eq!(code, 65, "envelope={envelope}");
+        assert_eq!(envelope["error"]["code"], "finish-line-state-limit");
+        hit_state_limit = true;
+        break;
+    }
+    assert!(admitted.len() > 1, "test must create terminal pressure");
+    assert!(
+        hit_state_limit,
+        "test must saturate the projected state limit"
+    );
+
+    let (_, acceptance_path) = finish_line_state_paths(&fixture);
+    assert!(
+        std::fs::metadata(&acceptance_path)
+            .expect("acceptance state metadata")
+            .len()
+            < 384 * 1024,
+        "pre-terminal sidecar must remain within the public read limit"
+    );
+    for operation_id in &admitted {
+        let (code, envelope) = observe(
+            &fixture,
+            session_id,
+            &capability,
+            operation_id,
+            "infrastructure-blocked",
+        );
+        assert_eq!(code, 0, "operation_id={operation_id}; envelope={envelope}");
+    }
+    let (release_code, released) = release(&fixture, session_id, &capability);
+    assert_eq!(release_code, 0, "envelope={released}");
+}
+
+#[test]
 fn generation_advance_prunes_contained_source_claim_history() {
     let fixture = fixture();
     let capability = open(&fixture, "session-claim-rollover");
