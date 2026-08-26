@@ -25448,6 +25448,11 @@ exit 0
             .expect("transcript dir");
         let provider_id = "notification-active-provider";
         let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
         seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
         let launch_id = seed_codex_app_server_session(tmp.path(), "beta");
         let record_path = tmp.path().join("sessions/beta/session.json");
