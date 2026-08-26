@@ -1006,7 +1006,8 @@ fn maintenance_failure_error(
     operation: MaintenanceOperation,
 ) -> CliError {
     let kind = match reason {
-        SessionTerminationFailure::StillRunning => "session_still_running",
+        SessionTerminationFailure::GracefulShutdownIncomplete
+        | SessionTerminationFailure::StillRunning => "session_still_running",
         SessionTerminationFailure::ProcessStillRunning => "process_boundary_live",
         SessionTerminationFailure::RuntimeIdentityChanged
         | SessionTerminationFailure::RuntimeIdentityMismatch => "runtime_identity_changed",

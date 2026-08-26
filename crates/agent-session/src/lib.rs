@@ -79,6 +79,7 @@ const STARTUP_EXTRA_KEY: &str = "startup";
 const AGENT_PROFILE_RUNTIME_KEY: &str = "agent_profile";
 const AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY: &str = "agent_profile_provider_config_dir";
 const AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY: &str = "agent_profile_auto_resume_supported";
+const AGENT_PROFILE_GRACEFUL_SHUTDOWN_RUNTIME_KEY: &str = "agent_profile_graceful_shutdown";
 const AGENT_PROFILE_CODEX_USAGE_ACCOUNT_RUNTIME_KEY: &str = "agent_profile_codex_usage_account";
 const PROVIDER_STOP_CANARY_RUNTIME_KEY: &str = "provider_stop_canary";
 const PROVIDER_STOP_CANARY_PROOF_RUNTIME_KEY: &str = "provider_stop_canary_proof";
@@ -150,6 +151,10 @@ const DELETE_TERMINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const DELETE_TERMINATION_IDENTITY_RETRY_LIMIT: usize = 3;
+const DELETE_GRACEFUL_SHUTDOWN_TIMEOUT_MULTIPLIER: u32 = 8;
+const DELETE_GRACEFUL_SHUTDOWN_MAX_TIMEOUT: Duration = Duration::from_secs(8);
+const DELETE_GRACEFUL_SHUTDOWN_INPUT_INTERVAL: Duration = Duration::from_millis(500);
+const PROFILE_GRACEFUL_SHUTDOWN_DOUBLE_CTRL_C: &str = "double-ctrl-c";
 const DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024;
 #[cfg(target_os = "linux")]
 const SYSTEMD_SCOPE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1547,6 +1552,7 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) agent_profile: Option<String>,
     pub(crate) provider_config_dir: Option<PathBuf>,
     pub(crate) profile_auto_resume_supported: Option<bool>,
+    pub(crate) profile_graceful_shutdown: Option<String>,
     pub(crate) codex_usage_account: Option<String>,
     pub(crate) agent_args: Vec<String>,
     pub(crate) format: OutputFormat,
@@ -1898,6 +1904,7 @@ fn start_session_with_create_guard(
         args.initial_agent_profile.as_deref(),
         args.initial_provider_config_dir.as_deref(),
         args.initial_profile_auto_resume_supported,
+        args.initial_profile_graceful_shutdown.as_deref(),
         args.initial_codex_usage_account.as_deref(),
     )?;
     if let Err(err) = codex_account::set_initial_binding(
@@ -2412,6 +2419,7 @@ pub(crate) fn start_provider_resume_session(
         args.agent_profile.as_deref(),
         args.provider_config_dir.as_deref(),
         args.profile_auto_resume_supported,
+        args.profile_graceful_shutdown.as_deref(),
         args.codex_usage_account.as_deref(),
     )?;
 
@@ -2518,11 +2526,13 @@ fn persist_initial_profile_context(
     agent_profile: Option<&str>,
     provider_config_dir: Option<&Path>,
     profile_auto_resume_supported: Option<bool>,
+    profile_graceful_shutdown: Option<&str>,
     codex_usage_account: Option<&str>,
 ) -> Result<(), CliError> {
     if agent_profile.is_none()
         && provider_config_dir.is_none()
         && profile_auto_resume_supported.is_none()
+        && profile_graceful_shutdown.is_none()
         && codex_usage_account.is_none()
     {
         return Ok(());
@@ -2550,6 +2560,12 @@ fn persist_initial_profile_context(
         runtime.extra.insert(
             AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY.to_string(),
             json!(supported),
+        );
+    }
+    if let Some(mode) = profile_graceful_shutdown {
+        runtime.extra.insert(
+            AGENT_PROFILE_GRACEFUL_SHUTDOWN_RUNTIME_KEY.to_string(),
+            json!(mode),
         );
     }
     if let Some(account) = codex_usage_account {
@@ -11761,6 +11777,27 @@ pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> b
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileGracefulShutdown {
+    DoubleCtrlC,
+}
+
+fn session_profile_graceful_shutdown(
+    record: &SessionRecord,
+) -> Result<Option<ProfileGracefulShutdown>, SessionTerminationFailure> {
+    let Some(mode) = runtime_extra_string(record, AGENT_PROFILE_GRACEFUL_SHUTDOWN_RUNTIME_KEY)
+    else {
+        return Ok(None);
+    };
+    if session_agent_profile(record).is_none() {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    match mode {
+        PROFILE_GRACEFUL_SHUTDOWN_DOUBLE_CTRL_C => Ok(Some(ProfileGracefulShutdown::DoubleCtrlC)),
+        _ => Err(SessionTerminationFailure::RuntimeIdentityUnavailable),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableProfileResumeContext {
     profile_id: String,
@@ -12213,6 +12250,10 @@ fn delete_session_locked_with_timeouts(
         return finish_session_delete(context, record, session_dir, registry_fence);
     }
     let registry_fence = SessionRegistryFence::from_record(&record);
+    gracefully_shutdown_profiled_tmux_session(context, &mut record, tmux_bin, verify_timeout)
+        .map_err(|reason| {
+            session_termination_error(&record, reason, SessionTerminationOperation::Delete)
+        })?;
     terminate_tmux_session_with_timeouts(
         context,
         &mut record,
@@ -12373,6 +12414,7 @@ fn cleanup_session_delete_tombstones(context: &CliContext, limit: usize) -> io::
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionTerminationFailure {
+    GracefulShutdownIncomplete,
     KillFailed,
     KillTimeout,
     KillError,
@@ -12431,6 +12473,7 @@ pub(crate) fn stop_session_runtime_locked(
 impl SessionTerminationFailure {
     fn reason(self) -> &'static str {
         match self {
+            Self::GracefulShutdownIncomplete => "graceful-shutdown-incomplete",
             Self::KillFailed => "kill-failed",
             Self::KillTimeout => "kill-timeout",
             Self::KillError => "kill-error",
@@ -12445,6 +12488,9 @@ impl SessionTerminationFailure {
 
     fn message(self) -> &'static str {
         match self {
+            Self::GracefulShutdownIncomplete => {
+                "the launch profile's graceful shutdown did not reach a verified stop"
+            }
             Self::KillFailed => "tmux kill-session failed",
             Self::KillTimeout => "tmux kill-session timed out",
             Self::KillError => "tmux kill-session could not be executed",
@@ -12888,6 +12934,126 @@ fn terminate_tmux_session_with_timeouts(
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
                 return Ok(());
             }
+        }
+    }
+}
+
+fn gracefully_shutdown_profiled_tmux_session(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    tmux_bin: &Path,
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    let Some(mode) = session_profile_graceful_shutdown(record)? else {
+        return Ok(());
+    };
+    if persisted_tmux_termination_state(record)?.is_some() {
+        return Ok(());
+    }
+    recover_interrupted_tmux_termination_locked(context, record)?;
+    let identity = match capture_tmux_runtime_identity(
+        context,
+        record,
+        tmux_bin,
+        verify_timeout.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+    )? {
+        TmuxRuntimeProbe::Stopped => return Ok(()),
+        TmuxRuntimeProbe::Running(identity) => *identity,
+    };
+    persist_tmux_runtime_identities(record, &identity, &[])?;
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+
+    let graceful_timeout = verify_timeout
+        .saturating_mul(DELETE_GRACEFUL_SHUTDOWN_TIMEOUT_MULTIPLIER)
+        .min(DELETE_GRACEFUL_SHUTDOWN_MAX_TIMEOUT);
+    let started_at = Instant::now();
+    loop {
+        let remaining = graceful_timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(SessionTerminationFailure::GracefulShutdownIncomplete);
+        }
+        match mode {
+            ProfileGracefulShutdown::DoubleCtrlC => {
+                match tmux_send_ctrl_c_if_identity_matches(
+                    tmux_bin,
+                    &identity,
+                    remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+                ) {
+                    Ok(TmuxGracefulInputOutcome::Delivered) => {}
+                    Ok(TmuxGracefulInputOutcome::IdentityChanged) => {
+                        if verified_tmux_status_with_timeout(
+                            tmux_bin,
+                            &identity.session_id,
+                            remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+                        ) == "stopped"
+                        {
+                            return verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)
+                                .map_err(|_| {
+                                    SessionTerminationFailure::GracefulShutdownIncomplete
+                                });
+                        }
+                        return Err(SessionTerminationFailure::RuntimeIdentityChanged);
+                    }
+                    Err(reason) => {
+                        if verified_tmux_status_with_timeout(
+                            tmux_bin,
+                            &identity.session_id,
+                            remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+                        ) == "stopped"
+                        {
+                            return verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)
+                                .map_err(|_| {
+                                    SessionTerminationFailure::GracefulShutdownIncomplete
+                                });
+                        }
+                        return Err(reason);
+                    }
+                }
+            }
+        }
+        thread::sleep(
+            DELETE_GRACEFUL_SHUTDOWN_INPUT_INTERVAL
+                .min(graceful_timeout.saturating_sub(started_at.elapsed())),
+        );
+        let remaining = graceful_timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(SessionTerminationFailure::GracefulShutdownIncomplete);
+        }
+        match verified_tmux_status_with_timeout(
+            tmux_bin,
+            &identity.session_id,
+            remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+        )
+        .as_str()
+        {
+            "stopped" => {
+                return verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)
+                    .map_err(|_| SessionTerminationFailure::GracefulShutdownIncomplete);
+            }
+            "running"
+                if !tmux_pane_identity_matches(
+                    tmux_bin,
+                    record,
+                    &identity.session_id,
+                    &identity.pane_id,
+                    identity.pane_pid,
+                    remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+                ) =>
+            {
+                if verified_tmux_status_with_timeout(
+                    tmux_bin,
+                    &identity.session_id,
+                    remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+                ) == "stopped"
+                {
+                    return verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)
+                        .map_err(|_| SessionTerminationFailure::GracefulShutdownIncomplete);
+                }
+                return Err(SessionTerminationFailure::RuntimeIdentityChanged);
+            }
+            "running" | "unknown" => {}
+            _ => return Err(SessionTerminationFailure::VerificationFailed),
         }
     }
 }
@@ -15777,6 +15943,46 @@ fn tmux_output_reports_absent(output: &std::process::Output) -> bool {
     }
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     stderr.contains("can't find session:") || stderr.contains("no server running on")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TmuxGracefulInputOutcome {
+    Delivered,
+    IdentityChanged,
+}
+
+fn tmux_send_ctrl_c_if_identity_matches(
+    tmux_bin: &Path,
+    identity: &TmuxRuntimeIdentity,
+    timeout: Duration,
+) -> Result<TmuxGracefulInputOutcome, SessionTerminationFailure> {
+    let condition = format!(
+        "#{{&&:#{{==:#{{session_id}},{}}},#{{&&:#{{==:#{{pane_id}},{}}},#{{==:#{{pane_pid}},{}}}}}}}",
+        identity.session_id, identity.pane_id, identity.pane_pid
+    );
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .arg("if-shell")
+        .arg("-F")
+        .arg("-t")
+        .arg(&identity.pane_id)
+        .arg(condition)
+        .arg(format!("send-keys -t {} C-c", identity.pane_id))
+        .arg(format!(
+            "display-message -p {TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT}"
+        ));
+    let output = run_output_with_timeout(command, timeout)
+        .map_err(|_| SessionTerminationFailure::GracefulShutdownIncomplete)?;
+    if !output.status.success() {
+        return Err(SessionTerminationFailure::GracefulShutdownIncomplete);
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    match stdout.trim() {
+        "" => Ok(TmuxGracefulInputOutcome::Delivered),
+        TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT => Ok(TmuxGracefulInputOutcome::IdentityChanged),
+        _ => Err(SessionTerminationFailure::VerificationFailed),
+    }
 }
 
 fn tmux_kill_identity_with_timeout(
@@ -22759,6 +22965,152 @@ fi
             "tmux must remain untouched without a cgroup"
         );
         assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+    }
+
+    #[test]
+    fn profiled_graceful_delete_sends_ctrl_c_and_never_falls_through_to_kill_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Hermes,
+            None,
+            Some("profiled-graceful-delete"),
+        );
+        let mut record = load_session_record(&context, &id).unwrap();
+        record
+            .runtime
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("agent_profile".to_string(), serde_json::json!("dsh-tui"));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_graceful_shutdown".to_string(),
+            serde_json::json!("double-ctrl-c"),
+        );
+        write_session_record(&context, &record).unwrap();
+        let mut pane = TestProcessGroup::spawn();
+        let tmux = tmp.path().join("tmux-profiled-graceful-delete");
+        let calls = tmp.path().join("tmux-profiled-graceful-delete.calls");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n{identity}if [ \"$1\" = has-session ]; then exit 0; fi\nif [ \"$1\" = if-shell ]; then exit 0; fi\nexit 42\n",
+                calls = calls.display(),
+                identity = deletion_identity_script(&context, &record, pane.pid()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert_eq!(
+            error.details.unwrap()["reason"],
+            "graceful-shutdown-incomplete"
+        );
+        assert!(session_dir(&context, &id).exists());
+        let calls = fs::read_to_string(calls).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.contains("send-keys") && line.contains("C-c")),
+            "profiled delete must first request the TUI's own disposal path: {calls}",
+        );
+        assert!(
+            !calls.contains("kill-session"),
+            "an incomplete graceful shutdown must retain the session instead of orphaning mutation state: {calls}",
+        );
+        assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
+        pane.stop();
+    }
+
+    #[test]
+    fn profiled_graceful_delete_removes_the_record_after_verified_tui_exit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Hermes,
+            None,
+            Some("profiled-graceful-delete-success"),
+        );
+        let mut record = load_session_record(&context, &id).unwrap();
+        record
+            .runtime
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("agent_profile".to_string(), serde_json::json!("dsh-tui"));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_graceful_shutdown".to_string(),
+            serde_json::json!("double-ctrl-c"),
+        );
+        write_session_record(&context, &record).unwrap();
+        let mut pane = ReapedTestProcessGroup::spawn();
+        let tmux = tmp.path().join("tmux-profiled-graceful-delete-success");
+        let calls = tmp
+            .path()
+            .join("tmux-profiled-graceful-delete-success.calls");
+        let stopped = tmp.path().join("tmux-profiled-graceful-delete-stopped");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+if [ -f {stopped} ] && {{ [ "$1" = display-message ] || [ "$1" = has-session ]; }}; then
+  printf "%s\n" "can't find session: $91" >&2
+  exit 1
+fi
+{identity}if [ "$1" = has-session ]; then exit 0; fi
+if [ "$1" = if-shell ]; then
+  case "$*" in
+    *send-keys*)
+      count=$(grep -c send-keys {calls})
+      if [ "$count" -ge 3 ]; then
+        kill -TERM {pane_pid}
+        : > {stopped}
+        exit 1
+      fi
+      exit 0
+      ;;
+    *kill-session*) exit 42 ;;
+  esac
+fi
+exit 42
+"#,
+                calls = calls.display(),
+                stopped = stopped.display(),
+                identity = deletion_identity_script(&context, &record, pane.pid()),
+                pane_pid = pane.pid(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
+        let calls = fs::read_to_string(calls).unwrap();
+        assert!(calls.matches("send-keys").count() >= 3, "{calls}");
+        assert!(!calls.contains("kill-session"), "{calls}");
+        pane.stop();
     }
 
     #[cfg(target_os = "linux")]

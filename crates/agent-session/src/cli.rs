@@ -171,6 +171,10 @@ pub struct StartArgs {
     #[arg(skip)]
     pub initial_profile_auto_resume_supported: Option<bool>,
 
+    /// Internal: bounded graceful shutdown mode owned by the selected profile.
+    #[arg(skip)]
+    pub initial_profile_graceful_shutdown: Option<String>,
+
     /// Internal: authoritative Codex usage account nickname for a `claude`
     /// launch profile that actually runs on a Codex/GPT backend. When set, the
     /// auto-resume loop keys off this Codex account's rate limits instead of
