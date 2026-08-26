@@ -717,8 +717,15 @@ pub fn ensure_merge_ready<R: BackendRunner>(
             return Err(ForgeError::validation(
                 schema_err(),
                 "review_state_conflict",
-                "bounded review delivery requires an explicit genesis ledger observation",
-                Some(format!("pr={number}; expected_head={expected_head}")),
+                "bounded review delivery requires an explicit genesis ledger observation; \
+                 record the reviewed head with `forge-cli pr review-loop observe <id> \
+                 --expected-head <sha> --findings-file <path>` (a bare `[]` array records a \
+                 clean review), or pass --review-convergence=false to deliver without the \
+                 enforced review policy",
+                Some(format!(
+                    "pr={number}; expected_head={expected_head}; \
+                     required_by=[review_convergence].require"
+                )),
             ));
         }
         return Ok(None);
@@ -733,7 +740,9 @@ pub fn ensure_merge_ready<R: BackendRunner>(
                     "review_finding_reopened" => "review_finding_reopened",
                     _ => "review_state_conflict",
                 },
-                "the durable review-loop hard stop blocks merge",
+                "the durable review-loop hard stop blocks merge; clear it with \
+                 `forge-cli pr review-loop extend` once a provider-visible approval comment \
+                 carries the approval_marker reported in this detail",
                 None,
             ),
             stop,
@@ -745,7 +754,9 @@ pub fn ensure_merge_ready<R: BackendRunner>(
         return Err(ForgeError::validation(
             schema_err(),
             "review_state_conflict",
-            "the latest review-loop observation is not bound to the merge head",
+            "the latest review-loop observation is not bound to the merge head; re-review the \
+             current head and record it with `forge-cli pr review-loop observe <id> \
+             --expected-head <merge_head> --findings-file <path>`",
             Some(format!(
                 "merge_head={expected_head}; review_loop_head={}",
                 state.head_sha
@@ -764,7 +775,10 @@ pub fn ensure_merge_ready<R: BackendRunner>(
         return Err(ForgeError::validation(
             schema_err(),
             "review_findings_open",
-            "the durable review-loop ledger still contains blocking open findings",
+            "the durable review-loop ledger still contains blocking open findings; repair them, \
+             push, then record the repaired head with `forge-cli pr review-loop observe <id> \
+             --expected-head <sha> --findings-file <path>` carrying disposition `fixed` (use \
+             `accepted`, `preference`, or `follow-up` when no repair is warranted)",
             Some(format!("findings={}", open_blocking_findings.join(","))),
         ));
     }
@@ -797,7 +811,8 @@ pub fn recheck_merge_ready<R: BackendRunner>(
             ForgeError::validation(
                 schema_err(),
                 "review_state_conflict",
-                "the review-loop state disappeared before merge",
+                "the review-loop state disappeared before merge; a concurrent ledger write \
+                 raced this delivery, so re-run it to re-read the chain",
                 None,
             )
         })?;
@@ -805,7 +820,8 @@ pub fn recheck_merge_ready<R: BackendRunner>(
         return Err(ForgeError::validation(
             schema_err(),
             "review_state_conflict",
-            "the review-loop state changed after merge gates and before provider merge",
+            "the review-loop state changed after merge gates and before provider merge; a \
+             concurrent ledger write raced this delivery, so re-run it to re-read the chain",
             Some(format!(
                 "expected_tip={}; provider_tip={}",
                 previous.state_tip_digest, current.state_tip_digest
@@ -3099,6 +3115,25 @@ mod tests {
         .expect_err("bounded delivery needs a ledger");
 
         assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error.message().contains("forge-cli pr review-loop observe"),
+            "the gate must name the command that satisfies it: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("--review-convergence=false"),
+            "the gate must name its bypass: {}",
+            error.message()
+        );
+        // This is the only merge gate whose trigger is invisible on the pull
+        // request itself, so the detail has to name the config that armed it.
+        assert!(
+            error
+                .detail()
+                .is_some_and(|detail| detail.contains("required_by=[review_convergence].require")),
+            "the gate must name the config key that enabled it: {:?}",
+            error.detail()
+        );
     }
 
     #[test]
@@ -3126,6 +3161,11 @@ mod tests {
         .expect_err("hard stop blocks merge");
 
         assert_eq!(error.kind(), "review_round_limit_exceeded");
+        assert!(
+            error.message().contains("forge-cli pr review-loop extend"),
+            "the gate must name the command that clears it: {}",
+            error.message()
+        );
     }
 
     #[test]
@@ -3144,6 +3184,11 @@ mod tests {
         .expect_err("ledger head mismatch");
 
         assert_eq!(error.kind(), "review_state_conflict");
+        assert!(
+            error.message().contains("forge-cli pr review-loop observe"),
+            "the gate must name the command that rebinds the ledger: {}",
+            error.message()
+        );
         assert!(
             error
                 .detail()
@@ -3170,6 +3215,12 @@ mod tests {
         .expect_err("blocking findings stay open");
 
         assert_eq!(error.kind(), "review_findings_open");
+        assert!(
+            error.message().contains("forge-cli pr review-loop observe")
+                && error.message().contains("fixed"),
+            "the gate must name the command and disposition that clear it: {}",
+            error.message()
+        );
         assert!(
             error
                 .detail()
