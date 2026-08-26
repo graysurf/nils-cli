@@ -10740,6 +10740,12 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
 
     #[tokio::test]
     async fn unix_control_projects_live_failure_and_acknowledges_exact_turn_without_content() {
+        let env_lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(
+            &env_lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
         let tmp = tempfile::TempDir::new().unwrap();
         let socket = tmp.path().join("codex.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
