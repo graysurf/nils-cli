@@ -18,7 +18,9 @@ set -euo pipefail
 #       TMPDIR after the run
 #   (f) --probe-root with any Git ancestry is refused, because tests that
 #       assert a path is outside a git repo break under it
-#   (g) usage errors exit 2
+#   (g) roots hidden by the workspace's sandbox mount plan are skipped by
+#       default and refused when explicit
+#   (h) usage errors exit 2
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
@@ -234,6 +236,45 @@ if [[ "$status" -ne 2 ]]; then
   exit 1
 fi
 echo "ok: probe roots with Git ancestry are refused"
+
+echo "== sandbox-masked probe roots are refused and skipped =="
+masked_root=""
+for candidate in "${XDG_RUNTIME_DIR:-}" /dev/shm /run; do
+  [[ -n "$candidate" && -d "$candidate" && -w "$candidate" ]] || continue
+  candidate="$(cd "$candidate" && pwd -P)"
+  case "$candidate/" in
+    /run/* | /dev/*)
+      if ! has_git_marker_ancestry "$candidate"; then
+        masked_root="$candidate"
+        break
+      fi
+      ;;
+  esac
+done
+if [[ -n "$masked_root" ]]; then
+  write_cargo_stub 'printf "%s\n" "$TMPDIR" >"$CARGO_STUB_LOG"'
+  CARGO_STUB_LOG="$work/sandbox-visible-root.log" \
+    PATH="$work/bin:$PATH" \
+    TMPDIR="$masked_root" \
+    XDG_RUNTIME_DIR="$masked_root" \
+    bash "$probe_script" >/dev/null 2>&1
+  selected_root="$(cat "$work/sandbox-visible-root.log")"
+  case "$selected_root/" in
+    /run/* | /dev/*)
+      echo "FAIL: the default probe used a sandbox-masked root: $selected_root"
+      exit 1
+      ;;
+  esac
+  status=0
+  PATH="$work/bin:$PATH" bash "$probe_script" --probe-root "$masked_root" >/dev/null 2>&1 || status=$?
+  if [[ "$status" -ne 2 ]]; then
+    echo "FAIL: an explicit sandbox-masked probe root should exit 2, got $status"
+    exit 1
+  fi
+  echo "ok: sandbox-masked roots are skipped by default and refused when explicit"
+else
+  echo "ok: no writable sandbox-masked root is present on this platform"
+fi
 
 echo "== usage =="
 status=0
