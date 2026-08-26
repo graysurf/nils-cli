@@ -25604,6 +25604,22 @@ exit 0
             crate::maintenance::MaintenanceContract::V1,
         )
         .expect("maintenance preview before notification submission");
+        let inspect_preview = crate::maintenance::preview(
+            &maintenance_context,
+            "beta",
+            &maintenance_tmux,
+            crate::maintenance::MaintenanceOperation::Inspect,
+            crate::maintenance::MaintenanceContract::V1,
+        )
+        .expect("inspect preview before notification submission");
+        let attach_preview = crate::maintenance::preview(
+            &maintenance_context,
+            "beta",
+            &maintenance_tmux,
+            crate::maintenance::MaintenanceOperation::Attach,
+            crate::maintenance::MaintenanceContract::V1,
+        )
+        .expect("attach preview before notification submission");
         let responder = tokio::spawn(async move {
             let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
@@ -25644,7 +25660,37 @@ exit 0
                 "coordination-notification-submission-in-progress"
             );
             let maintenance = tokio::task::spawn_blocking(move || {
-                crate::maintenance::execute_with_resume_guard(
+                let inspect = crate::maintenance::execute_with_resume_guard(
+                    &maintenance_context,
+                    "beta",
+                    &maintenance_tmux,
+                    crate::maintenance::MaintenanceActionRequest {
+                        schema_version: crate::maintenance::MaintenanceContract::V1,
+                        operation: crate::maintenance::MaintenanceOperation::Inspect,
+                        action: crate::maintenance::MaintenanceActionId::Inspect,
+                        expected_session_incarnation: inspect_preview.session_incarnation.clone(),
+                        expected_session_generation: inspect_preview.session_generation,
+                        expected_preview_digest: inspect_preview.preview_digest.clone(),
+                        confirmed: false,
+                    },
+                    |_| Ok(()),
+                );
+                let attach = crate::maintenance::execute_with_resume_guard(
+                    &maintenance_context,
+                    "beta",
+                    &maintenance_tmux,
+                    crate::maintenance::MaintenanceActionRequest {
+                        schema_version: crate::maintenance::MaintenanceContract::V1,
+                        operation: crate::maintenance::MaintenanceOperation::Attach,
+                        action: crate::maintenance::MaintenanceActionId::RetryAttach,
+                        expected_session_incarnation: attach_preview.session_incarnation.clone(),
+                        expected_session_generation: attach_preview.session_generation,
+                        expected_preview_digest: attach_preview.preview_digest.clone(),
+                        confirmed: false,
+                    },
+                    |_| Ok(()),
+                );
+                let delete = crate::maintenance::execute_with_resume_guard(
                     &maintenance_context,
                     "beta",
                     &maintenance_tmux,
@@ -25660,12 +25706,27 @@ exit 0
                         confirmed: true,
                     },
                     |_| Ok(()),
-                )
+                );
+                (inspect, attach, delete)
             });
-            let maintenance_error = tokio::time::timeout(Duration::from_millis(250), maintenance)
-                .await
-                .expect("maintenance admission must remain bounded during checkpoint provider I/O")
-                .expect("maintenance probe worker")
+            let (inspect, attach, delete) =
+                tokio::time::timeout(Duration::from_millis(250), maintenance)
+                    .await
+                    .expect(
+                        "maintenance admission must remain bounded during checkpoint provider I/O",
+                    )
+                    .expect("maintenance probe worker");
+            let inspect = serde_json::to_value(
+                inspect.expect("read-only inspect must remain available during checkpoint steer"),
+            )
+            .expect("inspect result json");
+            assert_eq!(inspect["outcome"], "inspected");
+            let attach = serde_json::to_value(
+                attach.expect("read-only attach must remain available during checkpoint steer"),
+            )
+            .expect("attach result json");
+            assert_eq!(attach["outcome"], "inspected");
+            let maintenance_error = delete
                 .expect_err("maintenance mutation must preserve the checkpoint retry contract");
             assert_eq!(
                 maintenance_error.code(),

@@ -92,6 +92,10 @@ impl MaintenanceActionId {
         )
     }
 
+    fn mutates_session_state(self) -> bool {
+        !matches!(self, Self::RetryAttach | Self::Inspect)
+    }
+
     /// Whether this action signals a process or tmux runtime.
     ///
     /// Record-only removal deliberately signals nothing, so it must never claim
@@ -760,7 +764,9 @@ fn execute_inner(
         return Err(stale_preview_error(&record));
     }
 
-    crate::ensure_session_lifecycle_mutation_allowed(context, &record)?;
+    if request.action.mutates_session_state() {
+        crate::ensure_session_lifecycle_mutation_allowed(context, &record)?;
+    }
 
     if matches!(
         request.action,
