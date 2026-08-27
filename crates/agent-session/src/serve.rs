@@ -15400,6 +15400,7 @@ esac
         );
         let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "auto");
         let _runtime_dir = EnvGuard::set(
             &lock,
             "XDG_RUNTIME_DIR",
@@ -15502,6 +15503,7 @@ esac
         let codex = fake_agent(tmp.path(), "codex");
         let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "auto");
         let st = state(tmp.path(), Some(TOKEN), tmux);
 
         let (status, body) = call(
