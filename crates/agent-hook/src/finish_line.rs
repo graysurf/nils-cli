@@ -31,6 +31,8 @@ use uuid::Uuid;
 
 use crate::error::HookError;
 
+mod acceptance;
+
 const STATE_SCHEMA: &str = "agent-hook.finish-line.state.v1";
 const MAX_RELEASE_TOMBSTONES: usize = 64;
 const CAPABILITY_LEASE_DURATION_SECS: u64 = 24 * 60 * 60;
@@ -105,6 +107,10 @@ pub enum Operation {
     Open,
     Begin,
     Run,
+    Register,
+    Admit,
+    Observe,
+    Verdict,
     Stop,
     Status,
     Quiesce,
@@ -571,7 +577,7 @@ impl ValidationExecution {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum CompletionDisposition {
     Applied,
@@ -595,6 +601,10 @@ pub fn run(state_root: &Path, operation: Operation) -> Result<Outcome, HookError
         Operation::Open => open(state_root, parse_request(&input)?),
         Operation::Begin => begin(state_root, parse_request(&input)?),
         Operation::Run => run_validation(state_root, parse_request(&input)?),
+        Operation::Register => acceptance::register(state_root, &input),
+        Operation::Admit => acceptance::admit(state_root, &input),
+        Operation::Observe => acceptance::observe(state_root, &input),
+        Operation::Verdict => acceptance::verdict(state_root, &input),
         Operation::Stop => stop(state_root, parse_request(&input)?),
         Operation::Status => status(state_root, parse_request(&input)?),
         Operation::Quiesce => quiesce(state_root, parse_request(&input)?),
@@ -769,6 +779,22 @@ fn begin(state_root: &Path, request: BeginRequest) -> Result<Outcome, HookError>
         }
 
         ensure_state_capacity(&store.state, &identity.session_key)?;
+        if acceptance::repository_completion_reserved(&store, &identity)? {
+            return Err(finish_line_temporary(
+                "finish-line-completion-reserved",
+                "the repository is reserved by an authoritative completion",
+            ));
+        }
+        if acceptance::repository_mutation_active(&store, &identity)?
+            || store.state.operations.values().any(|operation| {
+                operation.kind == StoredOperationKind::Shell && operation.terminal.is_none()
+            })
+        {
+            return Err(finish_line_temporary(
+                "finish-line-repository-mutation-active",
+                "a prior repository mutation is still active",
+            ));
+        }
         store.state.generation = store.state.generation.checked_add(1).ok_or_else(|| {
             HookError::data(
                 "finish-line-generation-exhausted",
@@ -956,6 +982,12 @@ fn run_validation(state_root: &Path, request: RunRequest) -> Result<Outcome, Hoo
         compact_state(&mut store.state);
         compact_obsolete_sessions(&mut store.state);
         ensure_state_capacity(&store.state, &identity.session_key)?;
+        if acceptance::repository_mutation_active(&store, &identity)? {
+            return Err(finish_line_temporary(
+                "finish-line-repository-mutation-active",
+                "a repository mutation is still active",
+            ));
+        }
         generation = store.state.generation;
         sequence = store.state.next_sequence()?;
         let session = store
@@ -1003,7 +1035,7 @@ fn run_validation(state_root: &Path, request: RunRequest) -> Result<Outcome, Hoo
         store.save()?;
     }
 
-    let execution = execute_validation_command(
+    let execution = match execute_validation_command(
         state_root,
         &workdir,
         &request.command,
@@ -1011,7 +1043,21 @@ fn run_validation(state_root: &Path, request: RunRequest) -> Result<Outcome, Hoo
         Duration::from_millis(request.timeout_ms),
         output_max_bytes,
         &unit,
-    )?;
+    ) {
+        Ok(execution) => execution,
+        Err(error) => {
+            let store = Store::open(state_root, &identity)?;
+            acceptance::record_contained_infrastructure_failure(
+                &store,
+                &identity,
+                generation,
+                &target.target_digest,
+                &target.contract_digest,
+                &operation_key,
+            )?;
+            return Err(error);
+        }
+    };
     let observed_outcome = execution.outcome();
     let current_snapshot = resolve_contracts(&identity)?;
     let disposition;
@@ -1179,6 +1225,22 @@ fn run_ordinary_shell(
 
         compact_state(&mut store.state);
         ensure_state_capacity(&store.state, &identity.session_key)?;
+        if acceptance::repository_completion_reserved(&store, &identity)? {
+            return Err(finish_line_temporary(
+                "finish-line-completion-reserved",
+                "the repository is reserved by an authoritative completion",
+            ));
+        }
+        if acceptance::repository_mutation_active(&store, &identity)?
+            || store.state.operations.values().any(|operation| {
+                operation.kind == StoredOperationKind::Shell && operation.terminal.is_none()
+            })
+        {
+            return Err(finish_line_temporary(
+                "finish-line-repository-mutation-active",
+                "a prior repository mutation is still active",
+            ));
+        }
         store.state.generation = store.state.generation.checked_add(1).ok_or_else(|| {
             HookError::data(
                 "finish-line-generation-exhausted",
@@ -1337,6 +1399,31 @@ fn quiesce(state_root: &Path, request: QuiesceRequest) -> Result<Outcome, HookEr
                     && operation.active_unit == active_unit
             });
         if still_pending {
+            if kind == StoredOperationKind::Validation
+                && let (Some(target_digest), Some(contract_digest)) = (
+                    store
+                        .state
+                        .operations
+                        .get(&operation_key)
+                        .and_then(|operation| operation.target_digest.as_deref()),
+                    store
+                        .state
+                        .operations
+                        .get(&operation_key)
+                        .and_then(|operation| operation.contract_digest.as_deref()),
+                )
+            {
+                let target_digest = target_digest.to_string();
+                let contract_digest = contract_digest.to_string();
+                acceptance::record_contained_infrastructure_failure(
+                    &store,
+                    &identity,
+                    generation,
+                    &target_digest,
+                    &contract_digest,
+                    &operation_key,
+                )?;
+            }
             store.state.operations.remove(&operation_key);
             if kind == StoredOperationKind::Validation
                 && let Some(target_digest) = target_digest
@@ -1386,6 +1473,7 @@ fn release(state_root: &Path, request: ReleaseRequest) -> Result<Outcome, HookEr
             )
         })
     {
+        acceptance::release_session(&store, &identity, &supplied_digest)?;
         return Ok(success_outcome(
             json!({
                 "schema_version": "agent-hook.finish-line.release-result.v1",
@@ -1400,11 +1488,11 @@ fn release(state_root: &Path, request: ReleaseRequest) -> Result<Outcome, HookEr
     let busy = store.state.operations.values().any(|operation| {
         operation.session_key == identity.session_key
             && (operation.terminal.is_none() || operation.active_unit.is_some())
-    });
+    }) || acceptance::session_busy(&store, &identity)?;
     if busy {
         return Err(finish_line_temporary(
             "finish-line-session-busy",
-            "finish-line session cannot be released while contained execution is pending",
+            "finish-line session cannot be released while authoritative execution is pending",
         ));
     }
 
@@ -1418,13 +1506,14 @@ fn release(state_root: &Path, request: ReleaseRequest) -> Result<Outcome, HookEr
     store.state.released_sessions.insert(
         released_key,
         ReleasedSession {
-            capability_digest: supplied_digest,
+            capability_digest: supplied_digest.clone(),
             session_key: Some(identity.session_key.clone()),
             sequence,
         },
     );
     compact_release_tombstones(&mut store.state);
     store.save()?;
+    acceptance::release_session(&store, &identity, &supplied_digest)?;
     Ok(success_outcome(
         json!({
             "schema_version": "agent-hook.finish-line.release-result.v1",

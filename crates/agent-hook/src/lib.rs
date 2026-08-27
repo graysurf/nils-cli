@@ -384,6 +384,26 @@ fn run_finish_line(layout: &Layout, command: FinishLineCommand) -> i32 {
             args.format,
             finish_line::Operation::Run,
         ),
+        FinishLineCommand::Register(args) => (
+            "agent-hook finish-line register",
+            args.format,
+            finish_line::Operation::Register,
+        ),
+        FinishLineCommand::Admit(args) => (
+            "agent-hook finish-line admit",
+            args.format,
+            finish_line::Operation::Admit,
+        ),
+        FinishLineCommand::Observe(args) => (
+            "agent-hook finish-line observe",
+            args.format,
+            finish_line::Operation::Observe,
+        ),
+        FinishLineCommand::Verdict(args) => (
+            "agent-hook finish-line verdict",
+            args.format,
+            finish_line::Operation::Verdict,
+        ),
         FinishLineCommand::Stop(args) => (
             "agent-hook finish-line stop",
             args.format,

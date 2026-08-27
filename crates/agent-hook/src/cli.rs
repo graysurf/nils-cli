@@ -114,6 +114,14 @@ pub enum FinishLineCommand {
     Begin(FinishLineFormatArgs),
     /// Probe or supervise one foreground DSH Bash command and classify exact validation targets.
     Run(FinishLineFormatArgs),
+    /// Register one immutable named acceptance contract for a DSH session.
+    Register(FinishLineFormatArgs),
+    /// Admit one exact structured mutation or validator before its body runs.
+    Admit(FinishLineFormatArgs),
+    /// Record one authenticated terminal observation for an admitted operation.
+    Observe(FinishLineFormatArgs),
+    /// Return the authoritative verdict and optionally reserve completion.
+    Verdict(FinishLineFormatArgs),
     /// Decide whether every current validation target is satisfied.
     Stop(FinishLineFormatArgs),
     /// Inspect bounded redacted finish-line state.

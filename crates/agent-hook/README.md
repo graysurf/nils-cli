@@ -47,6 +47,10 @@ printf '%s' "$DSH_INGRESS_JSON" | agent-hook dispatch --product dsh --format jso
 printf '%s' "$FINISH_LINE_OPEN_JSON" | agent-hook finish-line open
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line begin --format json
 printf '%s' "$FINISH_LINE_RUN_JSON" | agent-hook finish-line run --format json
+printf '%s' "$FINISH_LINE_REGISTER_JSON" | agent-hook finish-line register --format json
+printf '%s' "$FINISH_LINE_ADMIT_JSON" | agent-hook finish-line admit --format json
+printf '%s' "$FINISH_LINE_OBSERVE_JSON" | agent-hook finish-line observe --format json
+printf '%s' "$FINISH_LINE_VERDICT_JSON" | agent-hook finish-line verdict --format json
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line stop --format json
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line status --format json
 printf '%s' "$WORKSPACE_BIND_JSON" | agent-hook workspace-lease bind
@@ -150,8 +154,9 @@ Private state lives below
 global `--state-dir` override) behind owner-only directories, bounded files,
 and per-workspace cross-process locks.
 
-The separate `finish-line` service exposes only five public operations: `open`,
-`begin`, `run`, `stop`, and `status`. On a supported Linux containment host,
+The separate `finish-line` service exposes nine public operations: `open`,
+`begin`, `run`, `register`, `admit`, `observe`, `verdict`, `stop`, and
+`status`. On a supported Linux containment host,
 `open` requires a caller-generated private attempt token and derives a private
 runner capability bound to that token, the exact repository, and the DSH
 session. An exact retry returns the same capability and renews its 24-hour
@@ -217,12 +222,17 @@ with the same private capability and operation binding. Nils performs bounded
 three consecutive observations, 25 ms apart, with no pending job and either an
 absent unit or an inactive/failed unit whose extant cgroup reports
 `populated 0`. Only then does it clear pending state. `quiesce` is absent from
-public help and completion and cannot report a validation outcome. After
-`agent/disposed`, the integration calls the hidden authenticated `finish-line
-release` RPC. Release refuses pending execution, removes terminal state for the
-exact session, retains a bounded capability-digest tombstone so a recent
-ambiguous response can be retried, and advances the persisted monotonic
-incarnation sequence before any later open.
+public help and completion and cannot report caller-controlled success. For an
+exact contained-Bash acceptance source, stabilized cleanup instead records a
+durable `infrastructure-blocked` acceptance terminal before it clears the main
+pending execution record. After `agent/disposed`, the integration calls the
+hidden authenticated `finish-line release` RPC. Release refuses every
+nonterminal main or acceptance-sidecar operation for the exact session. Once
+quiescent, it removes that session's main execution records but preserves
+terminal acceptance evidence in the sidecar for deterministic recovery. It
+also retains a bounded capability-digest tombstone so a recent ambiguous
+response can be retried, and advances the persisted monotonic incarnation
+sequence before any later open.
 The tombstone retires that capability incarnation, not the stable DSH session
 identity: a later rc.7 resume can open a new private incarnation, while an old
 release retry stays duplicate and cannot delete the new session state. The
@@ -250,12 +260,29 @@ session; `status` exposes only bounded redacted state. There is no `complete`,
 `waive`, `approve`, or `revoke` finish-line operation, and no waiver path or
 ambient waiver environment variable.
 
+The authenticated acceptance extension composes named host-observed and
+contained-Bash validators without letting the caller choose a generation or
+write success. `register` freezes one canonical contract for the DSH session;
+`admit` advances the shared generation before an exact invalidating tool body
+or binds a validator to the current generation. Mutation barriers are
+repository-wide across DSH sessions and ordinary supervised Bash. A contained
+validator reserves one exact future, single-use `run` operation at admission;
+`observe` accepts a normalized host result or derives that contained-Bash
+result under the same private capability incarnation; and `verdict`
+reconstructs the detached per-requirement, repository-mutation, and aggregate
+result.
+Dynamic state is held in a separate rollback-compatible sidecar under the same
+repository lock. Exact schemas, ordering, statuses, compaction, recovery, and
+privacy constraints are defined in
+[`finish-line-acceptance-v1.md`](docs/specs/finish-line-acceptance-v1.md).
+
 Finish-line commands default to service JSON. Both `open` and `begin` require a
 caller-generated unpredictable `attempt_token`; responses never echo it and
 state stores neither token. An exact retry safely recovers a lost success
 response. The capability returned by `open` is the only private bearer
-accepted by `run`, `quiesce`, and `release`; it must stay out of logs and
-persistent configuration.
+accepted by `run`, acceptance `register`, `admit`, `observe`, and `verdict`,
+and hidden `quiesce` and `release`; it must stay out of logs and persistent
+configuration.
 
 Every request must name the exact canonical Git root resolved for the running
 process; nested and unrelated repositories are rejected. Every successful

@@ -93,7 +93,7 @@ above.
   `tool.prerequisite_receipt`. The receipt is re-resolved against the current
   agent-docs catalog and exact execution binding; verification creates no
   activation. V5 fields are rejected on every older ingress version.
-- `agent-hook.finish-line.{open,begin,run,stop,status}.v1`: strict DSH lifecycle
+- `agent-hook.finish-line.{open,begin,run,register,admit,observe,verdict,stop,status}.v1`: strict DSH lifecycle
   requests for the native execution-owned finish line. Their
   command result schemas use the matching
   `agent-hook.finish-line.<command>-result.v1` name and the normal
@@ -389,10 +389,13 @@ the finish-line service. This is an integration boundary: the public
 finish-line request does not accept a caller assertion that a command was
 foreground, background, completed, or successful.
 
-The public CLI surface is exactly `open`, `begin`, `run`, `stop`, and `status`.
-Hidden `quiesce` and `release` commands exist only for DSH cancellation,
-failed-execution cleanup, and authenticated disposed-session retirement. Both
-are deliberately absent from public help and completion.
+The public CLI surface is exactly `open`, `begin`, `run`, `register`, `admit`,
+`observe`, `verdict`, `stop`, and `status`. Hidden `quiesce` and `release`
+commands exist only for DSH cancellation, failed-execution cleanup, and
+authenticated disposed-session retirement. Both are deliberately absent from
+public help and completion. The four acceptance commands use the exact wire,
+ordering, provenance, verdict, privacy, recovery, and compaction contract in
+[`finish-line-acceptance-v1.md`](finish-line-acceptance-v1.md).
 
 The request and response contracts are:
 
@@ -540,11 +543,14 @@ The request and response contracts are:
   raw commands, paths, identities, capabilities, tokens, or child output.
 - The internal `release` request carries the common identity and exact
   session-bound `runner_capability`. It refuses release while any operation for
-  that session is nonterminal or retains an active unit. Once quiescent, it
-  removes the session and its terminal operation records. A bounded
-  capability-digest tombstone makes an exact lost-response retry return
-  `status = "duplicate"`. The tombstone binds that released capability
-  incarnation rather than permanently retiring the stable session identity.
+  that session is nonterminal or retains an active unit, including operations
+  retained in the acceptance sidecar. Once quiescent, it removes the session
+  and terminal operation records from the main execution state. Terminal
+  acceptance evidence remains in the sidecar for deterministic recovery and
+  verdict reconstruction. A bounded capability-digest tombstone makes an exact
+  lost-response retry return `status = "duplicate"`. The tombstone binds that
+  released capability incarnation rather than permanently retiring the stable
+  session identity.
   A later open may create a new incarnation; retrying the old release remains
   duplicate while its bounded tombstone remains and cannot remove the new one.
   Reusing an old attempt token after release creates a new sequence-bound
@@ -561,10 +567,12 @@ single absent-unit observation is insufficient: cleanup requires three
 consecutive observations 25 ms apart with no pending job and either a missing
 unit or an inactive/failed, dead/failed unit whose extant cgroup reports
 `populated 0`. Only after that stabilized proof does it remove the pending
-operation and target attempt. Execution/control errors retain `active_unit` and
-pending state so authenticated cleanup remains possible. The idempotent result is
-`status = "quiescent"`; it cannot create terminal execution or validation
-evidence.
+operation and target attempt. For an exact contained-Bash acceptance source,
+the same proof first records a durable `infrastructure-blocked` acceptance
+terminal. Execution/control errors retain `active_unit` and pending state so
+authenticated cleanup remains possible. The idempotent result is
+`status = "quiescent"`; it cannot create successful execution or validation
+evidence, and the caller cannot choose the infrastructure terminal result.
 
 There is no public `complete`, `waive`, `approve`, or `revoke` finish-line operation.
 There is no caller-reported result path, review authority, waiver artifact, or

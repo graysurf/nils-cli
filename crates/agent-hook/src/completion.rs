@@ -35,6 +35,9 @@ pub fn run(shell: CompletionShell) -> i32 {
 
 fn public_completion(shell: Shell, script: &str) -> String {
     const INTERNAL_COMMANDS: [&str; 2] = ["quiesce", "release"];
+    const BASH_COMMANDS_WITH_INTERNAL: &str =
+        "open begin run register admit observe verdict stop status quiesce release";
+    const BASH_PUBLIC_COMMANDS: &str = "open begin run register admit observe verdict stop status";
     let mut filtered = String::with_capacity(script.len());
     let mut skip_until_case_end = None;
     let mut skip_until_function_end = false;
@@ -110,12 +113,9 @@ fn public_completion(shell: Shell, script: &str) -> String {
             _ => {}
         }
 
-        if shell == Shell::Bash && line.contains("open begin run stop status quiesce release") {
+        if shell == Shell::Bash && line.contains(BASH_COMMANDS_WITH_INTERNAL) {
             removed_entries = removed_entries.saturating_add(1);
-            filtered.push_str(&line.replace(
-                "open begin run stop status quiesce release",
-                "open begin run stop status",
-            ));
+            filtered.push_str(&line.replace(BASH_COMMANDS_WITH_INTERNAL, BASH_PUBLIC_COMMANDS));
         } else {
             filtered.push_str(line);
         }
@@ -154,7 +154,7 @@ fn public_completion(shell: Shell, script: &str) -> String {
     assert!(
         !filtered.contains("finish-line__subcmd__release")
             && !filtered.contains("finish__line__release")
-            && !filtered.contains("open begin run stop status release"),
+            && !filtered.contains(&format!("{BASH_PUBLIC_COMMANDS} release")),
         "internal finish-line release survived completion filtering"
     );
     filtered
