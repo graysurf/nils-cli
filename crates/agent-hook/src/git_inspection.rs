@@ -267,3 +267,24 @@ pub(crate) fn dirty_entries(layout: &GitLayout) -> Result<Vec<DirtyEntry>, HookE
 pub(crate) fn checkout_dirty(layout: &GitLayout) -> Result<bool, HookError> {
     Ok(!dirty_entries(layout)?.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::projected_path;
+
+    #[test]
+    fn path_projection_marks_invalid_utf8_without_a_filesystem_fixture() {
+        let (path, lossy) = projected_path("nested", b"opaque-\xff.txt").expect("projection");
+
+        assert_eq!(path, "nested/opaque-\u{fffd}.txt");
+        assert!(lossy);
+    }
+
+    #[test]
+    fn path_projection_preserves_valid_utf8() {
+        let (path, lossy) = projected_path("nested", b"notes.txt").expect("projection");
+
+        assert_eq!(path, "nested/notes.txt");
+        assert!(!lossy);
+    }
+}

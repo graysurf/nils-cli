@@ -1,11 +1,14 @@
 mod support;
 
-use std::ffi::OsString;
 use std::fs;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
@@ -236,6 +239,7 @@ fn inspect_never_executes_repository_filters() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn inspect_marks_lossy_dirty_paths_without_exposing_file_contents() {
     let (fixture, _managed) = fixture();
     let path = fixture
