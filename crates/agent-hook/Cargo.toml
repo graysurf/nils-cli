@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
+git2 = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 nils-agent-docs = { version = "1.27.16", path = "../agent-docs" }

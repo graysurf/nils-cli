@@ -3614,36 +3614,9 @@ fn current_branch(layout: &GitLayout) -> Option<String> {
 
 pub(crate) fn checkout_dirty(
     layout: &GitLayout,
-    run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
+    _run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
 ) -> Result<bool, HookError> {
-    let mut command = trusted_git_command()?;
-    command
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.pager=cat",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-        ])
-        .current_dir(&layout.root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let output = run_child(command)?;
-    if !output.status.success() {
-        return Err(HookError::runtime(
-            "checkout-status-unavailable",
-            "checkout dirty-state inspection failed",
-        ));
-    }
-    Ok(!output.stdout.is_empty())
+    crate::git_inspection::checkout_dirty(layout)
 }
 
 fn trusted_git_command() -> Result<Command, HookError> {

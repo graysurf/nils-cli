@@ -58,6 +58,8 @@ printf '%s' "$WORKSPACE_BEGIN_JSON" | agent-hook workspace-lease begin
 printf '%s' "$WORKSPACE_COMPLETE_JSON" | agent-hook workspace-lease complete
 printf '%s' "$WORKSPACE_RENEW_JSON" | agent-hook workspace-lease renew
 printf '%s' "$WORKSPACE_RELEASE_JSON" | agent-hook workspace-lease release
+printf '%s' "$WORKSPACE_RECOVERY_JSON" | agent-hook workspace-recovery inspect
+printf '%s' "$WORKSPACE_HANDOFF_JSON" | agent-hook workspace-recovery verify-handoff
 agent-hook completion zsh
 ```
 
@@ -153,6 +155,24 @@ Private state lives below
 `${XDG_STATE_HOME:-$HOME/.local/state}/agent-hook/workspace-leases/` (or the
 global `--state-dir` override) behind owner-only directories, bounded files,
 and per-workspace cross-process locks.
+
+The separate `workspace-recovery` service is a read-only escape hatch for a
+fresh DSH session whose initial workspace bind was denied as dirty. `inspect`
+accepts only an absolute checkout path and projects its canonical branch/head,
+bounded dirty path names, and bounded linked-worktree facts. `verify-handoff`
+additionally accepts one exact absolute candidate path and succeeds only when
+it is a different clean, non-bare, non-detached, non-prunable worktree below
+the managed `git-cli worktree` root. Both operations use a fresh in-process
+libgit2 repository context with no registered repository command filters and
+disable index refreshes. Dirty submodules remain dirty through an explicit,
+bounded recursive `SubmoduleIgnore::None` walk without launching a child Git
+process. Result data is capped at 192 KiB and carries typed omitted counts when
+dirty/worktree arrays are shortened for the 256 KiB DSH transport. The
+operations do not launch Git,
+execute repository filters, create lease state, return file contents, or
+create, clean, stash, commit, switch, adopt, or transfer a worktree. A fresh
+session at a verified handoff path must still pass the normal lease bind.
+Recoverable exit `69` failures include typed bounded recovery details.
 
 The separate `finish-line` service exposes nine public operations: `open`,
 `begin`, `run`, `register`, `admit`, `observe`, `verdict`, `stop`, and

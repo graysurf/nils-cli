@@ -29,6 +29,8 @@ The CLI resolves only absolute XDG roots and rejects relative roots.
 | provider payload | standard input | 1 MiB |
 | workspace-lease request | standard input | 256 KiB, strict duplicate-free JSON |
 | workspace-lease state | state-owned per-worktree JSON | 512 KiB, `0600`, keyed private identity |
+| workspace-recovery request | standard input | 64 KiB, strict duplicate-free JSON |
+| workspace-recovery result | standard output | 192 KiB result data, 512 inspected worktrees, 2,048 inspected dirty paths, 16 KiB per path; arrays carry omitted counts when projected |
 | trace | state-owned JSONL | 256 entries, 256 KiB, redacted metadata only |
 | rule inventory | one policy bundle | 512 rules, unique IDs |
 | reason metadata | one aggregate decision | 64 reasons, 256 bytes per code/message |
@@ -106,6 +108,11 @@ above.
   native WorkspaceLease provider requests. Matching results use
   `agent-hook.workspace-lease.<command>-result.v1` inside the normal
   `cli.agent-hook.workspace-lease-<command>.v1` service envelope.
+- `agent-hook.workspace-recovery.inspect.v1` and
+  `agent-hook.workspace-recovery.verify-handoff.v1`: strict read-only dirty
+  checkout inspection and exact clean managed-worktree handoff verification.
+  Both return `agent-hook.workspace-recovery.result.v1` inside the matching
+  `cli.agent-hook.workspace-recovery-<command>.v1` service envelope.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, and config /
   policy digests.
@@ -365,6 +372,41 @@ canonical paths, Git directories, session/parent IDs, tool arguments, command
 output, or persisted digests. Canonical paths exist only in the private state
 needed to revalidate physical identity and run a trusted, hooks-disabled Git
 dirty-state probe.
+
+## Native DSH workspace recovery
+
+`agent-hook workspace-recovery inspect --format json` and
+`agent-hook workspace-recovery verify-handoff --format json` each read exactly
+one strict, duplicate-free JSON object from standard input. Requests are
+limited to 64 KiB and carry protocol version `1`, an absolute current checkout
+path, and, for handoff verification, one exact absolute candidate path.
+
+The result projects only canonical checkout/worktree paths, branch and object
+identity, bounded dirty path names with typed status states, managed/bare/
+detached/prunable flags, and an optional verified handoff. It never includes
+file contents, environment values, Git command output, lease authority, or
+provider payloads. Result data is capped at 192 KiB so the complete service
+envelope stays within the DSH client's 256 KiB transport cap. Oversized dirty
+and worktree arrays are deterministically shortened and report
+`dirty_entries_omitted` / `worktrees_omitted`; omission never changes the
+dirty decision.
+
+Inspection runs in-process through fresh libgit2 repository contexts. The
+process registers no repository-provided filters and does not launch Git or
+any repository command. Regular status excludes submodules from
+repository-controlled ignore semantics; every submodule layer is instead
+checked explicitly with `SubmoduleIgnore::None` through a bounded recursive
+walk. Repository cycles, excessive depth/count, ambiguous paths, and
+open/status failures fail closed. Index refresh is disabled and
+workspace-lease records are never written. Recoverable exit `69` failures
+carry typed `retryable`, `next_action`, and bounded `recovery` details.
+
+A handoff is eligible only when it is a different, clean, live, non-bare,
+non-detached, non-prunable worktree below the exact managed root convention
+owned by `git-cli worktree`. Verification does not create, clean, stash,
+commit, switch, adopt, or transfer the candidate. Its output is advisory to
+the host: a fresh DSH session at that exact path must independently acquire a
+normal workspace lease, so post-verification drift remains fail-closed.
 
 ## Native DSH finish line
 

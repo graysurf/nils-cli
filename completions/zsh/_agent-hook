@@ -392,6 +392,49 @@ json\:"Single-record JSON envelope (snake_case)"))' \
     ;;
 esac
 ;;
+(workspace-recovery)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-hook__subcmd__workspace-recovery_commands" \
+"*::: :->workspace-recovery" \
+&& ret=0
+
+    case $state in
+    (workspace-recovery)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-workspace-recovery-command-$line[1]:"
+        case $line[1] in
+            (inspect)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(verify-handoff)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -418,6 +461,7 @@ _agent-hook_commands() {
 'recovery:Create, authorize, inspect, consume, or revoke governed recovery' \
 'finish-line:Persist edit generations, execute declared validations, and enforce the DSH stop boundary' \
 'workspace-lease:Bind canonical workspaces and operate durable cross-process mutation leases' \
+'workspace-recovery:Inspect a denied dirty checkout and verify a clean managed-worktree handoff' \
 'completion:Print a shell completion script' \
     )
     _describe -t commands 'agent-hook commands' commands "$@"
@@ -583,6 +627,24 @@ _agent-hook__subcmd__workspace-lease__subcmd__release_commands() {
 _agent-hook__subcmd__workspace-lease__subcmd__renew_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook workspace-lease renew commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-recovery_commands] )) ||
+_agent-hook__subcmd__workspace-recovery_commands() {
+    local commands; commands=(
+'inspect:Project bounded dirty paths and linked worktrees without repository commands' \
+'verify-handoff:Verify one different clean managed worktree for an operator handoff' \
+    )
+    _describe -t commands 'agent-hook workspace-recovery commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-recovery__subcmd__inspect_commands] )) ||
+_agent-hook__subcmd__workspace-recovery__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-recovery inspect commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-recovery__subcmd__verify-handoff_commands] )) ||
+_agent-hook__subcmd__workspace-recovery__subcmd__verify-handoff_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-recovery verify-handoff commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_agent-hook" ]; then

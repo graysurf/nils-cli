@@ -395,6 +395,7 @@ fn cli_help_version_and_completion_surface_are_complete() {
         "recovery",
         "finish-line",
         "workspace-lease",
+        "workspace-recovery",
         "completion",
         "-V, --version",
     ] {
@@ -471,6 +472,28 @@ fn cli_help_version_and_completion_surface_are_complete() {
             .contains("[default: json]")
     );
 
+    let recovery_help = fixture.run(&["workspace-recovery", "--help"], None);
+    assert_eq!(
+        recovery_help.code,
+        0,
+        "stderr={}",
+        recovery_help.stderr_text()
+    );
+    let recovery_help_text = recovery_help.stdout_text();
+    for required in ["inspect", "verify-handoff"] {
+        assert!(
+            recovery_help_text.contains(required),
+            "workspace-recovery help missing {required}: {recovery_help_text}"
+        );
+    }
+    let recovery_inspect_help = fixture.run(&["workspace-recovery", "inspect", "--help"], None);
+    assert_eq!(recovery_inspect_help.code, 0);
+    assert!(
+        recovery_inspect_help
+            .stdout_text()
+            .contains("[default: json]")
+    );
+
     for shell in ["bash", "zsh"] {
         let completion = fixture.run(&["completion", shell], None);
         assert_eq!(completion.code, 0, "shell={shell}");
@@ -481,6 +504,8 @@ fn cli_help_version_and_completion_surface_are_complete() {
         );
         assert!(script.contains("dispatch"), "shell={shell}");
         assert!(script.contains("workspace-lease"), "shell={shell}");
+        assert!(script.contains("workspace-recovery"), "shell={shell}");
+        assert!(script.contains("verify-handoff"), "shell={shell}");
         assert!(script.contains("renew"), "shell={shell}");
         assert!(script.contains("--expected-plan-digest"), "shell={shell}");
         let (scope_start, scope_end) = if shell == "bash" {

@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `6dc14bf99861287c412f0224726440ca504bf9ff0f2becea213851165fa97d0b`
-- Third-party crates (`source != null`): 493
+- Cargo.lock SHA256: `bcf43b99e63ece1db0720b60aa89ccb7b6f2fc797429f85158cf35292ef86586`
+- Third-party crates (`source != null`): 496
 - Workspace crates (`source == null`, excluded below): 46
 
 ## Notes
@@ -17,7 +17,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 236 |
+| MIT OR Apache-2.0 | 239 |
 | MIT | 103 |
 | Apache-2.0 OR MIT | 40 |
 | Zlib OR Apache-2.0 OR MIT | 20 |
@@ -185,6 +185,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | crates.io |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | crates.io |
 | gif | 0.14.2 | MIT OR Apache-2.0 | crates.io |
+| git2 | 0.21.0 | MIT OR Apache-2.0 | crates.io |
 | harfrust | 0.12.0 | MIT | crates.io |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 | crates.io |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | crates.io |
@@ -247,8 +248,10 @@ This file documents third-party Rust crate licenses used by this workspace.
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | crates.io |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 | crates.io |
 | libc | 0.2.189 | MIT OR Apache-2.0 | crates.io |
+| libgit2-sys | 0.18.8+1.9.7 | MIT OR Apache-2.0 | crates.io |
 | libm | 0.2.16 | MIT | crates.io |
 | libsqlite3-sys | 0.38.2 | MIT | crates.io |
+| libz-sys | 1.1.29 | MIT OR Apache-2.0 | crates.io |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | crates.io |
 | litemap | 0.8.2 | Unicode-3.0 | crates.io |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | crates.io |

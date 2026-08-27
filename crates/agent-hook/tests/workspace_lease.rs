@@ -1,6 +1,7 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -277,6 +278,295 @@ fn dirty_state_refuses_takeover_and_clean_expiry_recovers_with_a_new_generation(
     let refused = bind(&fixture, "session-c", "dirty-takeover", &fixture.root);
     assert_eq!(refused["kind"], "denied");
     assert_eq!(refused["state"], "dirty");
+}
+
+#[test]
+fn dirty_bind_never_executes_repository_clean_filters() {
+    let fixture = fixture();
+    fs::write(
+        fixture.root.join(".gitattributes"),
+        "tracked.txt filter=hostile\n",
+    )
+    .expect("hostile attributes");
+    git(&fixture.root, &["add", ".gitattributes"]);
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-m", "test: hostile filter fixture"],
+    );
+
+    let marker = fixture.root.join("filter-executed");
+    let filter = fixture.root.join("hostile-filter.sh");
+    fs::write(
+        &filter,
+        format!("#!/bin/sh\n: > {}\n/bin/cat\n", marker.to_string_lossy()),
+    )
+    .expect("hostile filter script");
+    fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+        .expect("hostile filter permissions");
+    git(
+        &fixture.root,
+        &[
+            "config",
+            "filter.hostile.clean",
+            filter.to_str().expect("filter path UTF-8"),
+        ],
+    );
+    fs::write(fixture.root.join("tracked.txt"), "next\n").expect("dirty tracked file");
+
+    let denied = bind(&fixture, "session-a", "hostile-filter-bind", &fixture.root);
+
+    assert_eq!(denied["kind"], "denied");
+    assert_eq!(denied["code"], "WORKSPACE_DIRTY");
+    assert!(
+        !marker.exists(),
+        "workspace dirtiness inspection executed a repository clean filter"
+    );
+}
+
+fn dirty_submodule_denial(ignore_source: Option<&str>, request_id: &str) -> (Value, bool) {
+    let fixture = fixture();
+    let source = ScopedTempDir::with_prefix("agent-hook-submodule-source-");
+    git(source.path(), &["init", "--quiet"]);
+    git(
+        source.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(source.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(source.path().join("tracked.txt"), "base\n").expect("submodule tracked file");
+    fs::write(
+        source.path().join(".gitattributes"),
+        "tracked.txt filter=hostile\n",
+    )
+    .expect("submodule hostile attributes");
+    git(source.path(), &["add", "--all"]);
+    git(source.path(), &["commit", "--quiet", "-m", "test: initial"]);
+
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.path().to_str().expect("submodule source UTF-8"),
+            "module",
+        ],
+    );
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "test: add submodule"],
+    );
+    match ignore_source {
+        Some("gitmodules") => {
+            git(
+                &fixture.root,
+                &[
+                    "config",
+                    "-f",
+                    ".gitmodules",
+                    "submodule.module.ignore",
+                    "all",
+                ],
+            );
+            git(
+                &fixture.root,
+                &[
+                    "commit",
+                    "--quiet",
+                    "-am",
+                    "test: ignore submodule dirtiness",
+                ],
+            );
+        }
+        Some("config") => git(&fixture.root, &["config", "diff.ignoreSubmodules", "all"]),
+        None => {}
+        Some(value) => panic!("unsupported submodule ignore source: {value}"),
+    }
+
+    let marker = fixture.state_home.join("submodule-filter-executed");
+    let filter = fixture.state_home.join("submodule-hostile-filter.sh");
+    fs::write(
+        &filter,
+        format!("#!/bin/sh\n: > {}\n/bin/cat\n", marker.to_string_lossy()),
+    )
+    .expect("submodule hostile filter script");
+    fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+        .expect("submodule hostile filter permissions");
+    let checkout = fixture.root.join("module");
+    git(
+        &checkout,
+        &[
+            "config",
+            "filter.hostile.clean",
+            filter.to_str().expect("submodule filter UTF-8"),
+        ],
+    );
+    fs::write(checkout.join("tracked.txt"), "next\n").expect("dirty submodule tracked file");
+
+    let denied = bind(&fixture, "session-a", request_id, &fixture.root);
+
+    (denied, marker.exists())
+}
+
+fn nested_dirty_submodule_denial() -> (Value, bool) {
+    let fixture = fixture();
+    let leaf = ScopedTempDir::with_prefix("agent-hook-nested-leaf-");
+    git(leaf.path(), &["init", "--quiet"]);
+    git(
+        leaf.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(leaf.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(leaf.path().join("tracked.txt"), "base\n").expect("nested tracked file");
+    fs::write(
+        leaf.path().join(".gitattributes"),
+        "tracked.txt filter=hostile\n",
+    )
+    .expect("nested hostile attributes");
+    git(leaf.path(), &["add", "--all"]);
+    git(leaf.path(), &["commit", "--quiet", "-m", "test: initial"]);
+
+    let parent = ScopedTempDir::with_prefix("agent-hook-nested-parent-");
+    git(parent.path(), &["init", "--quiet"]);
+    git(
+        parent.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(parent.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(parent.path().join("parent.txt"), "base\n").expect("parent tracked file");
+    git(parent.path(), &["add", "--all"]);
+    git(parent.path(), &["commit", "--quiet", "-m", "test: initial"]);
+    git(
+        parent.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            leaf.path().to_str().expect("nested leaf source UTF-8"),
+            "leaf",
+        ],
+    );
+    git(
+        parent.path(),
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.leaf.ignore",
+            "all",
+        ],
+    );
+    git(
+        parent.path(),
+        &[
+            "commit",
+            "--quiet",
+            "-am",
+            "test: add ignored nested submodule",
+        ],
+    );
+
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            parent.path().to_str().expect("nested parent source UTF-8"),
+            "module",
+        ],
+    );
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    );
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "test: add nested submodule"],
+    );
+
+    let marker = fixture.state_home.join("nested-submodule-filter-executed");
+    let filter = fixture
+        .state_home
+        .join("nested-submodule-hostile-filter.sh");
+    fs::write(
+        &filter,
+        format!("#!/bin/sh\n: > {}\n/bin/cat\n", marker.to_string_lossy()),
+    )
+    .expect("nested submodule hostile filter script");
+    fs::set_permissions(&filter, fs::Permissions::from_mode(0o700))
+        .expect("nested submodule hostile filter permissions");
+    let checkout = fixture.root.join("module/leaf");
+    git(
+        &checkout,
+        &[
+            "config",
+            "filter.hostile.clean",
+            filter.to_str().expect("nested submodule filter UTF-8"),
+        ],
+    );
+    fs::write(checkout.join("tracked.txt"), "next\n").expect("dirty nested tracked file");
+
+    let denied = bind(
+        &fixture,
+        "session-a",
+        "nested-gitmodules-ignore-bind",
+        &fixture.root,
+    );
+    (denied, marker.exists())
+}
+
+#[test]
+fn dirty_submodule_bind_stays_closed_without_executing_its_clean_filter() {
+    let (denied, filter_executed) = dirty_submodule_denial(None, "dirty-submodule-bind");
+
+    assert_eq!(denied["kind"], "denied");
+    assert_eq!(denied["code"], "WORKSPACE_DIRTY");
+    assert!(
+        !filter_executed,
+        "workspace dirtiness inspection executed a submodule clean filter"
+    );
+}
+
+#[test]
+fn gitmodules_ignore_all_cannot_hide_a_dirty_submodule_from_bind() {
+    let (denied, filter_executed) =
+        dirty_submodule_denial(Some("gitmodules"), "gitmodules-ignore-bind");
+
+    assert_eq!(denied["kind"], "denied");
+    assert_eq!(denied["code"], "WORKSPACE_DIRTY");
+    assert!(!filter_executed, "submodule clean filter executed");
+}
+
+#[test]
+fn diff_ignore_submodules_all_cannot_hide_a_dirty_submodule_from_bind() {
+    let (denied, filter_executed) =
+        dirty_submodule_denial(Some("config"), "diff-ignore-submodules-bind");
+
+    assert_eq!(denied["kind"], "denied");
+    assert_eq!(denied["code"], "WORKSPACE_DIRTY");
+    assert!(!filter_executed, "submodule clean filter executed");
+}
+
+#[test]
+fn nested_gitmodules_ignore_all_cannot_hide_a_dirty_submodule_from_bind() {
+    let (denied, filter_executed) = nested_dirty_submodule_denial();
+
+    assert_eq!(denied["kind"], "denied");
+    assert_eq!(denied["code"], "WORKSPACE_DIRTY");
+    assert!(!filter_executed, "nested submodule clean filter executed");
 }
 
 #[test]
