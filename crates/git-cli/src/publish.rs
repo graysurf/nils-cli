@@ -11,6 +11,8 @@
 //!   branch and refuses outright when that branch is the remote's default.
 //! * [`run_sync_default`] only ever fast-forwards the local default branch to a
 //!   commit that is already published, and refuses anything else.
+//! * [`run_sync_branch`] only ever fast-forwards the checked-out, published
+//!   non-default branch to its own remote-tracking ref.
 //!
 //! Every refusal is a typed envelope error, so a caller can tell "this is
 //! forbidden" from "this could not be proven" without parsing prose.
@@ -30,6 +32,7 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "push" => Some(run_push(args)),
         "sync-default" => Some(run_sync_default(args)),
+        "sync-branch" => Some(run_sync_branch(args)),
         _ => None,
     }
 }
@@ -84,6 +87,20 @@ struct PushOutput {
 #[derive(Debug, Serialize)]
 struct SyncOutput {
     default_branch: String,
+    remote: String,
+    remote_ref: String,
+    previous_head: String,
+    new_head: String,
+    strategy: &'static str,
+    already_current: bool,
+    fast_forward: bool,
+    dry_run: bool,
+    fetched: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncBranchOutput {
+    branch: String,
     remote: String,
     remote_ref: String,
     previous_head: String,
@@ -471,6 +488,158 @@ fn sync_default(args: &SyncArgs) -> Result<SyncOutput, CliError> {
     })
 }
 
+// ----------------------------------------------------------- sync-branch
+
+fn run_sync_branch(args: &[String]) -> i32 {
+    let requested_format = detect_format(args);
+    if take_help(args) {
+        print_sync_branch_help();
+        return 0;
+    }
+    let parsed = match parse_sync_args_for("sync-branch", args) {
+        Ok(parsed) => parsed,
+        Err(err) => return emit_error("sync-branch", requested_format, err),
+    };
+
+    match sync_branch(&parsed) {
+        Ok(output) => emit_success("sync-branch", parsed.format, &output, || {
+            if output.already_current {
+                format!(
+                    "Already current: {} at {}",
+                    output.branch,
+                    short(&output.new_head)
+                )
+            } else if output.dry_run {
+                format!(
+                    "Would fast-forward {} {}..{}",
+                    output.branch,
+                    short(&output.previous_head),
+                    short(&output.new_head)
+                )
+            } else {
+                format!(
+                    "Fast-forwarded {} {}..{}",
+                    output.branch,
+                    short(&output.previous_head),
+                    short(&output.new_head)
+                )
+            }
+        }),
+        Err(err) => emit_error("sync-branch", parsed.format, err),
+    }
+}
+
+fn sync_branch(args: &SyncArgs) -> Result<SyncBranchOutput, CliError> {
+    ensure_inside_git_repo()?;
+    require_remote(&args.remote)?;
+
+    let branch = current_branch().ok_or_else(|| {
+        CliError::data("detached-head", "HEAD is not attached to a branch")
+            .with_hint("check out the published non-default branch you want to synchronize")
+    })?;
+    let default_branch = cached_default_branch(&args.remote).ok_or_else(|| {
+        CliError::data(
+            "default-branch-unresolved",
+            format!(
+                "cannot prove '{branch}' is non-default because remote '{}' has no cached default branch",
+                args.remote
+            ),
+        )
+        .with_hint(format!(
+            "run `git remote set-head {} --auto` to cache it",
+            args.remote
+        ))
+    })?;
+    if branch == default_branch {
+        return Err(CliError::data(
+            "refuse-default-branch",
+            format!(
+                "'{branch}' is the default branch of remote '{}'; use `git-cli sync-default`",
+                args.remote
+            ),
+        ));
+    }
+    if !upstream_is_own_ref(&args.remote, &branch) {
+        return Err(CliError::data(
+            "branch-upstream-mismatch",
+            format!(
+                "'{branch}' does not track its own branch on remote '{}'",
+                args.remote
+            ),
+        )
+        .with_hint("publish or repair the branch upstream with `git-cli push` first"));
+    }
+    if !args.dry_run {
+        require_clean_checkout()?;
+    }
+
+    let remote_ref = format!("refs/remotes/{}/{branch}", args.remote);
+    if args.fetch {
+        let refspec = format!("+refs/heads/{branch}:{remote_ref}");
+        git_output(&["fetch", "--quiet", &args.remote, &refspec]).map_err(|err| {
+            CliError::runtime("git-fetch-failed", summarize_git_error(&err.to_string()))
+                .with_hint("pass `--no-fetch` to sync against the already-fetched remote ref")
+        })?;
+    }
+
+    let previous_head = rev_parse_commit("HEAD")
+        .ok_or_else(|| CliError::data("head-unresolved", "HEAD does not resolve to a commit"))?;
+    let new_head = rev_parse_commit(&remote_ref).ok_or_else(|| {
+        CliError::data(
+            "remote-branch-missing",
+            format!("'{remote_ref}' does not resolve to a commit"),
+        )
+        .with_hint("publish the branch first, or drop `--no-fetch`")
+    })?;
+
+    if previous_head == new_head {
+        return Ok(SyncBranchOutput {
+            branch,
+            remote: args.remote.clone(),
+            remote_ref,
+            previous_head: previous_head.clone(),
+            new_head: previous_head,
+            strategy: "noop",
+            already_current: true,
+            fast_forward: true,
+            dry_run: args.dry_run,
+            fetched: args.fetch,
+        });
+    }
+    if !git_status_success(&["merge-base", "--is-ancestor", &previous_head, &new_head]) {
+        return Err(CliError::data(
+            "not-fast-forward",
+            format!(
+                "'{branch}' has diverged from '{remote_ref}'; synchronizing would discard local commits"
+            ),
+        )
+        .with_hint("deliver or move the local-only commits before synchronizing")
+        .with_details(json!({
+            "local_head": previous_head,
+            "remote_head": new_head,
+        })));
+    }
+
+    if !args.dry_run {
+        git_output(&["merge", "--ff-only", "--quiet", &remote_ref]).map_err(|err| {
+            CliError::runtime("git-merge-failed", summarize_git_error(&err.to_string()))
+        })?;
+    }
+
+    Ok(SyncBranchOutput {
+        branch,
+        remote: args.remote.clone(),
+        remote_ref,
+        previous_head,
+        new_head,
+        strategy: "merge-ff-only",
+        already_current: false,
+        fast_forward: true,
+        dry_run: args.dry_run,
+        fetched: args.fetch,
+    })
+}
+
 // ----------------------------------------------------------------- git
 
 fn current_branch() -> Option<String> {
@@ -534,7 +703,7 @@ fn require_clean_checkout() -> Result<(), CliError> {
         "dirty-checkout",
         "the checkout has staged or unstaged changes",
     )
-    .with_hint("commit or stash the changes before moving the default branch"))
+    .with_hint("commit or stash the changes before moving the checked-out branch"))
 }
 
 /// Which other worktree, if any, holds `branch` checked out.
@@ -618,6 +787,10 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
 }
 
 fn parse_sync_args(args: &[String]) -> Result<SyncArgs, CliError> {
+    parse_sync_args_for("sync-default", args)
+}
+
+fn parse_sync_args_for(command: &str, args: &[String]) -> Result<SyncArgs, CliError> {
     let mut rest: Vec<String> = args.to_vec();
     let format = take_format(&mut rest)?;
     let mut remote = DEFAULT_REMOTE.to_string();
@@ -648,7 +821,9 @@ fn parse_sync_args(args: &[String]) -> Result<SyncArgs, CliError> {
                     "unknown-argument",
                     format!("unknown argument: {other}"),
                 )
-                .with_hint("run `git-cli sync-default --help` for the accepted flags"));
+                .with_hint(format!(
+                    "run `git-cli {command} --help` for the accepted flags"
+                )));
             }
         }
     }
@@ -695,6 +870,17 @@ fn print_sync_help() {
         "  Refuses anything that is not a pure fast-forward onto an already-published commit."
     );
     println!("  Moves the ref directly when no worktree holds the default branch checked out.");
+    println!(
+        "  --no-fetch syncs against the already-fetched remote ref instead of contacting the remote."
+    );
+}
+
+fn print_sync_branch_help() {
+    println!(
+        "Usage: git-cli sync-branch [--remote <name>] [--no-fetch] [--dry-run] [--format text|json]"
+    );
+    println!("  Fast-forward the checked-out non-default branch to its own remote-tracking ref.");
+    println!("  Refuses detached, default, untracked, dirty, or diverged branches.");
     println!(
         "  --no-fetch syncs against the already-fetched remote ref instead of contacting the remote."
     );

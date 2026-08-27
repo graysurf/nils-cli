@@ -21,7 +21,7 @@ use crate::rate_limit::default_runner;
 const SCHEMA: &str = "pr.list";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str = "number,url,state,title,headRefName,headRepository,author";
+const GH_JSON_FIELDS: &str = "number,url,state,title,headRefName,headRepository,baseRefName,author";
 
 /// Envelope payload for `cli.forge-cli.pr.list.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -38,6 +38,7 @@ pub struct PrListItem {
     pub state: &'static str,
     pub title: String,
     pub head: String,
+    pub base: Option<String>,
     #[serde(skip_serializing)]
     pub head_repository: Option<String>,
     pub author: Option<String>,
@@ -120,6 +121,10 @@ pub(crate) fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> Backe
                 argv.push(OsString::from("--head"));
                 argv.push(OsString::from(h));
             }
+            if let Some(base) = &args.base {
+                argv.push(OsString::from("--base"));
+                argv.push(OsString::from(base));
+            }
             argv.push(OsString::from("--json"));
             argv.push(OsString::from(GH_JSON_FIELDS));
         }
@@ -138,6 +143,10 @@ pub(crate) fn build_list_call(ctx: &ProviderContext, args: &PrListArgs) -> Backe
             if let Some(h) = &args.head {
                 argv.push(OsString::from("--source-branch"));
                 argv.push(OsString::from(h));
+            }
+            if let Some(base) = &args.base {
+                argv.push(OsString::from("--target-branch"));
+                argv.push(OsString::from(base));
             }
             argv.push(OsString::from("--output"));
             argv.push(OsString::from("json"));
@@ -197,6 +206,10 @@ fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<PrListIt
             )?,
             title: required_str(raw, "title")?,
             head: required_str(raw, "headRefName")?,
+            base: raw
+                .get("baseRefName")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             head_repository: raw
                 .get("headRepository")
                 .and_then(|repository| repository.get("nameWithOwner"))
@@ -220,6 +233,10 @@ fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<PrListIt
             )?,
             title: required_str(raw, "title")?,
             head: required_str(raw, "source_branch")?,
+            base: raw
+                .get("target_branch")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             head_repository: None,
             author: raw
                 .get("author")
@@ -282,6 +299,7 @@ mod tests {
             state: PrStateFilter::Open,
             author: None,
             head: None,
+            base: None,
             limit: 30,
         }
     }
@@ -301,6 +319,7 @@ mod tests {
         let mut args = default_args();
         args.author = Some("alice".into());
         args.head = Some("feat/x".into());
+        args.base = Some("mainline".into());
         args.limit = 1;
         args.state = PrStateFilter::Merged;
         let call = build_list_call(&ctx(Provider::GitHub), &args);
@@ -309,6 +328,8 @@ mod tests {
         assert_eq!(plan[a_idx + 1], "alice");
         let h_idx = plan.iter().position(|s| s == "--head").unwrap();
         assert_eq!(plan[h_idx + 1], "feat/x");
+        let b_idx = plan.iter().position(|s| s == "--base").unwrap();
+        assert_eq!(plan[b_idx + 1], "mainline");
         let l_idx = plan.iter().position(|s| s == "--limit").unwrap();
         assert_eq!(plan[l_idx + 1], "1");
         let s_idx = plan.iter().position(|s| s == "--state").unwrap();
@@ -332,19 +353,22 @@ mod tests {
     fn build_list_call_gitlab_maps_state_to_flag() {
         let mut args = default_args();
         args.state = PrStateFilter::Merged;
+        args.base = Some("mainline".into());
         let call = build_list_call(&ctx(Provider::GitLab), &args);
         let plan = call.plan_argv();
         assert!(plan.contains(&"--merged".to_string()));
         assert!(plan.contains(&"--per-page".to_string()));
         assert!(plan.contains(&"--output".to_string()));
         assert!(!plan.contains(&"-F".to_string()));
+        let b_idx = plan.iter().position(|s| s == "--target-branch").unwrap();
+        assert_eq!(plan[b_idx + 1], "mainline");
     }
 
     #[test]
     fn parse_list_output_github() {
         let stdout = r#"[
-          {"number":1,"url":"u1","state":"OPEN","title":"a","headRefName":"feat/a","author":{"login":"alice"}},
-          {"number":2,"url":"u2","state":"CLOSED","title":"b","headRefName":"feat/b","author":{"login":"bob"}}
+          {"number":1,"url":"u1","state":"OPEN","title":"a","headRefName":"feat/a","baseRefName":"mainline","author":{"login":"alice"}},
+          {"number":2,"url":"u2","state":"CLOSED","title":"b","headRefName":"feat/b","baseRefName":"main","author":{"login":"bob"}}
         ]"#;
         let payload = parse_list_output(
             &ctx(Provider::GitHub),
@@ -358,12 +382,13 @@ mod tests {
         assert_eq!(payload.items[0].state, "open");
         assert_eq!(payload.items[1].state, "closed");
         assert_eq!(payload.items[0].author.as_deref(), Some("alice"));
+        assert_eq!(payload.items[0].base.as_deref(), Some("mainline"));
     }
 
     #[test]
     fn parse_list_output_gitlab() {
         let stdout = r#"[
-          {"iid":7,"web_url":"u","state":"opened","title":"x","source_branch":"feat/x","author":{"username":"alice"}}
+          {"iid":7,"web_url":"u","state":"opened","title":"x","source_branch":"feat/x","target_branch":"mainline","author":{"username":"alice"}}
         ]"#;
         let payload = parse_list_output(
             &ctx(Provider::GitLab),
@@ -375,6 +400,7 @@ mod tests {
         .unwrap();
         assert_eq!(payload.items[0].number, 7);
         assert_eq!(payload.items[0].state, "open");
+        assert_eq!(payload.items[0].base.as_deref(), Some("mainline"));
     }
 
     #[test]

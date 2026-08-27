@@ -452,6 +452,40 @@ fn pr_merge_expected_head_rejects_provider_drift_before_mutation() {
 }
 
 #[test]
+fn pr_merge_expected_base_rejects_provider_drift_before_mutation() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let merged = stub.tempdir.path().join("github-merged");
+    let body = github_merge_stub(&stub, "", "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--expected-base",
+            "mainline",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "delivery_base_mismatch");
+    assert!(
+        !merged.exists(),
+        "merge mutation must not run after base drift"
+    );
+}
+
+#[test]
 fn pr_merge_expected_head_allows_the_matching_provider_head() {
     let tempdir = make_github_repo(None);
     let repo_path = tempdir.path().join("repo");

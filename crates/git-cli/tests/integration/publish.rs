@@ -23,6 +23,41 @@ fn repo_with_published_main() -> (TempDir, TempDir) {
     (repo, remote)
 }
 
+fn publish_branch(repo: &Path, branch: &str) {
+    git(repo, &["checkout", "-q", "-b", branch]);
+    git(repo, &["push", "-q", "--set-upstream", "origin", branch]);
+}
+
+fn advance_remote_branch(remote: &Path, branch: &str) -> String {
+    let scratch = TempDir::new().expect("scratch clone");
+    let remote_path = remote.to_string_lossy().to_string();
+    let scratch_path = scratch.path().to_string_lossy().to_string();
+    git(
+        remote,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            branch,
+            &remote_path,
+            &scratch_path,
+        ],
+    );
+    git(
+        scratch.path(),
+        &["config", "user.email", "test@example.com"],
+    );
+    git(scratch.path(), &["config", "user.name", "Test"]);
+    commit_file(
+        scratch.path(),
+        "remote.txt",
+        "remote\n",
+        "advance remote branch",
+    );
+    git(scratch.path(), &["push", "-q", "origin", branch]);
+    rev_parse(scratch.path(), "HEAD")
+}
+
 fn git_config_optional(repo: &Path, key: &str) -> Option<String> {
     let output = git_output(repo, &["config", "--get", key]);
     output
@@ -456,4 +491,132 @@ fn sync_default_dry_run_reports_the_plan_without_moving_the_ref() {
         previous,
         "a dry run moves nothing"
     );
+}
+
+#[test]
+fn sync_branch_fast_forwards_a_checked_out_non_default_branch() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_published_main();
+
+    publish_branch(repo.path(), "feat/integration");
+    let previous = rev_parse(repo.path(), "HEAD");
+    let advanced = advance_remote_branch(remote.path(), "feat/integration");
+
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+
+    let json = parse_json(&output);
+    assert_eq!(json["schema_version"], "cli.git-cli.sync-branch.v1");
+    assert_eq!(json["data"]["branch"], "feat/integration");
+    assert_eq!(json["data"]["previous_head"], previous);
+    assert_eq!(json["data"]["new_head"], advanced);
+    assert_eq!(json["data"]["strategy"], "merge-ff-only");
+    assert_eq!(rev_parse(repo.path(), "HEAD"), advanced);
+}
+
+#[test]
+fn sync_branch_refuses_the_default_branch() {
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_published_main();
+
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        parse_json(&output)["error"]["code"],
+        "refuse-default-branch"
+    );
+}
+
+#[test]
+fn sync_branch_refuses_an_unpublished_or_mistracked_branch() {
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_published_main();
+    git(
+        repo.path(),
+        &["checkout", "-q", "--no-track", "-b", "feat/local"],
+    );
+
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        parse_json(&output)["error"]["code"],
+        "branch-upstream-mismatch"
+    );
+}
+
+#[test]
+fn sync_branch_refuses_a_dirty_checkout_before_fast_forwarding() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_published_main();
+    publish_branch(repo.path(), "feat/integration");
+    let previous = rev_parse(repo.path(), "HEAD");
+    advance_remote_branch(remote.path(), "feat/integration");
+
+    std::fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
+    git(repo.path(), &["add", "dirty.txt"]);
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+
+    assert_ne!(output.code, 0);
+    assert_eq!(parse_json(&output)["error"]["code"], "dirty-checkout");
+    assert_eq!(rev_parse(repo.path(), "HEAD"), previous);
+    assert_eq!(
+        rev_parse(repo.path(), "refs/remotes/origin/feat/integration"),
+        previous,
+        "a dirty refusal must occur before fetch mutates the remote-tracking ref"
+    );
+}
+
+#[test]
+fn sync_branch_refuses_a_detached_head() {
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_published_main();
+    publish_branch(repo.path(), "feat/integration");
+    git(repo.path(), &["checkout", "-q", "--detach"]);
+
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+
+    assert_ne!(output.code, 0);
+    assert_eq!(parse_json(&output)["error"]["code"], "detached-head");
+}
+
+#[test]
+fn sync_branch_refuses_diverged_history_without_moving_head() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_published_main();
+    publish_branch(repo.path(), "feat/integration");
+    commit_file(repo.path(), "local.txt", "local\n", "advance locally");
+    let local_head = rev_parse(repo.path(), "HEAD");
+    let remote_head = advance_remote_branch(remote.path(), "feat/integration");
+
+    let output = harness.run(repo.path(), &["sync-branch", "--format", "json"]);
+
+    assert_ne!(output.code, 0);
+    let json = parse_json(&output);
+    assert_eq!(json["error"]["code"], "not-fast-forward");
+    assert_eq!(json["error"]["details"]["local_head"], local_head);
+    assert_eq!(json["error"]["details"]["remote_head"], remote_head);
+    assert_eq!(rev_parse(repo.path(), "HEAD"), local_head);
+}
+
+#[test]
+fn sync_branch_dry_run_reports_fast_forward_without_moving_head() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_published_main();
+    publish_branch(repo.path(), "feat/integration");
+    let previous = rev_parse(repo.path(), "HEAD");
+    let advanced = advance_remote_branch(remote.path(), "feat/integration");
+
+    let output = harness.run(
+        repo.path(),
+        &["sync-branch", "--dry-run", "--format", "json"],
+    );
+
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert_eq!(json["data"]["previous_head"], previous);
+    assert_eq!(json["data"]["new_head"], advanced);
+    assert_eq!(rev_parse(repo.path(), "HEAD"), previous);
 }

@@ -37,8 +37,8 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{
     BodyHeadings, PrKind, body_sections, branch_kind_matches, branch_name, branch_pushed,
-    git_branch_state, git_status_porcelain, no_agent_attribution, no_local_path, title_length,
-    worktree_clean,
+    delivery_base_matches, git_branch_state, git_status_porcelain, no_agent_attribution,
+    no_local_path, title_length, worktree_clean,
 };
 
 const SCHEMA: &str = "pr.create";
@@ -734,6 +734,7 @@ pub fn run_with<R: BackendRunner>(
     }
 
     let payload = create_and_fetch(runner, &ctx, &create_call, kind)?;
+    delivery_base_matches(&base, &payload.base)?;
     validate_qualified_provider_subject(
         qualified_subject.as_ref(),
         &payload.head,
@@ -868,6 +869,7 @@ fn compute_with_subject_inner<R: BackendRunner>(
         &args.labels,
     );
     let payload = create_and_fetch(runner, &ctx, &create_call, kind)?;
+    delivery_base_matches(&base, &payload.base)?;
     validate_qualified_provider_subject(
         qualified_subject.as_ref(),
         &payload.head,

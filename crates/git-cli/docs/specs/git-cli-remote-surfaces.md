@@ -2,8 +2,8 @@
 
 ## Ownership
 
-This is a crate-local specification for `git-cli push` and
-`git-cli sync-default`.
+This is a crate-local specification for `git-cli push`,
+`git-cli sync-default`, and `git-cli sync-branch`.
 
 ## Why These Exist
 
@@ -12,10 +12,11 @@ go through `semantic-commit`, worktrees through `git-cli worktree`, PR/MR
 records and merges through `forge-cli pr`, and default-branch delivery through
 `semantic-commit default-branch` / `forge-cli repo push-default`.
 
-Two mutations had no owner:
+Three mutations had no owner:
 
 - publishing a feature branch, and
-- advancing the local default branch to a commit already on its remote.
+- advancing the local default branch to a commit already on its remote, and
+- advancing a checked-out persistent integration branch to its published head.
 
 Both had to fall back to raw `git`, which the delivery guard is built to
 distrust because a raw invocation cannot prove what it will touch. These two
@@ -111,12 +112,31 @@ Refusals:
 | `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached |
 | `git-fetch-failed` | the fetch failed; `--no-fetch` syncs against the already-fetched ref |
 
+## `git-cli sync-branch`
+
+```text
+git-cli sync-branch [--remote <name>] [--no-fetch] [--dry-run]
+                    [--format text|json]
+```
+
+Fast-forwards the checked-out non-default branch to the same-named branch on
+`<remote>`. The branch must already track exactly `refs/heads/<branch>` on that
+remote, so the command cannot infer or redirect the destination. Unless
+`--no-fetch` is passed, it fetches only that branch through an explicit
+fully-qualified refspec.
+
+The command refuses detached HEAD, the remote default branch, an unknown or
+mismatched upstream, divergence, and a dirty checkout. It uses
+`git merge --ff-only` for the sole mutation; it never authors, rebases, resets,
+pushes, or changes upstream configuration.
+
 ## JSON Contract
 
 Both commands accept `--format text|json` and use the shared workspace envelope:
 
 - `cli.git-cli.push.v1`
 - `cli.git-cli.sync-default.v1`
+- `cli.git-cli.sync-branch.v1`
 
 `push` returns `branch`, `remote`, `remote_branch`, `refspec`, `head`,
 `default_branch`, `pushed`, `dry_run`, `created_remote_branch`, `upstream`, and
@@ -125,6 +145,10 @@ Both commands accept `--format text|json` and use the shared workspace envelope:
 `sync-default` returns `default_branch`, `remote`, `remote_ref`,
 `previous_head`, `new_head`, `strategy`, `already_current`, `fast_forward`,
 `dry_run`, and `fetched`.
+
+`sync-branch` returns `branch`, `remote`, `remote_ref`, `previous_head`,
+`new_head`, `strategy`, `already_current`, `fast_forward`, `dry_run`, and
+`fetched`.
 
 `--dry-run` performs every read-only check and reports the strategy and target
 head it would use, without mutating anything.

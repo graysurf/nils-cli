@@ -2,9 +2,9 @@
 
 ## Overview
 
-git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes nine
-command groups (`utils`, `reset`, `commit`, `branch`, `worktree`, `ci`, `open`, `summary`,
-`completion`) with
+git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes the
+top-level remote surfaces `push`, `sync-default`, and `sync-branch` plus nine command groups
+(`utils`, `reset`, `commit`, `branch`, `worktree`, `ci`, `open`, `summary`, `completion`) with
 consistent help / version handling: `git-cli help` (or `-h`/`--help`) prints top-level usage,
 `git-cli <group> help` prints group usage, and `git-cli -V`/`--version` prints the binary version.
 
@@ -132,6 +132,13 @@ from the primary checkout or from inside any linked worktree.
   else. Uses `git merge --ff-only` when the default branch is checked out here, and a
   compare-and-swap `git update-ref` when no worktree holds it. Refuses divergence
   (`not-fast-forward`), a dirty checkout, and a default branch held by another worktree.
+  Options: `--remote <name>`, `--no-fetch`, `--dry-run`, `--format text|json`.
+
+### sync-branch
+
+- `sync-branch`: Fast-forward the checked-out, published non-default branch to its own
+  remote-tracking ref. Refuses the remote default branch, detached HEAD, missing or mismatched
+  upstream, divergence, and a dirty checkout. It never publishes or rewrites commits.
   Options: `--remote <name>`, `--no-fetch`, `--dry-run`, `--format text|json`.
 
 See the [remote surfaces spec](docs/specs/git-cli-remote-surfaces.md) for the full contract.

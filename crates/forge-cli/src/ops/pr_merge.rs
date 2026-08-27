@@ -45,7 +45,7 @@ use crate::ops::required_check_gate::{CheckPresence, ensure_required_checks_gree
 use crate::ops::review_convergence::{self, ReviewConvergenceSnapshot};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
-use crate::validations::{git_status_porcelain, worktree_clean};
+use crate::validations::{delivery_base_matches, git_status_porcelain, worktree_clean};
 
 pub const SCHEMA: &str = "pr.merge";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -310,6 +310,9 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
 
     // Rule 7 + base discovery — fetch pr.view once and reuse.
     let pr = fetch_pr_view(runner, ctx, args.id)?;
+    if let Some(expected_base) = args.expected_base.as_deref() {
+        delivery_base_matches(expected_base, &pr.base)?;
+    }
     if let Some(expected) = args.expected_head_sha.as_deref()
         && pr.head_sha.as_deref() != Some(expected)
     {

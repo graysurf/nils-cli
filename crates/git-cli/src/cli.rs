@@ -42,6 +42,11 @@ enum Group {
         about = "Fast-forward the local default branch to its remote-tracking ref"
     )]
     SyncDefault(RawArgs),
+    #[command(
+        name = "sync-branch",
+        about = "Fast-forward the checked-out non-default branch to its remote-tracking ref"
+    )]
+    SyncBranch(RawArgs),
     #[command(about = "Summarize repository history")]
     Summary(RawArgs),
     #[command(about = "Export shell completion script")]
@@ -296,6 +301,9 @@ where
         Some(Group::Push(raw)) => publish::dispatch("push", &raw.args).unwrap_or(exit::USAGE),
         Some(Group::SyncDefault(raw)) => {
             publish::dispatch("sync-default", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(Group::SyncBranch(raw)) => {
+            publish::dispatch("sync-branch", &raw.args).unwrap_or(exit::USAGE)
         }
         Some(Group::Summary(raw)) => git_summary::cli::run_embedded(&raw.args),
         Some(Group::Completion(raw)) => run_completion(raw),

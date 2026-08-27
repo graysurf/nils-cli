@@ -107,9 +107,12 @@ comment fails closed. It works for GitHub App installation actors without the
 user-only `GET /user` endpoint. GitHub provides no content CAS for deletion, so
 a small final-read-to-mutation race remains.
 
-Direct `pr merge` callers can pass `--expected-head <sha>` to bind the merge to
-the head they reviewed. Provider drift then fails before the merge mutation;
-`pr deliver` uses the same compare-and-swap internally.
+Direct `pr merge` callers can pass `--expected-head <sha>` and
+`--expected-base <branch>` to bind the merge to the head and target they
+reviewed. Provider drift then fails before the merge mutation; `pr deliver`
+binds both values internally. A requested `--base` is exact throughout lookup,
+adoption, create read-back, ready, and merge; `--allow-non-default-base` only
+authorizes that named target and never widens it to another non-default branch.
 
 `pr review --submit-review` requires `--expected-head <sha>` and compares the
 provider head before any native review mutation. Summary-only reviews keep the
