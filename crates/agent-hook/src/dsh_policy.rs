@@ -2598,7 +2598,7 @@ fn unsafe_default_delivery(
     Ok(false)
 }
 
-fn read_only_git_invocation(subcommand: &str, _action: &[String]) -> bool {
+fn read_only_git_invocation(subcommand: &str, action: &[String]) -> bool {
     matches!(
         subcommand,
         "blame"
@@ -2628,7 +2628,33 @@ fn read_only_git_invocation(subcommand: &str, _action: &[String]) -> bool {
             | "verify-commit"
             | "verify-tag"
             | "whatchanged"
-    )
+    ) || (subcommand == "remote" && read_only_git_remote_invocation(action))
+}
+
+fn read_only_git_remote_invocation(action: &[String]) -> bool {
+    if action
+        .iter()
+        .all(|word| matches!(word.as_str(), "-v" | "--verbose"))
+    {
+        return true;
+    }
+    let Some(("get-url", query)) = action
+        .split_first()
+        .map(|(command, rest)| (command.as_str(), rest))
+    else {
+        return false;
+    };
+    let mut names = 0;
+    for word in query {
+        if matches!(word.as_str(), "--push" | "--all") {
+            continue;
+        }
+        if word.starts_with('-') {
+            return false;
+        }
+        names += 1;
+    }
+    names == 1
 }
 
 fn branch_reset_targets_default(subcommand: &str, action: &[String], default: &str) -> bool {
