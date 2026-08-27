@@ -25,7 +25,7 @@ commands close that gap by making the safe cases provable rather than inferred.
 ## `git-cli push`
 
 ```text
-git-cli push [--remote <name>] [--expect-default <branch>]
+git-cli push [--remote <name>] [--expect-default <branch>] [--bootstrap]
              [--force-with-lease] [--dry-run] [--format text|json]
 ```
 
@@ -55,6 +55,10 @@ Refusals:
 | `default-branch-unverifiable` | the remote head is not cached and the checked-out branch is a conventional default-branch name |
 | `expect-default-mismatch` | `--expect-default` disagrees with the cached remote head |
 | `refuse-default-branch` | the checked-out branch is the remote's default branch |
+| `remote-has-no-branches` | the remote advertises no refs, so `--bootstrap` is the route |
+| `bootstrap-remote-not-empty` | `--bootstrap` was passed but the remote already has refs |
+| `bootstrap-conflicting-flag` | `--bootstrap` was combined with `--expect-default` or `--force-with-lease` |
+| `remote-unreadable` | `--bootstrap` could not list the remote's refs, so emptiness is unproven |
 | `unknown-remote` | `<remote>` is not configured |
 
 `--expect-default` names what the default branch *is* when the remote HEAD is
@@ -74,6 +78,38 @@ refuse.
 Pushing the default branch is a delivery decision, not a publish step, so
 `refuse-default-branch` points at `forge-cli repo push-default` rather than
 offering a flag.
+
+### `--bootstrap`
+
+A remote that advertises no refs has no default branch, so publishing its first
+branch cannot move one. That is the single case none of the rules above can
+satisfy: there is nothing to cache, `git remote set-head <remote> --auto` fails
+because the remote has no HEAD to read, `--expect-default` is refused as
+unverifiable for a conventional name, and `forge-cli repo push-default` needs an
+expected base that does not exist. Before `--bootstrap` a newly created
+repository could not receive its first branch through any governed surface.
+
+The safety argument is the emptiness, and it is checked against the remote with
+`git ls-remote`, never inferred from local state — a fresh clone has no
+remote-tracking refs either. Emptiness that cannot be established is
+`remote-unreadable`, not an assumption.
+
+The check and the push are two round trips, and a plain push would not close the
+gap between them: if the remote gained this branch in between, a plain push
+*fast-forwards* it rather than refusing, which is exactly the default-branch
+write this command must never make. The push therefore carries
+`--force-with-lease=refs/heads/<branch>:` — an empty expected value, which Git
+admits only when the ref does not exist. It can create and can never overwrite,
+so the operation stays create-only even under a concurrent writer, and `forced`
+stays `false` in the result because nothing was overwritten.
+
+Because there is no default branch and no prior value to lease against,
+`--expect-default` and `--force-with-lease` are refused alongside it rather than
+ignored. `default_branch` is `null` in the result, and `bootstrapped` is `true`.
+
+When the ordinary path fails only because the remote is empty, the refusal is
+`remote-has-no-branches` and names this flag, instead of the generic hint to
+cache a remote head that cannot exist yet.
 
 ## `git-cli sync-default`
 
@@ -139,8 +175,9 @@ Both commands accept `--format text|json` and use the shared workspace envelope:
 - `cli.git-cli.sync-branch.v1`
 
 `push` returns `branch`, `remote`, `remote_branch`, `refspec`, `head`,
-`default_branch`, `pushed`, `dry_run`, `created_remote_branch`, `upstream`, and
-`forced`.
+`default_branch`, `pushed`, `dry_run`, `created_remote_branch`, `bootstrapped`,
+`upstream`, and `forced`. `default_branch` is `null` exactly when
+`bootstrapped` is `true`.
 
 `sync-default` returns `default_branch`, `remote`, `remote_ref`,
 `previous_head`, `new_head`, `strategy`, `already_current`, `fast_forward`,

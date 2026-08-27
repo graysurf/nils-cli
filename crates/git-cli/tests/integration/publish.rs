@@ -329,6 +329,144 @@ fn push_expect_default_still_refuses_the_default_branch() {
     );
 }
 
+/// A repository with `origin` wired to a remote that has never been pushed to,
+/// which is the shape of a freshly created repository on a provider.
+fn repo_with_empty_remote() -> (TempDir, TempDir) {
+    let repo = init_repo();
+    let remote = init_bare_remote();
+    let remote_path = remote.path().to_string_lossy().to_string();
+    git(repo.path(), &["remote", "add", "origin", &remote_path]);
+    (repo, remote)
+}
+
+#[test]
+fn push_bootstrap_publishes_the_first_branch_of_an_empty_remote() {
+    // An empty remote has no default branch to move, so publishing its first
+    // branch is safe by construction — and it is the one thing no governed
+    // surface could do before.
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_empty_remote();
+    let head = rev_parse(repo.path(), "HEAD");
+
+    let output = harness.run(repo.path(), &["push", "--bootstrap", "--format", "json"]);
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+
+    let json = parse_json(&output);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["data"]["branch"], "main");
+    assert_eq!(json["data"]["refspec"], "refs/heads/main:refs/heads/main");
+    assert_eq!(json["data"]["bootstrapped"], true);
+    assert_eq!(json["data"]["created_remote_branch"], true);
+    // There is no default branch yet, and reporting one would be a guess.
+    assert_eq!(json["data"]["default_branch"], Value::Null);
+    assert_eq!(
+        git(remote.path(), &["rev-parse", "refs/heads/main"]).trim(),
+        head
+    );
+    // The upstream is set, so the follow-up work needs no second decision.
+    assert_eq!(
+        git_config_optional(repo.path(), "branch.main.remote").as_deref(),
+        Some("origin")
+    );
+}
+
+#[test]
+fn push_bootstrap_publishes_a_feature_branch_of_an_empty_remote() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_empty_remote();
+    git(
+        repo.path(),
+        &["checkout", "-q", "--no-track", "-b", "feat/topic"],
+    );
+    commit_file(repo.path(), "topic.txt", "one\n", "add topic");
+
+    let output = harness.run(repo.path(), &["push", "--bootstrap", "--format", "json"]);
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+    assert_eq!(parse_json(&output)["data"]["branch"], "feat/topic");
+    assert!(
+        git_output(remote.path(), &["rev-parse", "refs/heads/feat/topic"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn push_bootstrap_refuses_a_remote_that_already_has_refs() {
+    // The emptiness claim is checked against the remote itself, not inferred
+    // from missing local remote-tracking refs, which a fresh clone also lacks.
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_published_main();
+    git(
+        repo.path(),
+        &["checkout", "-q", "--no-track", "-b", "feat/topic"],
+    );
+    commit_file(repo.path(), "topic.txt", "one\n", "add topic");
+
+    let output = harness.run(repo.path(), &["push", "--bootstrap", "--format", "json"]);
+    assert_ne!(output.code, 0);
+    let json = parse_json(&output);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "bootstrap-remote-not-empty");
+}
+
+#[test]
+fn push_bootstrap_rejects_flags_that_contradict_a_create_only_publish() {
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_empty_remote();
+
+    for flags in [
+        vec!["push", "--bootstrap", "--expect-default", "main"],
+        vec!["push", "--bootstrap", "--force-with-lease"],
+    ] {
+        let mut argv = flags.clone();
+        argv.extend_from_slice(&["--format", "json"]);
+        let output = harness.run(repo.path(), &argv);
+        assert_ne!(output.code, 0, "flags: {flags:?}");
+        assert_eq!(
+            parse_json(&output)["error"]["code"],
+            "bootstrap-conflicting-flag",
+            "flags: {flags:?}"
+        );
+    }
+}
+
+#[test]
+fn push_on_an_empty_remote_names_the_bootstrap_route() {
+    // Without this the refusal sends the caller to `git remote set-head
+    // --auto`, which cannot succeed against a remote that has no HEAD.
+    let harness = GitCliHarness::new();
+    let (repo, _remote) = repo_with_empty_remote();
+
+    let output = harness.run(repo.path(), &["push", "--format", "json"]);
+    assert_ne!(output.code, 0);
+    let json = parse_json(&output);
+    assert_eq!(json["error"]["code"], "remote-has-no-branches");
+    let hint = json["error"]["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("--bootstrap"), "hint was: {hint}");
+}
+
+#[test]
+fn push_dry_run_bootstrap_reports_without_publishing() {
+    let harness = GitCliHarness::new();
+    let (repo, remote) = repo_with_empty_remote();
+
+    let output = harness.run(
+        repo.path(),
+        &["push", "--bootstrap", "--dry-run", "--format", "json"],
+    );
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+    let json = parse_json(&output);
+    assert_eq!(json["data"]["pushed"], false);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert_eq!(json["data"]["bootstrapped"], true);
+    assert!(
+        !git_output(remote.path(), &["rev-parse", "refs/heads/main"])
+            .status
+            .success(),
+        "dry run must not publish"
+    );
+}
+
 // -------------------------------------------------------- sync-default
 
 /// Advance the remote's default branch by one commit, from a scratch clone, so
