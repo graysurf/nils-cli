@@ -359,19 +359,21 @@ backend mapping, validation rules, and output schema versions.
 
 ### `pr create`
 
-- Input: `--head <branch>` (default current branch), `--base <branch>`
+- Input: `--head <branch>` (default current branch; GitHub also accepts
+  `<owner>:<branch>` for a cross-fork head), `--base <branch>`
   (default repo default branch), `--title <str>`, `--body-file <path>`
   or `--body <str>`, `--kind feature|bug`, `--draft` (default `true`),
   `--reviewer <user>...`, `--label <name>...`,
   `--label-catalog <path>`, `--strict-labels`.
 - Validation (see "Lock-down policy" for the full list):
-  - branch name MUST match `^(feat|fix)/[a-z0-9][a-z0-9-]{1,63}$` and
-    align with `--kind`;
+  - the branch, or the branch suffix of a qualified GitHub head, MUST match
+    the semantic branch-name rule and align with `--kind`; the GitHub owner
+    qualifier is preserved only for provider dispatch;
   - title length ≤ 70 chars, no trailing whitespace;
   - body MUST contain non-empty `## Summary` and `## Test plan`
     sections;
   - working tree MUST be clean (`git status --porcelain` empty);
-  - resolved head branch MUST be pushed and remote-tracked.
+  - resolved local head branch MUST be pushed and remote-tracked.
 - Output schema: `cli.forge-cli.pr.create.v1`,
   `data = { number, url, head, base, draft, title, kind, provider }`.
 

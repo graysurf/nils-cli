@@ -178,7 +178,7 @@ operations:
     schema_version: cli.forge-cli.pr.create.v1
     summary: Open a draft pull/merge request from the current branch.
     inputs:
-      - { name: --head,        type: string,         default: current-branch }
+      - { name: --head,        type: string,         default: current-branch } # GitHub also accepts <owner>:<branch>; validations consume the branch suffix
       - { name: --base,        type: string,         default: repo-default-branch }
       - { name: --title,       type: string,         required: true }
       - { name: --body,        type: string,         required: false }

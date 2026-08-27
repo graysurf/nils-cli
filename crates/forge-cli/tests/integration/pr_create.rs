@@ -567,6 +567,99 @@ fn pr_create_head_flag_uses_named_branch_push_state() {
 }
 
 #[test]
+fn pr_create_github_qualified_head_validates_local_suffix_and_preserves_provider_ref() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    git(&repo_path, &["checkout", "-q", "main"]);
+
+    let stub = StubEnv::new();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "fork-owner:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: cross-fork sample",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let plan = envelope["data"]["plan"].as_array().expect("plan array");
+    let head_index = plan
+        .iter()
+        .position(|value| value == "--head")
+        .expect("--head argument");
+    assert_eq!(plan[head_index + 1], "fork-owner:feat/sample");
+}
+
+#[test]
+fn pr_create_qualified_head_is_github_only_and_rejects_invalid_owners() {
+    for (provider, head) in [
+        ("gitlab", "fork-owner:feat/sample"),
+        ("github", "fork-owner-:feat/sample"),
+        ("github", "fork/owner:feat/sample"),
+        ("github", "fork-owner:feat/sample:extra"),
+    ] {
+        let tempdir = make_git_repo(
+            if provider == "github" {
+                "github.com"
+            } else {
+                "gitlab.com"
+            },
+            "sympoies/nils-cli",
+        );
+        let repo_path = tempdir.path().join("repo");
+        let stub = StubEnv::new();
+        let out = run_in_repo(
+            &stub,
+            &repo_path,
+            &[
+                "--provider",
+                provider,
+                "--dry-run",
+                "--format",
+                "json",
+                "pr",
+                "create",
+                "--head",
+                head,
+                "--base",
+                "main",
+                "--title",
+                "feat: invalid qualified head",
+                "--kind",
+                "feature",
+                "--body",
+                well_formed_body(),
+            ],
+        );
+
+        assert_eq!(
+            out.code, 65,
+            "provider={provider} head={head} stdout={} stderr={}",
+            out.stdout, out.stderr
+        );
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(envelope["error"]["code"], "branch_name_invalid");
+    }
+}
+
+#[test]
 fn pr_create_gitlab_full_chain_emits_canonical_envelope() {
     let tempdir = make_git_repo("gitlab.com", "sympoies/nils-cli");
     let repo_path = tempdir.path().join("repo");

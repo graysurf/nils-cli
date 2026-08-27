@@ -156,6 +156,62 @@ fn schema_ok() -> String {
     schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION)
 }
 
+/// Provider-facing and local forms of a PR head reference.
+///
+/// GitHub accepts `<owner>:<branch>` for cross-fork PRs. The owner qualifier
+/// is preserved for `gh pr create`, while every local governance check remains
+/// bound to the semantic branch suffix. GitLab and local-provider heads remain
+/// unqualified and therefore unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedHeadRef<'a> {
+    pub provider_ref: &'a str,
+    pub local_branch: &'a str,
+}
+
+pub(crate) fn resolve_head_ref<'a>(
+    provider: Provider,
+    head: &'a str,
+) -> Result<ResolvedHeadRef<'a>, ForgeError> {
+    let Some((owner, branch)) = head.split_once(':') else {
+        return Ok(ResolvedHeadRef {
+            provider_ref: head,
+            local_branch: head,
+        });
+    };
+
+    if provider != Provider::GitHub {
+        return Ok(ResolvedHeadRef {
+            provider_ref: head,
+            local_branch: head,
+        });
+    }
+
+    let owner_bytes = owner.as_bytes();
+    let owner_is_valid = !owner_bytes.is_empty()
+        && owner_bytes.len() <= 39
+        && owner_bytes[0].is_ascii_alphanumeric()
+        && owner_bytes[owner_bytes.len() - 1].is_ascii_alphanumeric()
+        && owner_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-');
+    if !owner_is_valid || branch.is_empty() || branch.contains(':') {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "branch_name_invalid",
+            format!("GitHub head '{head}' is not a valid <owner>:<branch> reference"),
+            Some(
+                "rule=<github-owner>:<(feat|fix|chore|docs|ci|refactor)/semantic-branch>"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    Ok(ResolvedHeadRef {
+        provider_ref: head,
+        local_branch: branch,
+    })
+}
+
 /// Resolve the git toplevel for layered-config discovery. Returns `None`
 /// outside a work tree (the layered loader then walks to the filesystem root).
 pub(crate) fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
@@ -405,7 +461,8 @@ pub fn run_with<R: BackendRunner>(
 
     // 3. Validation chain — order matches spec §"pr create" so the most
     //    obvious failure (bad branch name) is reported first.
-    let prefix = branch_name(&head)?;
+    let resolved_head = resolve_head_ref(ctx.provider, &head)?;
+    let prefix = branch_name(resolved_head.local_branch)?;
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
@@ -425,7 +482,9 @@ pub fn run_with<R: BackendRunner>(
         label_target,
     )?;
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
-    branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
+    branch_pushed(&env.workdir, resolved_head.local_branch, |w, branch| {
+        (env.head_state)(w, branch)
+    })?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
     let remote_url = evidence_remote_url(
         gate_applies,
@@ -444,7 +503,7 @@ pub fn run_with<R: BackendRunner>(
         &env.workdir,
         &global.remote,
         repository_id.as_deref(),
-        &head,
+        resolved_head.local_branch,
     )?;
 
     let draft = !args.no_draft;
@@ -457,7 +516,7 @@ pub fn run_with<R: BackendRunner>(
 
     let create_call = build_create_call(
         &ctx,
-        &head,
+        resolved_head.provider_ref,
         &base,
         &args.title,
         &body,
@@ -540,7 +599,8 @@ fn compute_with_subject_inner<R: BackendRunner>(
         None => (env.default_branch)(runner as &dyn BackendRunner, &ctx)?,
     };
     let body = read_body(args.body.as_deref(), args.body_file.as_deref())?;
-    let prefix = branch_name(&head)?;
+    let resolved_head = resolve_head_ref(ctx.provider, &head)?;
+    let prefix = branch_name(resolved_head.local_branch)?;
     let kind: PrKind = args.kind.into_kind();
     branch_kind_matches(prefix, kind)?;
     title_length(&args.title)?;
@@ -562,7 +622,9 @@ fn compute_with_subject_inner<R: BackendRunner>(
         )?;
     }
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
-    branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
+    branch_pushed(&env.workdir, resolved_head.local_branch, |w, branch| {
+        (env.head_state)(w, branch)
+    })?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
     let remote_url = evidence_remote_url(
         gate_applies,
@@ -581,7 +643,7 @@ fn compute_with_subject_inner<R: BackendRunner>(
         &env.workdir,
         &global.remote,
         repository_id.as_deref(),
-        &head,
+        resolved_head.local_branch,
     )?;
 
     let draft = !args.no_draft;
@@ -589,7 +651,7 @@ fn compute_with_subject_inner<R: BackendRunner>(
     let body_path = body_tempfile.path().to_path_buf();
     let create_call = build_create_call(
         &ctx,
-        &head,
+        resolved_head.provider_ref,
         &base,
         &args.title,
         &body,
