@@ -125,8 +125,8 @@ from the primary checkout or from inside any linked worktree.
   unresolvable remote default (`default-branch-unresolved`).
   `--bootstrap` publishes the first branch of a remote proven to have no refs at all, which is
   the one case the default-branch checks can never satisfy.
-  Options: `--remote <name>`, `--expect-default <branch>`, `--bootstrap`, `--force-with-lease`,
-  `--dry-run`, `--format text|json`.
+  Options: `--remote <name>`, `--bootstrap`, `--force-with-lease`, `--dry-run`,
+  `--format text|json`.
 
 ### sync-default
 

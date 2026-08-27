@@ -233,27 +233,32 @@ fn push_refuses_when_the_remote_default_branch_is_unknown() {
     assert_eq!(json["error"]["code"], "default-branch-unresolved");
     let hint = json["error"]["hint"].as_str().unwrap_or_default();
     assert!(
-        hint.contains("--expect-default"),
-        "the refusal names the offline escape hatch, got: {hint}"
+        hint.contains("git remote set-head origin --auto"),
+        "the refusal names the one way to resolve this, got: {hint}"
     );
 
-    // The escape hatch names what the default *is*, so it can admit this push
-    // without ever admitting a push of the default branch itself.
-    let admitted = harness.run(
-        repo.path(),
-        &["push", "--expect-default", "main", "--format", "json"],
-    );
+    // A bare fixture remote is created with whatever `init.defaultBranch` the
+    // host happens to use, so its HEAD can point at a branch that was never
+    // pushed and `--auto` has nothing to read. A real provider remote always
+    // advertises a valid HEAD; point it at the published branch so the fixture
+    // models that rather than the host's git config.
+    git(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    // Caching the real remote head is now the only route, and it works: the
+    // remote is populated, so it has a HEAD to read.
+    git(repo.path(), &["remote", "set-head", "origin", "--auto"]);
+    let admitted = harness.run(repo.path(), &["push", "--format", "json"]);
     assert_eq!(admitted.code, 0, "stderr: {}", admitted.stderr_text());
     assert_eq!(parse_json(&admitted)["data"]["pushed"], true);
 }
 
 #[test]
-fn push_expect_default_cannot_widen_admission() {
-    // `--expect-default` exists so an offline caller can name the default branch
-    // when the remote head is not cached. It must never be able to *admit* a
-    // push that would otherwise be refused, or it is a bypass rather than an
-    // escape hatch: asserting some other branch while standing on the real
-    // default would publish the default branch.
+fn push_no_longer_accepts_a_caller_asserted_default_branch() {
+    // A caller-supplied `--expect-default` used to name the default branch for
+    // an uncached remote head, guarded by a list of conventional default names.
+    // That guard only ever stopped the honest caller: `--expect-default main`
+    // was refused while `--expect-default trunk` cleared the very same push.
+    // The flag is gone, so the assertion cannot be made at all.
     let harness = GitCliHarness::new();
     let repo = init_repo();
     let remote = init_bare_remote();
@@ -263,37 +268,28 @@ fn push_expect_default_cannot_widen_admission() {
     let published = rev_parse(repo.path(), "HEAD");
     commit_file(repo.path(), "local.txt", "local\n", "local only");
 
-    // No cached `origin/HEAD`, standing on `main`, asserting a different branch.
-    let output = harness.run(
-        repo.path(),
-        &["push", "--expect-default", "develop", "--format", "json"],
-    );
-    assert_ne!(
-        output.code, 0,
-        "a wrong --expect-default must not admit a push of a default-looking branch"
-    );
+    for argv in [
+        vec!["push", "--expect-default", "trunk", "--format", "json"],
+        vec!["push", "--expect-default=trunk", "--format", "json"],
+    ] {
+        let output = harness.run(repo.path(), &argv);
+        assert_ne!(output.code, 0, "argv: {argv:?}");
+        assert_eq!(
+            parse_json(&output)["error"]["code"],
+            "unknown-argument",
+            "argv: {argv:?}"
+        );
+    }
+
     assert_eq!(
         rev_parse(remote.path(), "refs/heads/main"),
         published,
         "the remote default branch is untouched"
     );
-
-    // With the real default cached, a disagreeing assertion is a mismatch, not a
-    // second opinion that wins.
-    git(repo.path(), &["remote", "set-head", "origin", "main"]);
-    let mismatch = harness.run(
-        repo.path(),
-        &["push", "--expect-default", "develop", "--format", "json"],
-    );
-    assert_ne!(mismatch.code, 0);
-    assert_eq!(
-        parse_json(&mismatch)["error"]["code"],
-        "expect-default-mismatch"
-    );
 }
 
 #[test]
-fn push_expect_default_still_refuses_the_default_branch() {
+fn push_still_refuses_the_default_branch_once_the_head_is_cached() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
     let remote = init_bare_remote();
@@ -302,26 +298,8 @@ fn push_expect_default_still_refuses_the_default_branch() {
     git(repo.path(), &["push", "origin", "main"]);
     commit_file(repo.path(), "local.txt", "local\n", "local only");
 
-    // Uncached remote head: refused before the assertion is even consulted,
-    // because a conventional default-branch name cannot be cleared by an
-    // unverifiable claim.
-    let unverifiable = harness.run(
-        repo.path(),
-        &["push", "--expect-default", "main", "--format", "json"],
-    );
-    assert_ne!(unverifiable.code, 0);
-    assert_eq!(
-        parse_json(&unverifiable)["error"]["code"],
-        "default-branch-unverifiable"
-    );
-
-    // Cached remote head: the assertion agrees, and the push is refused for the
-    // plain reason that this *is* the default branch.
     git(repo.path(), &["remote", "set-head", "origin", "main"]);
-    let refused = harness.run(
-        repo.path(),
-        &["push", "--expect-default", "main", "--format", "json"],
-    );
+    let refused = harness.run(repo.path(), &["push", "--format", "json"]);
     assert_ne!(refused.code, 0);
     assert_eq!(
         parse_json(&refused)["error"]["code"],
@@ -410,24 +388,27 @@ fn push_bootstrap_refuses_a_remote_that_already_has_refs() {
 }
 
 #[test]
-fn push_bootstrap_rejects_flags_that_contradict_a_create_only_publish() {
+fn push_bootstrap_rejects_a_force_that_contradicts_a_create_only_publish() {
+    // A bootstrap publish only ever creates a ref, so a caller-supplied force is
+    // a contradiction rather than a no-op and is refused instead of ignored.
     let harness = GitCliHarness::new();
     let (repo, _remote) = repo_with_empty_remote();
 
-    for flags in [
-        vec!["push", "--bootstrap", "--expect-default", "main"],
-        vec!["push", "--bootstrap", "--force-with-lease"],
-    ] {
-        let mut argv = flags.clone();
-        argv.extend_from_slice(&["--format", "json"]);
-        let output = harness.run(repo.path(), &argv);
-        assert_ne!(output.code, 0, "flags: {flags:?}");
-        assert_eq!(
-            parse_json(&output)["error"]["code"],
-            "bootstrap-conflicting-flag",
-            "flags: {flags:?}"
-        );
-    }
+    let output = harness.run(
+        repo.path(),
+        &[
+            "push",
+            "--bootstrap",
+            "--force-with-lease",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        parse_json(&output)["error"]["code"],
+        "bootstrap-conflicting-flag"
+    );
 }
 
 #[test]
