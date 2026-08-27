@@ -41,6 +41,11 @@ fn assert_top_level_help(stdout: &str) {
         "sync-default",
         "Fast-forward the local default branch to its remote-tracking ref",
     );
+    assert_command_row(
+        stdout,
+        "sync-branch",
+        "Fast-forward the checked-out non-default branch to its remote-tracking ref",
+    );
     assert_contains(stdout, "-V, --version  Print version");
 }
 

@@ -188,6 +188,25 @@ pub fn branch_kind_matches(prefix: BranchPrefix, kind: PrKind) -> Result<(), For
     }
 }
 
+/// Require the provider-side target to equal the delivery target selected by
+/// the caller. This remains exact even when that target is not the repository
+/// default branch.
+pub fn delivery_base_matches(expected: &str, observed: &str) -> Result<(), ForgeError> {
+    if expected == observed {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema(),
+        "delivery_base_mismatch",
+        format!(
+            "provider PR/MR base '{observed}' differs from requested delivery base '{expected}'"
+        ),
+        Some(format!(
+            "expected_base={expected}; observed_base={observed}; select or create a PR/MR for the exact requested base"
+        )),
+    ))
+}
+
 /// Rule 3 — `len(title) <= 70` (codepoint count) and no trailing whitespace.
 pub fn title_length(title: &str) -> Result<(), ForgeError> {
     if title.is_empty() {

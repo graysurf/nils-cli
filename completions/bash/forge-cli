@@ -4274,7 +4274,7 @@ _forge__cli() {
             return 0
             ;;
         forge__cli__pr__list)
-            opts="-h --state --author --head --limit --format --remote --provider --host --repo --store-root --dry-run --help"
+            opts="-h --state --author --head --base --limit --format --remote --provider --host --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4289,6 +4289,10 @@ _forge__cli() {
                     return 0
                     ;;
                 --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --base)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -4328,13 +4332,17 @@ _forge__cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --expected-head --method --keep-branch --allow-non-default-base --allow-unresolved-threads --allow-unresolved-threads-reason --review-convergence --allow-no-checks --allow-no-checks-reason --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --host --repo --store-root --dry-run --help"
+            opts="-h --expected-head --expected-base --method --keep-branch --allow-non-default-base --allow-unresolved-threads --allow-unresolved-threads-reason --review-convergence --allow-no-checks --allow-no-checks-reason --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --host --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-base)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

@@ -1082,6 +1082,9 @@ distinctions that cannot be proven offline.
   must still expose that exact head or the command returns
   `test_first_evidence_provider_head_mismatch` before any merge mutation. The
   same reviewed head remains bound through the provider merge compare-and-swap.
+- Direct callers may pass `--expected-base <branch>`. The first provider
+  snapshot must expose that exact target or the command returns
+  `delivery_base_mismatch` before any merge mutation.
 - With convergence enabled, complete native-review and review-thread/comment
   snapshots are fetched once more after the thread/task gates and immediately
   before the provider merge. A late request blocks; any semantic digest change,
@@ -1167,7 +1170,8 @@ label errors are returned before provider access in every mode.
 1. `auth status` — fail-fast on missing auth.
 2. `repo view` — resolve default branch, repo slug, default merge
    method override.
-3. Head-branch lookup (`pr list --state open --head <branch>`) — when an
+3. Exact head-and-base lookup (`pr list --state open --head <branch> --base
+   <resolved-base>`) — when an
    open PR/MR already exists for the resolved head branch, the macro
    adopts it instead of creating: the create step (and its create-input
    gates) is skipped, an `adopt` step carrying the PR's `pr.view`
@@ -1181,8 +1185,10 @@ label errors are returned before provider access in every mode.
    and adopts only a row whose branch and `headRepository` exactly match the
    locally bound user/upstream repository; a same-named branch from any other
    fork is ignored. A saturated bounded result without that exact row fails
-   closed instead of assuming absence. The subsequent `pr view` must still match branch,
-   repository, and local SHA, and that SHA becomes the merge CAS input.
+   closed instead of assuming absence. The subsequent `pr view` must still
+   match branch, repository, local SHA, and the exact resolved base. The same
+   base is revalidated after checks, after ready, and by merge;
+   `--allow-non-default-base` authorizes only this value.
 4. `pr create --draft` — atom; validates branch / title / body. Only
    runs when the lookup found nothing.
 5. `pr wait-checks` — atom; blocks until terminal within one cumulative

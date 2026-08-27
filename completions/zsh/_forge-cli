@@ -209,6 +209,7 @@ _arguments "${_arguments_options[@]}" : \
 '--state=[Filter by state (default\: open)]:STATE:(open closed merged all)' \
 '--author=[Filter by author handle]:AUTHOR:_default' \
 '--head=[Filter by head / source branch]:HEAD:_default' \
+'--base=[Filter by target / base branch]:BASE:_default' \
 '--limit=[Cap the number of returned PRs (default\: 30)]:LIMIT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -818,6 +819,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (merge)
 _arguments "${_arguments_options[@]}" : \
 '--expected-head=[Compare-and-swap head verified by the caller before merge]:SHA:_default' \
+'--expected-base=[Exact target / base branch the provider PR/MR must still use]:BRANCH:_default' \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
 '--allow-unresolved-threads-reason=[Required when \`--allow-unresolved-threads\` is set. Non-empty free-form text describing why the unresolved threads are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--review-convergence=[Override \`\[review_convergence\].require\`. Passing the flag without a value enables it; use \`--review-convergence=false\` to disable a repo or user-global opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \

@@ -51,8 +51,8 @@ use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{
     BodyHeadings, PreflightInputs, RuleVerdict, body_sections, branch_kind_matches, branch_name,
-    branch_pushed, git_branch_state, git_current_branch, git_status_porcelain, run_local_preflight,
-    worktree_clean,
+    branch_pushed, delivery_base_matches, git_branch_state, git_current_branch,
+    git_status_porcelain, run_local_preflight, worktree_clean,
 };
 
 pub const SCHEMA: &str = "pr.deliver";
@@ -220,6 +220,10 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         schema_version: schema_version_for(BINARY, "repo.view", 1),
         payload: to_value(&repo_payload),
     });
+    let expected_base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| repo_payload.default_branch.clone());
 
     // 3. Head-branch lookup, then adopt-or-create. An open PR already on
     //    the resolved head branch is adopted — the macro skips the create
@@ -251,7 +255,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     } else {
         None
     };
-    let lookup_args = adopt_lookup_args(ctx, resolved_head);
+    let lookup_args = adopt_lookup_args(ctx, resolved_head, &expected_base);
     let existing = match pr_list::compute(runner, ctx, &lookup_args) {
         Ok(payload) => {
             match select_adoptable(payload.items, resolved_head, qualified_subject.as_ref()) {
@@ -311,6 +315,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             test_first_required,
             resolved_head,
             qualified_subject: qualified_subject.as_ref(),
+            expected_base: &expected_base,
         };
         let verified_subject = match validate_adopted(&view, args, &adopt_context) {
             Ok(subject) => subject,
@@ -519,7 +524,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         }
     }
 
-    if verified_subject.is_some() || qualified_subject.is_some() {
+    {
         let current_view = match pr_view::compute(runner, ctx, pr_number) {
             Ok(view) => view,
             Err(err) => {
@@ -533,6 +538,16 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 ));
             }
         };
+        if let Err(err) = delivery_base_matches(&expected_base, &current_view.base) {
+            return Ok(emit_chain_failure(
+                steps,
+                args,
+                ctx,
+                Some((pr_number, pr_url)),
+                &err,
+                format,
+            ));
+        }
         if let Err(err) = validate_provider_subject_head(
             verified_subject.as_ref(),
             current_view.head_sha.as_deref(),
@@ -586,6 +601,16 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 ));
             }
         };
+    if let Err(err) = delivery_base_matches(&expected_base, &ready_payload.base) {
+        return Ok(emit_chain_failure(
+            steps,
+            args,
+            ctx,
+            Some((pr_number, pr_url)),
+            &err,
+            format,
+        ));
+    }
     if let Err(err) =
         validate_provider_subject_head(verified_subject.as_ref(), ready_payload.head_sha.as_deref())
     {
@@ -629,7 +654,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 .as_ref()
                 .map(|subject| subject.head_sha.clone())
         });
-    let merge_args = build_merge_args(args, pr_number, expected_head_sha);
+    let merge_args = build_merge_args(args, pr_number, expected_head_sha, expected_base.clone());
     let merge_payload =
         match pr_merge::compute_with_clock(runner, clock, global, &merge_args, workdir) {
             Ok(p) => p,
@@ -672,10 +697,12 @@ fn build_merge_args(
     args: &PrDeliverArgs,
     pr_number: u64,
     expected_head_sha: Option<String>,
+    expected_base: String,
 ) -> PrMergeArgs {
     PrMergeArgs {
         id: pr_number,
         expected_head_sha,
+        expected_base: Some(expected_base),
         method: Some(args.method),
         keep_branch: false,
         allow_non_default_base: args.allow_non_default_base,
@@ -747,12 +774,17 @@ fn run_issue_closeout<R: BackendRunner>(runner: &R, ctx: &ProviderContext, pr_nu
 /// Lookup filter for the adopt step. Unqualified heads use the provider's
 /// branch filter. Qualified GitHub heads use a bounded open-PR projection and
 /// select only the exact source repository + branch identity.
-fn adopt_lookup_args(ctx: &ProviderContext, head: ResolvedHeadRef<'_>) -> PrListArgs {
+fn adopt_lookup_args(
+    ctx: &ProviderContext,
+    head: ResolvedHeadRef<'_>,
+    expected_base: &str,
+) -> PrListArgs {
     let qualified_github = ctx.provider == Provider::GitHub && head.github_user.is_some();
     PrListArgs {
         state: PrStateFilter::Open,
         author: None,
         head: (!qualified_github).then(|| head.local_branch.to_string()),
+        base: Some(expected_base.to_string()),
         limit: if qualified_github {
             QUALIFIED_ADOPT_LOOKUP_LIMIT
         } else {
@@ -806,6 +838,7 @@ struct AdoptValidationContext<'a> {
     test_first_required: bool,
     resolved_head: ResolvedHeadRef<'a>,
     qualified_subject: Option<&'a QualifiedHeadSubject>,
+    expected_base: &'a str,
 }
 
 fn validate_adopted(
@@ -813,6 +846,7 @@ fn validate_adopted(
     args: &PrDeliverArgs,
     context: &AdoptValidationContext<'_>,
 ) -> Result<Option<VerifiedTestFirstSubject>, ForgeError> {
+    delivery_base_matches(context.expected_base, &view.base)?;
     validate_qualified_provider_subject(
         context.qualified_subject,
         &view.head,
@@ -949,7 +983,11 @@ fn build_dry_run_payload(
         },
         DryRunStep {
             step: "lookup",
-            plan: pr_lookup_dry_plan(ctx, &branch),
+            plan: pr_lookup_dry_plan(
+                ctx,
+                &branch,
+                args.base.as_deref().unwrap_or("<repo-default-branch>"),
+            ),
         },
         DryRunStep {
             step: "create",
@@ -1039,18 +1077,19 @@ fn build_dry_run_payload(
     }
 }
 
-fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {
+fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str, expected_base: &str) -> Vec<String> {
     let head = if head.is_empty() {
         "<current-branch>"
     } else {
         head
     };
     let lookup = resolve_head_ref(ctx.provider, head)
-        .map(|resolved| adopt_lookup_args(ctx, resolved))
+        .map(|resolved| adopt_lookup_args(ctx, resolved, expected_base))
         .unwrap_or_else(|_| PrListArgs {
             state: PrStateFilter::Open,
             author: None,
             head: Some(head.to_string()),
+            base: Some(expected_base.to_string()),
             limit: 1,
         });
     pr_list::build_list_call(ctx, &lookup).plan_argv()
@@ -1333,6 +1372,7 @@ mod tests {
                 state: "open",
                 title: "collision".into(),
                 head: "feat/demo".into(),
+                base: Some("main".into()),
                 head_repository: Some(format!("other-{number}/nils-cli")),
                 author: None,
             })
@@ -1374,9 +1414,10 @@ mod tests {
     fn deliver_forwards_review_convergence_override_to_merge() {
         let mut deliver = args(false);
         deliver.review_convergence = Some(false);
-        let merge = build_merge_args(&deliver, 42, Some("head123".into()));
+        let merge = build_merge_args(&deliver, 42, Some("head123".into()), "main".into());
         assert_eq!(merge.id, 42);
         assert_eq!(merge.expected_head_sha.as_deref(), Some("head123"));
+        assert_eq!(merge.expected_base.as_deref(), Some("main"));
         assert_eq!(merge.review_convergence, Some(false));
     }
 
@@ -1449,7 +1490,7 @@ mod tests {
         });
         plan_steps.push(DryRunStep {
             step: "lookup",
-            plan: pr_lookup_dry_plan(&c, "feat/demo"),
+            plan: pr_lookup_dry_plan(&c, "feat/demo", "main"),
         });
         plan_steps.push(DryRunStep {
             step: "create",
@@ -1610,7 +1651,7 @@ mod tests {
 
     #[test]
     fn lookup_dry_plan_filters_open_prs_on_head_branch() {
-        let plan = pr_lookup_dry_plan(&ctx(), "feat/demo");
+        let plan = pr_lookup_dry_plan(&ctx(), "feat/demo", "main");
         let h_idx = plan.iter().position(|s| s == "--head").expect("--head");
         assert_eq!(plan[h_idx + 1], "feat/demo");
         let s_idx = plan.iter().position(|s| s == "--state").expect("--state");
@@ -1619,7 +1660,7 @@ mod tests {
 
     #[test]
     fn lookup_dry_plan_renders_placeholder_for_unknown_branch() {
-        let plan = pr_lookup_dry_plan(&ctx(), "");
+        let plan = pr_lookup_dry_plan(&ctx(), "", "main");
         let h_idx = plan.iter().position(|s| s == "--head").expect("--head");
         assert_eq!(plan[h_idx + 1], "<current-branch>");
     }

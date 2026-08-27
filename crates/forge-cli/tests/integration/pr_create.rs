@@ -396,6 +396,10 @@ fn pr_create_rejects_body_and_body_file_conflict_with_usage_exit() {
 /// Dispatching gh stub: branches on the first arg-2 pair (`repo view`,
 /// `pr create`, `pr view`).
 fn write_gh_dispatch_stub(stub: &StubEnv) -> PathBuf {
+    write_gh_dispatch_stub_with_view(stub, FIXTURE_GH_VIEW_JSON)
+}
+
+fn write_gh_dispatch_stub_with_view(stub: &StubEnv, view: &str) -> PathBuf {
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -430,7 +434,7 @@ EOF
 esac
 "#,
         create = FIXTURE_GH_CREATE_STDOUT,
-        view = FIXTURE_GH_VIEW_JSON,
+        view = view,
     );
     stub.write_stub("gh", &body)
 }
@@ -562,6 +566,45 @@ fn pr_create_github_full_chain_emits_canonical_envelope() {
         envelope["data"]["url"],
         "https://github.com/sympoies/nils-cli/pull/123"
     );
+}
+
+#[test]
+fn pr_create_rejects_provider_base_drift_after_creation() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    let wrong_base =
+        FIXTURE_GH_VIEW_JSON.replace(r#""baseRefName": "main""#, r#""baseRefName": "mainline""#);
+
+    let stub = StubEnv::new();
+    let gh_path = write_gh_dispatch_stub_with_view(&stub, &wrong_base);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: sample feature",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "delivery_base_mismatch");
 }
 
 #[test]

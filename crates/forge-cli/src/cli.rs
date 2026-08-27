@@ -808,6 +808,13 @@ pub struct PrMergeArgs {
         value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub expected_head_sha: Option<String>,
+    /// Exact target / base branch the provider PR/MR must still use.
+    #[arg(
+        long = "expected-base",
+        value_name = "BRANCH",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub expected_base: Option<String>,
     /// Merge method override. When omitted, falls back to
     /// `.forge-cli.toml [merge].method` then the spec default `squash`.
     #[arg(long, value_enum)]
@@ -1285,6 +1292,9 @@ pub struct PrListArgs {
     /// Filter by head / source branch.
     #[arg(long)]
     pub head: Option<String>,
+    /// Filter by target / base branch.
+    #[arg(long)]
+    pub base: Option<String>,
     /// Cap the number of returned PRs (default: 30).
     #[arg(long, default_value_t = 30)]
     pub limit: u32,

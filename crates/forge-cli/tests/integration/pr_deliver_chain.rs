@@ -165,6 +165,23 @@ const ADOPTABLE_PR_VIEW_JSON: &str = r###"{
   "body": "## Summary\n\nAdopted draft.\n\n## Test plan\n\n- [x] unit\n"
 }"###;
 
+/// Same head as the requested delivery, but targeting another non-default
+/// branch. `--allow-non-default-base` authorizes the requested target; it must
+/// never turn into permission to adopt an arbitrary target from the same head.
+const ADOPTABLE_WRONG_BASE_PR_VIEW_JSON: &str = r###"{
+  "number": 123,
+  "url": "https://github.com/sympoies/nils-cli/pull/123",
+  "state": "OPEN",
+  "isDraft": true,
+  "title": "feat: sample feature",
+  "headRefName": "feat/sample",
+  "baseRefName": "test",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": [],
+  "body": "## Summary\n\nWrong target.\n\n## Test plan\n\n- [x] unit\n"
+}"###;
+
 /// Post-ready view of the adopted PR: same record once `pr ready` promoted
 /// the draft, so the merge step's draft gate passes.
 const ADOPTED_READY_PR_VIEW_JSON: &str = r###"{
@@ -2125,6 +2142,49 @@ fn pr_deliver_adopts_existing_open_pr_for_head_branch() {
     assert!(
         !create_sentinel.exists(),
         "adopt path must never call the backend pr create"
+    );
+}
+
+#[test]
+fn pr_deliver_refuses_to_adopt_same_head_on_a_different_base() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_adopt_chain_stub(&stub, ADOPTABLE_WRONG_BASE_PR_VIEW_JSON);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--head",
+            "feat/sample",
+            "--base",
+            "feat/integration",
+            "--allow-non-default-base",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "delivery_base_mismatch");
+    assert!(
+        !stub.tempdir.path().join("create-called").exists(),
+        "a wrong-target PR must fail closed instead of creating or adopting"
     );
 }
 
