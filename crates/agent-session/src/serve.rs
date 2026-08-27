@@ -110,6 +110,13 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS: usize = 2;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
+/// Upper bound on the `keys` list a single `send` request may carry.
+///
+/// The list is remote input whose length is otherwise bounded only by the Axum
+/// body limit, and it is what sizes the handler's key allocation. Every accepted
+/// name resolves to one of nine `SpecialKey` variants, so this is far above any
+/// real caller while keeping the allocation bounded by a constant.
+const MAX_SEND_KEYS: usize = 64;
 const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 std::thread_local! {
@@ -4539,7 +4546,14 @@ async fn send_handler(
     if let Some(resp) = deny_unauthorized(&state, &headers) {
         return resp;
     }
-    let mut keys = Vec::with_capacity(body.keys.len());
+    if body.keys.len() > MAX_SEND_KEYS {
+        return envelope_err(CliError::usage(
+            "too-many-keys",
+            format!("send accepts at most {MAX_SEND_KEYS} keys per request"),
+            Some(json!({ "limit": MAX_SEND_KEYS })),
+        ));
+    }
+    let mut keys = Vec::with_capacity(MAX_SEND_KEYS.min(body.keys.len()));
     for name in &body.keys {
         match SpecialKey::from_name(name) {
             Some(key) => keys.push(key),
@@ -16019,6 +16033,57 @@ esac
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid-key");
+    }
+
+    /// A `send` body's key list is remote input whose length is bounded only by
+    /// the Axum body limit, so the handler must reject an oversized list before
+    /// it sizes any allocation from it. Every accepted name maps to one of nine
+    /// `SpecialKey` variants, so a request carrying more than
+    /// `MAX_SEND_KEYS` names is never a real caller.
+    /// `sympoies/nils-cli#1542`.
+    #[tokio::test]
+    async fn send_rejects_a_key_list_past_the_allocation_bound() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let keys = vec![json!("enter"); MAX_SEND_KEYS + 1];
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions/steer/send", Some(TOKEN), json!({ "keys": keys })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["error"]["code"], "too-many-keys");
+        assert_eq!(body["error"]["details"]["limit"], MAX_SEND_KEYS);
+    }
+
+    /// The bound must admit the whole documented range: a request at exactly the
+    /// limit is still a legitimate caller. `sympoies/nils-cli#1542`.
+    #[tokio::test]
+    async fn send_admits_a_key_list_at_the_allocation_bound() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let keys = vec![json!("enter"); MAX_SEND_KEYS];
+        let (status, body) = call(
+            router(st.clone()),
+            post_json("/sessions/steer/send", Some(TOKEN), json!({ "keys": keys })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body["data"]["sent"]["keys"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            MAX_SEND_KEYS
+        );
     }
 
     #[tokio::test]

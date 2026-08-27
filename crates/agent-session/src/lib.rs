@@ -10389,7 +10389,7 @@ fn normalize_title_state(mut state: SessionTitleState) -> Result<SessionTitleSta
             Some(json!({ "field": "title_state.references" })),
         ));
     }
-    let mut normalized_references = Vec::with_capacity(state.references.len());
+    let mut normalized_references = Vec::with_capacity(SESSION_TITLE_MAX_REFERENCES);
     for reference in state.references {
         let reference = reference.trim_matches(is_javascript_whitespace).to_string();
         let number = reference.strip_prefix('#').unwrap_or_default();
@@ -18951,6 +18951,29 @@ exit 97
 
         assert_eq!(err.0.code, "invalid-title-state");
         assert_eq!(consumed.get(), super::SESSION_TITLE_MAX_CHARS + 1);
+    }
+
+    /// The reference list is remote input on `POST /sessions`, and the
+    /// normalized-reference allocation is sized from
+    /// `SESSION_TITLE_MAX_REFERENCES`. Keep the guard that makes that bound
+    /// true under test. `sympoies/nils-cli#1542`.
+    #[test]
+    fn structured_title_rejects_references_past_the_supported_bound() {
+        let references = (0..=super::SESSION_TITLE_MAX_REFERENCES)
+            .map(|index| format!("#{}", index + 1))
+            .collect::<Vec<_>>();
+        let state = super::SessionTitleState {
+            topic: None,
+            topic_source: super::SessionTitleTopicSource::None,
+            references,
+            activity: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let err = super::normalize_title_state(state)
+            .expect_err("one reference past the bound must be rejected");
+
+        assert_eq!(err.0.code, "invalid-title-state");
     }
 
     #[test]

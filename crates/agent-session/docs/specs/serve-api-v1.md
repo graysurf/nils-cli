@@ -452,6 +452,11 @@ recorded in `sympoies/nils-cli#1409`.
   structured state if an older writer changed only the compatibility title.
   Session and glance responses advertise `title_state_supported: true` independently of whether that session already
   has structured state, allowing upgraded clients to migrate title-only records conservatively.
+- `POST /sessions/{id}/send` accepts at most 64 entries in `keys`; a longer list is
+  rejected with `400 too-many-keys` and a `limit` detail before the daemon sizes any
+  allocation from the request. Every accepted name resolves to one of the nine
+  canonical `SpecialKey` values, so the bound is far above any real caller. An
+  unknown name still fails the whole request with `400 invalid-key`.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.
