@@ -51,6 +51,8 @@ pub enum Command {
     FinishLine(FinishLineArgs),
     /// Bind canonical workspaces and operate durable cross-process mutation leases.
     WorkspaceLease(WorkspaceLeaseArgs),
+    /// Inspect a denied dirty checkout and verify a clean managed-worktree handoff.
+    WorkspaceRecovery(WorkspaceRecoveryArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
 }
@@ -59,6 +61,20 @@ pub enum Command {
 pub struct WorkspaceLeaseArgs {
     #[command(subcommand)]
     pub command: WorkspaceLeaseCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceRecoveryArgs {
+    #[command(subcommand)]
+    pub command: WorkspaceRecoveryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceRecoveryCommand {
+    /// Project bounded dirty paths and linked worktrees without repository commands.
+    Inspect(WorkspaceLeaseFormatArgs),
+    /// Verify one different clean managed worktree for an operator handoff.
+    VerifyHandoff(WorkspaceLeaseFormatArgs),
 }
 
 #[derive(Debug, Subcommand)]

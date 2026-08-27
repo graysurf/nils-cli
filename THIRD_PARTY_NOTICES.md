@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `6dc14bf99861287c412f0224726440ca504bf9ff0f2becea213851165fa97d0b`
-- Third-party crates (`source != null`): 493
+- Cargo.lock SHA256: `bcf43b99e63ece1db0720b60aa89ccb7b6f2fc797429f85158cf35292ef86586`
+- Third-party crates (`source != null`): 496
 
 ## Notice Extraction Policy
 
@@ -1157,6 +1157,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
+### git2 0.21.0
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
 ### harfrust 0.12.0
 
 - License: `MIT`
@@ -1683,6 +1692,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
+### libgit2-sys 0.18.8+1.9.7
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
+
 ### libm 0.2.16
 
 - License: `MIT`
@@ -1698,6 +1716,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### libz-sys 1.1.29
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
 
 ### linux-raw-sys 0.12.1
 

@@ -7,7 +7,7 @@
 - Contract owner: Codex
 - Target PR: pending
 - Status: implemented
-- Last updated: 2026-08-25
+- Last updated: 2026-08-27
 - Enforcement: `completion_mode=clap-first`;
   `completion_mode_toggles=forbidden`;
   `alternate_completion_dispatch=forbidden`;
@@ -26,6 +26,7 @@
 | `recovery authorize` | challenge/output paths and reviewed digest |
 | `recovery consume` | capability path and exact binding values |
 | `recovery status`, `recovery revoke` | public capability selector and output enum |
+| `workspace-recovery inspect`, `verify-handoff` | JSON-default output enum; strict request data is supplied on stdin |
 | `finish-line open`, `begin`, `run`, `register`, `admit`, `observe`, `verdict`, `stop`, `status` | JSON-default output enum; request data is strict service JSON on stdin; `run` describes foreground probe/supervision; the acceptance commands describe immutable registration, pre-body admission, authenticated terminal observation, and detached verdicts; internal `quiesce` and `release` lifecycle RPCs are excluded |
 | `completion` | `bash` and `zsh` shell enum |
 

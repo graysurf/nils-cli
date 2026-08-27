@@ -18,6 +18,7 @@ mod finish_line;
 #[cfg(not(target_os = "linux"))]
 #[path = "finish_line_unsupported.rs"]
 mod finish_line;
+mod git_inspection;
 mod liveness;
 mod model;
 mod observe;
@@ -30,6 +31,7 @@ pub mod setup;
 mod strict_json;
 mod trace;
 mod workspace_lease;
+mod workspace_recovery;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -46,6 +48,7 @@ use serde_json::json;
 
 use cli::{
     Cli, Command, DispatchFormat, FinishLineCommand, RecoveryCommand, WorkspaceLeaseCommand,
+    WorkspaceRecoveryCommand,
 };
 use error::HookError;
 use model::{
@@ -159,6 +162,7 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
         Command::Completion(args) => completion::run(args.shell),
         Command::FinishLine(args) => run_finish_line(&layout, args.command),
         Command::WorkspaceLease(args) => run_workspace_lease(&layout, args.command),
+        Command::WorkspaceRecovery(args) => run_workspace_recovery(args.command),
         Command::Dispatch(args) => run_dispatch(&layout, policy_override, args),
         Command::Validate(args) => {
             let loaded = match contract::load(&layout, policy_override) {
@@ -362,6 +366,26 @@ fn run_workspace_lease(layout: &Layout, command: WorkspaceLeaseCommand) -> i32 {
     };
     let format = OutputFormat::from(format);
     match workspace_lease::run(&layout.state_root, operation) {
+        Ok(outcome) => emit_success(name, format, &outcome.data, || outcome.text),
+        Err(error) => emit_error(name, &error, format == OutputFormat::Json),
+    }
+}
+
+fn run_workspace_recovery(command: WorkspaceRecoveryCommand) -> i32 {
+    let (name, format, operation) = match command {
+        WorkspaceRecoveryCommand::Inspect(args) => (
+            "agent-hook workspace-recovery inspect",
+            args.format,
+            workspace_recovery::Operation::Inspect,
+        ),
+        WorkspaceRecoveryCommand::VerifyHandoff(args) => (
+            "agent-hook workspace-recovery verify-handoff",
+            args.format,
+            workspace_recovery::Operation::VerifyHandoff,
+        ),
+    };
+    let format = OutputFormat::from(format);
+    match workspace_recovery::run(operation) {
         Ok(outcome) => emit_success(name, format, &outcome.data, || outcome.text),
         Err(error) => emit_error(name, &error, format == OutputFormat::Json),
     }
