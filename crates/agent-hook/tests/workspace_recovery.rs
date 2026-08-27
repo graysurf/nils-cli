@@ -201,6 +201,149 @@ fn verify_handoff_accepts_only_a_different_clean_managed_worktree() {
 }
 
 #[test]
+fn redirected_submodule_gitdir_fails_closed_without_foreign_path_metadata() {
+    let (fixture, _managed) = fixture();
+    let source = ScopedTempDir::with_prefix("workspace-recovery-submodule-source-");
+    git(source.path(), &["init", "--quiet"]);
+    git(
+        source.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(source.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(source.path().join("tracked.txt"), "base\n").expect("submodule tracked file");
+    git(source.path(), &["add", "--all"]);
+    git(source.path(), &["commit", "--quiet", "-m", "test: initial"]);
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.path().to_str().expect("submodule source UTF-8"),
+            "module",
+        ],
+    );
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "test: add submodule"],
+    );
+    let foreign = fixture.state_home.join("foreign-submodule");
+    git(
+        &fixture.state_home,
+        &[
+            "clone",
+            "--quiet",
+            source.path().to_str().expect("submodule source UTF-8"),
+            foreign.to_str().expect("foreign clone UTF-8"),
+        ],
+    );
+    fs::write(
+        foreign.join("foreign-secret.txt"),
+        "must not be projected\n",
+    )
+    .expect("foreign dirty file");
+    fs::write(
+        fixture.root.join("module/.git"),
+        format!("gitdir: {}\n", foreign.join(".git").to_string_lossy()),
+    )
+    .expect("redirect submodule gitfile");
+
+    let (code, envelope) = inspect(&fixture);
+
+    assert_eq!(code, 69, "envelope={envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        "workspace-inspection-unavailable"
+    );
+    assert!(!envelope.to_string().contains("foreign-secret"));
+}
+
+#[test]
+fn redirected_worktree_admin_gitdir_cannot_verify_an_unrelated_handoff() {
+    let (fixture, managed) = fixture();
+    fs::write(fixture.root.join("notes.txt"), "dirty\n").expect("dirty primary");
+    let foreign = managed.parent().expect("managed parent").join("foreign");
+    fs::create_dir_all(&foreign).expect("foreign repository");
+    git(&foreign, &["init", "--quiet"]);
+    git(&foreign, &["config", "user.email", "workspace@example.com"]);
+    git(&foreign, &["config", "user.name", "Workspace Test"]);
+    fs::write(foreign.join("foreign.txt"), "unrelated\n").expect("foreign tracked file");
+    git(&foreign, &["add", "--all"]);
+    git(&foreign, &["commit", "--quiet", "-m", "test: unrelated"]);
+    let gitfile = fs::read_to_string(managed.join(".git")).expect("managed gitfile");
+    let admin = PathBuf::from(
+        gitfile
+            .trim()
+            .strip_prefix("gitdir: ")
+            .expect("managed gitdir"),
+    );
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", foreign.join(".git").to_string_lossy()),
+    )
+    .expect("redirect worktree admin gitdir");
+
+    let (code, envelope) = verify(&fixture, &foreign);
+
+    assert_eq!(code, 69, "envelope={envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        "workspace-recovery-worktrees-unavailable"
+    );
+    assert!(envelope["data"]["handoff"].is_null());
+}
+
+#[test]
+fn clean_linked_handoff_with_initialized_submodule_remains_verifiable() {
+    let (fixture, managed) = fixture();
+    let source = ScopedTempDir::with_prefix("workspace-recovery-linked-submodule-source-");
+    git(source.path(), &["init", "--quiet"]);
+    git(
+        source.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(source.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(source.path().join("tracked.txt"), "base\n").expect("submodule tracked file");
+    git(source.path(), &["add", "--all"]);
+    git(source.path(), &["commit", "--quiet", "-m", "test: initial"]);
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.path().to_str().expect("submodule source UTF-8"),
+            "module",
+        ],
+    );
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "test: add submodule"],
+    );
+    git(&managed, &["merge", "--quiet", "master"]);
+    git(
+        &managed,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ],
+    );
+    fs::write(fixture.root.join("notes.txt"), "dirty primary\n").expect("dirty primary");
+
+    let (code, envelope) = verify(&fixture, &managed);
+
+    assert_eq!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["data"]["handoff"]["status"], "verified");
+}
+
+#[test]
 fn inspect_never_executes_repository_filters() {
     let (fixture, _managed) = fixture();
     fs::write(

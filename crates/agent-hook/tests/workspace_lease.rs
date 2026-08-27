@@ -409,7 +409,7 @@ fn dirty_submodule_denial(ignore_source: Option<&str>, request_id: &str) -> (Val
     (denied, marker.exists())
 }
 
-fn nested_dirty_submodule_denial() -> (Value, bool) {
+fn nested_submodule_bind(dirty: bool, request_id: &str) -> (Value, bool) {
     let fixture = fixture();
     let leaf = ScopedTempDir::with_prefix("agent-hook-nested-leaf-");
     git(leaf.path(), &["init", "--quiet"]);
@@ -517,15 +517,12 @@ fn nested_dirty_submodule_denial() -> (Value, bool) {
             filter.to_str().expect("nested submodule filter UTF-8"),
         ],
     );
-    fs::write(checkout.join("tracked.txt"), "next\n").expect("dirty nested tracked file");
+    if dirty {
+        fs::write(checkout.join("tracked.txt"), "next\n").expect("dirty nested tracked file");
+    }
 
-    let denied = bind(
-        &fixture,
-        "session-a",
-        "nested-gitmodules-ignore-bind",
-        &fixture.root,
-    );
-    (denied, marker.exists())
+    let outcome = bind(&fixture, "session-a", request_id, &fixture.root);
+    (outcome, marker.exists())
 }
 
 #[test]
@@ -562,11 +559,73 @@ fn diff_ignore_submodules_all_cannot_hide_a_dirty_submodule_from_bind() {
 
 #[test]
 fn nested_gitmodules_ignore_all_cannot_hide_a_dirty_submodule_from_bind() {
-    let (denied, filter_executed) = nested_dirty_submodule_denial();
+    let (denied, filter_executed) = nested_submodule_bind(true, "nested-gitmodules-ignore-bind");
 
     assert_eq!(denied["kind"], "denied");
     assert_eq!(denied["code"], "WORKSPACE_DIRTY");
     assert!(!filter_executed, "nested submodule clean filter executed");
+}
+
+#[test]
+fn clean_nested_submodules_remain_leaseable_without_executing_filters() {
+    let (bound, filter_executed) = nested_submodule_bind(false, "clean-nested-submodule-bind");
+
+    assert_eq!(bound["kind"], "bound", "outcome={bound}");
+    assert!(!filter_executed, "nested submodule clean filter executed");
+}
+
+#[test]
+fn missing_submodule_gitdir_cannot_make_nonempty_nested_work_leaseable() {
+    let fixture = fixture();
+    let source = ScopedTempDir::with_prefix("agent-hook-missing-submodule-gitdir-");
+    git(source.path(), &["init", "--quiet"]);
+    git(
+        source.path(),
+        &["config", "user.email", "workspace@example.com"],
+    );
+    git(source.path(), &["config", "user.name", "Workspace Test"]);
+    fs::write(source.path().join("tracked.txt"), "base\n").expect("submodule tracked file");
+    git(source.path(), &["add", "--all"]);
+    git(source.path(), &["commit", "--quiet", "-m", "test: initial"]);
+    git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            source.path().to_str().expect("submodule source UTF-8"),
+            "module",
+        ],
+    );
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "test: add submodule"],
+    );
+    let checkout = fixture.root.join("module");
+    fs::write(checkout.join("private.txt"), "must remain untouched\n")
+        .expect("dirty submodule bytes");
+    let private_before = fs::read(checkout.join("private.txt")).expect("dirty bytes");
+    fs::remove_file(checkout.join(".git")).expect("remove submodule gitfile");
+
+    let (code, envelope) = invoke(
+        &fixture,
+        "bind",
+        bind_request(
+            "foreign-session",
+            "missing-submodule-gitdir-bind",
+            &fixture.root,
+        ),
+    );
+
+    assert_eq!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["data"]["kind"], "denied", "envelope={envelope}");
+    assert_eq!(envelope["data"]["code"], "WORKSPACE_DIRTY");
+    assert_eq!(
+        fs::read(checkout.join("private.txt")).expect("dirty bytes after bind"),
+        private_before
+    );
 }
 
 #[test]

@@ -72,6 +72,15 @@ struct Worktree {
     detached: bool,
     prunable: bool,
     managed: bool,
+    #[serde(skip)]
+    identity: Option<RepositoryIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryIdentity {
+    workdir: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,19 +260,79 @@ fn primary_root(layout: &GitLayout) -> Result<PathBuf, HookError> {
         })
 }
 
-fn repository_facts(path: &Path, managed_root: &Path) -> Result<Worktree, HookError> {
-    let canonical = fs::canonicalize(path).map_err(|_| {
-        unavailable(
-            "workspace-recovery-worktree-unavailable",
-            "workspace recovery worktree is unavailable",
-        )
-    })?;
-    let repository = Repository::open(&canonical).map_err(|_| {
-        unavailable(
-            "workspace-recovery-worktree-unavailable",
-            "workspace recovery worktree is unavailable",
-        )
-    })?;
+fn worktree_unavailable() -> HookError {
+    unavailable(
+        "workspace-recovery-worktree-unavailable",
+        "workspace recovery worktree is unavailable",
+    )
+}
+
+fn worktrees_unavailable() -> HookError {
+    unavailable(
+        "workspace-recovery-worktrees-unavailable",
+        "workspace recovery worktree inventory is unavailable",
+    )
+}
+
+fn repository_identity(repository: &Repository) -> Result<RepositoryIdentity, HookError> {
+    let workdir = repository
+        .workdir()
+        .and_then(|path| fs::canonicalize(path).ok())
+        .ok_or_else(worktree_unavailable)?;
+    let git_dir = fs::canonicalize(repository.path()).map_err(|_| worktree_unavailable())?;
+    let common_dir =
+        fs::canonicalize(repository.commondir()).map_err(|_| worktree_unavailable())?;
+    Ok(RepositoryIdentity {
+        workdir,
+        git_dir,
+        common_dir,
+    })
+}
+
+fn worktree_admin_git_dir(common_dir: &Path, name: &str) -> Result<PathBuf, HookError> {
+    if name.is_empty()
+        || name.len() > MAX_PATH_BYTES
+        || name.chars().any(char::is_control)
+        || Path::new(name).components().count() != 1
+    {
+        return Err(worktrees_unavailable());
+    }
+    let worktrees_path = common_dir.join("worktrees");
+    let metadata = fs::symlink_metadata(&worktrees_path).map_err(|_| worktrees_unavailable())?;
+    if metadata.file_type().is_symlink() {
+        return Err(worktrees_unavailable());
+    }
+    let worktrees = fs::canonicalize(&worktrees_path).map_err(|_| worktrees_unavailable())?;
+    if worktrees.parent() != Some(common_dir) {
+        return Err(worktrees_unavailable());
+    }
+    let candidate = worktrees.join(name);
+    let metadata = fs::symlink_metadata(&candidate).map_err(|_| worktrees_unavailable())?;
+    if metadata.file_type().is_symlink() {
+        return Err(worktrees_unavailable());
+    }
+    let candidate = fs::canonicalize(candidate).map_err(|_| worktrees_unavailable())?;
+    if candidate.parent() != Some(worktrees.as_path()) {
+        return Err(worktrees_unavailable());
+    }
+    Ok(candidate)
+}
+
+fn repository_facts(
+    path: &Path,
+    managed_root: &Path,
+    expected_common_dir: &Path,
+    expected_git_dir: &Path,
+) -> Result<Worktree, HookError> {
+    let canonical = fs::canonicalize(path).map_err(|_| worktree_unavailable())?;
+    let repository = Repository::open(&canonical).map_err(|_| worktree_unavailable())?;
+    let identity = repository_identity(&repository)?;
+    if identity.workdir != canonical
+        || identity.common_dir != expected_common_dir
+        || identity.git_dir != expected_git_dir
+    {
+        return Err(worktrees_unavailable());
+    }
     let head = repository.head().ok();
     let branch = head
         .as_ref()
@@ -275,6 +344,10 @@ fn repository_facts(path: &Path, managed_root: &Path) -> Result<Worktree, HookEr
         .and_then(|value| value.target())
         .map(|id| id.to_string());
     let detached = repository.head_detached().unwrap_or(true);
+    let reopened = Repository::open(&canonical).map_err(|_| worktree_unavailable())?;
+    if repository_identity(&reopened)? != identity {
+        return Err(worktrees_unavailable());
+    }
     Ok(Worktree {
         path: display_path(&canonical)?,
         branch: display_branch(branch.as_deref())?,
@@ -283,6 +356,7 @@ fn repository_facts(path: &Path, managed_root: &Path) -> Result<Worktree, HookEr
         detached,
         prunable: false,
         managed: canonical.starts_with(managed_root),
+        identity: Some(identity),
     })
 }
 
@@ -302,7 +376,47 @@ fn prunable_worktree(path: &Path, managed_root: &Path) -> Result<Worktree, HookE
         detached: true,
         prunable: true,
         managed: projected.starts_with(managed_root),
+        identity: None,
     })
+}
+
+fn revalidate_worktree(worktree: &Worktree) -> Result<(), HookError> {
+    let expected = worktree
+        .identity
+        .as_ref()
+        .ok_or_else(worktrees_unavailable)?;
+    let repository = Repository::open(&expected.workdir).map_err(|_| worktree_unavailable())?;
+    if repository_identity(&repository)? != *expected
+        || repository.is_bare() != worktree.bare
+        || repository.head_detached().unwrap_or(true) != worktree.detached
+    {
+        return Err(worktrees_unavailable());
+    }
+    let head = repository.head().ok();
+    let branch = head
+        .as_ref()
+        .filter(|value| value.is_branch())
+        .and_then(|value| value.shorthand().ok())
+        .map(str::to_string);
+    let head_id = head
+        .as_ref()
+        .and_then(|value| value.target())
+        .map(|id| id.to_string());
+    if branch != worktree.branch || head_id != worktree.head {
+        return Err(worktrees_unavailable());
+    }
+    Ok(())
+}
+
+fn revalidate_worktree_after_observer<F>(
+    worktree: &Worktree,
+    before_revalidate: F,
+) -> Result<(), HookError>
+where
+    F: FnOnce() -> Result<(), HookError>,
+{
+    before_revalidate()?;
+    revalidate_worktree(worktree)
 }
 
 fn inventory(layout: &GitLayout) -> Result<Vec<Worktree>, HookError> {
@@ -320,7 +434,16 @@ fn inventory(layout: &GitLayout) -> Result<Vec<Worktree>, HookError> {
             "workspace recovery repository is unavailable",
         )
     })?;
-    let mut entries = vec![repository_facts(&primary, &managed_root)?];
+    let source_identity = repository_identity(&repository)?;
+    if source_identity.workdir != primary {
+        return Err(worktrees_unavailable());
+    }
+    let mut entries = vec![repository_facts(
+        &primary,
+        &managed_root,
+        &source_identity.common_dir,
+        &source_identity.git_dir,
+    )?];
     let names = repository.worktrees().map_err(|_| {
         unavailable(
             "workspace-recovery-worktrees-unavailable",
@@ -355,7 +478,14 @@ fn inventory(layout: &GitLayout) -> Result<Vec<Worktree>, HookError> {
         entries.push(if prunable {
             prunable_worktree(worktree.path(), &managed_root)?
         } else {
-            repository_facts(worktree.path(), &managed_root)?
+            worktree.validate().map_err(|_| worktrees_unavailable())?;
+            let expected_git_dir = worktree_admin_git_dir(&source_identity.common_dir, name)?;
+            repository_facts(
+                worktree.path(),
+                &managed_root,
+                &source_identity.common_dir,
+                &expected_git_dir,
+            )?
         });
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -380,6 +510,7 @@ fn inspect(
             )
         })?;
     let current_dirty = dirty_entries(&layout)?;
+    revalidate_worktree_after_observer(current, || Ok(()))?;
     let checkout = Checkout {
         path: current.path.clone(),
         branch: current.branch.clone(),
@@ -423,12 +554,14 @@ fn inspect(
                 "workspace recovery handoff checkout is unavailable",
             )
         })?;
-        if !dirty_entries(&candidate_layout)?.is_empty() {
+        let candidate_dirty = dirty_entries(&candidate_layout)?;
+        if !candidate_dirty.is_empty() {
             return Err(HookError::data(
                 "workspace-recovery-handoff-dirty",
                 "workspace recovery handoff checkout is dirty",
             ));
         }
+        revalidate_worktree_after_observer(candidate, || Ok(()))?;
         Some(Handoff {
             status: "verified",
             path: candidate.path.clone(),
@@ -524,4 +657,111 @@ pub(crate) fn run(operation: Operation) -> Result<Outcome, HookError> {
         )
     };
     Ok(Outcome { data, text })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use tempfile::TempDir;
+
+    use super::{
+        repository_facts, repository_identity, revalidate_worktree_after_observer,
+        worktree_admin_git_dir,
+    };
+    use crate::dsh_policy::git_layout;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn committed_repository(path: &Path) {
+        fs::create_dir_all(path).expect("repository directory");
+        git(path, &["init", "--quiet"]);
+        git(path, &["config", "user.email", "workspace@example.com"]);
+        git(path, &["config", "user.name", "Workspace Test"]);
+        fs::write(path.join("tracked.txt"), "base\n").expect("tracked file");
+        git(path, &["add", "--all"]);
+        git(path, &["commit", "--quiet", "-m", "test: initial"]);
+    }
+
+    #[test]
+    fn handoff_identity_change_between_scan_and_revalidation_fails_closed() {
+        let temp = TempDir::new().expect("temporary directory");
+        let primary = temp.path().join("primary");
+        let managed_root = temp.path().join("managed");
+        let handoff = managed_root.join("handoff");
+        let foreign = temp.path().join("foreign");
+        committed_repository(&primary);
+        fs::create_dir_all(&managed_root).expect("managed root");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "fix/handoff",
+                handoff.to_str().expect("handoff UTF-8"),
+                "HEAD",
+            ],
+        );
+        committed_repository(&foreign);
+        fs::write(
+            foreign.join("foreign-secret.txt"),
+            "must not be projected\n",
+        )
+        .expect("foreign dirty file");
+
+        let primary_repository = git2::Repository::open(&primary).expect("primary repository");
+        let primary_identity = repository_identity(&primary_repository).expect("primary identity");
+        let names = primary_repository.worktrees().expect("worktree names");
+        let name = names
+            .iter()
+            .next()
+            .and_then(Result::ok)
+            .flatten()
+            .expect("linked worktree name");
+        let expected_git_dir = worktree_admin_git_dir(&primary_identity.common_dir, name)
+            .expect("worktree admin directory");
+        let facts = repository_facts(
+            &handoff,
+            &managed_root,
+            &primary_identity.common_dir,
+            &expected_git_dir,
+        )
+        .expect("initial handoff facts");
+        let layout = git_layout(&handoff).expect("handoff layout");
+        let mut switched = false;
+
+        let dirty = crate::git_inspection::dirty_entries(&layout).expect("initial clean scan");
+        assert!(dirty.is_empty(), "handoff must start clean");
+        let result = revalidate_worktree_after_observer(&facts, || {
+            fs::rename(handoff.join(".git"), handoff.join(".git-before-switch"))
+                .expect("preserve original gitfile");
+            fs::write(
+                handoff.join(".git"),
+                format!("gitdir: {}\n", foreign.join(".git").display()),
+            )
+            .expect("redirect handoff checkout");
+            switched = true;
+            Ok(())
+        });
+
+        assert!(switched, "phase-controlled identity switch was not reached");
+        let error = result.expect_err("identity change must fail closed");
+        assert_eq!(error.code, "workspace-recovery-worktrees-unavailable");
+        assert!(!error.message.contains("foreign-secret"));
+    }
 }
