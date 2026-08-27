@@ -109,7 +109,7 @@ Parity matrix (v1):
 
 | forge-cli op                                | github backend                                                                                                                               | gitlab backend                                                         | Parity                                                                                                                   |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `pr create`                                 | `gh pr create --draft`                                                                                                                       | `glab mr create --draft`                                               | exact                                                                                                                    |
+| `pr create`                                 | `gh pr create --draft`; qualified user forks use `<user>:<branch>`                                                                           | `glab mr create --draft`                                               | exact for unqualified heads; qualified heads are a GitHub-only seam                                                      |
 | `pr view <id>`                              | `gh pr view <id> --json …`                                                                                                                   | `glab mr view <id> -F json`                                            | exact                                                                                                                    |
 | `pr list`                                   | `gh pr list --json …`                                                                                                                        | `glab mr list -F json`                                                 | exact                                                                                                                    |
 | `pr edit <id>`                              | `gh pr edit <id> …`                                                                                                                          | `glab mr update <id> …`                                                | exact                                                                                                                    |
@@ -150,7 +150,7 @@ Parity matrix (v1):
 | `activity events`                           | `gh api users/<login>/events[/public]`                                                                                                       | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
 | `activity feed`                             | `gh api repos/<owner>/<repo>/commits` + repository activity REST                                                                             | `glab api projects/:id/repository/commits` + project events            | normalized open vocabulary                                                                                               |
 | `activity summary`                          | `gh api graphql` contribution query                                                                                                          | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
-| `pr deliver`                                | macro: `pr list` lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge`                                                  | same composition with gitlab atoms                                     | exact (same macro logic on both)                                                                                         |
+| `pr deliver`                                | macro: exact user/repository-aware lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge`                                | branch lookup → same remaining composition                             | exact for unqualified heads; qualified user-fork lookup is a GitHub-only seam                                            |
 
 "emulated" means the backend's native command differs in shape, but
 `forge-cli` normalises both into the same `cli.forge-cli.pr.checks.v1`
@@ -360,22 +360,35 @@ backend mapping, validation rules, and output schema versions.
 ### `pr create`
 
 - Input: `--head <branch>` (default current branch; GitHub also accepts
-  `<owner>:<branch>` for a cross-fork head), `--base <branch>`
+  `<user>:<branch>` for a cross-fork head), `--base <branch>`
   (default repo default branch), `--title <str>`, `--body-file <path>`
   or `--body <str>`, `--kind feature|bug`, `--draft` (default `true`),
   `--reviewer <user>...`, `--label <name>...`,
   `--label-catalog <path>`, `--strict-labels`.
 - Validation (see "Lock-down policy" for the full list):
   - the branch, or the branch suffix of a qualified GitHub head, MUST match
-    the semantic branch-name rule and align with `--kind`; the GitHub owner
-    qualifier is preserved only for provider dispatch;
+    the semantic branch-name rule and align with `--kind`;
+  - a qualified GitHub user MUST own the local branch's single upstream push
+    repository on the selected GitHub authority; the full `<user>:<branch>`
+    ref is preserved for provider dispatch, while local branch checks consume
+    only the suffix;
+  - immediately after creation, GitHub's `headRefName`, `headRefOid`, and
+    `headRepository.nameWithOwner` MUST match the local branch, local commit,
+    and upstream repository before success is reported;
   - title length ≤ 70 chars, no trailing whitespace;
   - body MUST contain non-empty `## Summary` and `## Test plan`
     sections;
   - working tree MUST be clean (`git status --porcelain` empty);
   - resolved local head branch MUST be pushed and remote-tracked.
 - Output schema: `cli.forge-cli.pr.create.v1`,
-  `data = { number, url, head, base, draft, title, kind, provider }`.
+  `data = { number, url, head, head_sha?, head_repository?, base, draft,
+  title, kind, provider }`.
+
+Qualified heads are deliberately a GitHub-only user-fork seam. GitHub CLI's
+`gh pr create --head` contract accepts `<user>:<branch>` but does not support
+an organization as the qualifier. `forge-cli` therefore does not advertise
+`<owner>:<branch>` or organization-fork support; provider rejection remains
+authoritative for account-type distinctions that cannot be proven offline.
 
 ### `repo push-default`
 
@@ -1160,6 +1173,13 @@ label errors are returned before provider access in every mode.
    against the body-section gate, and the branch-kind / clean-worktree /
    resolved-head push-state rules still apply. `--title` / `--body`
    inputs are ignored on adoption — the existing PR keeps its own.
+   For a qualified GitHub `<user>:<branch>` head, `gh pr list --head` is not
+   given the unsupported qualified syntax. Delivery lists a bounded open set
+   and adopts only a row whose branch and `headRepository` exactly match the
+   locally bound user/upstream repository; a same-named branch from any other
+   fork is ignored. A saturated bounded result without that exact row fails
+   closed instead of assuming absence. The subsequent `pr view` must still match branch,
+   repository, and local SHA, and that SHA becomes the merge CAS input.
 4. `pr create --draft` — atom; validates branch / title / body. Only
    runs when the lookup found nothing.
 5. `pr wait-checks` — atom; blocks until terminal within one cumulative

@@ -616,7 +616,7 @@ EOF"#,
         ),
     };
     let body = format!(
-        r#"#!/bin/sh
+        r###"#!/bin/sh
 set -e
 case "$1 $2" in
   "auth status")
@@ -714,7 +714,7 @@ EOF
     exit 99
     ;;
 esac
-"#,
+"###,
         create = FIXTURE_CREATE_STDOUT,
         pre_view = pre_view,
         post_view = post_view,
@@ -862,6 +862,71 @@ esac
     perm.set_mode(0o755);
     fs::set_permissions(&path, perm).expect("chmod");
     path
+}
+
+fn write_qualified_head_collision_stub(stub: &StubEnv, head_sha: &str) -> PathBuf {
+    let create_sentinel = stub.tempdir.path().join("qualified-create-called");
+    let list_args = stub.tempdir.path().join("qualified-list-args");
+    let body = format!(
+        r###"#!/bin/sh
+set -e
+case "$1 $2" in
+  "auth status")
+    printf '%s\n' 'github.com' 1>&2
+    ;;
+  "repo view")
+    cat <<'EOF'
+{{
+  "name": "nils-cli",
+  "owner": {{ "login": "sympoies" }},
+  "url": "https://github.com/sympoies/nils-cli",
+  "defaultBranchRef": {{ "name": "main" }},
+  "mergeCommitAllowed": false,
+  "squashMergeAllowed": true,
+  "rebaseMergeAllowed": false
+}}
+EOF
+    ;;
+  "pr list")
+    printf '%s\n' "$*" > {list_args}
+    cat <<'EOF'
+[{{"number":123,"url":"https://github.com/sympoies/nils-cli/pull/123","state":"OPEN","title":"feat: other fork","headRefName":"feat/sample","headRepository":{{"nameWithOwner":"other-user/nils-cli"}},"author":{{"login":"other-user"}}}}]
+EOF
+    ;;
+  "pr create")
+    touch {create_sentinel}
+    printf '%s\n' 'https://github.com/sympoies/nils-cli/pull/124'
+    ;;
+  "pr view")
+    case "$3" in
+      124)
+        cat <<'EOF'
+{{"number":124,"url":"https://github.com/sympoies/nils-cli/pull/124","state":"OPEN","isDraft":true,"title":"feat: qualified fork","headRefName":"feat/sample","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"fork-owner/nils-cli"}},"baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[],"body":"## Summary\n\nCreated.\n\n## Test plan\n\nVerified.\n"}}
+EOF
+        ;;
+      *)
+        cat <<'EOF'
+{{"number":123,"url":"https://github.com/sympoies/nils-cli/pull/123","state":"OPEN","isDraft":true,"title":"feat: other fork","headRefName":"feat/sample","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"other-user/nils-cli"}},"baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[],"body":"## Summary\n\nWrong fork.\n\n## Test plan\n\nWrong fork.\n"}}
+EOF
+        ;;
+    esac
+    ;;
+  "pr checks")
+    cat <<'EOF'
+{checks}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args" >&2
+    exit 99
+    ;;
+esac
+"###,
+        checks = FIXTURE_CHECKS_JSON,
+        create_sentinel = create_sentinel.display(),
+        list_args = list_args.display(),
+    );
+    stub.write_stub("gh", &body)
 }
 
 /// Full-chain stub whose post-merge `pr view` reports a closing-keyword
@@ -2060,6 +2125,76 @@ fn pr_deliver_adopts_existing_open_pr_for_head_branch() {
     assert!(
         !create_sentinel.exists(),
         "adopt path must never call the backend pr create"
+    );
+}
+
+#[test]
+fn pr_deliver_github_qualified_head_does_not_adopt_same_branch_from_another_user() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    git(
+        &repo_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/fork-owner/nils-cli.git",
+        ],
+    );
+    let head_sha = git_output(&repo_path, &["rev-parse", "feat/sample"]);
+
+    let stub = StubEnv::new();
+    let create_sentinel = stub.tempdir.path().join("qualified-create-called");
+    let list_args = stub.tempdir.path().join("qualified-list-args");
+    let gh_path = write_qualified_head_collision_stub(&stub, &head_sha);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: qualified fork",
+            "--body",
+            "## Summary\n\nCreated.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "fork-owner:feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let steps = envelope["data"]["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|step| step["step"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert!(steps.contains(&"create"), "steps={steps:?}");
+    assert!(!steps.contains(&"adopt"), "steps={steps:?}");
+    assert!(
+        create_sentinel.exists(),
+        "the exact qualified head must be created"
+    );
+    let lookup = fs::read_to_string(list_args).expect("list args");
+    assert!(
+        !lookup.contains("fork-owner:feat/sample"),
+        "gh pr list must not receive unsupported qualified --head syntax: {lookup}"
     );
 }
 

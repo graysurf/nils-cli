@@ -435,6 +435,46 @@ esac
     stub.write_stub("gh", &body)
 }
 
+fn write_qualified_gh_dispatch_stub(
+    stub: &StubEnv,
+    provider_head_sha: &str,
+    provider_head_repository: &str,
+) -> PathBuf {
+    let body = format!(
+        r#"#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr create")
+    printf '%s\n' 'https://github.com/sympoies/nils-cli/pull/124'
+    ;;
+  "pr view")
+    cat <<'EOF'
+{{
+  "number": 124,
+  "url": "https://github.com/sympoies/nils-cli/pull/124",
+  "state": "OPEN",
+  "isDraft": true,
+  "title": "feat: cross-fork sample",
+  "headRefName": "feat/sample",
+  "headRefOid": "{provider_head_sha}",
+  "headRepository": {{ "nameWithOwner": "{provider_head_repository}" }},
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergedAt": null,
+  "labels": []
+}}
+EOF
+    ;;
+  *)
+    echo "stub: unexpected gh args" >&2
+    exit 99
+    ;;
+esac
+"#,
+    );
+    stub.write_stub("gh", &body)
+}
+
 fn write_glab_dispatch_stub(stub: &StubEnv) -> PathBuf {
     let body = format!(
         r#"#!/bin/sh
@@ -570,6 +610,15 @@ fn pr_create_head_flag_uses_named_branch_push_state() {
 fn pr_create_github_qualified_head_validates_local_suffix_and_preserves_provider_ref() {
     let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
     let repo_path = tempdir.path().join("repo");
+    git(
+        &repo_path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/fork-owner/nils-cli.git",
+        ],
+    );
     git(&repo_path, &["checkout", "-q", "main"]);
 
     let stub = StubEnv::new();
@@ -579,6 +628,8 @@ fn pr_create_github_qualified_head_validates_local_suffix_and_preserves_provider
         &[
             "--provider",
             "github",
+            "--repo",
+            "sympoies/nils-cli",
             "--dry-run",
             "--format",
             "json",
@@ -605,6 +656,142 @@ fn pr_create_github_qualified_head_validates_local_suffix_and_preserves_provider
         .position(|value| value == "--head")
         .expect("--head argument");
     assert_eq!(plan[head_index + 1], "fork-owner:feat/sample");
+}
+
+#[test]
+fn pr_create_github_qualified_head_rejects_upstream_user_mismatch_before_provider() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "fork-owner:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: cross-fork sample",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "qualified_head_upstream_mismatch"
+    );
+}
+
+#[test]
+fn pr_create_github_qualified_head_rejects_provider_sha_mismatch() {
+    let tempdir = make_git_repo("github.com", "fork-owner/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let gh_path = write_qualified_gh_dispatch_stub(
+        &stub,
+        "0000000000000000000000000000000000000000",
+        "fork-owner/nils-cli",
+    );
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "fork-owner:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: cross-fork sample",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "qualified_head_provider_mismatch"
+    );
+}
+
+#[test]
+fn pr_create_github_qualified_head_rejects_provider_repository_mismatch() {
+    let tempdir = make_git_repo("github.com", "fork-owner/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    let local_sha = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["rev-parse", "feat/sample"])
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .expect("sha utf8");
+
+    let stub = StubEnv::new();
+    let gh_path = write_qualified_gh_dispatch_stub(&stub, local_sha.trim(), "other-user/nils-cli");
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "fork-owner:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: cross-fork sample",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "qualified_head_provider_mismatch"
+    );
 }
 
 #[test]

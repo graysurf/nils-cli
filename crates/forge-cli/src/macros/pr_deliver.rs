@@ -36,8 +36,10 @@ use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::pr_create::{
-    self, Environment, VerifiedTestFirstSubject, evidence_remote_url, evidence_repository_id,
-    find_git_toplevel, test_first_gate, validate_provider_subject_head,
+    self, Environment, QualifiedHeadSubject, ResolvedHeadRef, VerifiedTestFirstSubject,
+    evidence_remote_url, evidence_repository_id, find_git_toplevel,
+    qualified_head_subject_for_workdir, resolve_head_ref, test_first_gate,
+    validate_provider_subject_head, validate_qualified_provider_subject,
 };
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
@@ -234,9 +236,31 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             }
         },
     };
-    let lookup_args = adopt_lookup_args(&head);
+    let resolved_head = match resolve_head_ref(ctx.provider, &head) {
+        Ok(resolved) => resolved,
+        Err(err) => return Ok(emit_chain_failure(steps, args, ctx, None, &err, format)),
+    };
+    let qualified_subject = if resolved_head.github_user.is_some() {
+        if let Err(err) = branch_pushed(workdir, resolved_head.local_branch, git_branch_state) {
+            return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+        }
+        match qualified_head_subject_for_workdir(ctx, resolved_head, workdir) {
+            Ok(subject) => subject,
+            Err(err) => return Ok(emit_chain_failure(steps, args, ctx, None, &err, format)),
+        }
+    } else {
+        None
+    };
+    let lookup_args = adopt_lookup_args(ctx, resolved_head);
     let existing = match pr_list::compute(runner, ctx, &lookup_args) {
-        Ok(payload) => payload.items.into_iter().next(),
+        Ok(payload) => {
+            match select_adoptable(payload.items, resolved_head, qualified_subject.as_ref()) {
+                Ok(existing) => existing,
+                Err(err) => {
+                    return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+                }
+            }
+        }
         Err(err) => {
             return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
         }
@@ -280,14 +304,15 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         let repository_id = gate_applies
             .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
             .flatten();
-        let verified_subject = match validate_adopted(
-            &view,
-            args,
+        let adopt_context = AdoptValidationContext {
             workdir,
-            &global.remote,
-            repository_id.as_deref(),
+            remote: &global.remote,
+            repository_id: repository_id.as_deref(),
             test_first_required,
-        ) {
+            resolved_head,
+            qualified_subject: qualified_subject.as_ref(),
+        };
+        let verified_subject = match validate_adopted(&view, args, &adopt_context) {
             Ok(subject) => subject,
             Err(err) => {
                 steps.push(Step {
@@ -494,7 +519,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         }
     }
 
-    if let Some(subject) = verified_subject.as_ref() {
+    if verified_subject.is_some() || qualified_subject.is_some() {
         let current_view = match pr_view::compute(runner, ctx, pr_number) {
             Ok(view) => view,
             Err(err) => {
@@ -508,9 +533,25 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 ));
             }
         };
-        if let Err(err) =
-            validate_provider_subject_head(Some(subject), current_view.head_sha.as_deref())
-        {
+        if let Err(err) = validate_provider_subject_head(
+            verified_subject.as_ref(),
+            current_view.head_sha.as_deref(),
+        ) {
+            return Ok(emit_chain_failure(
+                steps,
+                args,
+                ctx,
+                Some((pr_number, pr_url)),
+                &err,
+                format,
+            ));
+        }
+        if let Err(err) = validate_qualified_provider_subject(
+            qualified_subject.as_ref(),
+            &current_view.head,
+            current_view.head_sha.as_deref(),
+            current_view.head_repository.as_deref(),
+        ) {
             return Ok(emit_chain_failure(
                 steps,
                 args,
@@ -557,6 +598,21 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             format,
         ));
     }
+    if let Err(err) = validate_qualified_provider_subject(
+        qualified_subject.as_ref(),
+        &ready_payload.head,
+        ready_payload.head_sha.as_deref(),
+        ready_payload.head_repository.as_deref(),
+    ) {
+        return Ok(emit_chain_failure(
+            steps,
+            args,
+            ctx,
+            Some((pr_number, pr_url)),
+            &err,
+            format,
+        ));
+    }
     steps.push(Step {
         step: "ready",
         ok: true,
@@ -565,13 +621,15 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     });
 
     // 6. pr.merge
-    let merge_args = build_merge_args(
-        args,
-        pr_number,
-        verified_subject
-            .as_ref()
-            .map(|subject| subject.head.clone()),
-    );
+    let expected_head_sha = verified_subject
+        .as_ref()
+        .map(|subject| subject.head.clone())
+        .or_else(|| {
+            qualified_subject
+                .as_ref()
+                .map(|subject| subject.head_sha.clone())
+        });
+    let merge_args = build_merge_args(args, pr_number, expected_head_sha);
     let merge_payload =
         match pr_merge::compute_with_clock(runner, clock, global, &merge_args, workdir) {
             Ok(p) => p,
@@ -686,16 +744,50 @@ fn run_issue_closeout<R: BackendRunner>(runner: &R, ctx: &ProviderContext, pr_nu
     }
 }
 
-/// Lookup filter for the adopt step: open PRs whose head / source branch is
-/// the resolved head. The first match wins; the provider returns them
-/// newest-first.
-fn adopt_lookup_args(head: &str) -> PrListArgs {
+/// Lookup filter for the adopt step. Unqualified heads use the provider's
+/// branch filter. Qualified GitHub heads use a bounded open-PR projection and
+/// select only the exact source repository + branch identity.
+fn adopt_lookup_args(ctx: &ProviderContext, head: ResolvedHeadRef<'_>) -> PrListArgs {
+    let qualified_github = ctx.provider == Provider::GitHub && head.github_user.is_some();
     PrListArgs {
         state: PrStateFilter::Open,
         author: None,
-        head: Some(head.to_string()),
-        limit: 1,
+        head: (!qualified_github).then(|| head.local_branch.to_string()),
+        limit: if qualified_github {
+            QUALIFIED_ADOPT_LOOKUP_LIMIT
+        } else {
+            1
+        },
     }
+}
+
+const QUALIFIED_ADOPT_LOOKUP_LIMIT: u32 = 100;
+
+fn select_adoptable(
+    items: Vec<pr_list::PrListItem>,
+    resolved_head: ResolvedHeadRef<'_>,
+    qualified_subject: Option<&QualifiedHeadSubject>,
+) -> Result<Option<pr_list::PrListItem>, ForgeError> {
+    let Some(subject) = qualified_subject else {
+        return Ok(items.into_iter().next());
+    };
+    let lookup_saturated = items.len() >= QUALIFIED_ADOPT_LOOKUP_LIMIT as usize;
+    let found = items.into_iter().find(|item| {
+        item.head == resolved_head.local_branch
+            && item
+                .head_repository
+                .as_deref()
+                .is_some_and(|repository| repository.eq_ignore_ascii_case(&subject.head_repository))
+    });
+    if found.is_none() && lookup_saturated {
+        return Err(ForgeError::validation(
+            schema_version_for(BINARY, "error", 1),
+            "qualified_head_provider_mismatch",
+            "bounded GitHub PR lookup could not prove the qualified head is absent",
+            Some("narrow the open PR set before retrying qualified-head delivery".into()),
+        ));
+    }
+    Ok(found)
 }
 
 /// Adopt-path validation. Mirrors the create-path gates that still apply to
@@ -707,28 +799,44 @@ fn adopt_lookup_args(head: &str) -> PrListArgs {
 /// local-path) are skipped — the PR already carries its own provider-validated
 /// title and body. `test_first_required` is resolved by the caller from
 /// layered config so this stays a pure validation.
+struct AdoptValidationContext<'a> {
+    workdir: &'a Path,
+    remote: &'a str,
+    repository_id: Option<&'a str>,
+    test_first_required: bool,
+    resolved_head: ResolvedHeadRef<'a>,
+    qualified_subject: Option<&'a QualifiedHeadSubject>,
+}
+
 fn validate_adopted(
     view: &PrViewPayload,
     args: &PrDeliverArgs,
-    workdir: &Path,
-    remote: &str,
-    repository_id: Option<&str>,
-    test_first_required: bool,
+    context: &AdoptValidationContext<'_>,
 ) -> Result<Option<VerifiedTestFirstSubject>, ForgeError> {
-    let prefix = branch_name(&view.head)?;
+    validate_qualified_provider_subject(
+        context.qualified_subject,
+        &view.head,
+        view.head_sha.as_deref(),
+        view.head_repository.as_deref(),
+    )?;
+    let prefix = branch_name(context.resolved_head.local_branch)?;
     branch_kind_matches(prefix, args.kind.into_kind())?;
     let headings = BodyHeadings::default();
     body_sections(view.body.as_deref().unwrap_or(""), &headings)?;
-    worktree_clean(workdir, git_status_porcelain)?;
-    branch_pushed(workdir, &view.head, git_branch_state)?;
+    worktree_clean(context.workdir, git_status_porcelain)?;
+    branch_pushed(
+        context.workdir,
+        context.resolved_head.local_branch,
+        git_branch_state,
+    )?;
     test_first_gate(
         args.kind.into_kind(),
-        test_first_required,
+        context.test_first_required,
         args.test_first_evidence.as_deref(),
-        workdir,
-        remote,
-        repository_id,
-        &view.head,
+        context.workdir,
+        context.remote,
+        context.repository_id,
+        context.resolved_head.local_branch,
     )
 }
 
@@ -825,6 +933,11 @@ fn build_dry_run_payload(
         Some(head) => head.clone(),
         None => git_current_branch(workdir).unwrap_or_default(),
     };
+    let resolved_head = resolve_head_ref(ctx.provider, &branch).ok();
+    let local_branch = resolved_head
+        .as_ref()
+        .map(|resolved| resolved.local_branch)
+        .unwrap_or(branch.as_str());
     let mut plan_steps = vec![
         DryRunStep {
             step: "auth_status",
@@ -870,7 +983,7 @@ fn build_dry_run_payload(
     let body = resolve_preview_body(args);
     let headings = BodyHeadings::default();
     let inputs = PreflightInputs {
-        branch: &branch,
+        branch: local_branch,
         kind: args.kind.into_kind(),
         title: &args.title,
         body: &body,
@@ -878,6 +991,12 @@ fn build_dry_run_payload(
     };
     let mut local_preflight =
         run_local_preflight(&inputs, workdir, git_status_porcelain, git_branch_state);
+    if let Some(resolved) = resolved_head.filter(|resolved| resolved.github_user.is_some()) {
+        local_preflight.push(RuleVerdict::from_result(
+            "qualified_head_upstream",
+            qualified_head_subject_for_workdir(ctx, resolved, workdir).map(|_| ()),
+        ));
+    }
     // Faithful test-first gate: when the repo opts in, the real run enforces
     // evidence for feature/bug kinds (both create and adopt paths), so surface
     // the same verdict here instead of predicting a success the real deliver
@@ -905,7 +1024,7 @@ fn build_dry_run_payload(
         workdir,
         &global.remote,
         repository_id.as_deref(),
-        &branch,
+        local_branch,
     ) {
         local_preflight.push(verdict);
     }
@@ -926,7 +1045,15 @@ fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {
     } else {
         head
     };
-    pr_list::build_list_call(ctx, &adopt_lookup_args(head)).plan_argv()
+    let lookup = resolve_head_ref(ctx.provider, head)
+        .map(|resolved| adopt_lookup_args(ctx, resolved))
+        .unwrap_or_else(|_| PrListArgs {
+            state: PrStateFilter::Open,
+            author: None,
+            head: Some(head.to_string()),
+            limit: 1,
+        });
+    pr_list::build_list_call(ctx, &lookup).plan_argv()
 }
 
 fn repo_view_dry_plan(ctx: &ProviderContext) -> Vec<String> {
@@ -1189,6 +1316,30 @@ mod tests {
         let snapshot = visible_snapshot(&ctx());
         let snapshot = with_total_duration(snapshot, std::time::Duration::from_millis(13));
         assert_eq!(snapshot.duration_ms, Some(20));
+    }
+
+    #[test]
+    fn qualified_head_adoption_fails_closed_when_the_bounded_lookup_is_saturated() {
+        let resolved = resolve_head_ref(Provider::GitHub, "alice:feat/demo").unwrap();
+        let subject = QualifiedHeadSubject {
+            branch: "feat/demo".into(),
+            head_sha: "abc123".into(),
+            head_repository: "alice/nils-cli".into(),
+        };
+        let items = (0..QUALIFIED_ADOPT_LOOKUP_LIMIT)
+            .map(|number| pr_list::PrListItem {
+                number: u64::from(number),
+                url: format!("https://github.com/sympoies/nils-cli/pull/{number}"),
+                state: "open",
+                title: "collision".into(),
+                head: "feat/demo".into(),
+                head_repository: Some(format!("other-{number}/nils-cli")),
+                author: None,
+            })
+            .collect();
+
+        let err = select_adoptable(items, resolved, Some(&subject)).unwrap_err();
+        assert_eq!(err.kind(), "qualified_head_provider_mismatch");
     }
 
     fn args(no_merge: bool) -> PrDeliverArgs {

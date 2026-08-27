@@ -51,6 +51,8 @@ type DefaultBranchFn<'a> =
 type GitStatusFn<'a> = Box<dyn Fn(&Path) -> Result<String, ForgeError> + 'a>;
 type HeadStateFn<'a> =
     Box<dyn Fn(&Path, &str) -> Result<crate::validations::HeadState, ForgeError> + 'a>;
+type UpstreamRepositoryFn<'a> =
+    Box<dyn Fn(&Path, &str) -> Result<GitHubUpstreamRepository, ForgeError> + 'a>;
 
 /// Envelope payload for `cli.forge-cli.pr.create.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -61,6 +63,9 @@ pub struct PrCreatePayload {
     pub head: String,
     /// Immutable provider head commit observed after creation.
     pub head_sha: Option<String>,
+    /// Provider repository identity for the source head when exposed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_repository: Option<String>,
     pub base: String,
     pub draft: bool,
     pub title: String,
@@ -98,6 +103,7 @@ pub struct Environment<'a> {
     pub default_branch: DefaultBranchFn<'a>,
     pub git_status: GitStatusFn<'a>,
     pub head_state: HeadStateFn<'a>,
+    pub(crate) upstream_repository: UpstreamRepositoryFn<'a>,
     pub workdir: PathBuf,
     pub headings: BodyHeadings,
     /// Resolved `[test_first].require`: when true, feature/bug PRs must carry
@@ -141,6 +147,7 @@ impl<'a> Environment<'a> {
             }),
             git_status: Box::new(git_status_porcelain),
             head_state: Box::new(git_branch_state),
+            upstream_repository: Box::new(git_branch_upstream_repository),
             workdir,
             headings: BodyHeadings::default(),
             test_first_required: cfg.resolve_test_first_required(None),
@@ -158,7 +165,7 @@ fn schema_ok() -> String {
 
 /// Provider-facing and local forms of a PR head reference.
 ///
-/// GitHub accepts `<owner>:<branch>` for cross-fork PRs. The owner qualifier
+/// GitHub accepts `<user>:<branch>` for cross-fork PRs. The user qualifier
 /// is preserved for `gh pr create`, while every local governance check remains
 /// bound to the semantic branch suffix. GitLab and local-provider heads remain
 /// unqualified and therefore unchanged.
@@ -166,6 +173,20 @@ fn schema_ok() -> String {
 pub(crate) struct ResolvedHeadRef<'a> {
     pub provider_ref: &'a str,
     pub local_branch: &'a str,
+    pub github_user: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubUpstreamRepository {
+    pub authority: String,
+    pub repository: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QualifiedHeadSubject {
+    pub branch: String,
+    pub head_sha: String,
+    pub head_repository: String,
 }
 
 pub(crate) fn resolve_head_ref<'a>(
@@ -176,6 +197,7 @@ pub(crate) fn resolve_head_ref<'a>(
         return Ok(ResolvedHeadRef {
             provider_ref: head,
             local_branch: head,
+            github_user: None,
         });
     };
 
@@ -183,6 +205,7 @@ pub(crate) fn resolve_head_ref<'a>(
         return Ok(ResolvedHeadRef {
             provider_ref: head,
             local_branch: head,
+            github_user: None,
         });
     }
 
@@ -198,9 +221,9 @@ pub(crate) fn resolve_head_ref<'a>(
         return Err(ForgeError::validation(
             schema_err(),
             "branch_name_invalid",
-            format!("GitHub head '{head}' is not a valid <owner>:<branch> reference"),
+            format!("GitHub head '{head}' is not a valid <user>:<branch> reference"),
             Some(
-                "rule=<github-owner>:<(feat|fix|chore|docs|ci|refactor)/semantic-branch>"
+                "rule=<github-user>:<(feat|fix|chore|docs|ci|refactor)/semantic-branch>; GitHub CLI does not support organization-qualified fork heads"
                     .to_string(),
             ),
         ));
@@ -209,7 +232,191 @@ pub(crate) fn resolve_head_ref<'a>(
     Ok(ResolvedHeadRef {
         provider_ref: head,
         local_branch: branch,
+        github_user: Some(owner),
     })
+}
+
+fn qualified_head_error(message: impl Into<String>, detail: Option<String>) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "qualified_head_upstream_mismatch",
+        message,
+        detail,
+    )
+}
+
+fn provider_subject_error(message: impl Into<String>, detail: Option<String>) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "qualified_head_provider_mismatch",
+        message,
+        detail,
+    )
+}
+
+pub(crate) fn git_branch_upstream_repository(
+    workdir: &Path,
+    branch: &str,
+) -> Result<GitHubUpstreamRepository, ForgeError> {
+    let config_key = format!("branch.{branch}.remote");
+    let remote = run_identity_git(workdir, &["config", "--get", &config_key])?;
+    let remote = remote.trim();
+    if remote.is_empty() || remote == "." {
+        return Err(qualified_head_error(
+            "qualified GitHub head requires a remote-tracking upstream repository",
+            None,
+        ));
+    }
+
+    let push_urls = run_identity_git(
+        workdir,
+        &["remote", "get-url", "--push", "--all", "--", remote],
+    )?;
+    let destinations = push_urls
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let [push_url] = destinations.as_slice() else {
+        return Err(qualified_head_error(
+            "qualified GitHub head requires exactly one upstream push repository",
+            Some(format!("push_destination_count={}", destinations.len())),
+        ));
+    };
+    let parsed = nils_common::git::parse_git_remote_url(push_url).ok_or_else(|| {
+        qualified_head_error(
+            "qualified GitHub head upstream is not a supported Git remote",
+            None,
+        )
+    })?;
+    let authority = crate::provider::parse_host(push_url).ok_or_else(|| {
+        qualified_head_error(
+            "qualified GitHub head upstream has no supported forge authority",
+            None,
+        )
+    })?;
+    let repository = parsed.path.trim_matches('/').trim_end_matches(".git");
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return Err(qualified_head_error(
+            "qualified GitHub head upstream must identify one user repository",
+            None,
+        ));
+    }
+    Ok(GitHubUpstreamRepository {
+        authority: crate::provider::canonical_provider_host(Provider::GitHub, &authority),
+        repository: format!("{owner}/{name}").to_ascii_lowercase(),
+    })
+}
+
+fn run_identity_git(workdir: &Path, args: &[&str]) -> Result<String, ForgeError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            qualified_head_error(
+                "failed to inspect the qualified head upstream repository",
+                Some(error.to_string()),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(qualified_head_error(
+            "failed to inspect the qualified head upstream repository",
+            None,
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn validate_qualified_head_subject(
+    ctx: &ProviderContext,
+    resolved: ResolvedHeadRef<'_>,
+    head_sha: &str,
+    upstream: GitHubUpstreamRepository,
+) -> Result<Option<QualifiedHeadSubject>, ForgeError> {
+    let Some(user) = resolved.github_user else {
+        return Ok(None);
+    };
+    let selected_authority = crate::provider::canonical_provider_host(Provider::GitHub, &ctx.host);
+    let upstream_user = upstream
+        .repository
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .unwrap_or_default();
+    if upstream.authority != selected_authority || !upstream_user.eq_ignore_ascii_case(user) {
+        return Err(qualified_head_error(
+            "qualified GitHub user does not match the local branch upstream repository",
+            Some("bind the branch upstream to the same GitHub user passed in --head".into()),
+        ));
+    }
+    Ok(Some(QualifiedHeadSubject {
+        branch: resolved.local_branch.to_string(),
+        head_sha: head_sha.to_string(),
+        head_repository: upstream.repository,
+    }))
+}
+
+fn qualified_head_subject_for_env(
+    ctx: &ProviderContext,
+    resolved: ResolvedHeadRef<'_>,
+    env: &Environment<'_>,
+) -> Result<Option<QualifiedHeadSubject>, ForgeError> {
+    let Some(_) = resolved.github_user else {
+        return Ok(None);
+    };
+    let state = (env.head_state)(&env.workdir, resolved.local_branch)?;
+    let upstream = (env.upstream_repository)(&env.workdir, resolved.local_branch)?;
+    validate_qualified_head_subject(ctx, resolved, &state.head_sha, upstream)
+}
+
+pub(crate) fn qualified_head_subject_for_workdir(
+    ctx: &ProviderContext,
+    resolved: ResolvedHeadRef<'_>,
+    workdir: &Path,
+) -> Result<Option<QualifiedHeadSubject>, ForgeError> {
+    let Some(_) = resolved.github_user else {
+        return Ok(None);
+    };
+    let state = git_branch_state(workdir, resolved.local_branch)?;
+    let upstream = git_branch_upstream_repository(workdir, resolved.local_branch)?;
+    validate_qualified_head_subject(ctx, resolved, &state.head_sha, upstream)
+}
+
+pub(crate) fn validate_qualified_provider_subject(
+    subject: Option<&QualifiedHeadSubject>,
+    provider_branch: &str,
+    provider_head: Option<&str>,
+    provider_repository: Option<&str>,
+) -> Result<(), ForgeError> {
+    let Some(subject) = subject else {
+        return Ok(());
+    };
+    let Some(provider_head) = provider_head.filter(|value| !value.is_empty()) else {
+        return Err(provider_subject_error(
+            "GitHub did not expose the qualified PR head commit",
+            None,
+        ));
+    };
+    let Some(provider_repository) = provider_repository.filter(|value| !value.is_empty()) else {
+        return Err(provider_subject_error(
+            "GitHub did not expose the qualified PR head repository",
+            None,
+        ));
+    };
+    if provider_branch != subject.branch
+        || provider_head != subject.head_sha
+        || !provider_repository.eq_ignore_ascii_case(&subject.head_repository)
+    {
+        return Err(provider_subject_error(
+            "GitHub qualified PR head does not match the local pushed branch subject",
+            Some("branch, head commit, and source repository must all match".into()),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the git toplevel for layered-config discovery. Returns `None`
@@ -485,6 +692,7 @@ pub fn run_with<R: BackendRunner>(
     branch_pushed(&env.workdir, resolved_head.local_branch, |w, branch| {
         (env.head_state)(w, branch)
     })?;
+    let qualified_subject = qualified_head_subject_for_env(&ctx, resolved_head, env)?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
     let remote_url = evidence_remote_url(
         gate_applies,
@@ -534,6 +742,12 @@ pub fn run_with<R: BackendRunner>(
     }
 
     let payload = create_and_fetch(runner, &ctx, &create_call, kind)?;
+    validate_qualified_provider_subject(
+        qualified_subject.as_ref(),
+        &payload.head,
+        payload.head_sha.as_deref(),
+        payload.head_repository.as_deref(),
+    )?;
     validate_provider_subject_head(verified_subject.as_ref(), payload.head_sha.as_deref())?;
     Ok(emit_success(schema_ok(), payload, format, render_text))
 }
@@ -625,6 +839,7 @@ fn compute_with_subject_inner<R: BackendRunner>(
     branch_pushed(&env.workdir, resolved_head.local_branch, |w, branch| {
         (env.head_state)(w, branch)
     })?;
+    let qualified_subject = qualified_head_subject_for_env(&ctx, resolved_head, env)?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
     let remote_url = evidence_remote_url(
         gate_applies,
@@ -661,6 +876,12 @@ fn compute_with_subject_inner<R: BackendRunner>(
         &args.labels,
     );
     let payload = create_and_fetch(runner, &ctx, &create_call, kind)?;
+    validate_qualified_provider_subject(
+        qualified_subject.as_ref(),
+        &payload.head,
+        payload.head_sha.as_deref(),
+        payload.head_repository.as_deref(),
+    )?;
     validate_provider_subject_head(verified_subject.as_ref(), payload.head_sha.as_deref())?;
     Ok(PrCreateComputation {
         payload,
@@ -923,6 +1144,12 @@ pub fn parse_view_output(
                 .and_then(|item| item.as_str())
                 .map(str::to_string)
                 .filter(|value| !value.is_empty()),
+            head_repository: value
+                .get("headRepository")
+                .and_then(|repository| repository.get("nameWithOwner"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
             base: required_str(&value, "baseRefName")?,
             draft: value
                 .get("isDraft")
@@ -941,6 +1168,10 @@ pub fn parse_view_output(
                 .unwrap_or(url_fallback),
             head: required_str(&value, "source_branch")?,
             head_sha: crate::ops::pr_view::gitlab_head_sha(&value),
+            head_repository: value
+                .get("source_project_id")
+                .and_then(|value| value.as_u64())
+                .map(|id| format!("gitlab-project-id:{id}")),
             base: required_str(&value, "target_branch")?,
             draft: gitlab_is_draft(&value),
             title: required_str(&value, "title")?,
@@ -1226,6 +1457,12 @@ mod tests {
                 Ok(crate::validations::HeadState {
                     head_sha: "abc".into(),
                     upstream_sha: Some("abc".into()),
+                })
+            }),
+            upstream_repository: Box::new(|_, _| {
+                Ok(GitHubUpstreamRepository {
+                    authority: "github.com".into(),
+                    repository: "o/r".into(),
                 })
             }),
             workdir: PathBuf::from("."),
