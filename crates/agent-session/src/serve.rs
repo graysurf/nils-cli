@@ -15405,6 +15405,11 @@ esac
             "XDG_RUNTIME_DIR",
             runtime_dir.path().to_str().unwrap(),
         );
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
         let st = state(tmp.path(), Some(TOKEN), tmux);
 
         let (status, body) = call(
