@@ -1694,6 +1694,64 @@ fn unsafe_default_delivery_blocks_default_branch_and_allows_feature_refs() {
 }
 
 #[test]
+fn unsafe_default_delivery_allows_read_only_remote_queries_without_default_evidence() {
+    let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
+    git(&fixture, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        &fixture,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/sympoies/example.git",
+        ],
+    );
+
+    for command in [
+        "git remote",
+        "git remote -v",
+        "git remote --verbose",
+        "git remote get-url origin",
+        "git remote get-url --push --all origin",
+    ] {
+        let output = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request(&fixture, "bash", json!({"command": command}))),
+        );
+
+        assert_eq!(
+            output.code,
+            0,
+            "read-only remote query must not require default-branch evidence: command={command} envelope={}",
+            output.stdout_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "allow");
+    }
+
+    for command in [
+        "git remote add backup https://example.com/sympoies/backup.git",
+        "git remote remove origin",
+        "git remote rename origin upstream",
+        "git remote set-url origin https://example.com/sympoies/other.git",
+        "git remote prune origin",
+        "git remote update",
+    ] {
+        let output = fixture.run(
+            &["dispatch", "--product", "dsh", "--format", "json"],
+            Some(&request(&fixture, "bash", json!({"command": command}))),
+        );
+
+        assert_eq!(
+            output.code,
+            1,
+            "remote mutation must remain fail-closed without default-branch evidence: command={command} envelope={}",
+            output.stdout_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "block");
+    }
+}
+
+#[test]
 fn unsafe_default_delivery_preserves_governed_recovery_and_feature_worktrees() {
     let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
     git(&fixture, &["init", "--quiet", "--initial-branch=main"]);
