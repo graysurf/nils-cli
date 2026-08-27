@@ -18,7 +18,8 @@
 //! forbidden" from "this could not be proven" without parsing prose.
 
 use crate::commit_shared::{
-    git_output, git_status_success, git_stdout_trimmed, git_stdout_trimmed_optional,
+    git_output, git_output_optional, git_status_success, git_stdout_trimmed,
+    git_stdout_trimmed_optional,
 };
 use crate::worktree::{
     CliError, detect_format, emit_error, emit_success, ensure_inside_git_repo,
@@ -57,6 +58,7 @@ struct PushArgs {
     remote: String,
     expect_default: Option<String>,
     force_with_lease: bool,
+    bootstrap: bool,
     dry_run: bool,
     format: OutputFormat,
 }
@@ -76,10 +78,13 @@ struct PushOutput {
     remote_branch: String,
     refspec: String,
     head: String,
-    default_branch: String,
+    /// `None` on a bootstrap publish: an empty remote has no default branch,
+    /// and naming one would be a guess the caller could act on.
+    default_branch: Option<String>,
     pushed: bool,
     dry_run: bool,
     created_remote_branch: bool,
+    bootstrapped: bool,
     upstream: String,
     forced: bool,
 }
@@ -169,6 +174,14 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
     // second opinion that can widen admission. Cached truth always wins, and a
     // disagreeing assertion is a mismatch: otherwise `--expect-default develop`
     // while standing on `main` would publish the default branch.
+    // Publishing the first ref of an empty remote cannot move a default branch,
+    // because there is none yet. That is the one case the resolution below can
+    // never satisfy, and refusing it left a new repository with no governed way
+    // to receive its first branch at all.
+    if args.bootstrap {
+        return bootstrap_branch(args, branch);
+    }
+
     let default_branch = match (cached_default_branch(&args.remote), &args.expect_default) {
         (Some(cached), Some(expected)) if cached != *expected => {
             return Err(CliError::data(
@@ -188,6 +201,9 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
         (None, Some(expected)) => {
             // The assertion is unverifiable here, so it cannot be trusted to
             // clear a branch that plausibly *is* a default branch.
+            if let Some(err) = empty_remote_refusal(&args.remote) {
+                return Err(err);
+            }
             if WELL_KNOWN_DEFAULT_BRANCHES.contains(&branch.as_str()) {
                 return Err(CliError::data(
                     "default-branch-unverifiable",
@@ -207,6 +223,9 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
             expected.clone()
         }
         (None, None) => {
+            if let Some(err) = empty_remote_refusal(&args.remote) {
+                return Err(err);
+            }
             return Err(CliError::data(
                 "default-branch-unresolved",
                 format!(
@@ -262,10 +281,11 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
                 .unwrap_or_default(),
             refspec,
             head,
-            default_branch,
+            default_branch: Some(default_branch),
             pushed: false,
             dry_run: true,
             created_remote_branch,
+            bootstrapped: false,
             upstream,
             forced: args.force_with_lease,
         });
@@ -294,12 +314,133 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
         remote: args.remote.clone(),
         refspec,
         head,
-        default_branch,
+        default_branch: Some(default_branch),
         pushed: true,
         dry_run: false,
         created_remote_branch,
+        bootstrapped: false,
         upstream,
         forced: args.force_with_lease,
+    })
+}
+
+/// Whether the remote advertises no refs at all.
+///
+/// `None` means the question could not be answered — the remote was
+/// unreachable, or Git failed for some other reason — and the caller must not
+/// read that as either answer.
+fn remote_has_no_refs(remote: &str) -> Option<bool> {
+    // `ls-remote` is the only way to know: a fresh clone also has no
+    // remote-tracking refs, so local state cannot tell an empty remote from an
+    // unfetched one.
+    let output = git_output_optional(&["ls-remote", "--quiet", remote])?;
+    Some(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+/// The refusal to raise when a push failed to resolve a default branch only
+/// because the remote has none yet.
+///
+/// Returning the generic "cache the remote head" hint here would send the
+/// caller to `git remote set-head --auto`, which cannot succeed against a
+/// remote that has no HEAD to read.
+fn empty_remote_refusal(remote: &str) -> Option<CliError> {
+    if remote_has_no_refs(remote) != Some(true) {
+        return None;
+    }
+    Some(
+        CliError::data(
+            "remote-has-no-branches",
+            format!("remote '{remote}' has no branches yet, so it has no default branch"),
+        )
+        .with_hint(
+            "pass `--bootstrap` to publish the checked-out branch as this \
+             remote's first branch; caching the remote head cannot work until \
+             one exists",
+        ),
+    )
+}
+
+/// Publish the checked-out branch as the first branch of an empty remote.
+///
+/// The safety argument is the emptiness itself, checked against the remote
+/// rather than inferred from local state, so it does not depend on the branch
+/// name or on any cached head. Nothing is forced: if the remote gained a ref
+/// between the check and the push, Git rejects the non-fast-forward and the
+/// operation fails closed.
+fn bootstrap_branch(args: &PushArgs, branch: String) -> Result<PushOutput, CliError> {
+    match remote_has_no_refs(&args.remote) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(CliError::data(
+                "bootstrap-remote-not-empty",
+                format!(
+                    "remote '{}' already has refs, so this is not a bootstrap publish",
+                    args.remote
+                ),
+            )
+            .with_hint(
+                "drop `--bootstrap`; the ordinary publish path proves the \
+                 destination against the remote's default branch",
+            ));
+        }
+        None => {
+            return Err(CliError::runtime(
+                "remote-unreadable",
+                format!("cannot list the refs of remote '{}'", args.remote),
+            )
+            .with_hint(
+                "`--bootstrap` publishes only against a remote proven empty, \
+                 so an unreachable remote is refused",
+            ));
+        }
+    }
+
+    let head = git_stdout_trimmed(&["rev-parse", "HEAD"]).map_err(|err| {
+        CliError::runtime("head-unresolved", summarize_git_error(&err.to_string()))
+    })?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let upstream = format!("{}/{branch}", args.remote);
+
+    if args.dry_run {
+        return Ok(PushOutput {
+            remote_branch: branch.clone(),
+            branch,
+            remote: args.remote.clone(),
+            refspec,
+            head,
+            default_branch: None,
+            pushed: false,
+            dry_run: true,
+            created_remote_branch: true,
+            bootstrapped: true,
+            upstream,
+            forced: false,
+        });
+    }
+
+    let mut argv: Vec<&str> = vec!["push", "--quiet"];
+    if !upstream_is_own_ref(&args.remote, &branch) {
+        argv.push("--set-upstream");
+    }
+    argv.push(&args.remote);
+    argv.push(&refspec);
+    git_output(&argv).map_err(|err| {
+        CliError::runtime("git-push-failed", summarize_git_error(&err.to_string()))
+    })?;
+
+    Ok(PushOutput {
+        remote_branch: branch.clone(),
+        branch,
+        remote: args.remote.clone(),
+        refspec,
+        head,
+        default_branch: None,
+        pushed: true,
+        dry_run: false,
+        created_remote_branch: true,
+        bootstrapped: true,
+        upstream,
+        forced: false,
     })
 }
 
@@ -725,6 +866,7 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
     let mut remote = DEFAULT_REMOTE.to_string();
     let mut expect_default = None;
     let mut force_with_lease = false;
+    let mut bootstrap = false;
     let mut dry_run = false;
 
     let mut index = 0usize;
@@ -748,6 +890,10 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
             }
             "--force-with-lease" => {
                 force_with_lease = true;
+                index += 1;
+            }
+            "--bootstrap" => {
+                bootstrap = true;
                 index += 1;
             }
             "--dry-run" => {
@@ -776,10 +922,36 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
             "--expect-default requires a branch name",
         ));
     }
+    // A bootstrap publish creates the remote's first ref. There is no default
+    // branch to name and no prior value to lease against, so a flag that speaks
+    // to either one is a contradiction rather than a no-op.
+    if bootstrap {
+        if expect_default.is_some() {
+            return Err(CliError::usage(
+                "bootstrap-conflicting-flag",
+                "--bootstrap cannot be combined with --expect-default",
+            )
+            .with_hint(
+                "an empty remote has no default branch to name; drop \
+                 `--expect-default`",
+            ));
+        }
+        if force_with_lease {
+            return Err(CliError::usage(
+                "bootstrap-conflicting-flag",
+                "--bootstrap cannot be combined with --force-with-lease",
+            )
+            .with_hint(
+                "a bootstrap publish only ever creates a ref, so there is \
+                 nothing to force; drop `--force-with-lease`",
+            ));
+        }
+    }
 
     Ok(PushArgs {
         remote,
         expect_default,
+        bootstrap,
         force_with_lease,
         dry_run,
         format,
@@ -851,7 +1023,7 @@ fn take_value(args: &[String], index: usize, flag: &str) -> Result<String, CliEr
 
 fn print_push_help() {
     println!(
-        "Usage: git-cli push [--remote <name>] [--expect-default <branch>] [--force-with-lease] [--dry-run] [--format text|json]"
+        "Usage: git-cli push [--remote <name>] [--expect-default <branch>] [--bootstrap] [--force-with-lease] [--dry-run] [--format text|json]"
     );
     println!("  Publish the checked-out branch to its own branch on <remote> (default: origin).");
     println!("  Refuses the remote's default branch; that is `forge-cli repo push-default`'s job.");
@@ -859,6 +1031,7 @@ fn print_push_help() {
     println!(
         "  --expect-default names the default branch when `refs/remotes/<remote>/HEAD` is not cached."
     );
+    println!("  --bootstrap publishes the first branch of a remote proven to have no refs at all.");
 }
 
 fn print_sync_help() {
