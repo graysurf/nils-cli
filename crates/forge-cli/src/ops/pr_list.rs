@@ -21,7 +21,7 @@ use crate::rate_limit::default_runner;
 const SCHEMA: &str = "pr.list";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str = "number,url,state,title,headRefName,author";
+const GH_JSON_FIELDS: &str = "number,url,state,title,headRefName,headRepository,author";
 
 /// Envelope payload for `cli.forge-cli.pr.list.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -38,6 +38,8 @@ pub struct PrListItem {
     pub state: &'static str,
     pub title: String,
     pub head: String,
+    #[serde(skip_serializing)]
+    pub head_repository: Option<String>,
     pub author: Option<String>,
 }
 
@@ -195,6 +197,12 @@ fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<PrListIt
             )?,
             title: required_str(raw, "title")?,
             head: required_str(raw, "headRefName")?,
+            head_repository: raw
+                .get("headRepository")
+                .and_then(|repository| repository.get("nameWithOwner"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
             author: raw
                 .get("author")
                 .and_then(|v| v.get("login").and_then(|n| n.as_str()))
@@ -212,6 +220,7 @@ fn parse_item(raw: &serde_json::Value, ctx: &ProviderContext) -> Result<PrListIt
             )?,
             title: required_str(raw, "title")?,
             head: required_str(raw, "source_branch")?,
+            head_repository: None,
             author: raw
                 .get("author")
                 .and_then(|v| v.get("username").and_then(|n| n.as_str()))

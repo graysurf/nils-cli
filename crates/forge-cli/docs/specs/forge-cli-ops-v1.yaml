@@ -55,6 +55,10 @@ validations_catalog:
     rule: "resolved head branch has upstream and matches remote-tracking ref"
     error_kind: head_not_pushed
     exit: DATA
+  qualified_github_head:
+    rule: "GitHub-only <user>:<branch> heads validate only a non-empty single-qualifier structure locally and delegate username grammar/account type to GitHub; they require one local upstream push repository on the selected GitHub authority whose owner equals <user>; post-create/adopt provider headRefName, headRefOid, and headRepository must equal the local branch, commit, and upstream repository; gh pr list lookup never receives the unsupported qualified syntax and a saturated bounded result without the exact repository+branch fails closed; GitHub CLI does not support organization qualifiers"
+    error_kind: qualified_head_upstream_mismatch | qualified_head_provider_mismatch
+    exit: DATA
   default_branch_protected:
     rule: "refuse caller-controlled force-push / direct merge to repo default branch; governed repo.push-default permits only one verified fast-forward commit with an exact-old-OID compare-and-swap"
     error_kind: default_branch_protected
@@ -178,7 +182,7 @@ operations:
     schema_version: cli.forge-cli.pr.create.v1
     summary: Open a draft pull/merge request from the current branch.
     inputs:
-      - { name: --head,        type: string,         default: current-branch }
+      - { name: --head,        type: string,         default: current-branch } # GitHub-only seam: <user>:<branch>; gh does not support organization qualifiers
       - { name: --base,        type: string,         default: repo-default-branch }
       - { name: --title,       type: string,         required: true }
       - { name: --body,        type: string,         required: false }
@@ -201,6 +205,7 @@ operations:
       - label_catalog # only when --strict-labels is set
       - worktree_clean
       - head_pushed
+      - qualified_github_head # only for GitHub <user>:<branch>; binds upstream repository + provider branch/repository/SHA read-back
       - test_first_evidence # only when [test_first].require resolves true
     backends:
       github:
@@ -217,6 +222,7 @@ operations:
         url: string
         head: string
         head_sha: optional<string>
+        head_repository: optional<string>
         base: string
         draft: bool
         title: string
@@ -1296,7 +1302,7 @@ macros:
       - { name: --title,                    type: string,                       required: false }
       - { name: --body,                     type: string,                       required: false }
       - { name: --body-file,                type: path,                         required: false }
-      - { name: --head,                     type: string,                       default: current-branch }
+      - { name: --head,                     type: string,                       default: current-branch } # GitHub-only <user>:<branch> seam; user forks only
       - { name: --base,                     type: string,                       default: repo-default-branch }
       - { name: --method,                   type: enum<squash|merge|rebase>,    default: squash }
       - { name: --reviewer,                 type: list<string>,                 default: [] }
@@ -1328,6 +1334,9 @@ macros:
       # resolves true the adopt path also enforces the test_first_evidence
       # validation, so an adopted feature/bug PR cannot bypass the gate. The
       # lifecycle then resumes at wait_checks. The lookup is not a recorded step.
+      # GitHub qualified <user>:<branch> lookup instead lists a bounded open
+      # set without --head and selects exact branch + headRepository identity;
+      # provider view must then match the local SHA before adoption.
       - { step: adopt,              op: pr.view,   when: "open PR exists for head branch" }
       - { step: create,             op: pr.create, when: "no open PR exists for head branch" }
       # GitHub delivery starts required-only. When that snapshot reports zero
