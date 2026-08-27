@@ -237,6 +237,13 @@ fn push_refuses_when_the_remote_default_branch_is_unknown() {
         "the refusal names the one way to resolve this, got: {hint}"
     );
 
+    // A bare fixture remote is created with whatever `init.defaultBranch` the
+    // host happens to use, so its HEAD can point at a branch that was never
+    // pushed and `--auto` has nothing to read. A real provider remote always
+    // advertises a valid HEAD; point it at the published branch so the fixture
+    // models that rather than the host's git config.
+    git(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
     // Caching the real remote head is now the only route, and it works: the
     // remote is populated, so it has a HEAD to read.
     git(repo.path(), &["remote", "set-head", "origin", "--auto"]);
