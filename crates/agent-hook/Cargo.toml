@@ -1,6 +1,6 @@
 [package]
 name = "nils-agent-hook"
-version = "1.27.16"
+version = "1.27.17"
 edition.workspace = true
 license.workspace = true
 
@@ -21,9 +21,9 @@ clap_complete = { workspace = true }
 git2 = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
-nils-agent-docs = { version = "1.27.16", path = "../agent-docs" }
-nils-build-info = { version = "1.27.16", path = "../nils-build-info" }
-nils-common = { version = "1.27.16", path = "../nils-common", package = "nils-common" }
+nils-agent-docs = { version = "1.27.17", path = "../agent-docs" }
+nils-build-info = { version = "1.27.17", path = "../nils-build-info" }
+nils-common = { version = "1.27.17", path = "../nils-common", package = "nils-common" }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +34,6 @@ toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-nils-test-support = { version = "1.27.16", path = "../nils-test-support" }
+nils-test-support = { version = "1.27.17", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
