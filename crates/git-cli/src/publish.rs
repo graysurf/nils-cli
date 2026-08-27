@@ -39,16 +39,6 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
 }
 
 const DEFAULT_REMOTE: &str = "origin";
-/// Branch names conventionally used as a repository default. Used only to refuse
-/// an *unverifiable* push, never to admit one.
-const WELL_KNOWN_DEFAULT_BRANCHES: &[&str] = &[
-    "main",
-    "master",
-    "trunk",
-    "develop",
-    "development",
-    "default",
-];
 const PUSH_DEFAULT_HINT: &str = "pushing the default branch is a delivery decision, not a publish step; use \
      `forge-cli repo push-default` with the expected base and reason file when \
      direct-main delivery was explicitly authorized";
@@ -56,7 +46,6 @@ const PUSH_DEFAULT_HINT: &str = "pushing the default branch is a delivery decisi
 #[derive(Debug)]
 struct PushArgs {
     remote: String,
-    expect_default: Option<String>,
     force_with_lease: bool,
     bootstrap: bool,
     dry_run: bool,
@@ -170,10 +159,6 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
     // default branch is the single fact that has to be established before any
     // mutation, and failing to establish it is a refusal, not a warning.
     //
-    // `--expect-default` is an escape hatch for an uncached remote head, never a
-    // second opinion that can widen admission. Cached truth always wins, and a
-    // disagreeing assertion is a mismatch: otherwise `--expect-default develop`
-    // while standing on `main` would publish the default branch.
     // Publishing the first ref of an empty remote cannot move a default branch,
     // because there is none yet. That is the one case the resolution below can
     // never satisfy, and refusing it left a new repository with no governed way
@@ -182,47 +167,16 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
         return bootstrap_branch(args, branch);
     }
 
-    let default_branch = match (cached_default_branch(&args.remote), &args.expect_default) {
-        (Some(cached), Some(expected)) if cached != *expected => {
-            return Err(CliError::data(
-                "expect-default-mismatch",
-                format!(
-                    "--expect-default '{expected}' disagrees with the cached default \
-                     branch '{cached}' of remote '{}'",
-                    args.remote
-                ),
-            )
-            .with_hint(
-                "drop `--expect-default`; it names the default branch only when the \
-                 remote head is not cached locally",
-            ));
-        }
-        (Some(cached), _) => cached,
-        (None, Some(expected)) => {
-            // The assertion is unverifiable here, so it cannot be trusted to
-            // clear a branch that plausibly *is* a default branch.
-            if let Some(err) = empty_remote_refusal(&args.remote) {
-                return Err(err);
-            }
-            if WELL_KNOWN_DEFAULT_BRANCHES.contains(&branch.as_str()) {
-                return Err(CliError::data(
-                    "default-branch-unverifiable",
-                    format!(
-                        "'{branch}' is a conventional default-branch name and the \
-                         default branch of remote '{}' is not cached, so this push \
-                         cannot be proven safe",
-                        args.remote
-                    ),
-                )
-                .with_hint(format!(
-                    "run `git remote set-head {} --auto` to establish the real \
-                     default branch; `--expect-default` cannot admit this push",
-                    args.remote
-                )));
-            }
-            expected.clone()
-        }
-        (None, None) => {
+    // The cached remote head is the only admissible source. A caller-supplied
+    // name was accepted here once, guarded by a list of conventional default
+    // names, but that guard only ever stopped the caller who answered
+    // truthfully: naming any branch outside the list cleared the push. Now that
+    // an empty remote has `--bootstrap` and a populated one can always answer
+    // `git remote set-head <remote> --auto`, the assertion bought nothing that
+    // was not either verifiable or already covered.
+    let default_branch = match cached_default_branch(&args.remote) {
+        Some(cached) => cached,
+        None => {
             if let Some(err) = empty_remote_refusal(&args.remote) {
                 return Err(err);
             }
@@ -234,8 +188,7 @@ fn push_branch(args: &PushArgs) -> Result<PushOutput, CliError> {
                 ),
             )
             .with_hint(format!(
-                "run `git remote set-head {} --auto` to cache it, or pass \
-                 `--expect-default <branch>` to name it offline",
+                "run `git remote set-head {} --auto` to cache it",
                 args.remote
             )));
         }
@@ -879,7 +832,6 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
     let mut rest: Vec<String> = args.to_vec();
     let format = take_format(&mut rest)?;
     let mut remote = DEFAULT_REMOTE.to_string();
-    let mut expect_default = None;
     let mut force_with_lease = false;
     let mut bootstrap = false;
     let mut dry_run = false;
@@ -893,14 +845,6 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
             }
             value if value.starts_with("--remote=") => {
                 remote = value.trim_start_matches("--remote=").to_string();
-                index += 1;
-            }
-            "--expect-default" => {
-                expect_default = Some(take_value(&rest, index, "--expect-default")?);
-                index += 2;
-            }
-            value if value.starts_with("--expect-default=") => {
-                expect_default = Some(value.trim_start_matches("--expect-default=").to_string());
                 index += 1;
             }
             "--force-with-lease" => {
@@ -931,41 +875,22 @@ fn parse_push_args(args: &[String]) -> Result<PushArgs, CliError> {
             "--remote requires a value",
         ));
     }
-    if expect_default.as_deref() == Some("") {
+    // A bootstrap publish creates the remote's first ref and has no prior value
+    // to lease against, so a caller-supplied force is a contradiction rather
+    // than a no-op.
+    if bootstrap && force_with_lease {
         return Err(CliError::usage(
-            "missing-expect-default",
-            "--expect-default requires a branch name",
+            "bootstrap-conflicting-flag",
+            "--bootstrap cannot be combined with --force-with-lease",
+        )
+        .with_hint(
+            "a bootstrap publish only ever creates a ref, so there is \
+             nothing to force; drop `--force-with-lease`",
         ));
-    }
-    // A bootstrap publish creates the remote's first ref. There is no default
-    // branch to name and no prior value to lease against, so a flag that speaks
-    // to either one is a contradiction rather than a no-op.
-    if bootstrap {
-        if expect_default.is_some() {
-            return Err(CliError::usage(
-                "bootstrap-conflicting-flag",
-                "--bootstrap cannot be combined with --expect-default",
-            )
-            .with_hint(
-                "an empty remote has no default branch to name; drop \
-                 `--expect-default`",
-            ));
-        }
-        if force_with_lease {
-            return Err(CliError::usage(
-                "bootstrap-conflicting-flag",
-                "--bootstrap cannot be combined with --force-with-lease",
-            )
-            .with_hint(
-                "a bootstrap publish only ever creates a ref, so there is \
-                 nothing to force; drop `--force-with-lease`",
-            ));
-        }
     }
 
     Ok(PushArgs {
         remote,
-        expect_default,
         bootstrap,
         force_with_lease,
         dry_run,
@@ -1038,14 +963,11 @@ fn take_value(args: &[String], index: usize, flag: &str) -> Result<String, CliEr
 
 fn print_push_help() {
     println!(
-        "Usage: git-cli push [--remote <name>] [--expect-default <branch>] [--bootstrap] [--force-with-lease] [--dry-run] [--format text|json]"
+        "Usage: git-cli push [--remote <name>] [--bootstrap] [--force-with-lease] [--dry-run] [--format text|json]"
     );
     println!("  Publish the checked-out branch to its own branch on <remote> (default: origin).");
     println!("  Refuses the remote's default branch; that is `forge-cli repo push-default`'s job.");
     println!("  Sets the upstream on first publish, so the branch tracks its own ref.");
-    println!(
-        "  --expect-default names the default branch when `refs/remotes/<remote>/HEAD` is not cached."
-    );
     println!("  --bootstrap publishes the first branch of a remote proven to have no refs at all.");
 }
 
@@ -1100,26 +1022,30 @@ mod tests {
         assert_eq!(parsed.remote, "origin");
         assert!(!parsed.force_with_lease);
         assert!(!parsed.dry_run);
-        assert!(parsed.expect_default.is_none());
+        assert!(!parsed.bootstrap);
     }
 
     #[test]
     fn push_args_accept_inline_and_separated_values() {
-        let inline =
-            parse_push_args(&["--remote=upstream".into(), "--expect-default=trunk".into()])
-                .expect("parse inline");
+        let inline = parse_push_args(&["--remote=upstream".into()]).expect("parse inline");
         assert_eq!(inline.remote, "upstream");
-        assert_eq!(inline.expect_default.as_deref(), Some("trunk"));
 
-        let separated = parse_push_args(&[
-            "--remote".into(),
-            "upstream".into(),
-            "--expect-default".into(),
-            "trunk".into(),
-        ])
-        .expect("parse separated");
+        let separated =
+            parse_push_args(&["--remote".into(), "upstream".into()]).expect("parse separated");
         assert_eq!(separated.remote, "upstream");
-        assert_eq!(separated.expect_default.as_deref(), Some("trunk"));
+    }
+
+    /// The flag is gone, so it must be rejected like any other unknown word
+    /// rather than silently ignored.
+    #[test]
+    fn push_args_reject_the_removed_expect_default_flag() {
+        for argv in [
+            vec!["--expect-default".to_string(), "trunk".to_string()],
+            vec!["--expect-default=trunk".to_string()],
+        ] {
+            let err = parse_push_args(&argv).expect_err("reject");
+            assert_eq!(err.code, "unknown-argument", "argv: {argv:?}");
+        }
     }
 
     #[test]

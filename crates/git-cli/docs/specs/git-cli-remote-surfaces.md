@@ -25,8 +25,8 @@ commands close that gap by making the safe cases provable rather than inferred.
 ## `git-cli push`
 
 ```text
-git-cli push [--remote <name>] [--expect-default <branch>] [--bootstrap]
-             [--force-with-lease] [--dry-run] [--format text|json]
+git-cli push [--remote <name>] [--bootstrap] [--force-with-lease]
+             [--dry-run] [--format text|json]
 ```
 
 Publishes the checked-out branch to the same-named branch on `<remote>`
@@ -51,29 +51,25 @@ Refusals:
 | `error.code` | Condition |
 | --- | --- |
 | `detached-head` | HEAD is not attached to a branch |
-| `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached and no `--expect-default` was given |
-| `default-branch-unverifiable` | the remote head is not cached and the checked-out branch is a conventional default-branch name |
-| `expect-default-mismatch` | `--expect-default` disagrees with the cached remote head |
+| `default-branch-unresolved` | `refs/remotes/<remote>/HEAD` is not cached |
 | `refuse-default-branch` | the checked-out branch is the remote's default branch |
 | `remote-has-no-branches` | the remote advertises no refs, so `--bootstrap` is the route |
 | `bootstrap-remote-not-empty` | `--bootstrap` was passed but the remote already has refs |
-| `bootstrap-conflicting-flag` | `--bootstrap` was combined with `--expect-default` or `--force-with-lease` |
+| `bootstrap-conflicting-flag` | `--bootstrap` was combined with `--force-with-lease` |
 | `remote-unreadable` | `--bootstrap` could not list the remote's refs, so emptiness is unproven |
 | `unknown-remote` | `<remote>` is not configured |
 
-`--expect-default` names what the default branch *is* when the remote HEAD is
-not cached locally, which is the offline path. It is an escape hatch, never a
-second opinion, so it can only ever *add* a refusal:
+The cached remote head is the only admissible source for the default branch.
+A caller-supplied `--expect-default` was accepted here once, for the offline case
+where the head is not cached, guarded by a list of conventional default names.
+That guard only ever stopped the honest caller: `--expect-default main` was
+refused as unverifiable while `--expect-default trunk` cleared the very same
+push, and the caller chose the name. It has been removed rather than hardened,
+because a longer list of names cannot fix an assertion the caller controls.
 
-- when the remote head **is** cached, cached truth wins and a disagreeing
-  assertion is `expect-default-mismatch`;
-- when it is **not** cached, the assertion cannot clear a branch whose name is
-  conventionally a default (`main`, `master`, `trunk`, `develop`,
-  `development`, `default`) — that is `default-branch-unverifiable`.
-
-Without those two rules `--expect-default develop` while standing on `main`
-would publish the default branch, which is the thing this command exists to
-refuse.
+Nothing is lost. An empty remote is `--bootstrap`, and a populated one always has
+a HEAD for `git remote set-head <remote> --auto` to read, so every case the
+escape hatch covered is now either verifiable or explicitly governed.
 
 Pushing the default branch is a delivery decision, not a publish step, so
 `refuse-default-branch` points at `forge-cli repo push-default` rather than
@@ -84,9 +80,8 @@ offering a flag.
 A remote that advertises no refs has no default branch, so publishing its first
 branch cannot move one. That is the single case none of the rules above can
 satisfy: there is nothing to cache, `git remote set-head <remote> --auto` fails
-because the remote has no HEAD to read, `--expect-default` is refused as
-unverifiable for a conventional name, and `forge-cli repo push-default` needs an
-expected base that does not exist. Before `--bootstrap` a newly created
+because the remote has no HEAD to read, and `forge-cli repo push-default` needs
+an expected base that does not exist. Before `--bootstrap` a newly created
 repository could not receive its first branch through any governed surface.
 
 The safety argument is the emptiness, and it is checked against the remote with
@@ -103,8 +98,8 @@ admits only when the ref does not exist. It can create and can never overwrite,
 so the operation stays create-only even under a concurrent writer, and `forced`
 stays `false` in the result because nothing was overwritten.
 
-Because there is no default branch and no prior value to lease against,
-`--expect-default` and `--force-with-lease` are refused alongside it rather than
+A bootstrap publish only ever creates a ref, so a caller-supplied
+`--force-with-lease` is a contradiction and is refused alongside it rather than
 ignored. `default_branch` is `null` in the result, and `bootstrapped` is `true`.
 
 When the ordinary path fails only because the remote is empty, the refusal is
