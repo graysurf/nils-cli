@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `78cdb57b1afd9a5149490e4b8c92e3042bba327671e5b89e755d34b0edc9a50f`
+- Cargo.lock SHA256: `4c708b719e38d6280d5c5778286e68fa6507887153d55c7f792d4fe5fa997a7d`
 - Third-party crates (`source != null`): 496
 - Workspace crates (`source == null`, excluded below): 46
 
@@ -227,7 +227,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | itoa | 1.0.18 | MIT OR Apache-2.0 | crates.io |
 | jaq-core | 3.1.0 | MIT | crates.io |
 | jaq-json | 2.0.2 | MIT | crates.io |
-| jaq-std | 3.0.1 | MIT | crates.io |
+| jaq-std | 3.0.2 | MIT | crates.io |
 | jiff | 0.2.35 | Unlicense OR MIT | crates.io |
 | jiff-core | 0.1.0 | Unlicense OR MIT | crates.io |
 | jiff-static | 0.2.35 | Unlicense OR MIT | crates.io |
@@ -474,7 +474,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | usvg | 0.48.1 | Apache-2.0 OR MIT | crates.io |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | crates.io |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | crates.io |
-| uuid | 1.24.0 | Apache-2.0 OR MIT | crates.io |
+| uuid | 1.25.0 | Apache-2.0 OR MIT | crates.io |
 | uuid-simd | 0.8.0 | MIT | crates.io |
 | valuable | 0.1.1 | MIT | crates.io |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | crates.io |
