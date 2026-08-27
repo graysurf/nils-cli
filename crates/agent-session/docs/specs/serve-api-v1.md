@@ -378,9 +378,11 @@ recorded in `sympoies/nils-cli#1409`.
   binding before submitting that prompt. `codex_account` is rejected for other
   providers and for provider-import mode. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
   Claude provider conversation instead: it resolves the original cwd from the selected local provider history, persists exact
-  `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
+  `provider_resume` metadata, and starts tmux with the canonical resume command. A capable Codex import uses the daemon-managed
+  app-server transport so account and auto-resume controls remain available; unsupported or explicitly raw Codex runtimes retain
+  the standalone resume fallback. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
-  For a fresh serve-managed Codex session, `agent-session` probes bounded
+  For a serve-managed Codex session, including provider imports, `agent-session` probes bounded
   `codex --version` and `codex app-server --help` process groups. App-server
   transport requires Codex `>= 0.144.1` and advertised Unix `--listen` support.
   Exact protocol-attention authority is audited only for Codex `0.144.1` and

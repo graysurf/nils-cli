@@ -2423,19 +2423,40 @@ pub(crate) fn start_provider_resume_session(
         args.codex_usage_account.as_deref(),
     )?;
 
+    if let Err(err) =
+        codex_app_server::configure_runtime(context, &agent_bin, &mut created.record, true)
+    {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    let app_server_managed = codex_app_server::runtime_is_supported(&created.record);
+
     advance_owned_startup_stage(context, &mut created.record, "tmux")?;
     if let Err(err) = created.validate_session_storage() {
         cleanup_created_record(context, &created);
         return Err(err);
     }
 
-    let launch_identity = match start_resume_tmux(
-        &tmux_bin,
-        &agent_bin,
-        &context.state_dir,
-        &created.record,
-        &provider_resume.resume_args,
-    ) {
+    let launch = if app_server_managed {
+        start_interactive_tmux(
+            &tmux_bin,
+            &agent_bin,
+            args.agent,
+            &context.state_dir,
+            &created.record,
+            &provider_resume.resume_args,
+            &created.record.agent_args,
+        )
+    } else {
+        start_resume_tmux(
+            &tmux_bin,
+            &agent_bin,
+            &context.state_dir,
+            &created.record,
+            &provider_resume.resume_args,
+        )
+    };
+    let launch_identity = match launch {
         Ok(identity) => identity,
         Err(err) => {
             // The launch already failed, so cleanup is secondary state and must
