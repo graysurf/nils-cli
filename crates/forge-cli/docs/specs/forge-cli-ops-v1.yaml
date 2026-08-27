@@ -56,7 +56,7 @@ validations_catalog:
     error_kind: head_not_pushed
     exit: DATA
   qualified_github_head:
-    rule: "GitHub-only <user>:<branch> heads require one local upstream push repository on the selected GitHub authority whose owner equals <user>; post-create/adopt provider headRefName, headRefOid, and headRepository must equal the local branch, commit, and upstream repository; gh pr list lookup never receives the unsupported qualified syntax and a saturated bounded result without the exact repository+branch fails closed; GitHub CLI does not support organization qualifiers"
+    rule: "GitHub-only <user>:<branch> heads validate only a non-empty single-qualifier structure locally and delegate username grammar/account type to GitHub; they require one local upstream push repository on the selected GitHub authority whose owner equals <user>; post-create/adopt provider headRefName, headRefOid, and headRepository must equal the local branch, commit, and upstream repository; gh pr list lookup never receives the unsupported qualified syntax and a saturated bounded result without the exact repository+branch fails closed; GitHub CLI does not support organization qualifiers"
     error_kind: qualified_head_upstream_mismatch | qualified_head_provider_mismatch
     exit: DATA
   default_branch_protected:

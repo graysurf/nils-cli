@@ -659,6 +659,48 @@ fn pr_create_github_qualified_head_validates_local_suffix_and_preserves_provider
 }
 
 #[test]
+fn pr_create_github_qualified_head_accepts_managed_user_login() {
+    let tempdir = make_git_repo("github.com", "managed_user/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "managed_user:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: managed user fork",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let plan = envelope["data"]["plan"].as_array().expect("plan array");
+    let head_index = plan
+        .iter()
+        .position(|value| value == "--head")
+        .expect("--head argument");
+    assert_eq!(plan[head_index + 1], "managed_user:feat/sample");
+}
+
+#[test]
 fn pr_create_github_qualified_head_rejects_upstream_user_mismatch_before_provider() {
     let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
     let repo_path = tempdir.path().join("repo");
@@ -795,11 +837,11 @@ fn pr_create_github_qualified_head_rejects_provider_repository_mismatch() {
 }
 
 #[test]
-fn pr_create_qualified_head_is_github_only_and_rejects_invalid_owners() {
+fn pr_create_qualified_head_is_github_only_and_rejects_malformed_refs() {
     for (provider, head) in [
         ("gitlab", "fork-owner:feat/sample"),
-        ("github", "fork-owner-:feat/sample"),
-        ("github", "fork/owner:feat/sample"),
+        ("github", ":feat/sample"),
+        ("github", "fork-owner:"),
         ("github", "fork-owner:feat/sample:extra"),
     ] {
         let tempdir = make_git_repo(
@@ -843,7 +885,54 @@ fn pr_create_qualified_head_is_github_only_and_rejects_invalid_owners() {
         );
         let envelope = parse_envelope(&out.stdout);
         assert_eq!(envelope["error"]["code"], "branch_name_invalid");
+        if provider == "github" {
+            let detail = envelope["error"]["details"]["detail"]
+                .as_str()
+                .expect("qualified-head error detail");
+            assert!(detail.contains("delegates username grammar and account type to GitHub"));
+            assert!(detail.contains("does not support organization-qualified fork heads"));
+        }
     }
+}
+
+#[test]
+fn pr_create_qualified_head_remains_rejected_for_local_provider() {
+    let tempdir = make_git_repo("github.com", "sympoies/nils-cli");
+    let repo_path = tempdir.path().join("repo");
+    let store_root = tempdir.path().join("local-store");
+    let store_root = store_root.to_string_lossy();
+    let stub = StubEnv::new();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "local",
+            "--repo",
+            "local:sympoies/nils-cli",
+            "--store-root",
+            store_root.as_ref(),
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "create",
+            "--head",
+            "managed_user:feat/sample",
+            "--base",
+            "main",
+            "--title",
+            "feat: local qualified head",
+            "--kind",
+            "feature",
+            "--body",
+            well_formed_body(),
+        ],
+    );
+
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "provider_unsupported");
 }
 
 #[test]

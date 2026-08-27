@@ -209,21 +209,13 @@ pub(crate) fn resolve_head_ref<'a>(
         });
     }
 
-    let owner_bytes = owner.as_bytes();
-    let owner_is_valid = !owner_bytes.is_empty()
-        && owner_bytes.len() <= 39
-        && owner_bytes[0].is_ascii_alphanumeric()
-        && owner_bytes[owner_bytes.len() - 1].is_ascii_alphanumeric()
-        && owner_bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-');
-    if !owner_is_valid || branch.is_empty() || branch.contains(':') {
+    if owner.is_empty() || branch.is_empty() || branch.contains(':') {
         return Err(ForgeError::validation(
             schema_err(),
             "branch_name_invalid",
             format!("GitHub head '{head}' is not a valid <user>:<branch> reference"),
             Some(
-                "rule=<github-user>:<(feat|fix|chore|docs|ci|refactor)/semantic-branch>; GitHub CLI does not support organization-qualified fork heads"
+                "rule=<non-empty-github-user>:<(feat|fix|chore|docs|ci|refactor)/semantic-branch> with exactly one qualifier; forge-cli delegates username grammar and account type to GitHub; GitHub CLI does not support organization-qualified fork heads"
                     .to_string(),
             ),
         ));

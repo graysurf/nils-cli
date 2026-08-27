@@ -387,8 +387,11 @@ backend mapping, validation rules, and output schema versions.
 Qualified heads are deliberately a GitHub-only user-fork seam. GitHub CLI's
 `gh pr create --head` contract accepts `<user>:<branch>` but does not support
 an organization as the qualifier. `forge-cli` therefore does not advertise
-`<owner>:<branch>` or organization-fork support; provider rejection remains
-authoritative for account-type distinctions that cannot be proven offline.
+`<owner>:<branch>` or organization-fork support. It validates only the
+non-empty, single-qualifier structure locally, so provider-valid Enterprise
+Managed User logins (including underscore suffixes) reach GitHub; provider
+rejection remains authoritative for username grammar and account-type
+distinctions that cannot be proven offline.
 
 ### `repo push-default`
 
