@@ -131,7 +131,10 @@ history. When a profile is selected, it must advertise import support and
 discovery is confined to that profile's provider root. In either import mode,
 omit `cwd`, `prompt`, `agent_args`, and `codex_account`; the daemon resolves the
 original working directory and exact provider metadata from the selected
-history source.
+history source. A capable Codex import uses the same daemon-managed app-server
+runtime as a fresh Codex session, preserving account and auto-resume controls;
+an unsupported or explicitly raw Codex runtime keeps the standalone resume
+fallback.
 
 The server owns executable paths, provider configuration roots, readiness
 commands, and auto-resume capability. Clients select only advertised safe IDs

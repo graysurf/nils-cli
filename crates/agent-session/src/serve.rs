@@ -15383,15 +15383,28 @@ esac
     async fn create_imports_codex_session_from_provider_resume_id() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("cx-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let cwd = tmp.path().join("repo");
         let codex_home = tmp.path().join("codex-home");
+        fs::set_permissions(runtime_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         write_codex_session_meta(&codex_home, "external-codex-id", &cwd);
         let log = tmp.path().join("tmux.log");
         let tmux = logging_tmux(tmp.path(), &log);
-        let codex = fake_agent(tmp.path(), "codex");
+        let codex = executable(
+            &tmp.path().join("codex"),
+            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
+        );
         let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_dir = EnvGuard::set(
+            &lock,
+            "XDG_RUNTIME_DIR",
+            runtime_dir.path().to_str().unwrap(),
+        );
         let st = state(tmp.path(), Some(TOKEN), tmux);
 
         let (status, body) = call(
@@ -15424,6 +15437,8 @@ esac
         assert_eq!(session["cwd"], cwd.to_string_lossy().as_ref());
         assert_eq!(session["status"], "running");
         assert_eq!(session["resumable"], true);
+        assert_eq!(session["auto_resume"]["supported"], true);
+        assert_eq!(session["codex_account"]["supported"], true);
         assert_eq!(
             session["provider_resume"]["session_id"],
             "external-codex-id"
@@ -15458,6 +15473,61 @@ esac
                 .is_file(),
             "import must persist durable resume metadata"
         );
+        let record: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("sessions/imported-codex/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["runtime"]["kind"], codex_app_server::RUNTIME_KIND);
+        assert_eq!(
+            record["runtime"][codex_app_server::PROTOCOL_KEY],
+            codex_app_server::PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn create_imports_unsupported_codex_session_with_standalone_resume() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_codex_session_meta(&codex_home, "standalone-codex-id", &cwd);
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let codex = fake_agent(tmp.path(), "codex");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "standalone-codex",
+                    "provider_resume_id": "standalone-codex-id"
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["auto_resume"]["supported"], false);
+        assert_eq!(session["codex_account"]["supported"], false);
+        let record: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("sessions/standalone-codex/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["runtime"]["kind"], "tmux");
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(
+            calls.contains("resume standalone-codex-id"),
+            "unsupported import must retain the standalone provider resume path: {calls:?}"
+        );
+        assert!(!calls.contains("agent-session-codex-app-server"));
     }
 
     #[tokio::test]
