@@ -1,6 +1,6 @@
 [package]
 name = "nils-macos-agent"
-version = "1.27.14"
+version = "1.27.15"
 edition.workspace = true
 license.workspace = true
 
@@ -18,16 +18,16 @@ path = "src/main.rs"
 base64 = "0.23"
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.27.14", path = "../nils-build-info" }
+nils-build-info = { version = "1.27.15", path = "../nils-build-info" }
 jiff = { workspace = true }
 libc = "0.2"
 roxmltree = "0.21"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-nils-common = { version = "1.27.14", path = "../nils-common", package = "nils-common" }
+nils-common = { version = "1.27.15", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-nils-test-support = { version = "1.27.14", path = "../nils-test-support" }
+nils-test-support = { version = "1.27.15", path = "../nils-test-support" }
 tempfile = "3"
