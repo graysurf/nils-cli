@@ -92,9 +92,16 @@ repository could not receive its first branch through any governed surface.
 The safety argument is the emptiness, and it is checked against the remote with
 `git ls-remote`, never inferred from local state — a fresh clone has no
 remote-tracking refs either. Emptiness that cannot be established is
-`remote-unreadable`, not an assumption. The push itself is an ordinary
-create-only push with no force of any kind, so a remote that gained a ref
-between the check and the push rejects it as a non-fast-forward.
+`remote-unreadable`, not an assumption.
+
+The check and the push are two round trips, and a plain push would not close the
+gap between them: if the remote gained this branch in between, a plain push
+*fast-forwards* it rather than refusing, which is exactly the default-branch
+write this command must never make. The push therefore carries
+`--force-with-lease=refs/heads/<branch>:` — an empty expected value, which Git
+admits only when the ref does not exist. It can create and can never overwrite,
+so the operation stays create-only even under a concurrent writer, and `forced`
+stays `false` in the result because nothing was overwritten.
 
 Because there is no default branch and no prior value to lease against,
 `--expect-default` and `--force-with-lease` are refused alongside it rather than

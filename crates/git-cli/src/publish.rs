@@ -364,9 +364,16 @@ fn empty_remote_refusal(remote: &str) -> Option<CliError> {
 ///
 /// The safety argument is the emptiness itself, checked against the remote
 /// rather than inferred from local state, so it does not depend on the branch
-/// name or on any cached head. Nothing is forced: if the remote gained a ref
-/// between the check and the push, Git rejects the non-fast-forward and the
-/// operation fails closed.
+/// name or on any cached head.
+///
+/// The emptiness check and the push are two round trips, and a plain push would
+/// not close the gap between them: if the remote gained this branch in between,
+/// a plain push *fast-forwards* it rather than refusing, which is exactly the
+/// default-branch write this command must never make. The push therefore
+/// carries a create-only lease — `--force-with-lease=refs/heads/<branch>:` with
+/// an empty expected value, which Git admits only when the ref does not exist.
+/// It can create and can never overwrite, so the operation stays create-only
+/// even under a concurrent writer.
 fn bootstrap_branch(args: &PushArgs, branch: String) -> Result<PushOutput, CliError> {
     match remote_has_no_refs(&args.remote) {
         Some(true) => {}
@@ -418,7 +425,8 @@ fn bootstrap_branch(args: &PushArgs, branch: String) -> Result<PushOutput, CliEr
         });
     }
 
-    let mut argv: Vec<&str> = vec!["push", "--quiet"];
+    let lease = create_only_lease(&branch);
+    let mut argv: Vec<&str> = vec!["push", "--quiet", &lease];
     if !upstream_is_own_ref(&args.remote, &branch) {
         argv.push("--set-upstream");
     }
@@ -440,8 +448,15 @@ fn bootstrap_branch(args: &PushArgs, branch: String) -> Result<PushOutput, CliEr
         created_remote_branch: true,
         bootstrapped: true,
         upstream,
+        // The lease can only create, never overwrite, so nothing was forced.
         forced: false,
     })
+}
+
+/// A `--force-with-lease` whose expected value is empty, which Git admits only
+/// when the named ref does not exist yet.
+fn create_only_lease(branch: &str) -> String {
+    format!("--force-with-lease=refs/heads/{branch}:")
 }
 
 // ---------------------------------------------------------- sync-default
@@ -1062,6 +1077,22 @@ fn print_sync_branch_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty expected value is the whole point: Git admits the push only
+    /// when the ref does not exist, so a bootstrap can create and can never
+    /// overwrite. A plain push would fast-forward an existing branch instead,
+    /// which is the one write this command must never make.
+    #[test]
+    fn bootstrap_lease_is_create_only() {
+        assert_eq!(
+            create_only_lease("main"),
+            "--force-with-lease=refs/heads/main:"
+        );
+        assert_eq!(
+            create_only_lease("feat/topic"),
+            "--force-with-lease=refs/heads/feat/topic:"
+        );
+    }
 
     #[test]
     fn push_args_default_to_origin_and_no_mutation_modifiers() {
