@@ -914,7 +914,7 @@ lane, and a typed runtime fault is handled per lane:
 | Lane | Events | Behavior on a typed runtime fault |
 | --- | --- | --- |
 | conversation | `UserPromptSubmit`, `SessionStart` | degrade to read-only with `coordination-degraded-read-only` |
-| audited read-only | `PreToolUse` whose in-process effect is exactly `read_only` | an activity fault warns and later authoritative rules still run |
+| audited read-only | `PreToolUse` whose in-process effect is exactly `read_only` | warn with `activity-degraded-audited-read-only`; later authoritative rules still run |
 | terminal | `Stop`, `StopFailure` | terminal warning with reconciliation-pending evidence |
 | mutation | every other event | unchanged fail-closed posture |
 
@@ -923,8 +923,9 @@ Only faults with a known recovery path are degradable:
 `runtime-version-skew`, and `activity-helper-unresolvable`. An unrecognized error
 keeps the existing fail-closed handling rather than being degraded on a guess.
 Within `agent-session.activity.v1`, the same bounded handling additionally
-recognizes its own helper and execution faults. An incomplete managed identity
-is never a degradation authority: it returns
+recognizes its own helper and execution faults. An incomplete managed identity,
+including selectorless identity while trusted managed metadata remains, is never
+a degradation authority: it returns
 `session-activity-identity-incomplete` and refuses provider work until the
 trusted launcher establishes the exact session/runtime pair.
 Bare `pwd` with no arguments or only `-L`/`-P`/`--logical`/`--physical` is the
@@ -932,7 +933,9 @@ initial audited Bash probe; composition, operands, or unknown options remain `un
 durable `advisory` or `off` mode may warn for another activity fault, but this
 does not change any other rule or admit an enforce-mode mutation.
 
-A degraded decision carries the fault code first, then the lane code, so
+A degraded decision carries the fault code first, then the stable lane code
+(`coordination-degraded-read-only`, `activity-degraded-audited-read-only`, or
+`activity-degraded-advisory-off`), so
 diagnostics keep the precise cause. Its human context states one primary
 diagnosis and one safe next action instead of a comma-separated list of every
 selected policy; the full reason list remains available in `--format json` and on

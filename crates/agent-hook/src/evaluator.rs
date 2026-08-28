@@ -35,6 +35,8 @@ const TYPED_BOOTSTRAP_AUTHORIZATION_SCHEMA: &str =
 const TYPED_BOOTSTRAP_AUTHORIZATION_CODE: &str = "typed-main-agent-bootstrap-authorized";
 pub(crate) const ACTIVITY_STOP_RECONCILIATION_REQUIRED: &str =
     "activity-stop-reconciliation-required";
+const ACTIVITY_DEGRADED_AUDITED_READ_ONLY: &str = "activity-degraded-audited-read-only";
+const ACTIVITY_DEGRADED_ADVISORY_OFF: &str = "activity-degraded-advisory-off";
 /// Environment variable that overrides how the activity helper is resolved.
 const HELPER_BIN_ENV: &str = "AGENT_SESSION_BIN";
 /// `PATH`-resolvable name of the activity capability helper.
@@ -406,7 +408,15 @@ fn evaluate_with_io(
     };
     let coordination_mode = liveness
         .as_ref()
-        .and_then(liveness::DispatchProjection::mode);
+        .and_then(liveness::DispatchProjection::mode)
+        .or_else(|| {
+            prepared
+                .rules
+                .iter()
+                .any(|prepared| activity_capability(&prepared.rule.capability))
+                .then(liveness::coordination_failure_mode)
+                .flatten()
+        });
     let mut read_only_bypassed_rule_ids = BTreeSet::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
@@ -501,6 +511,7 @@ fn evaluate_with_io(
             ));
             continue;
         }
+        let mut activity_lane_reason = None;
         let outcome = match evaluate_capability(
             &rule.capability,
             request,
@@ -512,7 +523,7 @@ fn evaluate_with_io(
             Err(error)
                 if activity_recovery_candidate
                     && activity_capability(&rule.capability)
-                    && activity_recovery_failure_is_deferrable(&error) =>
+                    && activity_runtime_fault(&error) =>
             {
                 simple(
                     DecisionAction::Allow,
@@ -543,11 +554,13 @@ fn evaluate_with_io(
                     &error,
                 ) =>
             {
-                activity_degradation_outcome(
+                let (outcome, lane_reason) = activity_degradation_outcome(
                     request,
                     operation_effect == OperationEffectClass::ReadOnly,
                     &error,
-                )
+                );
+                activity_lane_reason = Some(lane_reason);
+                outcome
             }
             Err(error) if error.code == "capability-timeout" => timeout_outcome(
                 loaded,
@@ -567,6 +580,9 @@ fn evaluate_with_io(
             ),
         };
         enforced.push((rule.id.clone(), outcome));
+        if let Some(code) = activity_lane_reason {
+            enforced.push((rule.id.clone(), simple(DecisionAction::Warn, code)));
+        }
     }
 
     let decision = aggregate(loaded, request, enforced, shadow, recovery_applied)?;
@@ -630,32 +646,44 @@ fn activity_degradation_outcome(
     request: &NormalizedRequest,
     read_only: bool,
     error: &HookError,
-) -> RuleOutcome {
+) -> (RuleOutcome, &'static str) {
     let conversation =
         crate::degradation::lane(request.event.as_str()) == crate::degradation::Lane::Conversation;
-    let availability = if conversation {
-        "Conversation remains available in a read-only degraded lane; no mutation authority was granted."
+    let (availability, lane_reason) = if conversation {
+        (
+            "Conversation remains available in a read-only degraded lane; no mutation authority was granted.",
+            crate::degradation::CONVERSATION_DEGRADED,
+        )
     } else if read_only {
-        "This audited read-only operation remains available; no mutation authority was granted."
+        (
+            "This audited read-only operation remains available; no mutation authority was granted.",
+            ACTIVITY_DEGRADED_AUDITED_READ_ONLY,
+        )
     } else {
-        "Advisory/off coordination does not make activity metadata an admission authority; every other safety and mutation gate remains authoritative."
+        (
+            "Advisory/off coordination does not make activity metadata an admission authority; every other safety and mutation gate remains authoritative.",
+            ACTIVITY_DEGRADED_ADVISORY_OFF,
+        )
     };
     crate::observe::Record::new("activity", &error.code, crate::observe::Severity::Warn)
         .provider(request.product, &request.event)
         .disposition("warn")
         .recovery(crate::observe::RECOVERY_HOOK_DOCTOR)
         .emit();
-    RuleOutcome {
-        action: DecisionAction::Warn,
-        code: error.code.clone(),
-        context: Some(format!(
-            "agent-hook activity metadata is unavailable ({}). {availability} Next: {}.",
-            error.code,
-            crate::observe::RECOVERY_HOOK_DOCTOR
-        )),
-        replacement: None,
-        provider_output: None,
-    }
+    (
+        RuleOutcome {
+            action: DecisionAction::Warn,
+            code: error.code.clone(),
+            context: Some(format!(
+                "agent-hook activity metadata is unavailable ({}). {availability} Next: {}.",
+                error.code,
+                crate::observe::RECOVERY_HOOK_DOCTOR
+            )),
+            replacement: None,
+            provider_output: None,
+        },
+        lane_reason,
+    )
 }
 
 fn exact_capability_recovery_candidate_for_session_coordination(
@@ -667,18 +695,6 @@ fn exact_capability_recovery_candidate_for_session_coordination(
         && request.event == "PreToolUse"
         && request.matcher.as_deref() == Some("Bash")
         && crate::adapter::exact_main_agent_capability_recovery_command(raw)
-}
-
-fn activity_recovery_failure_is_deferrable(error: &HookError) -> bool {
-    matches!(
-        error.code.as_str(),
-        "session-activity-failed"
-            | "capability-unavailable"
-            | "capability-timeout"
-            | "capability-wait-failed"
-            | "capability-input-failed"
-            | "capability-output-failed"
-    )
 }
 
 fn exact_bootstrap_candidate_for_session_coordination(
@@ -906,7 +922,7 @@ pub(crate) fn terminal_activity_failure_decision(
     capability: &Capability,
     event: &str,
 ) -> Option<(DecisionAction, &'static str)> {
-    (event == "Stop" && activity_capability(capability))
+    (matches!(event, "Stop" | "StopFailure") && activity_capability(capability))
         .then_some((DecisionAction::Warn, ACTIVITY_STOP_RECONCILIATION_REQUIRED))
 }
 
@@ -1516,7 +1532,14 @@ fn run_session_activity(
         ));
     }
     let (Some(session_id), Some(runtime_id)) = (session_id, runtime_id) else {
-        return Ok(());
+        return if crate::liveness::current_process_is_unmanaged() {
+            Ok(())
+        } else {
+            Err(HookError::data(
+                "session-activity-identity-incomplete",
+                "managed activity requires both session and runtime identity",
+            ))
+        };
     };
     let Some(event) = crate::adapter::normalize_activity_event(request, raw, &runtime_id)? else {
         return Ok(());
@@ -1556,8 +1579,8 @@ fn resolve_activity_helper() -> Result<std::ffi::OsString, HookError> {
     if let Some(override_path) = std::env::var_os(HELPER_BIN_ENV)
         && !override_path.is_empty()
     {
-        if executable_file(Path::new(&override_path)) {
-            return Ok(override_path);
+        if let Some(candidate) = canonical_executable(Path::new(&override_path)) {
+            return Ok(candidate.into_os_string());
         }
         crate::observe::Record::new(
             "activity",
@@ -1587,13 +1610,20 @@ pub(crate) fn locate_activity_helper() -> Option<PathBuf> {
     if let Some(override_path) = std::env::var_os(HELPER_BIN_ENV).filter(|value| !value.is_empty())
     {
         let candidate = PathBuf::from(override_path);
-        if executable_file(&candidate) {
+        if let Some(candidate) = canonical_executable(&candidate) {
             return Some(candidate);
         }
     }
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|directory| directory.join(ACTIVITY_HELPER))
-        .find(|candidate| executable_file(candidate))
+        .find_map(|candidate| canonical_executable(&candidate))
+}
+
+fn canonical_executable(path: &Path) -> Option<PathBuf> {
+    executable_file(path)
+        .then(|| fs::canonicalize(path).ok())
+        .flatten()
+        .filter(|path| executable_file(path))
 }
 
 /// Whether a path is a regular file the effective user can execute.
@@ -2121,6 +2151,41 @@ mod tests {
                 set_env(name, value);
             }
         }
+    }
+
+    #[test]
+    fn activity_helper_resolution_survives_cwd_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = std::env::current_dir().expect("current directory");
+        let temp = tempfile::Builder::new()
+            .prefix("activity-helper-")
+            .tempdir_in(&current)
+            .expect("tempdir");
+        let helper_root = temp.path();
+        let other = temp.path().join("other");
+        let bin = helper_root.join("bin");
+        fs::create_dir_all(&bin).expect("helper bin");
+        fs::create_dir_all(&other).expect("other cwd");
+        let helper = bin.join(ACTIVITY_HELPER);
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+
+        let relative = helper
+            .strip_prefix(&current)
+            .expect("helper relative to process cwd");
+        let resolved = canonical_executable(relative).expect("resolved helper");
+        assert!(resolved.is_absolute(), "resolved={}", resolved.display());
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&helper).expect("canonical helper")
+        );
+
+        let status = Command::new(&resolved)
+            .current_dir(&other)
+            .status()
+            .expect("run resolved helper after cwd drift");
+        assert!(status.success());
     }
 
     #[test]

@@ -92,19 +92,19 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
     let Some(program) = words.first() else {
         return OperationEffectClass::Unknown;
     };
-    let Some(name) = Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-    else {
-        return OperationEffectClass::Unknown;
-    };
-    if name == "pwd"
+    if trusted_pwd(program)
         && words[1..]
             .iter()
             .all(|arg| matches!(arg.as_str(), "-L" | "-P" | "--logical" | "--physical"))
     {
         return OperationEffectClass::ReadOnly;
     }
+    let Some(name) = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return OperationEffectClass::Unknown;
+    };
     if name == "forge-cli" && words.get(1).map(String::as_str) == Some("repo") {
         return OperationEffectClass::ExternalMutation;
     }
@@ -430,7 +430,11 @@ fn full_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn trusted_sibling(program: &str) -> bool {
+fn trusted_pwd(program: &str) -> bool {
+    matches!(program, "pwd" | "/bin/pwd" | "/usr/bin/pwd")
+}
+
+pub(crate) fn trusted_sibling(program: &str) -> bool {
     let candidate = if Path::new(program).components().count() > 1 {
         PathBuf::from(program)
     } else {
@@ -577,7 +581,13 @@ mod tests {
                 "command={command}"
             );
         }
-        for command in ["pwd target", "pwd --unknown", "pwd; touch changed"] {
+        for command in [
+            "pwd target",
+            "pwd --unknown",
+            "pwd; touch changed",
+            "./pwd",
+            "/tmp/pwd -P",
+        ] {
             assert_eq!(
                 classify_command(command, &request),
                 OperationEffectClass::Unknown,

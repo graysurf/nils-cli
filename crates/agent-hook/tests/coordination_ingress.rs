@@ -248,6 +248,58 @@ fn exact_recovery_reaches_authenticated_coordination_when_activity_is_stale() {
 }
 
 #[test]
+fn exact_recovery_reaches_coordination_when_the_activity_helper_is_unresolvable() {
+    let fixture = Fixture::new(&activity_recovery_policy(true));
+    install_coordination_handler(&fixture);
+    let capture = fixture.root.join("missing-helper-recovery.json");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "recover-without-activity-helper",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "main-agent self recover --idempotency-key recover-12345678 --format json"
+        }
+    })
+    .to_string();
+    let recovered = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("AGENT_SESSION_BIN", "/missing/agent-session"),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            ("PATH", "/usr/bin:/bin"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(
+        recovered.code,
+        0,
+        "missing activity helper must defer exact recovery: stdout={} stderr={}",
+        recovered.stdout_text(),
+        recovered.stderr_text()
+    );
+    assert_eq!(recovered.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][0]["code"],
+        "activity-recovery-deferred-to-coordination"
+    );
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][1]["code"],
+        "coordination-admitted"
+    );
+    assert_eq!(
+        fs::read_to_string(capture).expect("captured recovery request"),
+        payload
+    );
+}
+
+#[test]
 fn activity_recovery_degradation_requires_exact_shape_and_coordination() {
     let fixture = Fixture::new(&activity_recovery_policy(true));
     let activity = fixture.root.join("agent-session-stale-activity");
@@ -467,8 +519,24 @@ fn activity_metadata_failure_obeys_the_trusted_coordination_mode() {
             assert!(!capture.exists(), "enforce fault reached coordination");
         } else {
             assert_eq!(
-                decision.stdout_json()["data"]["reasons"][0]["code"],
-                "session-activity-failed",
+                decision.stdout_json()["data"]["reasons"],
+                json!([
+                    {
+                        "rule_id": "runtime.activity",
+                        "code": "session-activity-failed",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "runtime.activity",
+                        "code": "activity-degraded-advisory-off",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "runtime.coordination",
+                        "code": "coordination-admitted",
+                        "disposition": "allow"
+                    }
+                ]),
                 "mode={mode}"
             );
             assert!(capture.exists(), "mode={mode} skipped later authority");
