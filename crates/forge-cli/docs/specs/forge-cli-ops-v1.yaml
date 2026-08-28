@@ -461,6 +461,7 @@ operations:
         url: string
         total: integer
         unresolved: integer
+        completeness: { threads: boolean, comments: boolean }
         threads: list<{id,resolved,outdated,author,path,diff_side?,line?,original_line?,original_start_line?,start_diff_side?,start_line?,subject_type?,created_at,url,body,comments}>
 
   - id: pr.review-threads.resolve

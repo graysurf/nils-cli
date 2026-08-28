@@ -524,9 +524,17 @@ distinctions that cannot be proven offline.
 - Text output includes the same thread id on each thread line so terminal users
   can copy the `--thread` value without switching to JSON.
 - GitHub thread and per-thread comment connections are independently paginated.
-  The PR head and thread identity must remain stable across the complete read;
-  partial GraphQL results, missing required anchor/state fields, cursor loops,
-  or head drift fail closed as `review_snapshot_incomplete`.
+  Pagination continues until each provider connection is exhausted, without a
+  fixed page-count ceiling. Paginated connections must expose a stable
+  `totalCount`, and each page must make bounded progress toward it. The PR head
+  and thread identity must remain stable across the complete read; partial
+  GraphQL results, missing required anchor/state fields, cursor loops, count
+  mismatch, or head drift fail closed as `review_snapshot_incomplete`.
+- Successful JSON snapshots include
+  `data.completeness = { threads: true, comments: true }`. Internal callers that
+  intentionally fetch only root-comment fingerprints return `comments: false`,
+  so automation can require complete reply context without inferring it from a
+  thread count or page size.
 - `--dry-run` emits the planned thread-list backend call without running the
   preliminary PR/MR view lookup or touching the provider network. It resolves
   the repo/project from `--repo` or the configured remote URL.
