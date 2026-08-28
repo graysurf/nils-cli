@@ -443,7 +443,7 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
                     )),
                 ));
             }
-            hydrate_deferred_comment_sides(runner, ctx, &mut snapshot)?;
+            hydrate_deferred_comment_sides(runner, ctx, &mut snapshot, expected_state)?;
             ensure_pending_snapshot_within_limits(&snapshot, review_id)?;
             classify_pending_snapshot(&mut snapshot)?;
             snapshot.snapshot_digest = pending_snapshot_digest(&snapshot)?;
@@ -1124,6 +1124,7 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
     snapshot: &mut PendingReviewSnapshot,
+    expected_state: &str,
 ) -> Result<(), ForgeError> {
     let needs_recovery = snapshot.inline_comments.iter().any(|comment| {
         comment.subject_type == "LINE"
@@ -1149,11 +1150,30 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
         ctx,
         &snapshot.pr_url,
         snapshot.number,
+        &snapshot.review_id,
         &requested_ids,
     )?;
     if recovered.head_sha != snapshot.head_sha {
         return Err(snapshot_incomplete(
             "the PR head changed while recovering pending review comment anchors",
+            Some(format!("review_id={}", snapshot.review_id)),
+        ));
+    }
+    let review = &recovered.review;
+    if review.number != snapshot.number
+        || review.pr_url != snapshot.pr_url
+        || review.head_sha != snapshot.head_sha
+        || review.review_id != snapshot.review_id
+        || review.review_url != snapshot.review_url
+        || review.author != snapshot.author
+        || review.state != expected_state
+        || review.commit_sha != snapshot.commit_sha
+        || review.body != snapshot.body
+        || review.viewer_did_author != snapshot.viewer_did_author
+        || review.viewer_can_delete != snapshot.viewer_can_delete
+    {
+        return Err(snapshot_incomplete(
+            "pending review metadata changed while recovering comment anchors",
             Some(format!("review_id={}", snapshot.review_id)),
         ));
     }
@@ -1867,7 +1887,23 @@ mod tests {
     fn truncated_comment_thread(path: &str, comment_id: &str) -> BackendSuccess {
         BackendSuccess {
             stdout: serde_json::json!({
-                "data": {"repository": {"pullRequest": {
+                "data": {
+                    "review": {
+                        "id": "PRR_pending",
+                        "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-9",
+                        "author": {"login": "review-bot"},
+                        "state": "PENDING",
+                        "commit": {"oid": "head-7"},
+                        "body": "Summary",
+                        "viewerDidAuthor": true,
+                        "viewerCanDelete": true,
+                        "pullRequest": {
+                            "number": 7,
+                            "url": "https://github.com/acme/widgets/pull/7",
+                            "headRefOid": "head-7"
+                        }
+                    },
+                    "repository": {"pullRequest": {
                     "headRefOid": "head-7",
                     "reviewThreads": {
                         "nodes": [{
@@ -1895,11 +1931,72 @@ mod tests {
                         }],
                         "pageInfo": {"hasNextPage": false, "endCursor": null}
                     }
-                }}}
+                }}
+                }
             })
             .to_string(),
             stderr: String::new(),
         }
+    }
+
+    fn mixed_pending_snapshot_and_threads(
+        direct_thread_body: &str,
+    ) -> (BackendSuccess, BackendSuccess) {
+        let mut pending = truncated_pending_snapshot_page();
+        let mut pending_value: serde_json::Value =
+            serde_json::from_str(&pending.stdout).expect("pending fixture");
+        pending_value["data"]["node"]["comments"]["totalCount"] = 2.into();
+        pending_value["data"]["node"]["comments"]["nodes"]
+            .as_array_mut()
+            .expect("pending comments")
+            .push(serde_json::json!({
+                "id": "PRRC_direct",
+                "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct",
+                "author": {"login": "review-bot"},
+                "body": "direct-side finding",
+                "createdAt": "2026-07-20T12:00:00Z",
+                "path": "src/direct.rs",
+                "line": 12,
+                "originalLine": 12,
+                "diffSide": "RIGHT",
+                "startLine": null,
+                "originalStartLine": null,
+                "startDiffSide": null,
+                "subjectType": "LINE"
+            }));
+        pending.stdout = pending_value.to_string();
+
+        let mut threads = truncated_comment_thread("src/new.rs", "PRRC_truncated");
+        let mut thread_value: serde_json::Value =
+            serde_json::from_str(&threads.stdout).expect("thread fixture");
+        thread_value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            .as_array_mut()
+            .expect("review threads")
+            .push(serde_json::json!({
+                "id": "PRRT_direct",
+                "isResolved": false,
+                "isOutdated": false,
+                "path": "src/direct.rs",
+                "diffSide": "RIGHT",
+                "line": 12,
+                "originalLine": 12,
+                "originalStartLine": null,
+                "startDiffSide": null,
+                "startLine": null,
+                "subjectType": "LINE",
+                "comments": {
+                    "nodes": [{
+                        "id": "PRRC_direct",
+                        "author": {"login": "review-bot"},
+                        "body": direct_thread_body,
+                        "createdAt": "2026-07-20T12:00:00Z",
+                        "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct"
+                    }],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}
+                }
+            }));
+        threads.stdout = thread_value.to_string();
+        (pending, threads)
     }
 
     #[test]
@@ -1965,62 +2062,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_snapshot_recovery_rejects_cross_read_review_metadata_drift() {
+        let mut thread = truncated_comment_thread("src/new.rs", "PRRC_truncated");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&thread.stdout).expect("thread fixture");
+        value["data"]["review"]["body"] = "changed between provider reads".into();
+        thread.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![truncated_pending_snapshot_page(), thread]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("cross-read review metadata drift must fail before snapshot authority");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(
+            error.to_string().contains("metadata changed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn pending_snapshot_recovery_rejects_drift_in_a_non_deferred_comment() {
-        let mut pending = truncated_pending_snapshot_page();
-        let mut pending_value: serde_json::Value =
-            serde_json::from_str(&pending.stdout).expect("pending fixture");
-        pending_value["data"]["node"]["comments"]["totalCount"] = 2.into();
-        pending_value["data"]["node"]["comments"]["nodes"]
-            .as_array_mut()
-            .expect("pending comments")
-            .push(serde_json::json!({
-                "id": "PRRC_direct",
-                "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct",
-                "author": {"login": "review-bot"},
-                "body": "direct-side finding",
-                "createdAt": "2026-07-20T12:00:00Z",
-                "path": "src/direct.rs",
-                "line": 12,
-                "originalLine": 12,
-                "diffSide": "RIGHT",
-                "startLine": null,
-                "originalStartLine": null,
-                "startDiffSide": null,
-                "subjectType": "LINE"
-            }));
-        pending.stdout = pending_value.to_string();
-
-        let mut threads = truncated_comment_thread("src/new.rs", "PRRC_truncated");
-        let mut thread_value: serde_json::Value =
-            serde_json::from_str(&threads.stdout).expect("thread fixture");
-        thread_value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-            .as_array_mut()
-            .expect("review threads")
-            .push(serde_json::json!({
-                "id": "PRRT_direct",
-                "isResolved": false,
-                "isOutdated": false,
-                "path": "src/direct.rs",
-                "diffSide": "RIGHT",
-                "line": 12,
-                "originalLine": 12,
-                "originalStartLine": null,
-                "startDiffSide": null,
-                "startLine": null,
-                "subjectType": "LINE",
-                "comments": {
-                    "nodes": [{
-                        "id": "PRRC_direct",
-                        "author": {"login": "review-bot"},
-                        "body": "changed between provider reads",
-                        "createdAt": "2026-07-20T12:00:00Z",
-                        "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct"
-                    }],
-                    "pageInfo": {"hasNextPage": false, "endCursor": null}
-                }
-            }));
-        threads.stdout = thread_value.to_string();
-
+        let (pending, threads) =
+            mixed_pending_snapshot_and_threads("changed between provider reads");
         let runner = ScriptedRunner::new(vec![pending, threads]);
         let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
             .expect_err("every inline comment must be stable across provider reads");
@@ -2030,6 +2093,63 @@ mod tests {
             error.to_string().contains("identity differs"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn pending_snapshot_recovers_a_stable_mixed_comment_set() {
+        let (pending, threads) = mixed_pending_snapshot_and_threads("direct-side finding");
+        let runner = ScriptedRunner::new(vec![pending, threads]);
+
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("stable mixed comments should authenticate together")
+            .expect("pending snapshot");
+
+        assert_eq!(snapshot.inline_comments.len(), 2);
+        assert_eq!(
+            snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert_eq!(
+            snapshot.inline_comments[1].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert_eq!(snapshot.inline_comments[1].body, "direct-side finding");
+    }
+
+    #[test]
+    fn pending_snapshot_authenticates_a_file_comment_during_line_recovery() {
+        let (mut pending, mut threads) = mixed_pending_snapshot_and_threads("direct-side finding");
+        let mut pending_value: serde_json::Value =
+            serde_json::from_str(&pending.stdout).expect("pending fixture");
+        let file_comment = &mut pending_value["data"]["node"]["comments"]["nodes"][1];
+        file_comment["diffSide"] = serde_json::Value::Null;
+        file_comment["line"] = serde_json::Value::Null;
+        file_comment["originalLine"] = serde_json::Value::Null;
+        file_comment["subjectType"] = "FILE".into();
+        pending.stdout = pending_value.to_string();
+
+        let mut thread_value: serde_json::Value =
+            serde_json::from_str(&threads.stdout).expect("thread fixture");
+        let file_thread =
+            &mut thread_value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][1];
+        file_thread["diffSide"] = serde_json::Value::Null;
+        file_thread["line"] = serde_json::Value::Null;
+        file_thread["originalLine"] = serde_json::Value::Null;
+        file_thread["subjectType"] = "FILE".into();
+        threads.stdout = thread_value.to_string();
+
+        let runner = ScriptedRunner::new(vec![pending, threads]);
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("file comments should authenticate during line recovery")
+            .expect("pending snapshot");
+
+        assert_eq!(snapshot.inline_comments.len(), 2);
+        assert_eq!(
+            snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert_eq!(snapshot.inline_comments[1].subject_type, "FILE");
+        assert_eq!(snapshot.inline_comments[1].diff_side, None);
     }
 
     #[test]
