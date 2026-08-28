@@ -51,6 +51,12 @@ const DEFAULT_LEASE_TTL_SECONDS: u64 = 8 * 60 * 60;
 const MAX_LEASE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const UNBORN_HEAD_PREFIX: &str = "unborn:";
 const TRUSTED_GIT_PATHS: &[&str] = &["/usr/bin/git", "/bin/git"];
+#[cfg(target_os = "linux")]
+const LINUX_UID_MAP_PATH: &str = "/proc/self/uid_map";
+#[cfg(target_os = "linux")]
+const LINUX_OVERFLOW_UID_PATH: &str = "/proc/sys/kernel/overflowuid";
+#[cfg(target_os = "linux")]
+const MAX_LINUX_UID_MAP_BYTES: usize = 4 * 1024;
 const SNAPSHOT_WORKER_ENV: &str = "NILS_GIT_CLI_INTERNAL_DIRTY_SNAPSHOT_WORKER";
 const SNAPSHOT_WORKER_CHECKOUT_ENV: &str = "NILS_GIT_CLI_INTERNAL_DIRTY_SNAPSHOT_CHECKOUT";
 const PROCESS_SUPERVISOR_ENV: &str = "NILS_GIT_CLI_INTERNAL_PROCESS_SUPERVISOR";
@@ -5949,7 +5955,7 @@ fn trusted_git_executable() -> Result<PathBuf> {
             continue;
         };
         if metadata.file_type().is_file()
-            && metadata.uid() == 0
+            && trusted_system_git_owner(metadata.uid())
             && metadata.mode() & 0o022 == 0
             && metadata.mode() & 0o111 != 0
         {
@@ -5960,6 +5966,117 @@ fn trusted_git_executable() -> Result<PathBuf> {
         DirtyCheckoutErrorKind::ResourceUnavailable,
         "a trusted system Git executable is unavailable",
     ))
+}
+
+fn trusted_system_git_owner(uid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(overflow_uid) = read_linux_overflow_uid() else {
+            return false;
+        };
+        let Ok(uid_map) =
+            read_bounded_proc_text(Path::new(LINUX_UID_MAP_PATH), MAX_LINUX_UID_MAP_BYTES)
+        else {
+            return false;
+        };
+        linux_overflow_uid_proves_unmapped_host_root(uid, overflow_uid, &uid_map)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_overflow_uid() -> io::Result<u32> {
+    let value = read_bounded_proc_text(Path::new(LINUX_OVERFLOW_UID_PATH), 32)?;
+    let value = value.strip_suffix('\n').unwrap_or(&value);
+    if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel overflow UID is malformed",
+        ));
+    }
+    value.parse::<u32>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel overflow UID is out of range",
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_proc_text(path: &Path, limit: usize) -> io::Result<String> {
+    let mut input = File::open(path)?.take(limit.saturating_add(1) as u64);
+    let mut value = String::new();
+    input.read_to_string(&mut value)?;
+    if value.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel identity metadata exceeds its supported size",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_overflow_uid_proves_unmapped_host_root(
+    file_uid: u32,
+    overflow_uid: u32,
+    uid_map: &str,
+) -> bool {
+    if overflow_uid == 0 || file_uid != overflow_uid {
+        return false;
+    }
+
+    let mut saw_mapping = false;
+    for line in uid_map.lines() {
+        if line.is_empty() {
+            return false;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(inside_start), Some(outside_start), Some(length)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        if fields.next().is_some() {
+            return false;
+        }
+        let (Some(inside_start), Some(outside_start), Some(length)) = (
+            parse_linux_uid_map_field(inside_start),
+            parse_linux_uid_map_field(outside_start),
+            parse_linux_uid_map_field(length),
+        ) else {
+            return false;
+        };
+        let (Some(inside_end), Some(_outside_end)) = (
+            inside_start.checked_add(length),
+            outside_start.checked_add(length),
+        ) else {
+            return false;
+        };
+        if length == 0 {
+            return false;
+        }
+        saw_mapping = true;
+        let overflow_uid = u64::from(overflow_uid);
+        if outside_start == 0 || (inside_start <= overflow_uid && overflow_uid < inside_end) {
+            return false;
+        }
+    }
+
+    saw_mapping
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_uid_map_field(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
 }
 
 fn sanitize_git_environment(command: &mut Command) {
@@ -8351,6 +8468,50 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         {
             "/bin/true"
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn user_namespace_overflow_owner_requires_unmapped_host_root() {
+        let overflow_uid = 65_534;
+
+        assert!(!linux_overflow_uid_proves_unmapped_host_root(
+            overflow_uid,
+            overflow_uid,
+            "0 0 4294967295\n"
+        ));
+        assert!(linux_overflow_uid_proves_unmapped_host_root(
+            overflow_uid,
+            overflow_uid,
+            "0 1000 1\n1 100000 65533\n"
+        ));
+        assert!(!linux_overflow_uid_proves_unmapped_host_root(
+            1_000,
+            overflow_uid,
+            "0 1000 1\n"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn user_namespace_overflow_owner_rejects_malformed_or_ambiguous_maps() {
+        let overflow_uid = 65_534;
+        for uid_map in [
+            "",
+            "0 1000\n",
+            "0 1000 0\n",
+            "0 1000 1 trailing\n",
+            "0 nope 1\n",
+            "0 +1000 1\n",
+            "65534 1000 1\n",
+            "65000 1000 1000\n",
+            "0 1000 18446744073709551615\n",
+        ] {
+            assert!(
+                !linux_overflow_uid_proves_unmapped_host_root(overflow_uid, overflow_uid, uid_map),
+                "malformed or ambiguous UID maps must fail closed"
+            );
         }
     }
 
