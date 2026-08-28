@@ -7609,8 +7609,10 @@ fn wait_process_with_timeout(
 /// instead of continuing from wherever the live cursor happened to be.
 const ATTACH_REPLAY_ORIGIN: &str = "\x1b[H\x1b[2J";
 
-/// Turn a `capture-pane -p` screen into bytes that are safe to inject into the
-/// raw PTY stream an attaching client reads.
+/// Turn a `capture-pane -p -J` screen into bytes that are safe to inject into
+/// the raw PTY stream an attaching client reads. With `-J` each row is a joined
+/// logical line: it can exceed the pane width (the client re-wraps it) and
+/// keeps the trailing spaces at former wrap points.
 ///
 /// `capture-pane -p` joins pane rows with a bare `\n`. In a PTY stream a lone LF
 /// only moves the cursor down one row and keeps its column, so replaying the
