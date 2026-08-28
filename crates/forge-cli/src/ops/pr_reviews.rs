@@ -12,6 +12,7 @@ use crate::cli::{BINARY, GlobalFlags, PrReviewsArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comments::github_repo_slug_from_url;
+use crate::ops::pr_review_threads;
 use crate::ops::pr_view;
 use crate::ops::review_state;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
@@ -426,33 +427,10 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
             expected_total = Some(page.total_count);
             snapshot = Some(page.snapshot);
         }
-        let retained = snapshot.as_ref().expect("page created a snapshot");
-        if retained.inline_comments.len() as u64 > MAX_PENDING_REVIEW_COMMENTS {
-            return Err(snapshot_incomplete(
-                "pending review retained inline-comment count exceeds the recovery safety limit",
-                Some(format!(
-                    "review_id={review_id}; observed_comments={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
-                    retained.inline_comments.len()
-                )),
-            ));
-        }
-        let retained_bytes = serde_json::to_vec(retained)
-            .map_err(|error| {
-                ForgeError::software(
-                    schema_err(),
-                    "failed to size pending-review snapshot",
-                    Some(error.to_string()),
-                )
-            })?
-            .len();
-        if retained_bytes > MAX_PENDING_REVIEW_SNAPSHOT_BYTES {
-            return Err(snapshot_incomplete(
-                "pending review decoded snapshot exceeds the recovery safety limit",
-                Some(format!(
-                    "review_id={review_id}; retained_bytes={retained_bytes}; max_bytes={MAX_PENDING_REVIEW_SNAPSHOT_BYTES}"
-                )),
-            ));
-        }
+        ensure_pending_snapshot_within_limits(
+            snapshot.as_ref().expect("page created a snapshot"),
+            review_id,
+        )?;
         if !page.has_next_page {
             let mut snapshot = snapshot.expect("page created a snapshot");
             if snapshot.inline_comments.len() as u64 != expected_total.unwrap_or(0) {
@@ -465,6 +443,8 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
                     )),
                 ));
             }
+            hydrate_deferred_comment_sides(runner, ctx, &mut snapshot)?;
+            ensure_pending_snapshot_within_limits(&snapshot, review_id)?;
             classify_pending_snapshot(&mut snapshot)?;
             snapshot.snapshot_digest = pending_snapshot_digest(&snapshot)?;
             return Ok(Some(snapshot));
@@ -489,6 +469,39 @@ fn compute_review_snapshot_for_state<R: BackendRunner>(
             "review_id={review_id}; max_pages={MAX_REVIEW_PAGES}"
         )),
     ))
+}
+
+fn ensure_pending_snapshot_within_limits(
+    snapshot: &PendingReviewSnapshot,
+    review_id: &str,
+) -> Result<(), ForgeError> {
+    if snapshot.inline_comments.len() as u64 > MAX_PENDING_REVIEW_COMMENTS {
+        return Err(snapshot_incomplete(
+            "pending review retained inline-comment count exceeds the recovery safety limit",
+            Some(format!(
+                "review_id={review_id}; observed_comments={}; max_comments={MAX_PENDING_REVIEW_COMMENTS}",
+                snapshot.inline_comments.len()
+            )),
+        ));
+    }
+    let retained_bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| {
+            ForgeError::software(
+                schema_err(),
+                "failed to size pending-review snapshot",
+                Some(error.to_string()),
+            )
+        })?
+        .len();
+    if retained_bytes > MAX_PENDING_REVIEW_SNAPSHOT_BYTES {
+        return Err(snapshot_incomplete(
+            "pending review decoded snapshot exceeds the recovery safety limit",
+            Some(format!(
+                "review_id={review_id}; retained_bytes={retained_bytes}; max_bytes={MAX_PENDING_REVIEW_SNAPSHOT_BYTES}"
+            )),
+        ));
+    }
+    Ok(())
 }
 
 /// Deadline-aware variant used by merge convergence. The timeout covers the
@@ -1101,19 +1114,111 @@ fn normalized_comment_side(
         return Ok(None);
     }
     let diff_hunk = required_string(comment, "/diffHunk", "review.comment.diffHunk")?;
-    let side = infer_side_from_diff_hunk(&diff_hunk, anchor_line.expect("checked above"))
-        .ok_or_else(|| {
+    Ok(
+        infer_side_from_diff_hunk(&diff_hunk, anchor_line.expect("checked above"))
+            .map(str::to_string),
+    )
+}
+
+fn hydrate_deferred_comment_sides<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    snapshot: &mut PendingReviewSnapshot,
+) -> Result<(), ForgeError> {
+    let needs_thread_snapshot = snapshot.inline_comments.iter().any(|comment| {
+        comment.subject_type == "LINE"
+            && (comment.diff_side.is_none()
+                || (comment.start_line.is_some() && comment.start_diff_side.is_none()))
+    });
+    if !needs_thread_snapshot {
+        return Ok(());
+    }
+
+    let threads =
+        pr_review_threads::compute_for_pr(runner, ctx, &snapshot.pr_url, snapshot.number)?;
+    if threads.head_sha.as_deref() != Some(snapshot.head_sha.as_str()) {
+        return Err(snapshot_incomplete(
+            "the PR head changed while recovering pending review comment anchors",
+            Some(format!("review_id={}", snapshot.review_id)),
+        ));
+    }
+
+    for comment in &mut snapshot.inline_comments {
+        if comment.subject_type != "LINE"
+            || (comment.diff_side.is_some()
+                && (comment.start_line.is_none() || comment.start_diff_side.is_some()))
+        {
+            continue;
+        }
+        let mut matches = threads.threads.iter().filter(|thread| {
+            thread
+                .comments
+                .iter()
+                .any(|thread_comment| thread_comment.id == comment.id)
+        });
+        let thread = matches.next().ok_or_else(|| {
             snapshot_incomplete(
-                "pending review comment diff side cannot be derived from its diff hunk",
-                optional_string(comment, "/id").map(|id| {
-                    format!(
-                        "comment_id={id}; anchor_line={}",
-                        anchor_line.expect("checked above")
-                    )
-                }),
+                "pending review comment is missing from the exact review-thread snapshot",
+                Some(format!("comment_id={}", comment.id)),
             )
         })?;
-    Ok(Some(side.to_string()))
+        if matches.next().is_some() {
+            return Err(snapshot_incomplete(
+                "pending review comment appears in more than one review thread",
+                Some(format!("comment_id={}", comment.id)),
+            ));
+        }
+        if thread.path != comment.path
+            || thread.line != comment.line
+            || thread.original_line != comment.original_line
+            || thread.start_line != comment.start_line
+            || thread.original_start_line != comment.original_start_line
+            || thread.subject_type.as_deref() != Some(comment.subject_type.as_str())
+        {
+            return Err(snapshot_incomplete(
+                "pending review comment anchor differs from its review thread",
+                Some(format!("comment_id={}", comment.id)),
+            ));
+        }
+        let diff_side = thread.diff_side.as_deref().ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review thread is missing its line side",
+                Some(format!("comment_id={}", comment.id)),
+            )
+        })?;
+        if comment
+            .diff_side
+            .as_deref()
+            .is_some_and(|side| side != diff_side)
+        {
+            return Err(snapshot_incomplete(
+                "pending review comment side differs from its review thread",
+                Some(format!("comment_id={}", comment.id)),
+            ));
+        }
+        comment.diff_side = Some(diff_side.to_string());
+
+        if comment.start_line.is_some() {
+            let start_side = thread.start_diff_side.as_deref().ok_or_else(|| {
+                snapshot_incomplete(
+                    "pending review thread is missing its range start side",
+                    Some(format!("comment_id={}", comment.id)),
+                )
+            })?;
+            if comment
+                .start_diff_side
+                .as_deref()
+                .is_some_and(|side| side != start_side)
+            {
+                return Err(snapshot_incomplete(
+                    "pending review comment range side differs from its review thread",
+                    Some(format!("comment_id={}", comment.id)),
+                ));
+            }
+            comment.start_diff_side = Some(start_side.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn infer_side_from_diff_hunk(diff_hunk: &str, anchor_line: u32) -> Option<&'static str> {
@@ -1714,11 +1819,119 @@ mod tests {
             },
             "@@ -8,1 +8,1 @@\n-old value\n+new value",
         );
-        let error = match parse_github_pending_review_snapshot_page(&ambiguous, "PENDING") {
-            Err(error) => error,
-            Ok(_) => panic!("same-number replacement without a side discriminator is ambiguous"),
-        };
+        let page = parse_github_pending_review_snapshot_page(&ambiguous, "PENDING")
+            .expect("ambiguous hunk is deferred to the exact thread snapshot")
+            .expect("pending snapshot");
+        assert_eq!(page.snapshot.inline_comments[0].diff_side, None);
+    }
+
+    fn truncated_pending_snapshot_page() -> BackendSuccess {
+        let mut truncated = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_truncated",
+            path: "src/new.rs",
+            line: 982,
+            diff_side: "RIGHT",
+            start_line: None,
+            start_diff_side: None,
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&truncated.stdout).expect("snapshot fixture");
+        value["data"]["node"]["comments"]["totalCount"] = 1.into();
+        let comment = value
+            .pointer_mut("/data/node/comments/nodes/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("comment object");
+        comment.remove("diffSide");
+        comment.remove("startDiffSide");
+        comment.insert(
+            "diffHunk".into(),
+            "@@ -970,1 +970,1 @@\n-old context\n+new context".into(),
+        );
+        truncated.stdout = value.to_string();
+        truncated
+    }
+
+    fn truncated_comment_thread(path: &str, comment_id: &str) -> BackendSuccess {
+        BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                        "nodes": [{
+                            "id": "PRRT_truncated",
+                            "isResolved": false,
+                            "isOutdated": false,
+                            "path": path,
+                            "diffSide": "RIGHT",
+                            "line": 982,
+                            "originalLine": 982,
+                            "originalStartLine": null,
+                            "startDiffSide": null,
+                            "startLine": null,
+                            "subjectType": "LINE",
+                            "comments": {
+                                "nodes": [{
+                                    "id": comment_id,
+                                    "author": {"login": "review-bot"},
+                                    "body": "finding PRRC_truncated",
+                                    "createdAt": "2026-07-20T12:00:00Z",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_truncated"
+                                }],
+                                "pageInfo": {"hasNextPage": false, "endCursor": null}
+                            }
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn pending_snapshot_recovers_a_truncated_hunk_side_from_the_exact_review_thread() {
+        let runner = ScriptedRunner::new(vec![
+            truncated_pending_snapshot_page(),
+            truncated_comment_thread("src/new.rs", "PRRC_truncated"),
+        ]);
+
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("provider-valid truncated hunks recover from review threads")
+            .expect("pending snapshot");
+
+        assert_eq!(
+            snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("reviewThreads(first: 100")),
+            "the exact provider thread snapshot must own the fallback side"
+        );
+    }
+
+    #[test]
+    fn pending_snapshot_recovery_rejects_a_mismatched_thread_anchor() {
+        let runner = ScriptedRunner::new(vec![
+            truncated_pending_snapshot_page(),
+            truncated_comment_thread("src/other.rs", "PRRC_truncated"),
+        ]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("thread anchors must match before their side becomes authoritative");
+
         assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(
+            error.to_string().contains("anchor differs"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

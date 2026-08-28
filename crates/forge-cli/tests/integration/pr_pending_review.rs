@@ -413,6 +413,141 @@ esac
     .replace("@SECOND_PAGE@", &second_page)
 }
 
+fn truncated_pending_snapshot_script(capture: &str) -> String {
+    let pending = serde_json::json!({
+        "data": {"node": {
+            "id": "PRR_pending",
+            "url": "https://github.com/acme/widgets/pull/42#pullrequestreview-102",
+            "author": {"login": "review-bot"},
+            "state": "PENDING",
+            "commit": {"oid": "head-new"},
+            "body": "Summary",
+            "viewerDidAuthor": true,
+            "viewerCanDelete": true,
+            "comments": {
+                "totalCount": 1,
+                "nodes": [{
+                    "id": "PRRC_truncated",
+                    "url": "https://github.com/acme/widgets/pull/42#discussion_r123",
+                    "author": {"login": "review-bot"},
+                    "body": "finding",
+                    "createdAt": "2026-07-20T12:00:00Z",
+                    "path": "src/lib.rs",
+                    "diffHunk": "@@ -970,1 +970,1 @@\n-old context\n+new context",
+                    "line": 982,
+                    "originalLine": 982,
+                    "startLine": null,
+                    "originalStartLine": null,
+                    "subjectType": "LINE"
+                }],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            },
+            "pullRequest": {
+                "number": 42,
+                "url": "https://github.com/acme/widgets/pull/42",
+                "headRefOid": "head-new"
+            }
+        }}
+    })
+    .to_string();
+    let threads = serde_json::json!({
+        "data": {"repository": {"pullRequest": {
+            "headRefOid": "head-new",
+            "reviewThreads": {
+                "nodes": [{
+                    "id": "PRRT_truncated",
+                    "isResolved": false,
+                    "isOutdated": false,
+                    "path": "src/lib.rs",
+                    "diffSide": "RIGHT",
+                    "line": 982,
+                    "originalLine": 982,
+                    "originalStartLine": null,
+                    "startDiffSide": null,
+                    "startLine": null,
+                    "subjectType": "LINE",
+                    "comments": {
+                        "nodes": [{
+                            "id": "PRRC_truncated",
+                            "author": {"login": "review-bot"},
+                            "body": "finding",
+                            "createdAt": "2026-07-20T12:00:00Z",
+                            "url": "https://github.com/acme/widgets/pull/42#discussion_r123"
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}
+            }
+        }}}
+    })
+    .to_string();
+    r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "@CAPTURE@"
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"fix/reviews","headRefOid":"head-new","title":"fix: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"reviewThreads(first: 100"*)
+        printf '%s\n' '@THREADS@'
+        ;;
+      *"comments(first: 100"*)
+        printf '%s\n' '@PENDING@'
+        ;;
+      *)
+        echo "unexpected graphql args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .replace("@CAPTURE@", capture)
+    .replace("@PENDING@", &pending)
+    .replace("@THREADS@", &threads)
+}
+
+#[test]
+fn pr_pending_review_inspect_recovers_a_truncated_hunk_from_the_exact_thread() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("truncated-hunk-calls.log");
+    let script = truncated_pending_snapshot_script(&capture.to_string_lossy());
+    let stub = stub.gh_stub(&script);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["data"]["snapshot"]["inline_comments"][0]["diff_side"],
+        "RIGHT"
+    );
+    let calls = fs::read_to_string(capture).expect("read gh calls");
+    assert!(calls.contains("reviewThreads(first: 100"), "{calls}");
+}
+
 #[test]
 fn pr_pending_review_inspect_digests_later_comment_pages() {
     let mut digests = Vec::new();
