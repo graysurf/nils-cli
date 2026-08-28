@@ -19,7 +19,7 @@
 //! The local provider has no review-thread model: the atom returns an empty
 //! thread list and the merge gate passes trivially.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
@@ -48,6 +48,7 @@ const MAX_GITHUB_THREAD_COMMENT_PAGES: usize = 100;
 /// must not silently ignore a later reviewer reply.
 const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 100) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_THREAD_FINGERPRINTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_COMMENT_ANCHORS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } } } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_THREAD_COMMENTS_QUERY: &str = "query($thread: ID!, $after: String) { node(id: $thread) { ... on PullRequestReviewThread { id comments(first: 100, after: $after) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } } }";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -120,6 +121,32 @@ struct GitHubThreadNode {
 struct GitHubThreadCommentsPage {
     thread_id: String,
     comments: Vec<PrReviewThreadComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubReviewCommentAnchor {
+    pub comment: PrReviewThreadComment,
+    pub path: String,
+    pub diff_side: Option<String>,
+    pub line: Option<u32>,
+    pub original_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    pub start_diff_side: Option<String>,
+    pub start_line: Option<u32>,
+    pub subject_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubReviewCommentAnchorsSnapshot {
+    pub head_sha: String,
+    pub anchors: BTreeMap<String, GitHubReviewCommentAnchor>,
+}
+
+struct GitHubReviewCommentAnchorsPage {
+    head_sha: String,
+    anchors: Vec<GitHubReviewCommentAnchor>,
     has_next_page: bool,
     end_cursor: Option<String>,
 }
@@ -443,6 +470,106 @@ pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
     ))
 }
 
+/// Fetch only the root-comment identity and anchor fields for the requested
+/// GitHub comment IDs. Pending-review recovery uses this bounded read instead
+/// of hydrating every thread reply, and stops as soon as every globally unique
+/// comment node ID has been found.
+pub(crate) fn compute_comment_anchors_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+    requested_ids: &BTreeSet<String>,
+) -> Result<GitHubReviewCommentAnchorsSnapshot, ForgeError> {
+    if requested_ids.is_empty() {
+        return Err(snapshot_incomplete(
+            "review-comment anchor lookup requires at least one comment id",
+            None,
+        ));
+    }
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = slug.split_once('/').ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to split GitHub owner/repo slug",
+            Some(format!("slug={slug}")),
+        )
+    })?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut remaining = requested_ids.clone();
+    let mut anchors = BTreeMap::new();
+
+    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+        let output = runner.run(&build_github_comment_anchors_page_call(
+            ctx,
+            owner,
+            name,
+            number,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_comment_anchors_page(&output, requested_ids)?;
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating review-comment anchors",
+                Some(format!(
+                    "expected_head={}; provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        for anchor in page.anchors {
+            let comment_id = anchor.comment.id.clone();
+            if anchors.insert(comment_id.clone(), anchor).is_some() {
+                return Err(snapshot_incomplete(
+                    "a requested review comment appears in more than one review thread",
+                    Some(format!("comment_id={comment_id}")),
+                ));
+            }
+            remaining.remove(&comment_id);
+        }
+        if remaining.is_empty() {
+            return Ok(GitHubReviewCommentAnchorsSnapshot {
+                head_sha: expected_head.expect("the current page supplied a head"),
+                anchors,
+            });
+        }
+        if !page.has_next_page {
+            return Err(snapshot_incomplete(
+                "review-comment anchor lookup did not find every requested comment",
+                Some(format!("missing_count={}", remaining.len())),
+            ));
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchor pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "review-comment anchor pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Err(snapshot_incomplete(
+        "review-comment anchor pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
+    ))
+}
+
 fn complete_github_thread_comments<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -716,6 +843,34 @@ fn build_github_thread_fingerprints_page_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
+fn build_github_comment_anchors_page_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_COMMENT_ANCHORS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
 fn build_github_thread_comments_call(
     ctx: &ProviderContext,
     thread_id: &str,
@@ -890,6 +1045,104 @@ fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage,
     Ok(GitHubThreadPage {
         head_sha,
         threads,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_github_comment_anchors_page(
+    output: &BackendSuccess,
+    requested_ids: &BTreeSet<String>,
+) -> Result<GitHubReviewCommentAnchorsPage, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "review-comment anchors response is invalid JSON",
+            Some(e.to_string()),
+        )
+    })?;
+    reject_graphql_errors(&value, "review-comment anchors")?;
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchors response is missing pullRequest",
+                None,
+            )
+        })?;
+    let head_sha = required_json_string(pull, "/headRefOid", "headRefOid")?;
+    let connection = pull.pointer("/reviewThreads").ok_or_else(|| {
+        snapshot_incomplete(
+            "review-comment anchors response is missing reviewThreads",
+            None,
+        )
+    })?;
+    let nodes = connection
+        .pointer("/nodes")
+        .and_then(|nodes| nodes.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchors response is missing reviewThreads nodes",
+                None,
+            )
+        })?;
+    let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThreads")?;
+    let mut anchors = Vec::new();
+    for node in nodes {
+        let Some(comment) = node
+            .pointer("/comments/nodes")
+            .and_then(|comments| comments.as_array())
+            .and_then(|comments| comments.first())
+        else {
+            continue;
+        };
+        let Some(comment_id) = comment.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !requested_ids.contains(comment_id) {
+            continue;
+        }
+        let comment = PrReviewThreadComment {
+            id: comment_id.to_string(),
+            author: comment
+                .pointer("/author/login")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<unknown>")
+                .to_string(),
+            body: required_json_string_allow_empty(comment, "/body", "reviewThread.comment.body")?,
+            created_at: required_json_string(
+                comment,
+                "/createdAt",
+                "reviewThread.comment.createdAt",
+            )?,
+            url: required_json_string(comment, "/url", "reviewThread.comment.url")?,
+        };
+        anchors.push(GitHubReviewCommentAnchor {
+            comment,
+            path: required_json_string(node, "/path", "reviewThread.path")?,
+            diff_side: Some(required_json_string(
+                node,
+                "/diffSide",
+                "reviewThread.diffSide",
+            )?),
+            line: optional_json_u32(node, "/line"),
+            original_line: optional_json_u32(node, "/originalLine"),
+            original_start_line: optional_json_u32(node, "/originalStartLine"),
+            start_diff_side: node
+                .pointer("/startDiffSide")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            start_line: optional_json_u32(node, "/startLine"),
+            subject_type: Some(required_json_string(
+                node,
+                "/subjectType",
+                "reviewThread.subjectType",
+            )?),
+        });
+    }
+    Ok(GitHubReviewCommentAnchorsPage {
+        head_sha,
+        anchors,
         has_next_page,
         end_cursor,
     })
