@@ -1052,7 +1052,7 @@ fn emit_decision(format: DispatchFormat, decision: &NormalizedDecision) -> i32 {
             println!(
                 "agent-hook {} {}: {} ({} reasons, {} shadow)",
                 decision.product.as_str(),
-                decision.event,
+                public_event_label(&decision.event),
                 action_name(decision.action),
                 decision.reasons.len(),
                 decision.shadow.len()
@@ -1060,6 +1060,31 @@ fn emit_decision(format: DispatchFormat, decision: &NormalizedDecision) -> i32 {
         }
     }
     code
+}
+
+fn public_event_label(event: &str) -> &'static str {
+    match event {
+        "SessionStart" => "SessionStart",
+        "UserPromptSubmit" => "UserPromptSubmit",
+        "PermissionRequest" => "PermissionRequest",
+        "PreToolUse" => "PreToolUse",
+        "PostToolUse" => "PostToolUse",
+        "PostToolUseFailure" => "PostToolUseFailure",
+        "PreCompact" => "PreCompact",
+        "PostCompact" => "PostCompact",
+        "SubagentStart" => "SubagentStart",
+        "SubagentStop" => "SubagentStop",
+        "Stop" => "Stop",
+        "StopFailure" => "StopFailure",
+        "Notification" => "Notification",
+        "Elicitation" => "Elicitation",
+        "ElicitationResult" => "ElicitationResult",
+        "pre_llm_call" => "pre_llm_call",
+        "post_llm_call" => "post_llm_call",
+        "pre_approval_request" => "pre_approval_request",
+        "post_approval_response" => "post_approval_response",
+        _ => "unknown-event",
+    }
 }
 
 fn emit_dispatch_error(

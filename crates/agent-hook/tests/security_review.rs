@@ -895,53 +895,83 @@ fn trusted_semantic_commit_repo_binds_coordination_to_the_claimed_target() {
     fs::write(&semantic_commit, "#!/bin/sh\nexit 0\n").expect("semantic-commit companion");
     fs::set_permissions(&semantic_commit, fs::Permissions::from_mode(0o700))
         .expect("semantic-commit mode");
+    let explicit_repo = fs::canonicalize(&checkout_b).expect("canonical explicit repo");
+    let full_command = format!(
+        "{} commit --repo {} --type fix --subject bounded --body-bullet Bounded",
+        semantic_commit.display(),
+        explicit_repo.display()
+    );
     let payload = json!({
         "hook_event_name":"PreToolUse",
         "tool_name":"Bash",
         "cwd":checkout_a,
-        "tool_input":{"command":format!(
-            "{} commit --repo {} --type fix --subject bounded --body-bullet Bounded",
-            semantic_commit.display(),
-            checkout_b.display()
-        )}
+        "tool_input":{"command":full_command}
     })
     .to_string();
-    let mut child = Command::new(&agent_hook);
-    child
-        .args(["dispatch", "--product", "codex", "--format", "json"])
-        .current_dir(&fixture.root)
-        .env_clear()
-        .env("HOME", &fixture.home)
-        .env("PATH", "/usr/bin:/bin")
-        .env("XDG_CONFIG_HOME", &fixture.config_home)
-        .env("XDG_STATE_HOME", &fixture.state_home)
-        .env("AGENT_SESSION_STATE_DIR", &fixture.session_state)
-        .env("AGENT_SESSION_ID", "current")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = child.spawn().expect("copied agent-hook spawn");
-    child
-        .stdin
-        .take()
-        .expect("agent-hook stdin")
-        .write_all(payload.as_bytes())
-        .expect("agent-hook input");
-    let raw = child.wait_with_output().expect("agent-hook output");
-    let output: Value = serde_json::from_slice(&raw.stdout).unwrap_or_else(|error| {
-        panic!(
-            "invalid agent-hook JSON: {error}; status={} stderr={}",
-            raw.status,
-            String::from_utf8_lossy(&raw.stderr)
-        )
-    });
-    assert_eq!(
-        raw.status.code(),
-        Some(1),
-        "explicit --repo must bind the claimed target: {output}"
-    );
-    assert_eq!(output["data"]["action"], "block");
-    assert_eq!(output["data"]["reasons"][0]["code"], "owner-active-foreign");
+    let trace_path = fixture.state_home.join("agent-hook/trace.jsonl");
+
+    for (format, expected_code) in [("json", 1), ("text", 1), ("provider", 0)] {
+        let _ = fs::remove_file(&trace_path);
+        let mut child = Command::new(&agent_hook);
+        child
+            .args([
+                "dispatch",
+                "--product",
+                "codex",
+                "--format",
+                format,
+                "--trace",
+            ])
+            .current_dir(&fixture.root)
+            .env_clear()
+            .env("HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", &fixture.config_home)
+            .env("XDG_STATE_HOME", &fixture.state_home)
+            .env("AGENT_SESSION_STATE_DIR", &fixture.session_state)
+            .env("AGENT_SESSION_ID", "current")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = child.spawn().expect("copied agent-hook spawn");
+        child
+            .stdin
+            .take()
+            .expect("agent-hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("agent-hook input");
+        let raw = child.wait_with_output().expect("agent-hook output");
+        let stdout = String::from_utf8(raw.stdout).expect("agent-hook stdout UTF-8");
+        let stderr = String::from_utf8(raw.stderr).expect("agent-hook stderr UTF-8");
+        assert_eq!(
+            raw.status.code(),
+            Some(expected_code),
+            "format={format} explicit --repo must bind the claimed target: {stdout} {stderr}"
+        );
+        if format == "json" {
+            let output: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+                panic!("invalid agent-hook JSON: {error}; stderr={stderr}")
+            });
+            assert_eq!(output["data"]["action"], "block");
+            assert_eq!(output["data"]["reasons"][0]["code"], "owner-active-foreign");
+        }
+
+        let trace = fs::read_to_string(&trace_path).expect("agent-hook trace");
+        for (surface, contents) in [
+            ("stdout", stdout.as_str()),
+            ("stderr", stderr.as_str()),
+            ("trace", trace.as_str()),
+        ] {
+            assert!(
+                !contents.contains(explicit_repo.to_str().expect("explicit repo UTF-8")),
+                "format={format} {surface} exposed the explicit repository: {contents}"
+            );
+            assert!(
+                !contents.contains(&full_command),
+                "format={format} {surface} exposed the full command: {contents}"
+            );
+        }
+    }
 }
 
 #[test]
