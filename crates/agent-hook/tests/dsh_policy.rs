@@ -117,6 +117,35 @@ capability = {{ id = "dsh.policy.v1", group = "{group}" }}
     )
 }
 
+fn activity_then_direct_commit_policy() -> &'static str {
+    r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "dsh-runtime-kit-activity-authority"
+version = "2026.08.28.1"
+
+[[rules]]
+id = "dsh.activity"
+products = ["dsh"]
+events = ["PreToolUse"]
+matcher = "bash"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "dsh.policy.v1", group = "agent-activity" }
+
+[[rules]]
+id = "dsh.authority"
+products = ["dsh"]
+events = ["PreToolUse"]
+matcher = "bash"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "dsh.policy.v1", group = "block-direct-git-commit" }
+"#
+}
+
 fn lifecycle_request(
     fixture: &Fixture,
     event: &str,
@@ -717,6 +746,72 @@ fn dsh_activity_helper_fault_matches_read_only_mode_and_terminal_contracts() {
         stop.stdout_json()["data"]["reasons"][0]["code"],
         "activity-stop-reconciliation-required"
     );
+}
+
+#[test]
+fn dsh_activity_degradation_preserves_later_authoritative_rules() {
+    for mode in ["advisory", "off"] {
+        for (command, action, authority_code, authority_disposition) in [
+            (
+                "git commit -m test",
+                "block",
+                "block-direct-git-commit",
+                "block",
+            ),
+            (
+                "printf ok",
+                "warn",
+                "block-direct-git-commit-allow",
+                "allow",
+            ),
+        ] {
+            let fixture = Fixture::new(activity_then_direct_commit_policy());
+            install_dsh_activity_mode(&fixture, mode);
+            let helper = fixture.root.join("failing-agent-session");
+            fs::write(&helper, "#!/bin/sh\nexit 65\n").expect("failing activity helper");
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+            let output = fixture.run_with_env(
+                &["dispatch", "--product", "dsh", "--format", "json"],
+                Some(&request(&fixture, "bash", json!({"command": command}))),
+                &[
+                    ("AGENT_SESSION_ID", "managed-session"),
+                    ("AGENT_SESSION_RUNTIME_ID", "runtime-1"),
+                    ("AGENT_SESSION_COORDINATION_MODE", mode),
+                    (
+                        "AGENT_SESSION_BIN",
+                        helper.to_str().expect("helper path UTF-8"),
+                    ),
+                ],
+            );
+            assert_eq!(
+                output.stdout_json()["data"]["action"],
+                action,
+                "mode={mode} command={command} envelope={}",
+                output.stdout_text()
+            );
+            assert_eq!(
+                output.stdout_json()["data"]["reasons"],
+                json!([
+                    {
+                        "rule_id": "dsh.activity",
+                        "code": "session-activity-failed",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "dsh.activity",
+                        "code": "activity-degraded-advisory-off",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "dsh.authority",
+                        "code": authority_code,
+                        "disposition": authority_disposition
+                    }
+                ]),
+                "mode={mode} command={command}"
+            );
+        }
+    }
 }
 
 #[test]
