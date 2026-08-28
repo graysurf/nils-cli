@@ -889,13 +889,15 @@ plus `locked` rule deny at random, because whether the child won the race
 depended on machine load, and a `locked` rule offers no override to recover
 with.
 
-`agent-session.activity.v1` retains one terminal-only degradation boundary.
+`agent-session.activity.v1` is metadata observation, not mutation authority.
 Failure to record a `Stop` observation returns the stable warning
 `activity-stop-reconciliation-required` instead of denying provider
 termination. This prevents a missing, stale, or temporarily unavailable
-activity store from creating a non-terminating Stop-hook loop. The same
-capability remains fail-closed for `UserPromptSubmit`, `PreToolUse`, and every
-other non-terminal event, and the terminal warning does not release or alter
+activity store from creating a non-terminating Stop-hook loop. A typed activity
+fault also warns for conversation, a closed-set audited read-only `PreToolUse`,
+and a request authenticated to durable `advisory` or `off` mode. Every other
+non-terminal request retains the configured failure posture. No activity
+warning releases or alters
 claims, leases, operations, brokers, worktrees, or session state. Any retained
 activity uncertainty therefore remains visible for typed external
 reconciliation after the provider runner exits. Codex `Stop` renders this
@@ -912,6 +914,7 @@ lane, and a typed runtime fault is handled per lane:
 | Lane | Events | Behavior on a typed runtime fault |
 | --- | --- | --- |
 | conversation | `UserPromptSubmit`, `SessionStart` | degrade to read-only with `coordination-degraded-read-only` |
+| audited read-only | `PreToolUse` whose in-process effect is exactly `read_only` | an activity fault warns and later authoritative rules still run |
 | terminal | `Stop`, `StopFailure` | terminal warning with reconciliation-pending evidence |
 | mutation | every other event | unchanged fail-closed posture |
 
@@ -919,6 +922,15 @@ Only faults with a known recovery path are degradable:
 `coordination-unavailable`, `coordination-untrusted`, `coordination-invalid`,
 `runtime-version-skew`, and `activity-helper-unresolvable`. An unrecognized error
 keeps the existing fail-closed handling rather than being degraded on a guess.
+Within `agent-session.activity.v1`, the same bounded handling additionally
+recognizes its own helper and execution faults. An incomplete managed identity
+is never a degradation authority: it returns
+`session-activity-identity-incomplete` and refuses provider work until the
+trusted launcher establishes the exact session/runtime pair.
+Bare `pwd` with no arguments or only `-L`/`-P`/`--logical`/`--physical` is the
+initial audited Bash probe; composition, operands, or unknown options remain `unknown`. A trusted
+durable `advisory` or `off` mode may warn for another activity fault, but this
+does not change any other rule or admit an enforce-mode mutation.
 
 A degraded decision carries the fault code first, then the lane code, so
 diagnostics keep the precise cause. Its human context states one primary
@@ -981,7 +993,8 @@ prevent. An override that does not resolve to an executable regular file is
 therefore treated as absent, and the daemon-pinned `PATH` decides instead. This is
 a deliberate change to a fail-closed boundary rather than a downgrade: anyone able
 to set `AGENT_SESSION_BIN` can already set `PATH`, and the pinned `PATH` is
-daemon-controlled. The discarded override is recorded as
+daemon-controlled. The resolved executable is pinned as an absolute path for
+the activity attempt. The discarded override is recorded as
 `activity-helper-unresolvable` so it cannot silently mask a misconfiguration, and
 an empty assignment is the normalized "resolve through the pinned `PATH`" value.
 

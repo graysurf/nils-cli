@@ -583,7 +583,7 @@ fn dsh_agent_activity_emits_only_metadata_and_partial_identity_fails_closed() {
     assert_eq!(partial.stdout_json()["data"]["action"], "block");
     assert_eq!(
         partial.stdout_json()["data"]["reasons"][0]["code"],
-        "agent-activity"
+        "session-activity-identity-incomplete"
     );
 }
 

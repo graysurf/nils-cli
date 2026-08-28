@@ -98,6 +98,13 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
     else {
         return OperationEffectClass::Unknown;
     };
+    if name == "pwd"
+        && words[1..]
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-L" | "-P" | "--logical" | "--physical"))
+    {
+        return OperationEffectClass::ReadOnly;
+    }
     if name == "forge-cli" && words.get(1).map(String::as_str) == Some("repo") {
         return OperationEffectClass::ExternalMutation;
     }
@@ -560,6 +567,26 @@ mod tests {
     }
 
     #[test]
+    fn pwd_is_read_only_only_for_its_closed_argument_set() {
+        let directory = tempfile::tempdir().expect("execution directory");
+        let request = request_for(directory.path());
+        for command in ["pwd", "pwd -L", "/bin/pwd -P"] {
+            assert_eq!(
+                classify_command(command, &request),
+                OperationEffectClass::ReadOnly,
+                "command={command}"
+            );
+        }
+        for command in ["pwd target", "pwd --unknown", "pwd; touch changed"] {
+            assert_eq!(
+                classify_command(command, &request),
+                OperationEffectClass::Unknown,
+                "command={command}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_default_branch_form_replaces_local_default_admission() {
         let (directory, head) = default_branch_fixture();
         let receipt = directory
@@ -756,5 +783,27 @@ mod tests {
                 "{label}: {command}"
             );
         }
+
+        let feature = tempfile::tempdir().expect("feature worktree");
+        let feature_git_dir = directory.path().join(".git/worktrees/feature");
+        fs::create_dir_all(&feature_git_dir).expect("feature git directory");
+        fs::write(feature_git_dir.join("HEAD"), "ref: refs/heads/feature\n").expect("feature HEAD");
+        fs::write(feature_git_dir.join("commondir"), "../..\n").expect("feature commondir");
+        fs::write(
+            feature.path().join(".git"),
+            format!("gitdir: {}\n", feature_git_dir.display()),
+        )
+        .expect("feature gitfile");
+        let managed_session_cwd = request_for(other_repo.path());
+        let explicit_repo = format!(
+            "{} commit --repo {} --type fix --subject convergence --body-bullet bounded",
+            trusted.display(),
+            feature.path().display()
+        );
+        assert_eq!(
+            classify_command(&explicit_repo, &managed_session_cwd),
+            OperationEffectClass::LocalReversible,
+            "an explicit governed --repo must outrank an unrelated managed-session cwd"
+        );
     }
 }

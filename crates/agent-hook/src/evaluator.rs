@@ -391,6 +391,7 @@ fn evaluate_with_io(
     let operation_effect = if prepared.rules.iter().any(|prepared_rule| {
         prepared_rule.mode == RuleMode::Enforce
             && (prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
+                || activity_capability(&prepared_rule.rule.capability)
                 || matches!(
                     prepared_rule.rule.capability,
                     Capability::DshPolicy {
@@ -403,6 +404,9 @@ fn evaluate_with_io(
     } else {
         OperationEffectClass::Unknown
     };
+    let coordination_mode = liveness
+        .as_ref()
+        .and_then(liveness::DispatchProjection::mode);
     let mut read_only_bypassed_rule_ids = BTreeSet::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
@@ -507,12 +511,42 @@ fn evaluate_with_io(
             Ok(outcome) => outcome,
             Err(error)
                 if activity_recovery_candidate
-                    && matches!(rule.capability, Capability::SessionActivity { .. })
+                    && activity_capability(&rule.capability)
                     && activity_recovery_failure_is_deferrable(&error) =>
             {
                 simple(
                     DecisionAction::Allow,
                     "activity-recovery-deferred-to-coordination",
+                )
+            }
+            Err(error)
+                if activity_capability(&rule.capability)
+                    && error.code == "session-activity-identity-incomplete" =>
+            {
+                RuleOutcome {
+                    action: DecisionAction::Block,
+                    code: error.code,
+                    context: Some(
+                        "agent-hook managed identity is incomplete. The trusted runtime launcher must establish the exact session and runtime pair before provider work starts; do not retry from the model."
+                            .to_string(),
+                    ),
+                    replacement: None,
+                    provider_output: None,
+                }
+            }
+            Err(error)
+                if activity_failure_is_degradable(
+                    &rule.capability,
+                    request,
+                    operation_effect,
+                    coordination_mode,
+                    &error,
+                ) =>
+            {
+                activity_degradation_outcome(
+                    request,
+                    operation_effect == OperationEffectClass::ReadOnly,
+                    &error,
                 )
             }
             Err(error) if error.code == "capability-timeout" => timeout_outcome(
@@ -536,9 +570,6 @@ fn evaluate_with_io(
     }
 
     let decision = aggregate(loaded, request, enforced, shadow, recovery_applied)?;
-    let coordination_mode = liveness
-        .as_ref()
-        .and_then(liveness::DispatchProjection::mode);
     apply_session_coordination(
         Some(loaded),
         decision,
@@ -547,6 +578,84 @@ fn evaluate_with_io(
         prepared.session_coordination,
         CoordinationExecution::new(coordination_mode, operation_effect, coordination.unmanaged),
     )
+}
+
+fn activity_capability(capability: &Capability) -> bool {
+    matches!(
+        capability,
+        Capability::SessionActivity { .. }
+            | Capability::DshPolicy {
+                group: crate::policy_parity::DshCapabilityGroup::AgentActivity
+            }
+    )
+}
+
+fn activity_runtime_fault(error: &HookError) -> bool {
+    matches!(
+        error.code.as_str(),
+        ACTIVITY_HELPER_UNRESOLVABLE
+            | "session-activity-failed"
+            | "capability-timeout"
+            | "capability-wait-failed"
+            | "capability-input-failed"
+            | "capability-output-failed"
+            | "capability-unavailable"
+    )
+}
+
+fn activity_failure_is_degradable(
+    capability: &Capability,
+    request: &NormalizedRequest,
+    effect: OperationEffectClass,
+    mode: Option<nils_common::coordination_projection::CoordinationMode>,
+    error: &HookError,
+) -> bool {
+    use nils_common::coordination_projection::CoordinationMode;
+
+    if !activity_capability(capability) || !activity_runtime_fault(error) {
+        return false;
+    }
+    let read_only = effect == OperationEffectClass::ReadOnly;
+    let conversation =
+        crate::degradation::lane(request.event.as_str()) == crate::degradation::Lane::Conversation;
+    conversation
+        || read_only
+        || matches!(
+            mode,
+            Some(CoordinationMode::Advisory | CoordinationMode::Off)
+        )
+}
+
+fn activity_degradation_outcome(
+    request: &NormalizedRequest,
+    read_only: bool,
+    error: &HookError,
+) -> RuleOutcome {
+    let conversation =
+        crate::degradation::lane(request.event.as_str()) == crate::degradation::Lane::Conversation;
+    let availability = if conversation {
+        "Conversation remains available in a read-only degraded lane; no mutation authority was granted."
+    } else if read_only {
+        "This audited read-only operation remains available; no mutation authority was granted."
+    } else {
+        "Advisory/off coordination does not make activity metadata an admission authority; every other safety and mutation gate remains authoritative."
+    };
+    crate::observe::Record::new("activity", &error.code, crate::observe::Severity::Warn)
+        .provider(request.product, &request.event)
+        .disposition("warn")
+        .recovery(crate::observe::RECOVERY_HOOK_DOCTOR)
+        .emit();
+    RuleOutcome {
+        action: DecisionAction::Warn,
+        code: error.code.clone(),
+        context: Some(format!(
+            "agent-hook activity metadata is unavailable ({}). {availability} Next: {}.",
+            error.code,
+            crate::observe::RECOVERY_HOOK_DOCTOR
+        )),
+        replacement: None,
+        provider_output: None,
+    }
 }
 
 fn exact_capability_recovery_candidate_for_session_coordination(
@@ -723,7 +832,13 @@ fn evaluate_capability(
             crate::policy_parity::DshCapabilityGroup::AgentActivity => {
                 match run_session_activity(request, raw, execution_budget) {
                     Ok(()) => simple(DecisionAction::Allow, group.as_str()),
-                    Err(_) => simple(DecisionAction::Block, group.as_str()),
+                    Err(error) => {
+                        match terminal_activity_failure_decision(capability, request.event.as_str())
+                        {
+                            Some((action, code)) => simple(action, code),
+                            None => return Err(error),
+                        }
+                    }
                 }
             }
             crate::policy_parity::DshCapabilityGroup::SemanticConflict => {
@@ -791,7 +906,7 @@ pub(crate) fn terminal_activity_failure_decision(
     capability: &Capability,
     event: &str,
 ) -> Option<(DecisionAction, &'static str)> {
-    (event == "Stop" && matches!(capability, Capability::SessionActivity { .. }))
+    (event == "Stop" && activity_capability(capability))
         .then_some((DecisionAction::Warn, ACTIVITY_STOP_RECONCILIATION_REQUIRED))
 }
 
@@ -1394,10 +1509,10 @@ fn run_session_activity(
     let runtime_id = std::env::var("AGENT_SESSION_RUNTIME_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    if request.product == Product::Dsh && session_id.is_some() != runtime_id.is_some() {
+    if session_id.is_some() != runtime_id.is_some() {
         return Err(HookError::data(
             "session-activity-identity-incomplete",
-            "managed DSH activity requires both session and runtime identity",
+            "managed activity requires both session and runtime identity",
         ));
     }
     let (Some(session_id), Some(runtime_id)) = (session_id, runtime_id) else {
@@ -1406,7 +1521,7 @@ fn run_session_activity(
     let Some(event) = crate::adapter::normalize_activity_event(request, raw, &runtime_id)? else {
         return Ok(());
     };
-    let mut command = Command::new(resolve_activity_helper());
+    let mut command = Command::new(resolve_activity_helper()?);
     command
         .args(["activity", "event", "--stdin", &session_id])
         .stdin(Stdio::piped())
@@ -1437,26 +1552,30 @@ fn run_session_activity(
 /// `AGENT_SESSION_BIN` can already set `PATH`, and the pinned `PATH` is
 /// daemon-controlled. The discarded override is recorded as a typed
 /// classification so it cannot silently mask a misconfiguration.
-fn resolve_activity_helper() -> std::ffi::OsString {
-    let Some(override_path) = std::env::var_os(HELPER_BIN_ENV) else {
-        return ACTIVITY_HELPER.into();
-    };
-    let candidate = Path::new(&override_path);
-    if candidate.as_os_str().is_empty() {
-        return ACTIVITY_HELPER.into();
+fn resolve_activity_helper() -> Result<std::ffi::OsString, HookError> {
+    if let Some(override_path) = std::env::var_os(HELPER_BIN_ENV)
+        && !override_path.is_empty()
+    {
+        if executable_file(Path::new(&override_path)) {
+            return Ok(override_path);
+        }
+        crate::observe::Record::new(
+            "activity",
+            ACTIVITY_HELPER_UNRESOLVABLE,
+            crate::observe::Severity::Warn,
+        )
+        .disposition("path-fallback")
+        .recovery(crate::observe::RECOVERY_HOOK_DOCTOR)
+        .emit();
     }
-    if executable_file(candidate) {
-        return override_path;
-    }
-    crate::observe::Record::new(
-        "activity",
-        ACTIVITY_HELPER_UNRESOLVABLE,
-        crate::observe::Severity::Warn,
-    )
-    .disposition("path-fallback")
-    .recovery(crate::observe::RECOVERY_HOOK_DOCTOR)
-    .emit();
-    ACTIVITY_HELPER.into()
+    locate_activity_helper()
+        .map(PathBuf::into_os_string)
+        .ok_or_else(|| {
+            HookError::runtime(
+                ACTIVITY_HELPER_UNRESOLVABLE,
+                "the agent-session activity helper could not be resolved to an executable file",
+            )
+        })
 }
 
 /// Locate the helper that would actually run, or `None` when nothing resolves.
