@@ -19,7 +19,7 @@
 //! The local provider has no review-thread model: the atom returns an empty
 //! thread list and the merge gate passes trivially.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
@@ -48,6 +48,7 @@ const MAX_GITHUB_THREAD_COMMENT_PAGES: usize = 100;
 /// must not silently ignore a later reviewer reply.
 const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 100) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_THREAD_FINGERPRINTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_COMMENT_ANCHORS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $review: ID!, $after: String) { review: node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete pullRequest { number url headRefOid } } } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } } } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_THREAD_COMMENTS_QUERY: &str = "query($thread: ID!, $after: String) { node(id: $thread) { ... on PullRequestReviewThread { id comments(first: 100, after: $after) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } } }";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -120,6 +121,49 @@ struct GitHubThreadNode {
 struct GitHubThreadCommentsPage {
     thread_id: String,
     comments: Vec<PrReviewThreadComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubReviewCommentAnchor {
+    pub comment: PrReviewThreadComment,
+    pub path: String,
+    pub diff_side: Option<String>,
+    pub line: Option<u32>,
+    pub original_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    pub start_diff_side: Option<String>,
+    pub start_line: Option<u32>,
+    pub subject_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubReviewCommentAnchorsSnapshot {
+    pub head_sha: String,
+    pub review: GitHubPendingReviewIdentity,
+    pub anchors: BTreeMap<String, GitHubReviewCommentAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubPendingReviewIdentity {
+    pub number: u64,
+    pub pr_url: String,
+    pub head_sha: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub author: String,
+    pub state: String,
+    pub commit_sha: Option<String>,
+    pub body: String,
+    pub viewer_did_author: bool,
+    pub viewer_can_delete: bool,
+}
+
+struct GitHubReviewCommentAnchorsPage {
+    head_sha: String,
+    review: GitHubPendingReviewIdentity,
+    anchors: Vec<GitHubReviewCommentAnchor>,
     has_next_page: bool,
     end_cursor: Option<String>,
 }
@@ -443,6 +487,129 @@ pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
     ))
 }
 
+/// Fetch only the root-comment identity and anchor fields for the requested
+/// GitHub comment IDs. Pending-review recovery uses this bounded read instead
+/// of hydrating every thread reply, and stops as soon as every globally unique
+/// comment node ID has been found.
+pub(crate) fn compute_comment_anchors_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+    review_id: &str,
+    requested_ids: &BTreeSet<String>,
+) -> Result<GitHubReviewCommentAnchorsSnapshot, ForgeError> {
+    if requested_ids.is_empty() {
+        return Err(snapshot_incomplete(
+            "review-comment anchor lookup requires at least one comment id",
+            None,
+        ));
+    }
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = slug.split_once('/').ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to split GitHub owner/repo slug",
+            Some(format!("slug={slug}")),
+        )
+    })?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut expected_review = None;
+    let mut remaining = requested_ids.clone();
+    let mut anchors = BTreeMap::new();
+
+    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+        let output = runner.run(&build_github_comment_anchors_page_call(
+            ctx,
+            owner,
+            name,
+            number,
+            review_id,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_comment_anchors_page(&output, requested_ids)?;
+        if page.review.head_sha != page.head_sha {
+            return Err(snapshot_incomplete(
+                "the pending review and PR head differ during comment-anchor recovery",
+                Some(format!(
+                    "review_head={}; provider_head={}",
+                    page.review.head_sha, page.head_sha
+                )),
+            ));
+        }
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating review-comment anchors",
+                Some(format!(
+                    "expected_head={}; provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        if expected_review
+            .as_ref()
+            .is_some_and(|review| review != &page.review)
+        {
+            return Err(snapshot_incomplete(
+                "the pending review changed while paginating comment anchors",
+                Some(format!("review_id={review_id}")),
+            ));
+        }
+        expected_review.get_or_insert(page.review);
+        for anchor in page.anchors {
+            let comment_id = anchor.comment.id.clone();
+            if anchors.insert(comment_id.clone(), anchor).is_some() {
+                return Err(snapshot_incomplete(
+                    "a requested review comment appears in more than one review thread",
+                    Some(format!("comment_id={comment_id}")),
+                ));
+            }
+            remaining.remove(&comment_id);
+        }
+        if remaining.is_empty() {
+            return Ok(GitHubReviewCommentAnchorsSnapshot {
+                head_sha: expected_head.expect("the current page supplied a head"),
+                review: expected_review.expect("the current page supplied a review"),
+                anchors,
+            });
+        }
+        if !page.has_next_page {
+            return Err(snapshot_incomplete(
+                "review-comment anchor lookup did not find every requested comment",
+                Some(format!("missing_count={}", remaining.len())),
+            ));
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchor pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "review-comment anchor pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Err(snapshot_incomplete(
+        "review-comment anchor pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
+    ))
+}
+
 fn complete_github_thread_comments<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -716,6 +883,37 @@ fn build_github_thread_fingerprints_page_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
+fn build_github_comment_anchors_page_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    review_id: &str,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_COMMENT_ANCHORS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+        OsString::from("-f"),
+        OsString::from(format!("review={review_id}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
 fn build_github_thread_comments_call(
     ctx: &ProviderContext,
     thread_id: &str,
@@ -895,6 +1093,145 @@ fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage,
     })
 }
 
+fn parse_github_comment_anchors_page(
+    output: &BackendSuccess,
+    requested_ids: &BTreeSet<String>,
+) -> Result<GitHubReviewCommentAnchorsPage, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "review-comment anchors response is invalid JSON",
+            Some(e.to_string()),
+        )
+    })?;
+    reject_graphql_errors(&value, "review-comment anchors")?;
+    let review = value.pointer("/data/review").ok_or_else(|| {
+        snapshot_incomplete(
+            "review-comment anchors response is missing the pending review",
+            None,
+        )
+    })?;
+    if review.is_null() {
+        return Err(snapshot_incomplete(
+            "review-comment anchors response returned no pending review",
+            None,
+        ));
+    }
+    let review = GitHubPendingReviewIdentity {
+        number: required_json_u64(review, "/pullRequest/number", "review.pullRequest.number")?,
+        pr_url: required_json_string(review, "/pullRequest/url", "review.pullRequest.url")?,
+        head_sha: required_json_string(
+            review,
+            "/pullRequest/headRefOid",
+            "review.pullRequest.headRefOid",
+        )?,
+        review_id: required_json_string(review, "/id", "review.id")?,
+        review_url: required_json_string(review, "/url", "review.url")?,
+        author: review
+            .pointer("/author/login")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>")
+            .to_string(),
+        state: required_json_string(review, "/state", "review.state")?,
+        commit_sha: review
+            .pointer("/commit/oid")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        body: required_json_string_allow_empty(review, "/body", "review.body")?,
+        viewer_did_author: required_json_bool(
+            review,
+            "/viewerDidAuthor",
+            "review.viewerDidAuthor",
+        )?,
+        viewer_can_delete: required_json_bool(
+            review,
+            "/viewerCanDelete",
+            "review.viewerCanDelete",
+        )?,
+    };
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchors response is missing pullRequest",
+                None,
+            )
+        })?;
+    let head_sha = required_json_string(pull, "/headRefOid", "headRefOid")?;
+    let connection = pull.pointer("/reviewThreads").ok_or_else(|| {
+        snapshot_incomplete(
+            "review-comment anchors response is missing reviewThreads",
+            None,
+        )
+    })?;
+    let nodes = connection
+        .pointer("/nodes")
+        .and_then(|nodes| nodes.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-comment anchors response is missing reviewThreads nodes",
+                None,
+            )
+        })?;
+    let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThreads")?;
+    let mut anchors = Vec::new();
+    for node in nodes {
+        let Some(comment) = node
+            .pointer("/comments/nodes")
+            .and_then(|comments| comments.as_array())
+            .and_then(|comments| comments.first())
+        else {
+            continue;
+        };
+        let Some(comment_id) = comment.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !requested_ids.contains(comment_id) {
+            continue;
+        }
+        let comment = PrReviewThreadComment {
+            id: comment_id.to_string(),
+            author: comment
+                .pointer("/author/login")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<unknown>")
+                .to_string(),
+            body: required_json_string_allow_empty(comment, "/body", "reviewThread.comment.body")?,
+            created_at: required_json_string(
+                comment,
+                "/createdAt",
+                "reviewThread.comment.createdAt",
+            )?,
+            url: required_json_string(comment, "/url", "reviewThread.comment.url")?,
+        };
+        let subject_type = required_json_string(node, "/subjectType", "reviewThread.subjectType")?;
+        anchors.push(GitHubReviewCommentAnchor {
+            comment,
+            path: required_json_string(node, "/path", "reviewThread.path")?,
+            diff_side: node
+                .pointer("/diffSide")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            line: optional_json_u32(node, "/line"),
+            original_line: optional_json_u32(node, "/originalLine"),
+            original_start_line: optional_json_u32(node, "/originalStartLine"),
+            start_diff_side: node
+                .pointer("/startDiffSide")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            start_line: optional_json_u32(node, "/startLine"),
+            subject_type: Some(subject_type),
+        });
+    }
+    Ok(GitHubReviewCommentAnchorsPage {
+        head_sha,
+        review,
+        anchors,
+        has_next_page,
+        end_cursor,
+    })
+}
+
 fn parse_github_thread_comments_page(
     output: &BackendSuccess,
 ) -> Result<GitHubThreadCommentsPage, ForgeError> {
@@ -1049,6 +1386,22 @@ fn optional_json_u32(value: &serde_json::Value, pointer: &str) -> Option<u32> {
         .pointer(pointer)
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+}
+
+fn required_json_u64(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<u64, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
 }
 
 fn required_json_bool(
@@ -1318,6 +1671,71 @@ mod tests {
         )
     }
 
+    fn github_anchor_node(comment_id: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": path,
+            "diffSide": "RIGHT",
+            "line": 10,
+            "originalLine": 10,
+            "originalStartLine": null,
+            "startDiffSide": null,
+            "startLine": null,
+            "subjectType": "LINE",
+            "comments": {"nodes": [{
+                "id": comment_id,
+                "author": {"login": "review-bot"},
+                "body": format!("finding {comment_id}"),
+                "createdAt": "2026-07-20T12:00:00Z",
+                "url": format!("https://github.com/acme/widgets/pull/7#discussion_{comment_id}")
+            }]}
+        })
+    }
+
+    fn github_anchor_page(
+        head: &str,
+        nodes: Vec<serde_json::Value>,
+        has_next_page: bool,
+        end_cursor: Option<&str>,
+    ) -> BackendSuccess {
+        BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "review": {
+                        "id": "PRR_pending",
+                        "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-9",
+                        "author": {"login": "review-bot"},
+                        "state": "PENDING",
+                        "commit": {"oid": "head-7"},
+                        "body": "Summary",
+                        "viewerDidAuthor": true,
+                        "viewerCanDelete": true,
+                        "pullRequest": {
+                            "number": 7,
+                            "url": "https://github.com/acme/widgets/pull/7",
+                            "headRefOid": head
+                        }
+                    },
+                    "repository": {"pullRequest": {
+                        "headRefOid": head,
+                        "reviewThreads": {
+                            "nodes": nodes,
+                            "pageInfo": {
+                                "hasNextPage": has_next_page,
+                                "endCursor": end_cursor
+                            }
+                        }
+                    }}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    fn requested_comment_ids(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     #[test]
     fn github_threads_call_uses_graphql_with_owner_name_pr() {
         let call = build_threads_call(
@@ -1394,6 +1812,127 @@ mod tests {
         let query = calls[0].1.join(" ");
         assert!(query.contains("comments(first: 1)"), "{query}");
         assert!(!query.contains("thread=PRRT_1"), "{query}");
+    }
+
+    #[test]
+    fn comment_anchor_lookup_finds_a_requested_comment_on_page_two() {
+        let runner = ScriptedRunner::new(vec![
+            github_anchor_page("head-7", vec![], true, Some("page-2")),
+            github_anchor_page(
+                "head-7",
+                vec![github_anchor_node("PRRC_target", "src/lib.rs")],
+                false,
+                None,
+            ),
+        ]);
+
+        let snapshot = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_target"]),
+        )
+        .expect("later-page requested comment should be recovered");
+
+        assert_eq!(snapshot.anchors.len(), 1);
+        assert_eq!(snapshot.review.review_id, "PRR_pending");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].1.iter().any(|arg| arg == "after=page-2"));
+        assert!(calls[1].1.iter().any(|arg| arg == "review=PRR_pending"));
+    }
+
+    #[test]
+    fn comment_anchor_lookup_rejects_cross_page_head_drift() {
+        let runner = ScriptedRunner::new(vec![
+            github_anchor_page("head-7", vec![], true, Some("page-2")),
+            github_anchor_page(
+                "head-8",
+                vec![github_anchor_node("PRRC_target", "src/lib.rs")],
+                false,
+                None,
+            ),
+        ]);
+
+        let error = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_target"]),
+        )
+        .expect_err("head drift must fail closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("head changed"), "{error}");
+    }
+
+    #[test]
+    fn comment_anchor_lookup_rejects_a_repeated_cursor() {
+        let runner = ScriptedRunner::new(vec![
+            github_anchor_page("head-7", vec![], true, Some("same-cursor")),
+            github_anchor_page("head-7", vec![], true, Some("same-cursor")),
+        ]);
+
+        let error = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_missing"]),
+        )
+        .expect_err("repeated cursor must fail closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("repeated a cursor"), "{error}");
+    }
+
+    #[test]
+    fn comment_anchor_lookup_rejects_a_missing_requested_comment() {
+        let runner = ScriptedRunner::new(vec![github_anchor_page("head-7", vec![], false, None)]);
+
+        let error = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_missing"]),
+        )
+        .expect_err("missing requested comment must fail closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("did not find every"), "{error}");
+    }
+
+    #[test]
+    fn comment_anchor_lookup_rejects_a_duplicate_requested_comment() {
+        let runner = ScriptedRunner::new(vec![github_anchor_page(
+            "head-7",
+            vec![
+                github_anchor_node("PRRC_duplicate", "src/one.rs"),
+                github_anchor_node("PRRC_duplicate", "src/two.rs"),
+            ],
+            false,
+            None,
+        )]);
+
+        let error = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_duplicate"]),
+        )
+        .expect_err("duplicate requested comment must fail closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("more than one"), "{error}");
     }
 
     #[test]
