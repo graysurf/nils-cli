@@ -524,7 +524,13 @@ fn evaluate_with_io(
                 raw,
             ),
             Err(error) if error.code.starts_with("dispatch-") => return Err(error),
-            Err(_) => failure_outcome(rule.failure_posture, &rule.id),
+            Err(error) => failure_outcome(
+                rule.failure_posture,
+                &rule.id,
+                &rule.capability,
+                request.product,
+                &error,
+            ),
         };
         enforced.push((rule.id.clone(), outcome));
     }
@@ -958,10 +964,16 @@ pub fn apply_session_coordination(
         // rather than denying provider termination. The coordination transaction
         // needed the same terminal boundary: without it the very first Stop
         // delivery deadlocks, before provider re-entry metadata can help.
-        Err(_) => (
+        Err(error) => (
             match terminal_coordination_failure_outcome(request, raw) {
                 Some(outcome) => outcome,
-                None => failure_outcome(rule.failure_posture, &rule.id),
+                None => failure_outcome(
+                    rule.failure_posture,
+                    &rule.id,
+                    &rule.capability,
+                    request.product,
+                    &error,
+                ),
             },
             StopCoordinationOutcome::Unavailable {
                 mode: execution.mode,
@@ -1137,8 +1149,14 @@ fn merge_coordination_outcome(
     Ok(())
 }
 
-fn failure_outcome(posture: FailurePosture, rule_id: &str) -> RuleOutcome {
-    match posture {
+fn failure_outcome(
+    posture: FailurePosture,
+    rule_id: &str,
+    capability: &Capability,
+    product: Product,
+    error: &HookError,
+) -> RuleOutcome {
+    let mut outcome = match posture {
         FailurePosture::Open => simple(
             DecisionAction::Allow,
             &format!("{rule_id}:capability-failure-open"),
@@ -1151,7 +1169,34 @@ fn failure_outcome(posture: FailurePosture, rule_id: &str) -> RuleOutcome {
             DecisionAction::Block,
             &format!("{rule_id}:capability-failure-closed"),
         ),
+    };
+    if let Capability::RuntimeKitHandler { handler_id } = capability {
+        let failure_posture = match posture {
+            FailurePosture::Open => "fail-open",
+            FailurePosture::Warn => "warn",
+            FailurePosture::Closed => "fail-closed",
+        };
+        let boundary = match error.code.as_str() {
+            "handler-untrusted" => {
+                "The handler file must be a regular owner-owned executable and must not be group- or other-writable."
+            }
+            "handler-unavailable" | "capability-unavailable" => {
+                "The handler file is missing, inaccessible, or could not be started."
+            }
+            "handler-failed" => "The handler process exited unsuccessfully.",
+            "handler-output-invalid" => "The handler returned non-JSON output.",
+            "handler-output-too-large" => {
+                "The handler returned more output than the bounded contract permits."
+            }
+            _ => "The handler did not complete its bounded capability contract.",
+        };
+        outcome.context = Some(format!(
+            "agent-hook runtime-kit handler `{handler_id}` failed before producing a trusted verdict (`{}`). {boundary} The rule applied its configured {failure_posture} posture. Run `agent-hook doctor --product {}` and repair or reinstall the handler through the owning runtime sync/deploy workflow; do not bypass the hook.",
+            error.code,
+            product.as_str(),
+        ));
     }
+    outcome
 }
 
 fn timeout_outcome(
