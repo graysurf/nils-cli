@@ -1125,19 +1125,24 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
     ctx: &ProviderContext,
     snapshot: &mut PendingReviewSnapshot,
 ) -> Result<(), ForgeError> {
+    let needs_recovery = snapshot.inline_comments.iter().any(|comment| {
+        comment.subject_type == "LINE"
+            && (comment.diff_side.is_none()
+                || (comment.start_line.is_some() && comment.start_diff_side.is_none()))
+    });
+    if !needs_recovery {
+        return Ok(());
+    }
+
+    // Once recovery requires a second provider read, authenticate every inline
+    // comment against that same read. Otherwise a direct-side comment could
+    // change between reads and leave the snapshot with a stale body beside a
+    // freshly recovered anchor.
     let requested_ids = snapshot
         .inline_comments
         .iter()
-        .filter(|comment| {
-            comment.subject_type == "LINE"
-                && (comment.diff_side.is_none()
-                    || (comment.start_line.is_some() && comment.start_diff_side.is_none()))
-        })
         .map(|comment| comment.id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    if requested_ids.is_empty() {
-        return Ok(());
-    }
 
     let recovered = pr_review_threads::compute_comment_anchors_for_pr(
         runner,
@@ -1154,12 +1159,6 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
     }
 
     for comment in &mut snapshot.inline_comments {
-        if comment.subject_type != "LINE"
-            || (comment.diff_side.is_some()
-                && (comment.start_line.is_none() || comment.start_diff_side.is_some()))
-        {
-            continue;
-        }
         let anchor = recovered.anchors.get(&comment.id).ok_or_else(|| {
             snapshot_incomplete(
                 "pending review comment is missing from the exact review-thread snapshot",
@@ -1187,6 +1186,9 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
                 "pending review comment anchor differs from its review thread",
                 Some(format!("comment_id={}", comment.id)),
             ));
+        }
+        if comment.subject_type != "LINE" {
+            continue;
         }
         let diff_side = anchor.diff_side.as_deref().ok_or_else(|| {
             snapshot_incomplete(
@@ -1954,6 +1956,74 @@ mod tests {
 
         let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
             .expect_err("cross-read comment drift must fail before snapshot authority exists");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(
+            error.to_string().contains("identity differs"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pending_snapshot_recovery_rejects_drift_in_a_non_deferred_comment() {
+        let mut pending = truncated_pending_snapshot_page();
+        let mut pending_value: serde_json::Value =
+            serde_json::from_str(&pending.stdout).expect("pending fixture");
+        pending_value["data"]["node"]["comments"]["totalCount"] = 2.into();
+        pending_value["data"]["node"]["comments"]["nodes"]
+            .as_array_mut()
+            .expect("pending comments")
+            .push(serde_json::json!({
+                "id": "PRRC_direct",
+                "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct",
+                "author": {"login": "review-bot"},
+                "body": "direct-side finding",
+                "createdAt": "2026-07-20T12:00:00Z",
+                "path": "src/direct.rs",
+                "line": 12,
+                "originalLine": 12,
+                "diffSide": "RIGHT",
+                "startLine": null,
+                "originalStartLine": null,
+                "startDiffSide": null,
+                "subjectType": "LINE"
+            }));
+        pending.stdout = pending_value.to_string();
+
+        let mut threads = truncated_comment_thread("src/new.rs", "PRRC_truncated");
+        let mut thread_value: serde_json::Value =
+            serde_json::from_str(&threads.stdout).expect("thread fixture");
+        thread_value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            .as_array_mut()
+            .expect("review threads")
+            .push(serde_json::json!({
+                "id": "PRRT_direct",
+                "isResolved": false,
+                "isOutdated": false,
+                "path": "src/direct.rs",
+                "diffSide": "RIGHT",
+                "line": 12,
+                "originalLine": 12,
+                "originalStartLine": null,
+                "startDiffSide": null,
+                "startLine": null,
+                "subjectType": "LINE",
+                "comments": {
+                    "nodes": [{
+                        "id": "PRRC_direct",
+                        "author": {"login": "review-bot"},
+                        "body": "changed between provider reads",
+                        "createdAt": "2026-07-20T12:00:00Z",
+                        "url": "https://github.com/acme/widgets/pull/7#discussion_PRRC_direct"
+                    }],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}
+                }
+            }));
+        threads.stdout = thread_value.to_string();
+
+        let runner = ScriptedRunner::new(vec![pending, threads]);
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("every inline comment must be stable across provider reads");
 
         assert_eq!(error.kind(), "review_snapshot_incomplete");
         assert!(
