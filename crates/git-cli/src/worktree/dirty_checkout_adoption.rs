@@ -8510,7 +8510,7 @@ mod tests {
         ] {
             assert!(
                 !linux_overflow_uid_proves_unmapped_host_root(overflow_uid, overflow_uid, uid_map),
-                "malformed map must fail closed: {uid_map:?}"
+                "malformed or ambiguous UID maps must fail closed"
             );
         }
     }
