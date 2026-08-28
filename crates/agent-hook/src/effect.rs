@@ -92,6 +92,13 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
     let Some(program) = words.first() else {
         return OperationEffectClass::Unknown;
     };
+    if trusted_pwd(program)
+        && words[1..]
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-L" | "-P" | "--logical" | "--physical"))
+    {
+        return OperationEffectClass::ReadOnly;
+    }
     let Some(name) = Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
@@ -423,7 +430,11 @@ fn full_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn trusted_sibling(program: &str) -> bool {
+fn trusted_pwd(program: &str) -> bool {
+    matches!(program, "pwd" | "/bin/pwd" | "/usr/bin/pwd")
+}
+
+pub(crate) fn trusted_sibling(program: &str) -> bool {
     let candidate = if Path::new(program).components().count() > 1 {
         PathBuf::from(program)
     } else {
@@ -557,6 +568,32 @@ mod tests {
         assert!(sensitive(Path::new("/repo/.git/config")));
         assert!(sensitive(Path::new("/repo/.git/refs/heads/main")));
         assert!(!sensitive(Path::new("/repo/src/main.rs")));
+    }
+
+    #[test]
+    fn pwd_is_read_only_only_for_its_closed_argument_set() {
+        let directory = tempfile::tempdir().expect("execution directory");
+        let request = request_for(directory.path());
+        for command in ["pwd", "pwd -L", "/bin/pwd -P"] {
+            assert_eq!(
+                classify_command(command, &request),
+                OperationEffectClass::ReadOnly,
+                "command={command}"
+            );
+        }
+        for command in [
+            "pwd target",
+            "pwd --unknown",
+            "pwd; touch changed",
+            "./pwd",
+            "/tmp/pwd -P",
+        ] {
+            assert_eq!(
+                classify_command(command, &request),
+                OperationEffectClass::Unknown,
+                "command={command}"
+            );
+        }
     }
 
     #[test]
@@ -756,5 +793,27 @@ mod tests {
                 "{label}: {command}"
             );
         }
+
+        let feature = tempfile::tempdir().expect("feature worktree");
+        let feature_git_dir = directory.path().join(".git/worktrees/feature");
+        fs::create_dir_all(&feature_git_dir).expect("feature git directory");
+        fs::write(feature_git_dir.join("HEAD"), "ref: refs/heads/feature\n").expect("feature HEAD");
+        fs::write(feature_git_dir.join("commondir"), "../..\n").expect("feature commondir");
+        fs::write(
+            feature.path().join(".git"),
+            format!("gitdir: {}\n", feature_git_dir.display()),
+        )
+        .expect("feature gitfile");
+        let managed_session_cwd = request_for(other_repo.path());
+        let explicit_repo = format!(
+            "{} commit --repo {} --type fix --subject convergence --body-bullet bounded",
+            trusted.display(),
+            feature.path().display()
+        );
+        assert_eq!(
+            classify_command(&explicit_repo, &managed_session_cwd),
+            OperationEffectClass::LocalReversible,
+            "an explicit governed --repo must outrank an unrelated managed-session cwd"
+        );
     }
 }

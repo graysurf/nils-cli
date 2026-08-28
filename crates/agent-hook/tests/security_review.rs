@@ -1,9 +1,10 @@
 mod support;
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use pretty_assertions::{assert_eq, assert_ne};
 use serde_json::{Value, json};
@@ -879,6 +880,101 @@ fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
 }
 
 #[test]
+fn trusted_semantic_commit_repo_binds_coordination_to_the_claimed_target() {
+    let bash_owner_policy = owner_policy().replace(
+        "matcher = \"Write|Edit|NotebookEdit|apply_patch\"",
+        "matcher = \"Write|Edit|NotebookEdit|apply_patch|Bash\"",
+    );
+    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture_with(&bash_owner_policy, false);
+    let release = fixture.root.join("release");
+    fs::create_dir(&release).expect("release directory");
+    let agent_hook = release.join("agent-hook");
+    fs::copy(env!("CARGO_BIN_EXE_agent-hook"), &agent_hook).expect("copied agent-hook");
+    fs::set_permissions(&agent_hook, fs::Permissions::from_mode(0o700)).expect("agent-hook mode");
+    let semantic_commit = release.join("semantic-commit");
+    fs::write(&semantic_commit, "#!/bin/sh\nexit 0\n").expect("semantic-commit companion");
+    fs::set_permissions(&semantic_commit, fs::Permissions::from_mode(0o700))
+        .expect("semantic-commit mode");
+    let explicit_repo = fs::canonicalize(&checkout_b).expect("canonical explicit repo");
+    let full_command = format!(
+        "{} commit --repo {} --type fix --subject bounded --body-bullet Bounded",
+        semantic_commit.display(),
+        explicit_repo.display()
+    );
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"Bash",
+        "cwd":checkout_a,
+        "tool_input":{"command":full_command}
+    })
+    .to_string();
+    let trace_path = fixture.state_home.join("agent-hook/trace.jsonl");
+
+    for (format, expected_code) in [("json", 1), ("text", 1), ("provider", 0)] {
+        let _ = fs::remove_file(&trace_path);
+        let mut child = Command::new(&agent_hook);
+        child
+            .args([
+                "dispatch",
+                "--product",
+                "codex",
+                "--format",
+                format,
+                "--trace",
+            ])
+            .current_dir(&fixture.root)
+            .env_clear()
+            .env("HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", &fixture.config_home)
+            .env("XDG_STATE_HOME", &fixture.state_home)
+            .env("AGENT_SESSION_STATE_DIR", &fixture.session_state)
+            .env("AGENT_SESSION_ID", "current")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = child.spawn().expect("copied agent-hook spawn");
+        child
+            .stdin
+            .take()
+            .expect("agent-hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("agent-hook input");
+        let raw = child.wait_with_output().expect("agent-hook output");
+        let stdout = String::from_utf8(raw.stdout).expect("agent-hook stdout UTF-8");
+        let stderr = String::from_utf8(raw.stderr).expect("agent-hook stderr UTF-8");
+        assert_eq!(
+            raw.status.code(),
+            Some(expected_code),
+            "format={format} explicit --repo must bind the claimed target: {stdout} {stderr}"
+        );
+        if format == "json" {
+            let output: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+                panic!("invalid agent-hook JSON: {error}; stderr={stderr}")
+            });
+            assert_eq!(output["data"]["action"], "block");
+            assert_eq!(output["data"]["reasons"][0]["code"], "owner-active-foreign");
+        }
+
+        let trace = fs::read_to_string(&trace_path).expect("agent-hook trace");
+        for (surface, contents) in [
+            ("stdout", stdout.as_str()),
+            ("stderr", stderr.as_str()),
+            ("trace", trace.as_str()),
+        ] {
+            assert!(
+                !contents.contains(explicit_repo.to_str().expect("explicit repo UTF-8")),
+                "format={format} {surface} exposed the explicit repository: {contents}"
+            );
+            assert!(
+                !contents.contains(&full_command),
+                "format={format} {surface} exposed the full command: {contents}"
+            );
+        }
+    }
+}
+
+#[test]
 fn notebook_edit_uses_notebook_path_for_owner_liveness() {
     let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     assert_foreign_target_blocks(
@@ -1087,7 +1183,20 @@ fn undocumented_codex_apply_patch_alias_fails_closed() {
 }
 
 fn same_repository_foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
-    let fixture = Fixture::new(&owner_policy());
+    same_repository_foreign_owner_fixture_with(&owner_policy())
+}
+
+fn same_repository_foreign_owner_fixture_with(
+    policy: &str,
+) -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
+    foreign_owner_fixture_with(policy, true)
+}
+
+fn foreign_owner_fixture_with(
+    policy: &str,
+    shared_repository_context: bool,
+) -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
+    let fixture = Fixture::new(policy);
     let checkout_a = fixture.root.join("checkout-a");
     let checkout_b = fixture.root.join("checkout-b");
     for checkout in [&checkout_a, &checkout_b] {
@@ -1101,6 +1210,16 @@ fn same_repository_foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std:
     }
     let now = now_epoch();
     let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let claims = if shared_repository_context {
+        json!([
+            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":[fingerprint(key,1,&checkout_a)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
+            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":[fingerprint(key,1,&checkout_b)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
+        ])
+    } else {
+        json!([
+            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":[fingerprint(key,1,&checkout_b)],"repositories":["owner/peer"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
+        ])
+    };
     write_registry(
         &fixture,
         key,
@@ -1108,10 +1227,7 @@ fn same_repository_foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std:
             "current": {"session_id":"current","incarnation":"inc-current","state":"ready","heartbeat_epoch":now},
             "peer": {"session_id":"peer","incarnation":"inc-peer","state":"ready","heartbeat_epoch":now}
         }),
-        json!([
-            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":[fingerprint(key,1,&checkout_a)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
-            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":[fingerprint(key,1,&checkout_b)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
-        ]),
+        claims,
     );
     for (session, incarnation) in [("current", "inc-current"), ("peer", "inc-peer")] {
         let heartbeat = heartbeat_path(&fixture, session);

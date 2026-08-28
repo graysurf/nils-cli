@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use nils_test_support::{EnvGuard, GlobalStateLock};
 use pretty_assertions::{assert_eq, assert_ne};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use support::Fixture;
 
@@ -30,7 +30,17 @@ version = "2026.07.20.1"
 [[rules]]
 id = "coord.activity.prompt-stop"
 products = ["codex", "claude"]
-events = ["UserPromptSubmit", "Stop"]
+events = ["UserPromptSubmit", "PreToolUse", "Stop"]
+priority = 100
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+
+[[rules]]
+id = "coord.activity.stop-failure"
+products = ["claude"]
+events = ["StopFailure"]
 priority = 100
 mode = "enforce"
 failure_posture = "closed"
@@ -193,6 +203,29 @@ fn a_completely_unresolvable_helper_degrades_instead_of_deadlocking() {
         ("PATH", empty_dir.to_str().expect("empty dir")),
     ];
 
+    let prompt = fixture.run_with_env(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(r#"{"hook_event_name":"UserPromptSubmit","prompt":"status"}"#),
+        &envs,
+    );
+    assert_eq!(prompt.code, 0, "stderr={}", prompt.stderr_text());
+    assert_eq!(prompt.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        prompt.stdout_json()["data"]["reasons"],
+        json!([
+            {
+                "rule_id": "coord.activity.prompt-stop",
+                "code": "activity-helper-unresolvable",
+                "disposition": "warn"
+            },
+            {
+                "rule_id": "coord.activity.prompt-stop",
+                "code": "coordination-degraded-read-only",
+                "disposition": "warn"
+            }
+        ])
+    );
+
     let stop = fixture.run_with_env(
         &["dispatch", "--product", "claude", "--format", "json"],
         Some(r#"{"hook_event_name":"Stop","stop_hook_active":false}"#),
@@ -209,6 +242,27 @@ fn a_completely_unresolvable_helper_degrades_instead_of_deadlocking() {
         "activity-stop-reconciliation-required"
     );
 
+    let stop_failure = fixture.run_with_env(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
+        &envs,
+    );
+    assert_eq!(
+        stop_failure.code,
+        0,
+        "StopFailure must terminate with a warning: {}",
+        stop_failure.stdout_text()
+    );
+    assert_eq!(stop_failure.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        stop_failure.stdout_json()["data"]["reasons"],
+        json!([{
+            "rule_id": "coord.activity.stop-failure",
+            "code": "activity-stop-reconciliation-required",
+            "disposition": "warn"
+        }])
+    );
+
     // A re-entered Stop must not block again either.
     let reentry = fixture.run_with_env(
         &["dispatch", "--product", "claude", "--format", "json"],
@@ -216,6 +270,162 @@ fn a_completely_unresolvable_helper_degrades_instead_of_deadlocking() {
         &envs,
     );
     assert_eq!(reentry.code, 0, "stderr={}", reentry.stderr_text());
+}
+
+/// A half-inherited selector is managed-but-invalid, never unmanaged. The
+/// startup/conversation surface refuses provider work with one bounded typed
+/// diagnosis until the trusted launcher supplies the exact pair.
+#[test]
+fn a_partial_managed_identity_is_never_silently_unmanaged() {
+    let fixture = Fixture::new(ACTIVITY_POLICY);
+    let prompt = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(r#"{"hook_event_name":"UserPromptSubmit","prompt":"status"}"#),
+        &[("AGENT_SESSION_ID", "inherited-session")],
+    );
+    assert_eq!(prompt.code, 1, "stderr={}", prompt.stderr_text());
+    assert_eq!(prompt.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        prompt.stdout_json()["data"]["reasons"][0]["code"],
+        "session-activity-identity-incomplete"
+    );
+
+    let mutation = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch changed"}}"#,
+        ),
+        &[("AGENT_SESSION_ID", "inherited-session")],
+    );
+    assert_eq!(mutation.code, 1, "stdout={}", mutation.stdout_text());
+    assert_eq!(mutation.stdout_json()["data"]["action"], "block");
+}
+
+#[test]
+fn selectorless_managed_activity_requires_convergence_but_unmanaged_is_a_no_op() {
+    let fixture = Fixture::new(ACTIVITY_POLICY);
+    for payload in [
+        r#"{"hook_event_name":"UserPromptSubmit","prompt":"status"}"#,
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"pwd"}}"#,
+    ] {
+        let managed = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(payload),
+            &[("AGENT_SESSION_COORDINATION_MODE", "enforce")],
+        );
+        assert_eq!(
+            managed.code,
+            1,
+            "payload={payload}: {}",
+            managed.stdout_text()
+        );
+        assert_eq!(managed.stdout_json()["data"]["action"], "block");
+        assert_eq!(
+            managed.stdout_json()["data"]["reasons"][0]["code"],
+            "session-activity-identity-incomplete"
+        );
+    }
+
+    let unmanaged = fixture.run_with_env_and_removals(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(r#"{"hook_event_name":"UserPromptSubmit","prompt":"status"}"#),
+        &[],
+        &["AGENT_SESSION_STATE_DIR"],
+    );
+    assert_eq!(
+        unmanaged.code,
+        0,
+        "a genuinely unmanaged request must remain a no-op: {}",
+        unmanaged.stdout_text()
+    );
+    assert_eq!(unmanaged.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        unmanaged.stdout_json()["data"]["reasons"][0]["code"],
+        "activity-recorded"
+    );
+}
+
+/// Activity is metadata, so losing its helper must not make a verified local
+/// status probe depend on the same broken capability needed to diagnose it.
+/// Unknown or state-changing Bash remains fail-closed because this exception
+/// grants no owner, checkout, or coordination authority.
+#[test]
+fn an_unresolvable_helper_allows_only_audited_read_only_pre_tool_use() {
+    let fixture = Fixture::new(ACTIVITY_POLICY);
+    let empty_dir = fixture.root.join("empty-bin");
+    fs::create_dir_all(&empty_dir).expect("empty directory");
+    let envs = [
+        ("AGENT_SESSION_ID", "managed-session"),
+        ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+        ("PATH", empty_dir.to_str().expect("empty dir")),
+    ];
+
+    let read_only = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"pwd"}}"#,
+        ),
+        &envs,
+    );
+    assert_eq!(
+        read_only.code,
+        0,
+        "a missing metadata helper must not block pwd: stdout={} stderr={}",
+        read_only.stdout_text(),
+        read_only.stderr_text()
+    );
+    assert_eq!(read_only.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        read_only.stdout_json()["data"]["reasons"],
+        json!([
+            {
+                "rule_id": "coord.activity.prompt-stop",
+                "code": "activity-helper-unresolvable",
+                "disposition": "warn"
+            },
+            {
+                "rule_id": "coord.activity.prompt-stop",
+                "code": "activity-degraded-audited-read-only",
+                "disposition": "warn"
+            }
+        ])
+    );
+    let read_only_json = read_only.stdout_json();
+    let context = read_only_json["data"]["context"]
+        .as_str()
+        .expect("bounded activity degradation context");
+    assert!(context.contains("metadata"), "context={context}");
+    assert!(context.contains("agent-hook doctor"), "context={context}");
+
+    let mutation = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch changed"}}"#,
+        ),
+        &envs,
+    );
+    assert_eq!(
+        mutation.code,
+        1,
+        "an activity fault must not authorize unknown or mutating Bash: {}",
+        mutation.stdout_text()
+    );
+    assert_eq!(mutation.stdout_json()["data"]["action"], "block");
+
+    let conflicting = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","command":"pwd","tool_input":{"command":"touch changed"}}"#,
+        ),
+        &envs,
+    );
+    assert_eq!(
+        conflicting.code,
+        1,
+        "conflicting command representations must remain blocked: {}",
+        conflicting.stdout_text()
+    );
+    assert_eq!(conflicting.stdout_json()["data"]["action"], "block");
 }
 
 /// Install the managed Claude ingress so the provider reaches `converged`, which

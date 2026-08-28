@@ -928,6 +928,11 @@ fn target_paths(
     let mut execution = string_at(object, &["cwd", "working_directory"])
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
+    if matches!(matcher, Some("Bash" | "bash"))
+        && let Some(repo) = trusted_semantic_commit_repo(object, execution.as_deref())?
+    {
+        execution = Some(repo);
+    }
     let nested = object.get("tool_input").and_then(Value::as_object);
     let mut targets = if product == Product::Dsh {
         let Some(input) = nested else {
@@ -1168,8 +1173,97 @@ fn target_binding_material(binding: &TargetBinding) -> Result<Vec<u8>, HookError
 }
 
 pub(crate) fn command_text(object: &Map<String, Value>) -> Option<&str> {
-    string_at(object, &["command"])
-        .or_else(|| nested_string(object, "tool_input", &["command", "cmd"]))
+    let tool_input = object.get("tool_input").and_then(Value::as_object);
+    let dsh_arguments = object
+        .get("tool")
+        .and_then(Value::as_object)
+        .and_then(|tool| tool.get("arguments"))
+        .and_then(Value::as_object);
+    let candidates = [
+        object.get("command").and_then(Value::as_str),
+        tool_input
+            .and_then(|input| input.get("command"))
+            .and_then(Value::as_str),
+        tool_input
+            .and_then(|input| input.get("cmd"))
+            .and_then(Value::as_str),
+        dsh_arguments
+            .and_then(|input| input.get("command"))
+            .and_then(Value::as_str),
+        dsh_arguments
+            .and_then(|input| input.get("cmd"))
+            .and_then(Value::as_str),
+    ];
+    let mut selected = None;
+    for candidate in candidates.into_iter().flatten() {
+        if selected.is_some_and(|value| value != candidate) {
+            return None;
+        }
+        selected = Some(candidate);
+    }
+    selected
+}
+
+fn trusted_semantic_commit_repo(
+    object: &Map<String, Value>,
+    execution: Option<&Path>,
+) -> Result<Option<PathBuf>, HookError> {
+    let Some(command) = command_text(object) else {
+        return Ok(None);
+    };
+    let Ok(mut words) = crate::read_only::parse_simple_command(command) else {
+        return Ok(None);
+    };
+    if words.first().map(String::as_str) == Some("builtin")
+        && words.get(1).map(String::as_str) == Some("command")
+    {
+        words.drain(..2);
+    }
+    let Some(program) = words.first() else {
+        return Ok(None);
+    };
+    if Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("semantic-commit")
+        || !crate::effect::trusted_sibling(program)
+        || !matches!(
+            words.get(1).map(String::as_str),
+            Some("commit" | "fixup" | "squash" | "default-branch")
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut repo = None;
+    for (index, argument) in words[2..].iter().enumerate() {
+        if argument.starts_with("--repo=") {
+            return Err(untrusted_target(
+                "trusted semantic-commit requires a separate --repo value",
+            ));
+        }
+        if argument != "--repo" {
+            continue;
+        }
+        if repo.is_some() {
+            return Err(untrusted_target(
+                "trusted semantic-commit requires exactly one --repo target",
+            ));
+        }
+        repo = words.get(index + 3).map(String::as_str);
+    }
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let repo = resolve_mutation_target(repo, execution)?;
+    let canonical = std::fs::canonicalize(repo)
+        .map_err(|_| untrusted_target("trusted semantic-commit --repo target is unavailable"))?;
+    if !canonical.is_dir() {
+        return Err(untrusted_target(
+            "trusted semantic-commit --repo target must be a directory",
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 pub(crate) fn exact_main_agent_bootstrap_command(input: &[u8]) -> bool {
@@ -1317,15 +1411,6 @@ fn normalized_failure_reason(raw: Option<&str>) -> &'static str {
         Some("max_output_tokens") => "max_output_tokens",
         _ => "unknown",
     }
-}
-
-fn nested_string<'a>(
-    object: &'a Map<String, Value>,
-    parent: &str,
-    keys: &[&str],
-) -> Option<&'a str> {
-    let nested = object.get(parent)?.as_object()?;
-    string_at(nested, keys)
 }
 
 fn parse_provider_json(input: &[u8]) -> Result<Value, HookError> {

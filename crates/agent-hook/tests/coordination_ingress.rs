@@ -85,6 +85,41 @@ fn install_session_mode(fixture: &Fixture, mode: &str) {
     Fixture::set_private(&record);
 }
 
+fn install_current_broker(fixture: &Fixture, mode: &str) {
+    install_session_mode(fixture, mode);
+    let now = now_epoch();
+    let coordination = fixture.session_state.join("coordination");
+    fs::create_dir_all(&coordination).expect("coordination directory");
+    let registry = coordination.join("registry.json");
+    fs::write(
+        &registry,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.coordination-registry.v1",
+            "fingerprint_epoch": 1,
+            "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "brokers": {
+                "trusted": {
+                    "session_id": "trusted",
+                    "incarnation": "trusted-incarnation",
+                    "coordination_mode": mode,
+                    "state": "ready",
+                    "heartbeat_epoch": now
+                }
+            },
+            "claims": []
+        }))
+        .expect("registry JSON"),
+    )
+    .expect("registry");
+    Fixture::set_private(&registry);
+    let heartbeat = fixture
+        .session_state
+        .join("sessions/trusted/coordination/heartbeat");
+    fs::create_dir_all(heartbeat.parent().expect("heartbeat parent")).expect("heartbeat directory");
+    fs::write(&heartbeat, format!("trusted-incarnation:{now}\n")).expect("heartbeat");
+    Fixture::set_private(&heartbeat);
+}
+
 fn bootstrap_policy(extra_rule: &str) -> String {
     format!(
         r#"schema_version = "agent-hook.policy.v1"
@@ -213,9 +248,103 @@ fn exact_recovery_reaches_authenticated_coordination_when_activity_is_stale() {
 }
 
 #[test]
+fn exact_recovery_reaches_coordination_when_the_activity_helper_is_unresolvable() {
+    let fixture = Fixture::new(&activity_recovery_policy(true));
+    install_coordination_handler(&fixture);
+    let capture = fixture.root.join("missing-helper-recovery.json");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "recover-without-activity-helper",
+        "cwd": fixture.root,
+        "tool_input": {
+            "command": "main-agent self recover --idempotency-key recover-12345678 --format json"
+        }
+    })
+    .to_string();
+    let recovered = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("AGENT_SESSION_BIN", "/missing/agent-session"),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            ("PATH", "/usr/bin:/bin"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(
+        recovered.code,
+        0,
+        "missing activity helper must defer exact recovery: stdout={} stderr={}",
+        recovered.stdout_text(),
+        recovered.stderr_text()
+    );
+    assert_eq!(recovered.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][0]["code"],
+        "activity-recovery-deferred-to-coordination"
+    );
+    assert_eq!(
+        recovered.stdout_json()["data"]["reasons"][1]["code"],
+        "coordination-admitted"
+    );
+    assert_eq!(
+        fs::read_to_string(capture).expect("captured recovery request"),
+        payload
+    );
+}
+
+#[test]
 fn activity_recovery_degradation_requires_exact_shape_and_coordination() {
+    let fixture = Fixture::new(&activity_recovery_policy(true));
+    let activity = fixture.root.join("agent-session-stale-activity");
+    fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+    fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+        .expect("activity helper mode");
+    install_coordination_handler(&fixture);
+    let capture = fixture.root.join("read-only-coordination.json");
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_use_id": "read-only-after-activity-fault",
+        "cwd": fixture.root,
+        "tool_input": {"command": "pwd"}
+    })
+    .to_string();
+    let admitted = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            (
+                "AGENT_SESSION_BIN",
+                activity.to_str().expect("activity path"),
+            ),
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "stale-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "enforce"),
+            (
+                "COORDINATION_CAPTURE",
+                capture.to_str().expect("capture path"),
+            ),
+        ],
+    );
+    assert_eq!(admitted.code, 0, "stdout={}", admitted.stdout_text());
+    assert_eq!(admitted.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        admitted.stdout_json()["data"]["reasons"][0]["code"],
+        "session-activity-failed"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("captured read-only request"),
+        payload
+    );
+
     let commands = [
-        "pwd",
         "main-agent self recover --idempotency-key short --format json",
         "main-agent self recover --idempotency-key recover-12345678 --format json; pwd",
     ];
@@ -332,6 +461,87 @@ fn activity_recovery_degradation_requires_exact_shape_and_coordination() {
         rejected.stdout_json()["data"]["reasons"][1]["code"],
         "runtime.coordination:capability-failure-closed"
     );
+}
+
+#[test]
+fn activity_metadata_failure_obeys_the_trusted_coordination_mode() {
+    for (mode, expected_code, expected_action) in [
+        ("advisory", 0, "warn"),
+        ("off", 0, "warn"),
+        ("enforce", 1, "block"),
+    ] {
+        let fixture = Fixture::new(&activity_recovery_policy(true));
+        install_current_broker(&fixture, mode);
+        install_coordination_handler(&fixture);
+        let activity = fixture.root.join("agent-session-stale-activity");
+        fs::write(&activity, "#!/bin/sh\nexit 65\n").expect("stale activity helper");
+        fs::set_permissions(&activity, fs::Permissions::from_mode(0o700))
+            .expect("activity helper mode");
+        let capture = fixture.root.join("coordination.json");
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": format!("activity-fault-{mode}"),
+            "cwd": fixture.root,
+            "tool_input": {"command": "touch changed"}
+        })
+        .to_string();
+        let decision = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                (
+                    "AGENT_SESSION_BIN",
+                    activity.to_str().expect("activity path"),
+                ),
+                ("AGENT_SESSION_ID", "trusted"),
+                ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+                ("AGENT_SESSION_COORDINATION_MODE", mode),
+                (
+                    "COORDINATION_CAPTURE",
+                    capture.to_str().expect("capture path"),
+                ),
+            ],
+        );
+        assert_eq!(
+            decision.code,
+            expected_code,
+            "mode={mode}: {}",
+            decision.stdout_text()
+        );
+        assert_eq!(
+            decision.stdout_json()["data"]["action"],
+            expected_action,
+            "mode={mode}: {}",
+            decision.stdout_text()
+        );
+        if mode == "enforce" {
+            assert!(!capture.exists(), "enforce fault reached coordination");
+        } else {
+            assert_eq!(
+                decision.stdout_json()["data"]["reasons"],
+                json!([
+                    {
+                        "rule_id": "runtime.activity",
+                        "code": "session-activity-failed",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "runtime.activity",
+                        "code": "activity-degraded-advisory-off",
+                        "disposition": "warn"
+                    },
+                    {
+                        "rule_id": "runtime.coordination",
+                        "code": "coordination-admitted",
+                        "disposition": "allow"
+                    }
+                ]),
+                "mode={mode}"
+            );
+            assert!(capture.exists(), "mode={mode} skipped later authority");
+        }
+    }
 }
 
 fn install_foreign_owner(fixture: &Fixture) {
