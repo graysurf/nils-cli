@@ -40,16 +40,13 @@ use crate::rate_limit::default_runner;
 const SCHEMA: &str = "pr.review-threads";
 const SCHEMA_VERSION: u32 = 1;
 
-const MAX_GITHUB_THREAD_PAGES: usize = 100;
-const MAX_GITHUB_THREAD_COMMENT_PAGES: usize = 100;
-
 /// GitHub exposes thread resolution only through GraphQL. Both the thread and
 /// per-thread comment connections are paginated because semantic convergence
 /// must not silently ignore a later reviewer reply.
-const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 100) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
-const GITHUB_THREAD_FINGERPRINTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
-const GITHUB_COMMENT_ANCHORS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $review: ID!, $after: String) { review: node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete pullRequest { number url headRefOid } } } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } } } pageInfo { hasNextPage endCursor } } } } }";
-const GITHUB_THREAD_COMMENTS_QUERY: &str = "query($thread: ID!, $after: String) { node(id: $thread) { ... on PullRequestReviewThread { id comments(first: 100, after: $after) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { totalCount nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 100) { totalCount nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_THREAD_FINGERPRINTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { totalCount nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { totalCount nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_COMMENT_ANCHORS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $review: ID!, $after: String) { review: node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete pullRequest { number url headRefOid } } } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { totalCount nodes { path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_THREAD_COMMENTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $thread: ID!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid } } node(id: $thread) { ... on PullRequestReviewThread { id comments(first: 100, after: $after) { totalCount nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } } }";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrReviewThreadComment {
@@ -92,6 +89,27 @@ pub struct PrReviewThreadSummary {
     pub comments: Vec<PrReviewThreadComment>,
 }
 
+/// Explicit completeness evidence for a review-thread snapshot.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrReviewThreadsCompleteness {
+    /// Every page of the provider's review-thread connection was consumed.
+    pub threads: bool,
+    /// Every page of every returned thread's comment connection was consumed.
+    pub comments: bool,
+}
+
+impl PrReviewThreadsCompleteness {
+    const FULL: Self = Self {
+        threads: true,
+        comments: true,
+    };
+
+    const THREADS_ONLY: Self = Self {
+        threads: true,
+        comments: false,
+    };
+}
+
 /// Envelope payload for `cli.forge-cli.pr.review-threads.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PrReviewThreadsPayload {
@@ -102,11 +120,13 @@ pub struct PrReviewThreadsPayload {
     pub head_sha: Option<String>,
     pub total: usize,
     pub unresolved: usize,
+    pub completeness: PrReviewThreadsCompleteness,
     pub threads: Vec<PrReviewThreadSummary>,
 }
 
 struct GitHubThreadPage {
     head_sha: String,
+    total_count: Option<usize>,
     threads: Vec<GitHubThreadNode>,
     has_next_page: bool,
     end_cursor: Option<String>,
@@ -114,15 +134,24 @@ struct GitHubThreadPage {
 
 struct GitHubThreadNode {
     summary: PrReviewThreadSummary,
+    comments_total_count: Option<usize>,
     comments_has_next_page: bool,
     comments_end_cursor: Option<String>,
 }
 
 struct GitHubThreadCommentsPage {
+    head_sha: String,
     thread_id: String,
+    total_count: Option<usize>,
     comments: Vec<PrReviewThreadComment>,
     has_next_page: bool,
     end_cursor: Option<String>,
+}
+
+struct GitHubThreadRootsRead {
+    head_sha: Option<String>,
+    threads: Vec<PrReviewThreadSummary>,
+    matched_requested_thread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +192,8 @@ pub(crate) struct GitHubPendingReviewIdentity {
 struct GitHubReviewCommentAnchorsPage {
     head_sha: String,
     review: GitHubPendingReviewIdentity,
+    total_count: Option<usize>,
+    node_count: usize,
     anchors: Vec<GitHubReviewCommentAnchor>,
     has_next_page: bool,
     end_cursor: Option<String>,
@@ -252,6 +283,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 head_sha: None,
                 total: 0,
                 unresolved: 0,
+                completeness: PrReviewThreadsCompleteness::FULL,
                 threads: Vec::new(),
             },
             format,
@@ -303,6 +335,7 @@ pub fn compute_for_pr<R: BackendRunner>(
             head_sha: None,
             total: 0,
             unresolved: 0,
+            completeness: PrReviewThreadsCompleteness::FULL,
             threads: Vec::new(),
         });
     }
@@ -320,6 +353,7 @@ pub fn compute_for_pr<R: BackendRunner>(
         head_sha: None,
         total: threads.len(),
         unresolved,
+        completeness: PrReviewThreadsCompleteness::FULL,
         threads,
     })
 }
@@ -345,9 +379,13 @@ fn compute_github_for_pr<R: BackendRunner>(
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut expected_head = None;
+    let mut expected_total = None;
+    let mut seen_thread_ids = BTreeSet::new();
     let mut threads = Vec::new();
 
-    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+    let mut page_number = 0;
+    loop {
+        page_number += 1;
         let output = runner.run(&build_github_threads_page_call(
             ctx,
             owner,
@@ -369,9 +407,38 @@ fn compute_github_for_pr<R: BackendRunner>(
                 )),
             ));
         }
-        expected_head.get_or_insert(page.head_sha);
+        let stable_head = expected_head.get_or_insert(page.head_sha).clone();
+        let page_node_count = page.threads.len();
+        for node in &page.threads {
+            if !seen_thread_ids.insert(node.summary.id.clone()) {
+                return Err(snapshot_incomplete(
+                    "review-thread pagination returned a duplicate thread",
+                    Some(format!("thread_id={}; page={page_number}", node.summary.id)),
+                ));
+            }
+        }
+        validate_connection_progress(
+            "reviewThreads",
+            &mut expected_total,
+            page.total_count,
+            page_node_count,
+            threads
+                .len()
+                .checked_add(page_node_count)
+                .ok_or_else(|| snapshot_incomplete("review-thread count overflowed", None))?,
+            page.has_next_page,
+            Some(format!("page={page_number}")),
+        )?;
         for node in page.threads {
-            threads.push(complete_github_thread_comments(runner, ctx, node)?);
+            threads.push(complete_github_thread_comments(
+                runner,
+                ctx,
+                owner,
+                name,
+                number,
+                &stable_head,
+                node,
+            )?);
         }
         if !page.has_next_page {
             let unresolved = threads.iter().filter(|thread| !thread.resolved).count();
@@ -382,27 +449,24 @@ fn compute_github_for_pr<R: BackendRunner>(
                 head_sha: expected_head,
                 total: threads.len(),
                 unresolved,
+                completeness: PrReviewThreadsCompleteness::FULL,
                 threads,
             });
         }
         let next = page.end_cursor.ok_or_else(|| {
             snapshot_incomplete(
                 "review-thread pagination is missing endCursor",
-                Some(format!("page={}", page_index + 1)),
+                Some(format!("page={page_number}")),
             )
         })?;
         if !seen_cursors.insert(next.clone()) {
             return Err(snapshot_incomplete(
                 "review-thread pagination repeated a cursor",
-                Some(format!("page={}; cursor={next}", page_index + 1)),
+                Some(format!("page={page_number}; cursor={next}")),
             ));
         }
         cursor = Some(next);
     }
-    Err(snapshot_incomplete(
-        "review-thread pagination exceeded the safety page limit",
-        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
-    ))
 }
 
 /// Fetch only the root comment and anchor/status fields needed for review
@@ -414,6 +478,31 @@ pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
     pr_url: &str,
     number: u64,
 ) -> Result<PrReviewThreadsPayload, ForgeError> {
+    let snapshot = read_github_thread_roots(runner, ctx, pr_url, number, None)?;
+    let unresolved = snapshot
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved)
+        .count();
+    Ok(PrReviewThreadsPayload {
+        provider: ctx.provider.as_str(),
+        number,
+        url: pr_url.to_string(),
+        head_sha: snapshot.head_sha,
+        total: snapshot.threads.len(),
+        unresolved,
+        completeness: PrReviewThreadsCompleteness::THREADS_ONLY,
+        threads: snapshot.threads,
+    })
+}
+
+fn read_github_thread_roots<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+    requested_thread_id: Option<&str>,
+) -> Result<GitHubThreadRootsRead, ForgeError> {
     let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
         snapshot_incomplete(
             "unable to derive GitHub owner/repo from PR url",
@@ -429,9 +518,13 @@ pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut expected_head = None;
+    let mut expected_total = None;
+    let mut seen_thread_ids = BTreeSet::new();
     let mut threads = Vec::new();
 
-    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+    let mut page_number = 0;
+    loop {
+        page_number += 1;
         let output = runner.run(&build_github_thread_fingerprints_page_call(
             ctx,
             owner,
@@ -454,37 +547,60 @@ pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
             ));
         }
         expected_head.get_or_insert(page.head_sha);
+        let page_node_count = page.threads.len();
+        for node in &page.threads {
+            if !seen_thread_ids.insert(node.summary.id.clone()) {
+                return Err(snapshot_incomplete(
+                    "review-thread fingerprint pagination returned a duplicate thread",
+                    Some(format!("thread_id={}; page={page_number}", node.summary.id)),
+                ));
+            }
+        }
+        validate_connection_progress(
+            "reviewThread fingerprints",
+            &mut expected_total,
+            page.total_count,
+            page_node_count,
+            threads.len().checked_add(page_node_count).ok_or_else(|| {
+                snapshot_incomplete("review-thread fingerprint count overflowed", None)
+            })?,
+            page.has_next_page,
+            Some(format!("page={page_number}")),
+        )?;
+        let matched_requested_thread = requested_thread_id.is_some_and(|requested| {
+            page.threads
+                .iter()
+                .any(|thread| thread.summary.id.as_str() == requested)
+        });
         threads.extend(page.threads.into_iter().map(|node| node.summary));
-        if !page.has_next_page {
-            let unresolved = threads.iter().filter(|thread| !thread.resolved).count();
-            return Ok(PrReviewThreadsPayload {
-                provider: ctx.provider.as_str(),
-                number,
-                url: pr_url.to_string(),
+        if matched_requested_thread {
+            return Ok(GitHubThreadRootsRead {
                 head_sha: expected_head,
-                total: threads.len(),
-                unresolved,
                 threads,
+                matched_requested_thread: true,
+            });
+        }
+        if !page.has_next_page {
+            return Ok(GitHubThreadRootsRead {
+                head_sha: expected_head,
+                threads,
+                matched_requested_thread: false,
             });
         }
         let next = page.end_cursor.ok_or_else(|| {
             snapshot_incomplete(
                 "review-thread fingerprint pagination is missing endCursor",
-                Some(format!("page={}", page_index + 1)),
+                Some(format!("page={page_number}")),
             )
         })?;
         if !seen_cursors.insert(next.clone()) {
             return Err(snapshot_incomplete(
                 "review-thread fingerprint pagination repeated a cursor",
-                Some(format!("page={}; cursor={next}", page_index + 1)),
+                Some(format!("page={page_number}; cursor={next}")),
             ));
         }
         cursor = Some(next);
     }
-    Err(snapshot_incomplete(
-        "review-thread fingerprint pagination exceeded the safety page limit",
-        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
-    ))
 }
 
 /// Fetch only the root-comment identity and anchor fields for the requested
@@ -520,11 +636,15 @@ pub(crate) fn compute_comment_anchors_for_pr<R: BackendRunner>(
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut expected_head = None;
+    let mut expected_total = None;
+    let mut scanned_nodes = 0usize;
     let mut expected_review = None;
     let mut remaining = requested_ids.clone();
     let mut anchors = BTreeMap::new();
 
-    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+    let mut page_number = 0;
+    loop {
+        page_number += 1;
         let output = runner.run(&build_github_comment_anchors_page_call(
             ctx,
             owner,
@@ -534,6 +654,18 @@ pub(crate) fn compute_comment_anchors_for_pr<R: BackendRunner>(
             cursor.as_deref(),
         ))?;
         let page = parse_github_comment_anchors_page(&output, requested_ids)?;
+        scanned_nodes = scanned_nodes
+            .checked_add(page.node_count)
+            .ok_or_else(|| snapshot_incomplete("review-comment anchor count overflowed", None))?;
+        validate_connection_progress(
+            "review-comment anchors",
+            &mut expected_total,
+            page.total_count,
+            page.node_count,
+            scanned_nodes,
+            page.has_next_page,
+            Some(format!("page={page_number}")),
+        )?;
         if page.review.head_sha != page.head_sha {
             return Err(snapshot_incomplete(
                 "the pending review and PR head differ during comment-anchor recovery",
@@ -593,41 +725,61 @@ pub(crate) fn compute_comment_anchors_for_pr<R: BackendRunner>(
         let next = page.end_cursor.ok_or_else(|| {
             snapshot_incomplete(
                 "review-comment anchor pagination is missing endCursor",
-                Some(format!("page={}", page_index + 1)),
+                Some(format!("page={page_number}")),
             )
         })?;
         if !seen_cursors.insert(next.clone()) {
             return Err(snapshot_incomplete(
                 "review-comment anchor pagination repeated a cursor",
-                Some(format!("page={}; cursor={next}", page_index + 1)),
+                Some(format!("page={page_number}; cursor={next}")),
             ));
         }
         cursor = Some(next);
     }
-    Err(snapshot_incomplete(
-        "review-comment anchor pagination exceeded the safety page limit",
-        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
-    ))
 }
 
 fn complete_github_thread_comments<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    expected_head: &str,
     mut node: GitHubThreadNode,
 ) -> Result<PrReviewThreadSummary, ForgeError> {
     let mut cursor = node.comments_end_cursor.take();
     let mut seen_cursors = BTreeSet::new();
-    for page_index in 0..MAX_GITHUB_THREAD_COMMENT_PAGES {
-        if !node.comments_has_next_page {
-            return Ok(node.summary);
+    let mut seen_comment_ids = BTreeSet::new();
+    for comment in &node.summary.comments {
+        if !seen_comment_ids.insert(comment.id.clone()) {
+            return Err(snapshot_incomplete(
+                "review-thread comment pagination returned a duplicate comment",
+                Some(format!(
+                    "thread_id={}; comment_id={}",
+                    node.summary.id, comment.id
+                )),
+            ));
         }
+    }
+    let mut expected_total = node.comments_total_count;
+    validate_connection_progress(
+        "reviewThread.comments",
+        &mut expected_total,
+        node.comments_total_count,
+        node.summary.comments.len(),
+        node.summary.comments.len(),
+        node.comments_has_next_page,
+        Some(format!("thread_id={}; page=1", node.summary.id)),
+    )?;
+    let mut page_number = 1;
+    while node.comments_has_next_page {
+        page_number += 1;
         let after = cursor.as_deref().ok_or_else(|| {
             snapshot_incomplete(
                 "review-thread comment pagination is missing endCursor",
                 Some(format!(
                     "thread_id={}; page={}",
-                    node.summary.id,
-                    page_index + 1
+                    node.summary.id, page_number
                 )),
             )
         })?;
@@ -639,10 +791,22 @@ fn complete_github_thread_comments<R: BackendRunner>(
         }
         let output = runner.run(&build_github_thread_comments_call(
             ctx,
+            owner,
+            name,
+            number,
             &node.summary.id,
             Some(after),
         ))?;
         let page = parse_github_thread_comments_page(&output)?;
+        if page.head_sha != expected_head {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating review-thread comments",
+                Some(format!(
+                    "expected_head={expected_head}; provider_head={}",
+                    page.head_sha
+                )),
+            ));
+        }
         if page.thread_id != node.summary.id {
             return Err(snapshot_incomplete(
                 "review-thread comment page returned a different thread",
@@ -652,17 +816,33 @@ fn complete_github_thread_comments<R: BackendRunner>(
                 )),
             ));
         }
+        for comment in &page.comments {
+            if !seen_comment_ids.insert(comment.id.clone()) {
+                return Err(snapshot_incomplete(
+                    "review-thread comment pagination returned a duplicate comment",
+                    Some(format!(
+                        "thread_id={}; comment_id={}; page={page_number}",
+                        node.summary.id, comment.id
+                    )),
+                ));
+            }
+        }
+        let page_comment_count = page.comments.len();
         node.summary.comments.extend(page.comments);
+        validate_connection_progress(
+            "reviewThread.comments",
+            &mut expected_total,
+            page.total_count,
+            page_comment_count,
+            node.summary.comments.len(),
+            page.has_next_page,
+            Some(format!("thread_id={}; page={page_number}", node.summary.id)),
+        )?;
         node.comments_has_next_page = page.has_next_page;
+        node.comments_total_count = expected_total;
         cursor = page.end_cursor;
     }
-    Err(snapshot_incomplete(
-        "review-thread comment pagination exceeded the safety page limit",
-        Some(format!(
-            "thread_id={}; max_pages={MAX_GITHUB_THREAD_COMMENT_PAGES}",
-            node.summary.id
-        )),
-    ))
+    Ok(node.summary)
 }
 
 /// Apply the unresolved-thread merge gate to an already-fetched snapshot.
@@ -916,6 +1096,9 @@ fn build_github_comment_anchors_page_call(
 
 fn build_github_thread_comments_call(
     ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
     thread_id: &str,
     after: Option<&str>,
 ) -> BackendCall {
@@ -924,6 +1107,12 @@ fn build_github_thread_comments_call(
     argv.extend([
         OsString::from("-f"),
         OsString::from(format!("query={GITHUB_THREAD_COMMENTS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
         OsString::from("-f"),
         OsString::from(format!("thread={thread_id}")),
     ]);
@@ -976,8 +1165,8 @@ pub(crate) fn ensure_thread_belongs_to_pr<R: BackendRunner>(
 ) -> Result<(), ForgeError> {
     let view_output = runner.run(&pr_view::build_view_call(ctx, &number.to_string()))?;
     let view = pr_view::parse_view_output(ctx, &view_output)?;
-    let snapshot = compute_for_pr(runner, ctx, &view.url, view.number)?;
-    if snapshot.threads.iter().any(|thread| thread.id == thread_id) {
+    let snapshot = read_github_thread_roots(runner, ctx, &view.url, view.number, Some(thread_id))?;
+    if snapshot.matched_requested_thread {
         return Ok(());
     }
     Err(ForgeError::validation(
@@ -1028,6 +1217,7 @@ fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage,
             )
         })?;
     let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThreads")?;
+    let total_count = optional_connection_total_count(connection, "reviewThreads")?;
     let mut threads = Vec::new();
     for node in nodes {
         let id = required_json_string(&node, "/id", "reviewThread.id")?;
@@ -1040,6 +1230,8 @@ fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage,
         let comments = parse_github_thread_comments(comments_connection, &id)?;
         let (comments_has_next_page, comments_end_cursor) =
             parse_page_info(comments_connection, "reviewThread.comments")?;
+        let comments_total_count =
+            optional_connection_total_count(comments_connection, "reviewThread.comments")?;
         let first = comments.first().cloned().unwrap_or(PrReviewThreadComment {
             id: String::new(),
             author: String::new(),
@@ -1081,12 +1273,14 @@ fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage,
                 body: first.body.clone(),
                 comments,
             },
+            comments_total_count,
             comments_has_next_page,
             comments_end_cursor,
         });
     }
     Ok(GitHubThreadPage {
         head_sha,
+        total_count,
         threads,
         has_next_page,
         end_cursor,
@@ -1173,7 +1367,9 @@ fn parse_github_comment_anchors_page(
                 None,
             )
         })?;
+    let node_count = nodes.len();
     let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThreads")?;
+    let total_count = optional_connection_total_count(connection, "reviewThreads")?;
     let mut anchors = Vec::new();
     for node in nodes {
         let Some(comment) = node
@@ -1226,6 +1422,8 @@ fn parse_github_comment_anchors_page(
     Ok(GitHubReviewCommentAnchorsPage {
         head_sha,
         review,
+        total_count,
+        node_count,
         anchors,
         has_next_page,
         end_cursor,
@@ -1243,6 +1441,15 @@ fn parse_github_thread_comments_page(
         )
     })?;
     reject_graphql_errors(&value, "review-thread comments")?;
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread comments response is missing pullRequest",
+                None,
+            )
+        })?;
+    let head_sha = required_json_string(pull, "/headRefOid", "headRefOid")?;
     let node = value.pointer("/data/node").ok_or_else(|| {
         snapshot_incomplete("review-thread comments response is missing node", None)
     })?;
@@ -1255,8 +1462,11 @@ fn parse_github_thread_comments_page(
     })?;
     let comments = parse_github_thread_comments(connection, &thread_id)?;
     let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThread.comments")?;
+    let total_count = optional_connection_total_count(connection, "reviewThread.comments")?;
     Ok(GitHubThreadCommentsPage {
+        head_sha,
         thread_id,
+        total_count,
         comments,
         has_next_page,
         end_cursor,
@@ -1386,6 +1596,93 @@ fn optional_json_u32(value: &serde_json::Value, pointer: &str) -> Option<u32> {
         .pointer(pointer)
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+}
+
+fn optional_connection_total_count(
+    connection: &serde_json::Value,
+    label: &str,
+) -> Result<Option<usize>, ForgeError> {
+    connection
+        .get("totalCount")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| {
+                    snapshot_incomplete(
+                        "review pagination returned an invalid totalCount",
+                        Some(format!("connection={label}")),
+                    )
+                })
+        })
+        .transpose()
+}
+
+fn validate_connection_progress(
+    label: &str,
+    expected_total: &mut Option<usize>,
+    provider_total: Option<usize>,
+    page_node_count: usize,
+    accumulated_count: usize,
+    has_next_page: bool,
+    detail: Option<String>,
+) -> Result<(), ForgeError> {
+    if let Some(provider_total) = provider_total {
+        if expected_total.is_some_and(|expected| expected != provider_total) {
+            return Err(snapshot_incomplete(
+                "review pagination totalCount changed between pages",
+                Some(format!(
+                    "connection={label}; expected_total={}; provider_total={provider_total}; {}",
+                    expected_total.unwrap_or_default(),
+                    detail.as_deref().unwrap_or("context=unavailable")
+                )),
+            ));
+        }
+        expected_total.get_or_insert(provider_total);
+    }
+
+    if has_next_page && expected_total.is_none() {
+        return Err(snapshot_incomplete(
+            "review pagination cannot prove a finite connection without totalCount",
+            Some(format!(
+                "connection={label}; {}",
+                detail.as_deref().unwrap_or("context=unavailable")
+            )),
+        ));
+    }
+
+    if !has_next_page && expected_total.is_none() {
+        *expected_total = Some(accumulated_count);
+    }
+    let total = expected_total.expect("terminal pages derive a total above");
+    if accumulated_count > total {
+        return Err(snapshot_incomplete(
+            "review pagination returned more nodes than totalCount",
+            Some(format!(
+                "connection={label}; accumulated={accumulated_count}; total={total}; {}",
+                detail.as_deref().unwrap_or("context=unavailable")
+            )),
+        ));
+    }
+    if has_next_page && (page_node_count == 0 || accumulated_count >= total) {
+        return Err(snapshot_incomplete(
+            "review pagination did not make bounded progress",
+            Some(format!(
+                "connection={label}; page_nodes={page_node_count}; accumulated={accumulated_count}; total={total}; {}",
+                detail.as_deref().unwrap_or("context=unavailable")
+            )),
+        ));
+    }
+    if !has_next_page && accumulated_count != total {
+        return Err(snapshot_incomplete(
+            "review pagination ended before totalCount was consumed",
+            Some(format!(
+                "connection={label}; accumulated={accumulated_count}; total={total}; {}",
+                detail.as_deref().unwrap_or("context=unavailable")
+            )),
+        ));
+    }
+    Ok(())
 }
 
 fn required_json_u64(
@@ -1661,12 +1958,13 @@ mod tests {
             .enumerate()
             .map(|(index, (resolved, author, path))| {
                 format!(
-                    r#"{{"id":"PRRT_{index}","isResolved":{resolved},"isOutdated":false,"path":"{path}","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{{"nodes":[{{"id":"PRRC_{index}","author":{{"login":"{author}"}},"body":"finding body\nsecond line","createdAt":"2026-06-11T04:49:36Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}"#
+                    r#"{{"id":"PRRT_{index}","isResolved":{resolved},"isOutdated":false,"path":"{path}","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{{"totalCount":1,"nodes":[{{"id":"PRRC_{index}","author":{{"login":"{author}"}},"body":"finding body\nsecond line","createdAt":"2026-06-11T04:49:36Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}"#
                 )
             })
             .collect();
         format!(
-            r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-7","reviewThreads":{{"nodes":[{nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#,
+            r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-7","reviewThreads":{{"totalCount":{total},"nodes":[{nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#,
+            total = resolved_states.len(),
             nodes = nodes.join(",")
         )
     }
@@ -1694,6 +1992,7 @@ mod tests {
     fn github_anchor_page(
         head: &str,
         nodes: Vec<serde_json::Value>,
+        total_count: usize,
         has_next_page: bool,
         end_cursor: Option<&str>,
     ) -> BackendSuccess {
@@ -1718,6 +2017,7 @@ mod tests {
                     "repository": {"pullRequest": {
                         "headRefOid": head,
                         "reviewThreads": {
+                            "totalCount": total_count,
                             "nodes": nodes,
                             "pageInfo": {
                                 "hasNextPage": has_next_page,
@@ -1755,6 +2055,24 @@ mod tests {
         assert!(argv.iter().any(|s| s == "name=widgets"));
         assert!(argv.iter().any(|s| s == "pr=7"));
         assert!(argv.iter().any(|s| s.contains("reviewThreads")));
+        assert!(argv.iter().any(|s| s.contains("totalCount")));
+    }
+
+    #[test]
+    fn review_threads_catalog_declares_completeness_contract() {
+        let catalog = include_str!("../../docs/specs/forge-cli-ops-v1.yaml");
+        let operation = catalog
+            .split_once("  - id: pr.review-threads\n")
+            .expect("pr.review-threads catalog entry")
+            .1
+            .split_once("  - id: pr.review-threads.resolve\n")
+            .expect("resolve operation follows review-threads")
+            .0;
+
+        assert!(
+            operation.contains("completeness: { threads: boolean, comments: boolean }"),
+            "the catalog must declare both serialized completeness flags"
+        );
     }
 
     #[test]
@@ -1803,6 +2121,10 @@ mod tests {
         )
         .expect("fingerprint snapshot");
         assert_eq!(snapshot.threads.len(), 1);
+        assert_eq!(
+            snapshot.completeness,
+            PrReviewThreadsCompleteness::THREADS_ONLY
+        );
         let calls = runner.calls();
         assert_eq!(
             calls.len(),
@@ -1817,10 +2139,17 @@ mod tests {
     #[test]
     fn comment_anchor_lookup_finds_a_requested_comment_on_page_two() {
         let runner = ScriptedRunner::new(vec![
-            github_anchor_page("head-7", vec![], true, Some("page-2")),
+            github_anchor_page(
+                "head-7",
+                vec![github_anchor_node("PRRC_other", "src/other.rs")],
+                2,
+                true,
+                Some("page-2"),
+            ),
             github_anchor_page(
                 "head-7",
                 vec![github_anchor_node("PRRC_target", "src/lib.rs")],
+                2,
                 false,
                 None,
             ),
@@ -1847,10 +2176,17 @@ mod tests {
     #[test]
     fn comment_anchor_lookup_rejects_cross_page_head_drift() {
         let runner = ScriptedRunner::new(vec![
-            github_anchor_page("head-7", vec![], true, Some("page-2")),
+            github_anchor_page(
+                "head-7",
+                vec![github_anchor_node("PRRC_other", "src/other.rs")],
+                2,
+                true,
+                Some("page-2"),
+            ),
             github_anchor_page(
                 "head-8",
                 vec![github_anchor_node("PRRC_target", "src/lib.rs")],
+                2,
                 false,
                 None,
             ),
@@ -1873,8 +2209,20 @@ mod tests {
     #[test]
     fn comment_anchor_lookup_rejects_a_repeated_cursor() {
         let runner = ScriptedRunner::new(vec![
-            github_anchor_page("head-7", vec![], true, Some("same-cursor")),
-            github_anchor_page("head-7", vec![], true, Some("same-cursor")),
+            github_anchor_page(
+                "head-7",
+                vec![github_anchor_node("PRRC_other_1", "src/one.rs")],
+                3,
+                true,
+                Some("same-cursor"),
+            ),
+            github_anchor_page(
+                "head-7",
+                vec![github_anchor_node("PRRC_other_2", "src/two.rs")],
+                3,
+                true,
+                Some("same-cursor"),
+            ),
         ]);
 
         let error = compute_comment_anchors_for_pr(
@@ -1893,7 +2241,8 @@ mod tests {
 
     #[test]
     fn comment_anchor_lookup_rejects_a_missing_requested_comment() {
-        let runner = ScriptedRunner::new(vec![github_anchor_page("head-7", vec![], false, None)]);
+        let runner =
+            ScriptedRunner::new(vec![github_anchor_page("head-7", vec![], 0, false, None)]);
 
         let error = compute_comment_anchors_for_pr(
             &runner,
@@ -1917,6 +2266,7 @@ mod tests {
                 github_anchor_node("PRRC_duplicate", "src/one.rs"),
                 github_anchor_node("PRRC_duplicate", "src/two.rs"),
             ],
+            2,
             false,
             None,
         )]);
@@ -2054,6 +2404,7 @@ mod tests {
                         "startLine": null,
                         "subjectType": "LINE",
                         "comments": {
+                            "totalCount": 2,
                             "nodes": [{
                                 "id": "PRRC_1",
                                 "author": {"login": "reviewer"},
@@ -2072,9 +2423,10 @@ mod tests {
         };
         let second_page = BackendSuccess {
             stdout: serde_json::json!({
-                "data": {"node": {
-                    "id": "PRRT_1",
-                    "comments": {
+                "data": {
+                    "repository": {"pullRequest": {"headRefOid": "head-7"}},
+                    "node": {"id": "PRRT_1", "comments": {
+                        "totalCount": 2,
                         "nodes": [{
                             "id": "PRRC_2",
                             "author": {"login": "reviewer"},
@@ -2083,8 +2435,8 @@ mod tests {
                             "url": "https://github.com/acme/widgets/pull/7#discussion_r2"
                         }],
                         "pageInfo": {"hasNextPage": false, "endCursor": null}
-                    }
-                }}
+                    }}
+                }
             })
             .to_string(),
             stderr: String::new(),
@@ -2112,6 +2464,441 @@ mod tests {
             "later blocking finding"
         );
         assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
+    fn github_snapshot_rejects_head_drift_during_comment_pagination() {
+        let mut first_page: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/lib.rs")]))
+                .expect("thread fixture");
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/totalCount")
+            .expect("comment totalCount") = serde_json::json!(2);
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/pageInfo")
+            .expect("comment pageInfo") = serde_json::json!({
+            "hasNextPage": true,
+            "endCursor": "comment-page-2"
+        });
+        let runner = ScriptedRunner::new(vec![
+            BackendSuccess {
+                stdout: first_page.to_string(),
+                stderr: String::new(),
+            },
+            BackendSuccess {
+                stdout: serde_json::json!({
+                    "data": {
+                        "repository": {"pullRequest": {"headRefOid": "head-8"}},
+                        "node": {
+                            "id": "PRRT_0",
+                            "comments": {
+                                "totalCount": 2,
+                                "nodes": [{
+                                    "id": "PRRC_2",
+                                    "author": {"login": "reviewer"},
+                                    "body": "reply after push",
+                                    "createdAt": "2026-07-20T12:01:00Z",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_r2"
+                                }],
+                                "pageInfo": {"hasNextPage": false, "endCursor": null}
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let error = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect_err("comment hydration must fail closed when the PR head changes");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("head changed"), "{error}");
+    }
+
+    #[test]
+    fn github_snapshot_rejects_duplicate_comments_across_distinct_cursors() {
+        let mut first_page: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/lib.rs")]))
+                .expect("thread fixture");
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/totalCount")
+            .expect("comment totalCount") = serde_json::json!(2);
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/pageInfo")
+            .expect("comment pageInfo") = serde_json::json!({
+            "hasNextPage": true,
+            "endCursor": "comment-page-2"
+        });
+        let runner = ScriptedRunner::new(vec![
+            BackendSuccess {
+                stdout: first_page.to_string(),
+                stderr: String::new(),
+            },
+            BackendSuccess {
+                stdout: serde_json::json!({
+                    "data": {
+                        "repository": {"pullRequest": {"headRefOid": "head-7"}},
+                        "node": {
+                            "id": "PRRT_0",
+                            "comments": {
+                                "totalCount": 2,
+                                "nodes": [{
+                                    "id": "PRRC_0",
+                                    "author": {"login": "reviewer"},
+                                    "body": "duplicate reply node",
+                                    "createdAt": "2026-07-20T12:01:00Z",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_r1"
+                                }],
+                                "pageInfo": {"hasNextPage": false, "endCursor": null}
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let error = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect_err("duplicate comment identities must not satisfy totalCount");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("duplicate comment"), "{error}");
+    }
+
+    #[test]
+    fn github_thread_comments_paginate_beyond_legacy_page_cap() {
+        let first_page = BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                        "nodes": [{
+                            "id": "PRRT_1",
+                            "isResolved": false,
+                            "isOutdated": false,
+                            "path": "src/lib.rs",
+                            "diffSide": "RIGHT",
+                            "line": 10,
+                            "originalLine": 10,
+                            "originalStartLine": null,
+                            "startDiffSide": null,
+                            "startLine": null,
+                            "subjectType": "LINE",
+                            "comments": {
+                                "totalCount": 101,
+                                "nodes": [{
+                                    "id": "PRRC_1",
+                                    "author": {"login": "reviewer"},
+                                    "body": "comment 1",
+                                    "createdAt": "2026-07-20T12:00:00Z",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_r1"
+                                }],
+                                "pageInfo": {
+                                    "hasNextPage": true,
+                                    "endCursor": "comment-page-2"
+                                }
+                            }
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let mut pages = vec![first_page];
+        pages.extend((0..100).map(|page_index| {
+            let comment_number = page_index + 2;
+            let has_next_page = page_index < 99;
+            BackendSuccess {
+                stdout: serde_json::json!({
+                    "data": {
+                        "repository": {"pullRequest": {"headRefOid": "head-7"}},
+                        "node": {"id": "PRRT_1", "comments": {
+                            "totalCount": 101,
+                            "nodes": [{
+                                "id": format!("PRRC_{comment_number}"),
+                                "author": {"login": "reviewer"},
+                                "body": format!("comment {comment_number}"),
+                                "createdAt": "2026-07-20T12:00:00Z",
+                                "url": format!(
+                                    "https://github.com/acme/widgets/pull/7#discussion_r{comment_number}"
+                                )
+                            }],
+                            "pageInfo": {
+                                "hasNextPage": has_next_page,
+                                "endCursor": has_next_page.then(|| {
+                                    format!("comment-page-{}", comment_number + 1)
+                                })
+                            }
+                        }}
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            }
+        }));
+        let runner = ScriptedRunner::new(pages);
+
+        let payload = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect("comment pagination must continue until the connection is exhausted");
+
+        assert_eq!(payload.threads[0].comments.len(), 101);
+        assert_eq!(payload.completeness, PrReviewThreadsCompleteness::FULL);
+        assert_eq!(runner.calls().len(), 101);
+    }
+
+    #[test]
+    fn github_threads_paginates_beyond_legacy_page_cap_and_marks_complete() {
+        let pages = (0..=100)
+            .map(|page_index| {
+                let has_next_page = page_index < 100;
+                BackendSuccess {
+                    stdout: serde_json::json!({
+                        "data": {"repository": {"pullRequest": {
+                            "headRefOid": "head-7",
+                            "reviewThreads": {
+                                "totalCount": 101,
+                                "nodes": [{
+                                    "id": format!("PRRT_{page_index}"),
+                                    "isResolved": false,
+                                    "isOutdated": false,
+                                    "path": "src/lib.rs",
+                                    "diffSide": "RIGHT",
+                                    "line": 10,
+                                    "originalLine": 10,
+                                    "originalStartLine": null,
+                                    "startDiffSide": null,
+                                    "startLine": null,
+                                    "subjectType": "LINE",
+                                    "comments": {
+                                        "totalCount": 0,
+                                        "nodes": [],
+                                        "pageInfo": {
+                                            "hasNextPage": false,
+                                            "endCursor": null
+                                        }
+                                    }
+                                }],
+                                "pageInfo": {
+                                    "hasNextPage": has_next_page,
+                                    "endCursor": has_next_page
+                                        .then(|| format!("page-{}", page_index + 2))
+                                }
+                            }
+                        }}}
+                    })
+                    .to_string(),
+                    stderr: String::new(),
+                }
+            })
+            .collect();
+        let runner = ScriptedRunner::new(pages);
+
+        let payload = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect("pagination must continue until the provider connection is exhausted");
+        let value = serde_json::to_value(&payload).expect("serialize payload");
+
+        assert_eq!(runner.calls().len(), 101);
+        assert_eq!(payload.total, 101);
+        assert_eq!(
+            value["completeness"],
+            serde_json::json!({"threads": true, "comments": true})
+        );
+    }
+
+    #[test]
+    fn github_threads_reject_a_non_progressing_unfinished_connection() {
+        let runner = ScriptedRunner::new(vec![BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                        "totalCount": 1,
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": true, "endCursor": "page-2"}
+                    }
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+        }]);
+
+        let error = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect_err("a provider page that cannot approach totalCount must fail closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("bounded progress"), "{error}");
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn github_threads_reject_duplicate_nodes_across_distinct_cursors() {
+        let mut first_page: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/lib.rs")]))
+                .expect("first thread page");
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/totalCount")
+            .expect("thread totalCount") = serde_json::json!(2);
+        *first_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/pageInfo")
+            .expect("thread pageInfo") =
+            serde_json::json!({"hasNextPage": true, "endCursor": "page-2"});
+        let mut second_page: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/lib.rs")]))
+                .expect("second thread page");
+        *second_page
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/totalCount")
+            .expect("thread totalCount") = serde_json::json!(2);
+        let runner = ScriptedRunner::new(vec![
+            BackendSuccess {
+                stdout: first_page.to_string(),
+                stderr: String::new(),
+            },
+            BackendSuccess {
+                stdout: second_page.to_string(),
+                stderr: String::new(),
+            },
+        ]);
+
+        let error = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect_err("duplicate thread identities must not satisfy totalCount");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(error.to_string().contains("duplicate thread"), "{error}");
+    }
+
+    #[test]
+    fn github_fingerprints_paginate_beyond_legacy_page_cap() {
+        let pages = (0..=100)
+            .map(|page_index| {
+                let has_next_page = page_index < 100;
+                BackendSuccess {
+                    stdout: serde_json::json!({
+                        "data": {"repository": {"pullRequest": {
+                            "headRefOid": "head-7",
+                            "reviewThreads": {
+                                "totalCount": 101,
+                                "nodes": [{
+                                    "id": format!("PRRT_{page_index}"),
+                                    "isResolved": false,
+                                    "isOutdated": false,
+                                    "path": "src/lib.rs",
+                                    "diffSide": "RIGHT",
+                                    "line": 10,
+                                    "originalLine": 10,
+                                    "originalStartLine": null,
+                                    "startDiffSide": null,
+                                    "startLine": null,
+                                    "subjectType": "LINE",
+                                    "comments": {
+                                        "totalCount": 0,
+                                        "nodes": [],
+                                        "pageInfo": {
+                                            "hasNextPage": false,
+                                            "endCursor": null
+                                        }
+                                    }
+                                }],
+                                "pageInfo": {
+                                    "hasNextPage": has_next_page,
+                                    "endCursor": has_next_page
+                                        .then(|| format!("page-{}", page_index + 2))
+                                }
+                            }
+                        }}}
+                    })
+                    .to_string(),
+                    stderr: String::new(),
+                }
+            })
+            .collect();
+        let runner = ScriptedRunner::new(pages);
+
+        let payload = compute_fingerprints_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect("fingerprint pagination must consume every provider page");
+
+        assert_eq!(payload.total, 101);
+        assert_eq!(runner.calls().len(), 101);
+        assert_eq!(
+            payload.completeness,
+            PrReviewThreadsCompleteness::THREADS_ONLY
+        );
+    }
+
+    #[test]
+    fn github_comment_anchors_paginate_beyond_legacy_page_cap() {
+        let pages = (0..=100)
+            .map(|page_index| {
+                let has_next_page = page_index < 100;
+                let comment_id = if has_next_page {
+                    format!("PRRC_other_{page_index}")
+                } else {
+                    "PRRC_target".to_string()
+                };
+                github_anchor_page(
+                    "head-7",
+                    vec![github_anchor_node(&comment_id, "src/lib.rs")],
+                    101,
+                    has_next_page,
+                    has_next_page
+                        .then(|| format!("page-{}", page_index + 2))
+                        .as_deref(),
+                )
+            })
+            .collect();
+        let runner = ScriptedRunner::new(pages);
+
+        let snapshot = compute_comment_anchors_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+            "PRR_pending",
+            &requested_comment_ids(&["PRRC_target"]),
+        )
+        .expect("anchor pagination must find a requested comment after page 100");
+
+        assert!(snapshot.anchors.contains_key("PRRC_target"));
+        assert_eq!(runner.calls().len(), 101);
     }
 
     #[test]
@@ -2166,6 +2953,7 @@ mod tests {
             head_sha: Some("head-7".into()),
             total: 1,
             unresolved: 1,
+            completeness: PrReviewThreadsCompleteness::FULL,
             threads: vec![PrReviewThreadSummary {
                 id: "PRRT_kwDOExample1".into(),
                 resolved: false,
@@ -2251,6 +3039,7 @@ mod tests {
             head_sha: Some("head-7".into()),
             total: 1,
             unresolved: 1,
+            completeness: PrReviewThreadsCompleteness::FULL,
             threads: vec![PrReviewThreadSummary {
                 id: "PRRT_outdated".into(),
                 resolved: false,
@@ -2321,13 +3110,45 @@ mod tests {
             stdout: r#"{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","isDraft":false,"title":"demo","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
             stderr: String::new(),
         };
+        let mut first_page_value: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/other.rs")]))
+                .expect("first ownership page");
+        *first_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/totalCount")
+            .expect("thread totalCount") = serde_json::json!(3);
+        *first_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/id")
+            .expect("unrelated thread id") = serde_json::json!("PRRT_unrelated");
+        *first_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/totalCount")
+            .expect("unrelated comment totalCount") = serde_json::json!(10_001);
+        *first_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/comments/pageInfo")
+            .expect("unrelated comment pageInfo") =
+            serde_json::json!({"hasNextPage": true, "endCursor": "reply-page-2"});
+        *first_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/pageInfo")
+            .expect("thread pageInfo") =
+            serde_json::json!({"hasNextPage": true, "endCursor": "page-2"});
         let first_page = BackendSuccess {
-            stdout: r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head-7","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"page-2"}}}}}}"#.into(),
+            stdout: first_page_value.to_string(),
             stderr: String::new(),
         };
+        let mut second_page_value: serde_json::Value =
+            serde_json::from_str(&github_threads_json(&[(false, "reviewer", "src/lib.rs")]))
+                .expect("second ownership page");
+        *second_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/totalCount")
+            .expect("thread totalCount") = serde_json::json!(3);
+        *second_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0/id")
+            .expect("target thread id") = serde_json::json!("PRRT_target");
+        *second_page_value
+            .pointer_mut("/data/repository/pullRequest/reviewThreads/pageInfo")
+            .expect("thread pageInfo") =
+            serde_json::json!({"hasNextPage": true, "endCursor": "page-3"});
         let second_page = BackendSuccess {
-            stdout: github_threads_json(&[(false, "reviewer", "src/lib.rs")])
-                .replace("PRRT_0", "PRRT_target"),
+            stdout: second_page_value.to_string(),
             stderr: String::new(),
         };
         let runner = ScriptedRunner::new(vec![view, first_page, second_page]);
@@ -2337,6 +3158,17 @@ mod tests {
 
         assert_eq!(runner.calls().len(), 3);
         assert!(runner.calls()[2].1.iter().any(|arg| arg == "after=page-2"));
+        let queries = runner
+            .calls()
+            .into_iter()
+            .flat_map(|(_, args)| args)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(queries.contains("comments(first: 1)"), "{queries}");
+        assert!(
+            !queries.contains("thread=PRRT_unrelated"),
+            "ownership validation must not hydrate unrelated reply history: {queries}"
+        );
     }
 
     #[test]

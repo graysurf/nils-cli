@@ -2157,6 +2157,8 @@ mod tests {
         let mut thread = truncated_comment_thread("src/new.rs", "PRRC_truncated");
         let mut value: serde_json::Value =
             serde_json::from_str(&thread.stdout).expect("thread fixture");
+        value["data"]["repository"]["pullRequest"]["reviewThreads"]["totalCount"] =
+            serde_json::json!(2);
         value["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"] =
             serde_json::json!({"hasNextPage": true, "endCursor": "cursor-1"});
         thread.stdout = value.to_string();
