@@ -1905,11 +1905,22 @@ fn dispatch_rechecks_handler_trust_after_activation_health_passes() {
             Some(r#"{"hook_event_name":"SessionStart","source":"startup"}"#),
         );
         assert_eq!(dispatch.code, 1, "product={product}");
-        assert_eq!(dispatch.stdout_json()["data"]["action"], "block");
+        let decision = dispatch.stdout_json();
+        assert_eq!(decision["data"]["action"], "block");
         assert_eq!(
-            dispatch.stdout_json()["data"]["reasons"][0]["code"],
+            decision["data"]["reasons"][0]["code"],
             "runtime.session-start:capability-failure-closed",
             "product={product}"
+        );
+        let context = decision["data"]["context"]
+            .as_str()
+            .expect("failed runtime handler must explain the capability boundary");
+        assert!(
+            context.contains("session-start-healthcheck")
+                && context.contains("handler-untrusted")
+                && context.contains(&format!("agent-hook doctor --product {product}"))
+                && context.contains("runtime sync/deploy"),
+            "product={product} context={context}"
         );
     }
 }
