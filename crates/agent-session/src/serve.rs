@@ -7660,9 +7660,16 @@ async fn capture_attach_snapshot_with_timeout(
     let tmux_session = record.tmux_session.clone();
     tokio::task::spawn_blocking(move || {
         let mut command = ProcessCommand::new(&tmux);
+        // -J joins tmux-wrapped rows back into logical lines (preserving the
+        // trailing spaces at each join), so the attaching client's terminal
+        // re-wraps them at its own width and marks continuation rows as
+        // wrapped. Replayed wrapped URLs and commands then stay one logical
+        // line for client-side selection and link detection, and scrollback
+        // captured at an earlier pane width re-wraps at the current width.
         command
             .arg("capture-pane")
             .arg("-p")
+            .arg("-J")
             .arg("-t")
             .arg(&tmux_session)
             .arg("-S")
@@ -21819,6 +21826,51 @@ exit 0
         assert_eq!(handoff.live.len(), 1);
         assert_eq!(handoff.live[0], Bytes::from_static(b"after-recapture"));
         assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn attach_snapshot_capture_joins_wrapped_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let args_log = tmp.path().join("capture-args");
+        seed_session(&state_dir, "joined", "codex", "hs-codex-joined");
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$@\" > {args}\nprintf 'pane\\n'\nexit 0\n",
+                args = shell_words::quote(&args_log.to_string_lossy()),
+            ),
+        );
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let record = load_session_record(&context, "joined").unwrap();
+
+        let capture = capture_attach_snapshot(&tmux, &record).await.unwrap();
+
+        assert_eq!(capture.as_deref(), Some("pane\n"));
+        // -J joins tmux-wrapped rows back into logical lines, so the attaching
+        // client's terminal re-wraps them at its own width and marks the
+        // continuation rows as wrapped. Without it, a wrapped URL or command in
+        // the replayed scrollback arrives as unrelated hard rows.
+        let args: Vec<String> = std::fs::read_to_string(&args_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                "hs-codex-joined",
+                "-S",
+                "-200"
+            ],
+        );
     }
 
     #[tokio::test]
