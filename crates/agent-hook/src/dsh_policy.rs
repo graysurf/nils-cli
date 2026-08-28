@@ -57,6 +57,14 @@ impl Outcome {
         }
     }
 
+    fn block_with_context(group: DshCapabilityGroup, context: &str) -> Self {
+        Self {
+            action: DecisionAction::Block,
+            code: group.as_str().to_string(),
+            context: Some(context.to_string()),
+        }
+    }
+
     fn context(group: DshCapabilityGroup, context: impl Into<String>) -> Self {
         Self {
             action: DecisionAction::Context,
@@ -78,19 +86,25 @@ pub(crate) fn evaluate(
             return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
                 Outcome::allow(group)
             } else {
-                Outcome::block(group)
+                Outcome::block_with_context(group, SHELL_COMMAND_INVALID_CONTEXT)
             });
         };
         let invocations = parse_invocations(&command);
         if invocations
             .iter()
             .any(|invocation| invocation.unresolved_nested)
-            || sequential_shell_context_unknown(&invocations)
         {
             return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
                 Outcome::allow(group)
             } else {
-                Outcome::block(group)
+                Outcome::block_with_context(group, SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT)
+            });
+        }
+        if sequential_shell_context_unknown(&invocations) {
+            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
+                Outcome::allow(group)
+            } else {
+                Outcome::block_with_context(group, SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT)
             });
         }
         invocations
@@ -207,6 +221,9 @@ const MEMORY_WRITE_CONTEXT: &str = "Writing to agent memory: write only an untru
 const FORGE_LABEL_CONTEXT: &str = "forge-cli is about to create or deliver a record without --label. Consider labels from the repository catalog or taxonomy for triage and automation; labels remain optional, but an inline environment assignment is not authorization to suppress this reminder.";
 const SKILL_USAGE_CONTEXT: &str = "This request appears to match a skill-backed workflow. Use DSH's native skill catalog and skill tool before acting; load every explicitly named or clearly applicable skill and follow its complete instructions.";
 const PRE_PR_CONTEXT: &str = "delivery-readiness reminder: this feature branch has non-trivial changes relative to the default branch. Run the repository validation and review gates before delivery; a PR is the default unless the current request explicitly authorizes governed direct-main delivery.";
+const SHELL_COMMAND_INVALID_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because its command field was missing, empty, oversized, or invalid. Retry now with one bounded command in a separate Bash tool call. No operator intervention is required.";
+const SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because nested or dynamic shell execution could not be classified safely. Retry now by invoking the final executable or executable repository script directly in one Bash tool call, without a bash/sh/eval wrapper or an indirect command variable. Split compound operations into separate Bash tool calls. No operator intervention is required.";
+const SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because a preceding shell-state command such as `set`, `export`, or `cd` makes later commands impossible to classify safely. Retry now with separate Bash tool calls, one command per call; omit shell-state preambles and use the tool's `workdir` field instead of `cd`. No operator intervention is required.";
 
 fn sanitize_companion_env(command: &mut Command, retained_names: &[&str]) {
     let retained = retained_names

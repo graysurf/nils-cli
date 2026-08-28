@@ -34,6 +34,32 @@ capability = {{ id = "dsh.policy.v1", group = "{group}" }}
     )
 }
 
+fn policy_for_groups(groups: &[&str]) -> String {
+    let mut policy = String::from(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "dsh-runtime-kit-shell-diagnostics"
+version = "2026.08.28.1"
+"#,
+    );
+    for (index, group) in groups.iter().enumerate() {
+        policy.push_str(&format!(
+            r#"
+[[rules]]
+id = "dsh.shell-diagnostic-{index}"
+products = ["dsh"]
+events = ["PreToolUse"]
+matcher = "bash"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "dsh.policy.v1", group = "{group}" }}
+"#,
+        ));
+    }
+    policy
+}
+
 fn request(fixture: &Fixture, tool: &str, arguments: Value) -> String {
     request_for_session(fixture, "dsh-session-1", tool, arguments)
 }
@@ -1601,6 +1627,60 @@ fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
             assert_eq!(output.stdout_json()["data"]["action"], "block");
         }
     }
+}
+
+#[test]
+fn sequential_shell_state_denial_explains_one_immediate_retry_path() {
+    let fixture = Fixture::new(&policy_for_groups(&[
+        "block-direct-git-commit",
+        "block-direct-git-worktree",
+        "block-direct-pr-create",
+        "block-direct-python",
+        "semantic-commit-body-gate",
+        "block-unsafe-default-delivery",
+        "checkout-lease-guard",
+    ]));
+    let output = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request(
+            &fixture,
+            "bash",
+            json!({"command": "set -euo pipefail; git --version; gh --version; git status --short --branch"}),
+        )),
+    );
+
+    assert_eq!(output.code, 1, "envelope={}", output.stdout_text());
+    let decision = output.stdout_json();
+    assert_eq!(decision["data"]["action"], "block");
+    let reasons = decision["data"]["reasons"]
+        .as_array()
+        .expect("blocking reasons");
+    assert_eq!(reasons.len(), 7);
+    for (reason, expected) in reasons.iter().zip([
+        "block-direct-git-commit",
+        "block-direct-git-worktree",
+        "block-direct-pr-create",
+        "block-direct-python",
+        "semantic-commit-body-gate",
+        "block-unsafe-default-delivery",
+        "checkout-lease-guard",
+    ]) {
+        assert_eq!(reason["code"], expected);
+        assert_eq!(reason["disposition"], "block");
+    }
+    let context = decision["data"]["context"]
+        .as_str()
+        .expect("shell denial guidance");
+    assert!(context.contains("blocked before command dispatch"));
+    assert!(context.contains("set`, `export`, or `cd"));
+    assert!(context.contains("separate Bash tool calls"));
+    assert!(context.contains("tool's `workdir` field instead of `cd`"));
+    assert!(context.contains("Retry now"));
+    assert_eq!(
+        context.matches("blocked before command dispatch").count(),
+        1,
+        "guidance must be aggregated once: {context}"
+    );
 }
 
 #[test]

@@ -1316,7 +1316,9 @@ fn aggregate(
                 replacement = outcome.replacement.clone();
             }
         }
-        if let Some(context) = outcome.context {
+        if let Some(context) = outcome.context
+            && !contexts.contains(&context)
+        {
             contexts.push(context);
         }
         if rank(outcome.action) > rank(action) {
