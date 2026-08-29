@@ -78,6 +78,10 @@ const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
 const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
 const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const SYSTEM_EPHEMERAL_THREADS_FILE: &str = ".codex-app-server-system-ephemeral-threads.json";
+const SYSTEM_EPHEMERAL_THREADS_VERSION: &str = "agent-session.codex-system-ephemeral-threads.v1";
+const MAX_SYSTEM_EPHEMERAL_THREADS: usize = 16;
+const MAX_SYSTEM_EPHEMERAL_THREADS_BYTES: usize = 4096;
 pub(crate) const PROVIDER_RESUME_CAPTURE_METHOD: &str = "codex-app-server-thread-binding";
 
 pub(crate) fn attention_authority(record: &SessionRecord) -> &'static str {
@@ -2835,6 +2839,199 @@ fn projected_thread_binding(thread_id: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemEphemeralThreadRegistry {
+    schema_version: String,
+    runtime_id: String,
+    runtime_generation: u64,
+    identity_digests: Vec<String>,
+}
+
+fn projected_identity_digest_is_valid(value: &str) -> bool {
+    value.len() == 73
+        && value.starts_with("local:v1:")
+        && value[9..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn system_ephemeral_thread_registry_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
+    crate::session_dir(context, &record.id).join(SYSTEM_EPHEMERAL_THREADS_FILE)
+}
+
+fn read_system_ephemeral_thread_registry(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<Option<SystemEphemeralThreadRegistry>, CliError> {
+    let path = system_ephemeral_thread_registry_path(context, record);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::runtime(
+                "codex-system-ephemeral-registry-read-failed",
+                format!("failed to read the Codex system-ephemeral registry: {error}"),
+                Some(json!({ "id": record.id })),
+            ));
+        }
+    };
+    if bytes.len() > MAX_SYSTEM_EPHEMERAL_THREADS_BYTES {
+        return Err(CliError::data(
+            "codex-system-ephemeral-registry-invalid",
+            "Codex system-ephemeral registry exceeds its size limit",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    let registry: SystemEphemeralThreadRegistry = serde_json::from_slice(&bytes).map_err(|_| {
+        CliError::data(
+            "codex-system-ephemeral-registry-invalid",
+            "Codex system-ephemeral registry is invalid",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let unique = registry
+        .identity_digests
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len();
+    if registry.schema_version != SYSTEM_EPHEMERAL_THREADS_VERSION
+        || registry.runtime_id.is_empty()
+        || registry.identity_digests.len() > MAX_SYSTEM_EPHEMERAL_THREADS
+        || unique != registry.identity_digests.len()
+        || registry
+            .identity_digests
+            .iter()
+            .any(|identity_digest| !projected_identity_digest_is_valid(identity_digest))
+    {
+        return Err(CliError::data(
+            "codex-system-ephemeral-registry-invalid",
+            "Codex system-ephemeral registry failed validation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    Ok(Some(registry))
+}
+
+pub(crate) fn register_system_ephemeral_thread(
+    context: &CliContext,
+    expected: &SessionRecord,
+    thread_id: &str,
+) -> Result<(), CliError> {
+    if !runtime_is_supported(expected) || !protocol_id_is_valid(thread_id) {
+        return Err(CliError::data(
+            "codex-system-ephemeral-thread-invalid",
+            "Codex system-ephemeral thread metadata is invalid",
+            Some(json!({ "id": expected.id })),
+        ));
+    }
+    let _record_lock = crate::acquire_session_record_lock(context, &expected.id)?;
+    let current = crate::load_session_record(context, &expected.id)?;
+    crate::ensure_same_session_identity(expected, &current)?;
+    let runtime = current.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "codex-system-ephemeral-runtime-mismatch",
+            "Codex system-ephemeral thread does not belong to the active runtime",
+            Some(json!({ "id": current.id })),
+        )
+    })?;
+    let expected_runtime = expected.runtime.as_ref().expect("supported Codex runtime");
+    if !runtime_is_supported(&current)
+        || runtime.launch_id != expected_runtime.launch_id
+        || runtime.generation != expected_runtime.generation
+    {
+        return Err(CliError::data(
+            "codex-system-ephemeral-runtime-mismatch",
+            "Codex system-ephemeral thread does not belong to the active runtime",
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    let mut registry = match read_system_ephemeral_thread_registry(context, &current)? {
+        Some(registry)
+            if registry.runtime_id == runtime.launch_id
+                && registry.runtime_generation == runtime.generation =>
+        {
+            registry
+        }
+        _ => SystemEphemeralThreadRegistry {
+            schema_version: SYSTEM_EPHEMERAL_THREADS_VERSION.to_string(),
+            runtime_id: runtime.launch_id.clone(),
+            runtime_generation: runtime.generation,
+            identity_digests: Vec::new(),
+        },
+    };
+    let identity_digest =
+        crate::activity::projected_codex_session_identifier(&runtime.launch_id, thread_id)?;
+    if registry.identity_digests.contains(&identity_digest) {
+        return Ok(());
+    }
+    if registry.identity_digests.len() >= MAX_SYSTEM_EPHEMERAL_THREADS {
+        registry.identity_digests.remove(0);
+    }
+    registry.identity_digests.push(identity_digest);
+    let bytes = serde_json::to_vec(&registry).map_err(|_| {
+        CliError::runtime(
+            "codex-system-ephemeral-registry-render-failed",
+            "failed to render the Codex system-ephemeral registry",
+            Some(json!({ "id": current.id })),
+        )
+    })?;
+    write_private_file(
+        &system_ephemeral_thread_registry_path(context, &current),
+        &bytes,
+    )
+}
+
+fn system_ephemeral_identity_digest_is_registered(
+    context: &CliContext,
+    record: &SessionRecord,
+    identity_digest: &str,
+) -> Result<bool, CliError> {
+    if !runtime_is_supported(record) || !projected_identity_digest_is_valid(identity_digest) {
+        return Ok(false);
+    }
+    let Some(registry) = read_system_ephemeral_thread_registry(context, record)? else {
+        return Ok(false);
+    };
+    let Some(runtime) = record.runtime.as_ref() else {
+        return Ok(false);
+    };
+    if registry.runtime_id != runtime.launch_id || registry.runtime_generation != runtime.generation
+    {
+        return Ok(false);
+    }
+    Ok(registry
+        .identity_digests
+        .iter()
+        .any(|candidate| candidate == identity_digest))
+}
+
+pub(crate) fn system_ephemeral_normalized_session_is_registered(
+    context: &CliContext,
+    record: &SessionRecord,
+    identity_digest: &str,
+) -> Result<bool, CliError> {
+    system_ephemeral_identity_digest_is_registered(context, record, identity_digest)
+}
+
+pub(crate) fn system_ephemeral_raw_session_is_registered(
+    context: &CliContext,
+    record: &SessionRecord,
+    raw_provider_session_id: &str,
+) -> Result<bool, CliError> {
+    if !runtime_is_supported(record) || !protocol_id_is_valid(raw_provider_session_id) {
+        return Ok(false);
+    }
+    let Some(runtime) = record.runtime.as_ref() else {
+        return Ok(false);
+    };
+    let identity_digest = crate::activity::projected_codex_session_identifier(
+        &runtime.launch_id,
+        raw_provider_session_id,
+    )?;
+    system_ephemeral_identity_digest_is_registered(context, record, &identity_digest)
+}
+
 pub(crate) fn run_proxy(context: &CliContext, args: crate::cli::CodexAppServerProxyArgs) -> i32 {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2865,6 +3062,9 @@ impl Drop for ProxySocketGuard {
 
 struct ProxyObserver {
     pending_thread_starts: BTreeSet<String>,
+    pending_system_ephemeral_thread_starts: BTreeSet<String>,
+    system_ephemeral_threads: BTreeSet<String>,
+    system_ephemeral_thread_order: VecDeque<String>,
     pending_attention_requests: BTreeMap<String, String>,
     reducer: Option<FailureReducer>,
 }
@@ -2873,6 +3073,9 @@ impl ProxyObserver {
     fn new() -> Self {
         Self {
             pending_thread_starts: BTreeSet::new(),
+            pending_system_ephemeral_thread_starts: BTreeSet::new(),
+            system_ephemeral_threads: BTreeSet::new(),
+            system_ephemeral_thread_order: VecDeque::new(),
             pending_attention_requests: BTreeMap::new(),
             reducer: None,
         }
@@ -2882,12 +3085,20 @@ impl ProxyObserver {
         match value.get("method").and_then(Value::as_str) {
             Some("thread/start") => {
                 track_thread_start(&mut self.pending_thread_starts, value);
+                if value
+                    .pointer("/params/systemEphemeral")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    track_thread_start(&mut self.pending_system_ephemeral_thread_starts, value);
+                }
             }
             Some("turn/start") => {
                 if let Some(thread_id) = value
                     .pointer("/params/threadId")
                     .and_then(Value::as_str)
                     .filter(|id| protocol_id_is_valid(id))
+                    && !self.system_ephemeral_threads.contains(thread_id)
                 {
                     self.bind(record, thread_id)?;
                 }
@@ -2904,15 +3115,51 @@ impl ProxyObserver {
         value: &Value,
         persisted_thread: Option<&str>,
     ) -> Result<(), String> {
+        let response_key = value.get("id").and_then(json_id_key);
+        let system_ephemeral = response_key
+            .as_ref()
+            .is_some_and(|key| self.pending_system_ephemeral_thread_starts.remove(key));
         match (
             completed_thread_start(&mut self.pending_thread_starts, value),
             persisted_thread,
+            system_ephemeral,
         ) {
-            (Some(thread_id), Some(persisted_thread)) if thread_id == persisted_thread => {
+            (Some(thread_id), Some(persisted_thread), false) if thread_id == persisted_thread => {
                 self.bind_persisted(thread_id)?;
             }
-            (Some(thread_id), None) => self.bind(record, thread_id)?,
-            (None, None) => {}
+            (Some(thread_id), None, true) => {
+                if self.reducer.is_none() {
+                    return Err(
+                        "Codex system-ephemeral thread arrived before the primary binding"
+                            .to_string(),
+                    );
+                }
+                let worker_context = context.clone();
+                let worker_record = record.clone();
+                let worker_thread = thread_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    register_system_ephemeral_thread(
+                        &worker_context,
+                        &worker_record,
+                        &worker_thread,
+                    )
+                })
+                .await
+                .map_err(|error| format!("Codex system-ephemeral registry worker failed: {error}"))?
+                .map_err(|error| {
+                    format!(
+                        "Codex system-ephemeral registry update failed: {}",
+                        error.code()
+                    )
+                })?;
+                insert_bounded_id(
+                    &mut self.system_ephemeral_threads,
+                    &mut self.system_ephemeral_thread_order,
+                    thread_id,
+                );
+            }
+            (Some(thread_id), None, false) => self.bind(record, thread_id)?,
+            (None, None, false) => {}
             _ => {
                 return Err("Codex persisted thread binding did not match the response".to_string());
             }
@@ -3055,6 +3302,7 @@ struct ProxyProjection {
     task: Option<tokio::task::JoinHandle<()>>,
     fail_close_task: SharedFailCloseTask,
     pending_thread_starts: BTreeSet<String>,
+    pending_system_ephemeral_thread_starts: BTreeSet<String>,
     requires_thread_binding: bool,
     context: CliContext,
     record: SessionRecord,
@@ -3105,6 +3353,7 @@ impl ProxyProjection {
             task: Some(task),
             fail_close_task,
             pending_thread_starts: BTreeSet::new(),
+            pending_system_ephemeral_thread_starts: BTreeSet::new(),
             requires_thread_binding: thread_attached_path(&record)
                 .is_some_and(|path| !path.is_file()),
             context,
@@ -3119,6 +3368,13 @@ impl ProxyProjection {
         if let Some(value) = client_observation(value) {
             if value.get("method").and_then(Value::as_str) == Some("thread/start") {
                 track_thread_start(&mut self.pending_thread_starts, &value);
+                if value
+                    .pointer("/params/systemEphemeral")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    track_thread_start(&mut self.pending_system_ephemeral_thread_starts, &value);
+                }
             }
             self.enqueue(ProxyObservation::Client(value));
         }
@@ -3165,10 +3421,28 @@ impl ProxyProjection {
                 // worker to accept the bound identity, then publish the marker
                 // before forwarding the response. No new observation can make
                 // the acknowledged worker fail while this proxy branch waits.
-                let persisted_thread =
+                let response_key = value.get("id").and_then(json_id_key);
+                let system_ephemeral = response_key
+                    .as_ref()
+                    .is_some_and(|key| self.pending_system_ephemeral_thread_starts.remove(key));
+                let completed_thread =
                     completed_thread_start(&mut self.pending_thread_starts, &value)
                         .map(str::to_string);
-                let Some(persisted_thread) = persisted_thread else {
+                if system_ephemeral {
+                    let Some(_) = completed_thread else {
+                        self.disable();
+                        return Err(
+                            "Codex system-ephemeral thread response was invalid".to_string()
+                        );
+                    };
+                    if let Err(error) = self.enqueue_acknowledged_server(value, None).await {
+                        eprintln!("warning: Codex projection disabled: {error}");
+                        self.disable();
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                let Some(persisted_thread) = completed_thread else {
                     self.enqueue(ProxyObservation::Server {
                         value,
                         persisted_thread: None,
@@ -3184,29 +3458,10 @@ impl ProxyProjection {
                     });
                     return Ok(());
                 }
-                let (binding_ack, receive_ack) = oneshot::channel();
-                let queued = self
-                    .enqueue_binding(ProxyObservation::Server {
-                        value,
-                        persisted_thread: Some(persisted_thread.clone()),
-                        binding_ack: Some(binding_ack),
-                    })
-                    .await;
-                if let Err(error) = queued {
-                    eprintln!("warning: Codex projection disabled: {error}");
-                    self.disable();
-                    return Err(error);
-                }
-                let acknowledged = tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, receive_ack)
+                if let Err(error) = self
+                    .enqueue_acknowledged_server(value, Some(persisted_thread.clone()))
                     .await
-                    .map_err(|_| "Codex projection binding acknowledgement timed out".to_string())
-                    .and_then(|result| {
-                        result.map_err(|_| {
-                            "Codex projection binding acknowledgement was unavailable".to_string()
-                        })
-                    })
-                    .and_then(|result| result);
-                if let Err(error) = acknowledged {
+                {
                     eprintln!("warning: Codex projection disabled: {error}");
                     self.disable();
                     return Err(error);
@@ -3286,9 +3541,28 @@ impl ProxyProjection {
             .map_err(|_| "Codex projection binding queue unavailable".to_string())
     }
 
+    async fn enqueue_acknowledged_server(
+        &mut self,
+        value: Value,
+        persisted_thread: Option<String>,
+    ) -> Result<(), String> {
+        let (binding_ack, receive_ack) = oneshot::channel();
+        self.enqueue_binding(ProxyObservation::Server {
+            value,
+            persisted_thread,
+            binding_ack: Some(binding_ack),
+        })
+        .await?;
+        tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, receive_ack)
+            .await
+            .map_err(|_| "Codex projection acknowledgement timed out".to_string())?
+            .map_err(|_| "Codex projection acknowledgement was unavailable".to_string())?
+    }
+
     fn disable(&mut self) {
         self.sender = None;
         self.pending_thread_starts.clear();
+        self.pending_system_ephemeral_thread_starts.clear();
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -3365,7 +3639,17 @@ fn client_observation(value: &Value) -> Option<Value> {
         "thread/start" => {
             let id = value.get("id")?;
             json_id_key(id)?;
-            json!({ "id": id, "method": "thread/start" })
+            let system_ephemeral = value.pointer("/params/ephemeral").and_then(Value::as_bool)
+                == Some(true)
+                && value
+                    .pointer("/params/threadSource")
+                    .and_then(Value::as_str)
+                    == Some("system");
+            json!({
+                "id": id,
+                "method": "thread/start",
+                "params": { "systemEphemeral": system_ephemeral }
+            })
         }
         "turn/start" => {
             let thread_id = value.pointer("/params/threadId")?.as_str()?;
@@ -6822,12 +7106,13 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         };
         let record = record_with_runtime("persisted-binding", &tmp.path().join("server.sock"));
         let mut observer = ProxyObserver::new();
-        observer
-            .observe_client(
-                &record,
-                &json!({ "id": 1, "method": "thread/start", "params": {} }),
-            )
-            .unwrap();
+        let primary_start = client_observation(&json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": { "ephemeral": false, "threadSource": "user" }
+        }))
+        .unwrap();
+        observer.observe_client(&record, &primary_start).unwrap();
 
         observer
             .observe_server(
@@ -6849,6 +7134,206 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         assert!(
             !thread_attached_path(&record).unwrap().exists(),
             "the projection worker must not repeat marker persistence or validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_observer_keeps_primary_binding_when_tui_starts_an_auxiliary_thread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("auxiliary-thread", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        let mut observer = ProxyObserver::new();
+        observer
+            .observe_client(
+                &record,
+                &json!({ "id": 1, "method": "thread/start", "params": {} }),
+            )
+            .unwrap();
+        observer
+            .observe_server(
+                &context,
+                &record,
+                &json!({ "id": 1, "result": { "thread": { "id": "primary-thread" } } }),
+                Some("primary-thread"),
+            )
+            .await
+            .unwrap();
+
+        let auxiliary_thread = concat!(
+            "local:v1:",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa"
+        );
+
+        let auxiliary_start = client_observation(&json!({
+            "id": 2,
+            "method": "thread/start",
+            "params": {
+                "ephemeral": true,
+                "threadSource": "system",
+                "model": "must-not-leave-the-adapter"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            auxiliary_start,
+            json!({
+                "id": 2,
+                "method": "thread/start",
+                "params": { "systemEphemeral": true }
+            })
+        );
+        observer.observe_client(&record, &auxiliary_start).unwrap();
+        observer
+            .observe_server(
+                &context,
+                &record,
+                &json!({ "id": 2, "result": { "thread": { "id": auxiliary_thread } } }),
+                None,
+            )
+            .await
+            .expect("an auxiliary thread/start must not replace or disable the primary projection");
+        let registry_bytes = fs::read(system_ephemeral_thread_registry_path(&context, &record))
+            .expect("system-ephemeral registry");
+        let registry_json: Value =
+            serde_json::from_slice(&registry_bytes).expect("valid registry json");
+        assert!(registry_json.get("identity_digests").is_some());
+        assert!(registry_json.get("provider_session_ids").is_none());
+        let registry: SystemEphemeralThreadRegistry =
+            serde_json::from_slice(&registry_bytes).expect("valid system-ephemeral registry");
+        let projected_auxiliary = crate::activity::projected_codex_session_identifier(
+            &record.runtime.as_ref().unwrap().launch_id,
+            auxiliary_thread,
+        )
+        .expect("unconditionally project the raw auxiliary identity");
+        assert_ne!(projected_auxiliary, auxiliary_thread);
+        assert_eq!(registry.identity_digests, vec![projected_auxiliary.clone()]);
+        assert!(
+            system_ephemeral_raw_session_is_registered(&context, &record, auxiliary_thread)
+                .expect("look up a raw auxiliary identity")
+        );
+        assert!(
+            system_ephemeral_normalized_session_is_registered(
+                &context,
+                &record,
+                &projected_auxiliary,
+            )
+            .expect("look up a projected auxiliary identity"),
+            "the private registry must retain only projected provider identities"
+        );
+
+        assert_eq!(
+            observer
+                .reducer
+                .as_ref()
+                .map(|reducer| reducer.thread_id.as_str()),
+            Some("primary-thread")
+        );
+        observer
+            .observe_client(
+                &record,
+                &json!({
+                    "id": 3,
+                    "method": "turn/start",
+                    "params": { "threadId": auxiliary_thread }
+                }),
+            )
+            .expect("a turn on the confirmed system-ephemeral thread must be ignored");
+        assert_eq!(
+            observer
+                .observe_client(
+                    &record,
+                    &json!({
+                        "id": 4,
+                        "method": "turn/start",
+                        "params": { "threadId": "unknown-thread" }
+                    }),
+                )
+                .unwrap_err(),
+            "Codex TUI proxy switched to a different thread"
+        );
+
+        let user_start = client_observation(&json!({
+            "id": 5,
+            "method": "thread/start",
+            "params": { "ephemeral": false, "threadSource": "user" }
+        }))
+        .unwrap();
+        observer.observe_client(&record, &user_start).unwrap();
+        assert_eq!(
+            observer
+                .observe_server(
+                    &context,
+                    &record,
+                    &json!({ "id": 5, "result": { "thread": { "id": "other-user-thread" } } }),
+                    None,
+                )
+                .await
+                .unwrap_err(),
+            "Codex TUI proxy switched to a different thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_acknowledges_system_ephemeral_thread_before_forwarding_its_response() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("auxiliary-barrier", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+
+        projection.observe_client(&json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": { "ephemeral": false, "threadSource": "user" }
+        }));
+        projection
+            .observe_server_before_forward(&json!({
+                "id": 1,
+                "result": { "thread": { "id": "primary-thread" } }
+            }))
+            .await
+            .unwrap();
+
+        projection.observe_client(&json!({
+            "id": 2,
+            "method": "thread/start",
+            "params": { "ephemeral": true, "threadSource": "system" }
+        }));
+        projection
+            .observe_server_before_forward(&json!({
+                "id": 2,
+                "result": { "thread": { "id": "auxiliary-thread" } }
+            }))
+            .await
+            .expect("the auxiliary identity must be accepted before its response is forwarded");
+        projection.observe_client(&json!({
+            "id": 3,
+            "method": "turn/start",
+            "params": { "threadId": "auxiliary-thread" }
+        }));
+        projection.finish().await;
+
+        assert!(
+            !crate::session_dir(&context, &record.id)
+                .join("activity.unhealthy.json")
+                .exists(),
+            "the confirmed system-ephemeral turn must not fail the primary projection"
+        );
+        assert_eq!(
+            fs::read_to_string(thread_attached_path(&record).unwrap()).unwrap(),
+            projected_thread_binding("primary-thread")
         );
     }
 

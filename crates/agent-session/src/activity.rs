@@ -1123,6 +1123,13 @@ pub(crate) fn projected_codex_turn_identifier(
     projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", value)
 }
 
+pub(crate) fn projected_codex_session_identifier(
+    runtime_id: &str,
+    value: &str,
+) -> Result<String, CliError> {
+    projected_provider_identifier(runtime_id, AgentKind::Codex, "session", value)
+}
+
 fn hermes_approval_correlation_id(runtime_id: &str, raw: &Value) -> Result<String, CliError> {
     fn required_string<'a>(raw: &'a Value, field: &str) -> Result<&'a str, CliError> {
         raw.get(field).and_then(Value::as_str).ok_or_else(|| {
@@ -2608,11 +2615,35 @@ fn ingest_event_with_lock(
             projected_provider_identifier(active_runtime_id, agent, "session", &resume.session_id)
         })
         .transpose()?;
-    if let (Some(expected), Some(observed)) = (
-        expected_provider_session_id.as_ref(),
-        event.provider_session_id.as_ref(),
-    ) && expected != observed
+    let provider_session_mismatch = matches!(
+        (
+            expected_provider_session_id.as_ref(),
+            event.provider_session_id.as_ref(),
+        ),
+        (Some(expected), Some(observed)) if expected != observed
+    );
+    let provider_session_requires_classification = event.provider_session_id.is_some()
+        && expected_provider_session_id != event.provider_session_id;
+    let system_ephemeral_hook = if admission == EventAdmission::Generic
+        && agent == AgentKind::Codex
+        && provider_session_requires_classification
     {
+        event
+            .provider_session_id
+            .as_deref()
+            .map(|provider_session_id| {
+                crate::codex_app_server::system_ephemeral_normalized_session_is_registered(
+                    context,
+                    &record,
+                    provider_session_id,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if provider_session_mismatch && !system_ephemeral_hook {
         return Err(CliError::data(
             "provider-session-id-mismatch",
             "activity event does not belong to the provider session bound to this runtime",
@@ -2674,6 +2705,17 @@ fn ingest_event_with_lock(
             "activity evidence is unavailable until the session starts a new runtime generation",
             Some(json!({ "id": record.id, "reason": reason })),
         ));
+    }
+    if system_ephemeral_hook {
+        let state = document.state.clone();
+        drop(_health_fence);
+        drop(_lock);
+        drop(record_lock);
+        return Ok(ActivityResult {
+            id: record.id,
+            turn_state: state,
+            duplicate: true,
+        });
     }
     if event.kind == TurnEventKind::AttentionRequested
         && let (Some(expected), Some(observed)) = (
@@ -3130,6 +3172,23 @@ fn provider_resume_from_user_prompt_hook(
     else {
         return Ok(());
     };
+    let observed = load_session_record(context, id)?;
+    let runtime_matches = observed
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.launch_id == runtime_id);
+    let provider_session_requires_classification = observed
+        .provider_resume
+        .as_ref()
+        .is_none_or(|resume| resume.provider != agent.as_str() || resume.session_id != session_id);
+    if runtime_matches
+        && provider_session_requires_classification
+        && crate::codex_app_server::system_ephemeral_raw_session_is_registered(
+            context, &observed, session_id,
+        )?
+    {
+        return Ok(());
+    }
     mutate_session_record(context, id, |record| {
         let runtime_matches = record
             .runtime
@@ -6067,6 +6126,154 @@ mod tests {
                 .map(|diagnostic| diagnostic.reason.as_str()),
             Some("completion_evidence_pending")
         );
+    }
+
+    #[test]
+    fn confirmed_codex_system_ephemeral_hooks_are_noops_but_foreign_sessions_still_fail() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, mut created) = test_session(&tmp);
+        let runtime = created.record.runtime.as_mut().expect("runtime");
+        runtime.kind = crate::codex_app_server::RUNTIME_KIND.to_string();
+        runtime.extra = BTreeMap::from([
+            (
+                crate::codex_app_server::PROTOCOL_KEY.to_string(),
+                json!(crate::codex_app_server::PROTOCOL_VERSION),
+            ),
+            (
+                crate::codex_app_server::SOCKET_KEY.to_string(),
+                json!(tmp.path().join("app-server.sock")),
+            ),
+            (
+                crate::codex_app_server::PROXY_KEY.to_string(),
+                json!(tmp.path().join("proxy.sock")),
+            ),
+            (
+                crate::codex_app_server::THREAD_HANDOFF_KEY.to_string(),
+                json!(tmp.path().join("thread-handoff")),
+            ),
+            (
+                crate::codex_app_server::THREAD_ATTACHED_KEY.to_string(),
+                json!(tmp.path().join("thread-attached")),
+            ),
+        ]);
+        let runtime_id = runtime.launch_id.clone();
+        let auxiliary_session_id = concat!(
+            "local:v1:",
+            "bbbbbbbbbbbbbbbb",
+            "bbbbbbbbbbbbbbbb",
+            "bbbbbbbbbbbbbbbb",
+            "bbbbbbbbbbbbbbbb"
+        );
+        write_session_record(&context, &created.record).expect("persist app-server runtime");
+        activate_runtime(&context, &created.record).expect("activate runtime");
+        mutate_session_record(&context, &created.record.id, |record| {
+            record.provider_resume = None;
+            Ok(())
+        })
+        .expect("clear primary identity to model the fresh-session hook race");
+        crate::codex_app_server::register_system_ephemeral_thread(
+            &context,
+            &created.record,
+            auxiliary_session_id,
+        )
+        .expect("register confirmed system-ephemeral thread");
+        provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            &runtime_id,
+            None,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": auxiliary_session_id
+            }),
+        )
+        .expect("system-ephemeral prompt hook must not change provider resume identity");
+        assert!(
+            load_session_record(&context, &created.record.id)
+                .expect("record after auxiliary prompt hook")
+                .provider_resume
+                .is_none(),
+            "the auxiliary prompt hook must not capture the fresh session"
+        );
+
+        let activity_path = session_dir(&context, &created.record.id).join(ACTIVITY_FILE);
+        let before = fs::read(&activity_path).expect("activity before auxiliary hook");
+        let auxiliary = normalize_provider_hook(
+            AgentKind::Codex,
+            None,
+            &runtime_id,
+            &json!({
+                "hook_event_name": "Stop",
+                "session_id": auxiliary_session_id,
+                "turn_id": "system-ephemeral-turn"
+            }),
+        )
+        .expect("normalize deceptive raw auxiliary hook identity")
+        .expect("recognized auxiliary stop hook");
+        let accepted = ingest_event(&context, &created.record.id, auxiliary)
+            .expect("registered auxiliary hook must be accepted as a no-op");
+        assert!(accepted.duplicate);
+        assert_eq!(
+            fs::read(&activity_path).expect("activity after auxiliary hook"),
+            before,
+            "the system-ephemeral hook must not mutate primary activity"
+        );
+
+        provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            &runtime_id,
+            None,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1"
+            }),
+        )
+        .expect("the primary prompt hook must capture the fresh session");
+        assert_eq!(
+            load_session_record(&context, &created.record.id)
+                .expect("record after primary prompt hook")
+                .provider_resume
+                .expect("primary provider resume")
+                .session_id,
+            "session-1"
+        );
+        let mut primary_binding = event(TurnEventKind::Progress, "primary-binding");
+        primary_binding.runtime_id = runtime_id.clone();
+        ingest_event(&context, &created.record.id, primary_binding)
+            .expect("the primary activity hook must bind after the auxiliary no-op");
+
+        let mut foreign = event(TurnEventKind::StopObserved, "foreign-stop");
+        foreign.runtime_id = runtime_id.clone();
+        foreign.provider_session_id = Some("foreign-thread".to_string());
+        let error = ingest_event(&context, &created.record.id, foreign)
+            .expect_err("an unregistered provider session must still fail closed");
+        assert_eq!(error.code(), "provider-session-id-mismatch");
+
+        fs::write(
+            session_dir(&context, &created.record.id)
+                .join(".codex-app-server-system-ephemeral-threads.json"),
+            b"not-json",
+        )
+        .expect("corrupt auxiliary registry fixture");
+        provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            &runtime_id,
+            None,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1"
+            }),
+        )
+        .expect("the primary prompt hook must not read the auxiliary registry");
+        let mut primary = event(TurnEventKind::Progress, "primary-progress");
+        primary.runtime_id = runtime_id;
+        ingest_event(&context, &created.record.id, primary)
+            .expect("the primary activity hook must not read the auxiliary registry");
     }
 
     #[test]
