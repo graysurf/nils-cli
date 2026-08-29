@@ -1,6 +1,6 @@
 [package]
 name = "nils-evidence"
-version = "1.27.24"
+version = "1.27.25"
 edition.workspace = true
 license.workspace = true
 
@@ -18,10 +18,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.27.24", path = "../nils-build-info" }
+nils-build-info = { version = "1.27.25", path = "../nils-build-info" }
 indexmap = { workspace = true }
-nils-common = { version = "1.27.24", path = "../nils-common", package = "nils-common" }
-nils-scrub = { version = "1.27.24", path = "../nils-scrub" }
+nils-common = { version = "1.27.25", path = "../nils-common", package = "nils-common" }
+nils-scrub = { version = "1.27.25", path = "../nils-scrub" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
@@ -30,6 +30,6 @@ thiserror = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
-nils-test-support = { version = "1.27.24", path = "../nils-test-support" }
+nils-test-support = { version = "1.27.25", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
