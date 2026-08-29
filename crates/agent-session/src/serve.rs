@@ -7608,19 +7608,29 @@ fn wait_process_with_timeout(
 /// Cursor home plus erase-display, so a replayed screen lands at a known origin
 /// instead of continuing from wherever the live cursor happened to be.
 const ATTACH_REPLAY_ORIGIN: &str = "\x1b[H\x1b[2J";
-/// Close any hyperlink and clear any attributes, so the replay neither inherits
+/// Close every kind of run `-e` can leave open, so the replay neither inherits
 /// state from whatever was on the wire before it nor leaks state into the
-/// provider's own repaint underneath. A capture whose region ends inside an OSC 8
-/// hyperlink would otherwise make every byte the provider paints next part of
-/// that link, and a click anywhere would open its target.
-const ATTACH_REPLAY_RESET: &str = "\x1b]8;;\x1b\\\x1b[0m";
-
-/// Turn a `capture-pane -p -J` screen into bytes that are safe to inject into
-/// the raw PTY stream an attaching client reads. With `-J` each row is a joined
-/// logical line: it can exceed the pane width (the client re-wraps it) and
-/// keeps the trailing spaces at former wrap points.
+/// provider's own repaint underneath. `-J` closes NONE of them at the end of a
+/// row or region — verified against tmux 3.4 — so all three matter:
 ///
-/// `capture-pane -p` joins pane rows with a bare `\n`. In a PTY stream a lone LF
+/// - OSC 8: a capture ending inside a hyperlink would make every byte the
+///   provider paints next part of that link, and a click anywhere would open
+///   its target.
+/// - SGR: the last captured attribute would colour the repaint.
+/// - SI (shift-in): tmux encodes ACS line drawing as SO/SI, and the `-J` form
+///   emits the SO without its SI. A later `enacs` from any ncurses repaint
+///   would then translate ordinary text into box-drawing glyphs. SGR 0 does not
+///   reset the charset glevel, so this needs its own byte.
+const ATTACH_REPLAY_RESET: &str = "\x1b]8;;\x1b\\\x1b[0m\x0f";
+
+/// Turn a `capture-pane -p -e -J` screen into bytes that are safe to inject
+/// into the raw PTY stream an attaching client reads. With `-J` each row is a
+/// joined logical line: it can exceed the pane width (the client re-wraps it)
+/// and keeps the trailing spaces at former wrap points. `-e` adds escape
+/// sequences, and the alphabet it can emit is SGR, OSC 8, and SO/SI — never
+/// cursor motion, which is what keeps the staircase normalization below valid.
+///
+/// `capture-pane -p` joins pane rows with a bare `\n`, with or without `-e`. In a PTY stream a lone LF
 /// only moves the cursor down one row and keeps its column, so replaying the
 /// capture verbatim staircases every row further right until it wraps at the
 /// edge — the client then repaints the same content correctly underneath, which
@@ -7651,8 +7661,12 @@ fn pty_ready_attach_replay(capture: &str) -> Option<Vec<u8>> {
     let mut replay = String::with_capacity(
         ATTACH_REPLAY_ORIGIN.len() + 2 * ATTACH_REPLAY_RESET.len() + capture.len() + rows.len(),
     );
-    replay.push_str(ATTACH_REPLAY_ORIGIN);
+    // Reset BEFORE the erase: erase-display paints with the current background
+    // on a back-colour-erase terminal, and the client reuses one Terminal
+    // across reconnects, so a stream that ended mid-SGR would otherwise repaint
+    // the whole screen in that stale colour until the provider redraws.
     replay.push_str(ATTACH_REPLAY_RESET);
+    replay.push_str(ATTACH_REPLAY_ORIGIN);
     for row in rows {
         replay.push_str(row);
         replay.push_str("\r\n");
@@ -21727,7 +21741,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2Jfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
     }
 
@@ -21737,7 +21751,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2Jfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
     }
 
@@ -21747,7 +21761,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2Jfirst\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
     }
 
@@ -21757,7 +21771,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\r\nthird\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2Jfirst\r\n\r\nthird\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
     }
 
@@ -21774,7 +21788,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0m\x1b[32m✔ 測試通過\x1b[0m\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2J\x1b[32m✔ 測試通過\x1b[0m\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
     }
 
@@ -21806,8 +21820,37 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\x1b]8;;\x1b\\\x1b[0m",
+            "\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2Jfirst\r\n\x1b]8;;\x1b\\\x1b[0m\x0f",
         );
+    }
+
+    #[test]
+    fn attach_replay_closes_an_acs_run_left_open_by_the_captured_region() {
+        // tmux encodes ACS line drawing as SO/SI, and the -J capture emits the
+        // SO without its SI (verified against tmux 3.4). SGR 0 does not reset
+        // the charset glevel, so without an explicit SI a later `enacs` from any
+        // ncurses repaint would render ordinary text as box-drawing glyphs.
+        let replay = pty_ready_attach_replay("\x0elqqk\n").expect("replay");
+
+        let text = String::from_utf8(replay).expect("utf8");
+        assert!(
+            text.ends_with('\x0f'),
+            "replay must shift back in after a captured ACS run: {text:?}",
+        );
+    }
+
+    #[test]
+    fn attach_replay_resets_before_erasing_the_screen() {
+        // Erase-display paints with the current background on a back-colour-erase
+        // terminal, and the client reuses one Terminal across reconnects, so the
+        // reset has to precede the erase or a re-attach repaints the screen in
+        // the previous stream's stale colour.
+        let replay = pty_ready_attach_replay("first\n").expect("replay");
+
+        let text = String::from_utf8(replay).expect("utf8");
+        let reset = text.find("\x1b[0m").expect("reset present");
+        let erase = text.find("\x1b[2J").expect("erase present");
+        assert!(reset < erase, "reset must precede the erase: {text:?}");
     }
 
     #[test]
@@ -21821,11 +21864,11 @@ exit 0
 
         let text = String::from_utf8(replay).expect("utf8");
         assert!(
-            text.ends_with("\x1b]8;;\x1b\\\x1b[0m"),
+            text.ends_with("\x1b]8;;\x1b\\\x1b[0m\x0f"),
             "replay must close hyperlink and attribute state: {text:?}",
         );
         assert!(
-            text.starts_with("\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0m"),
+            text.starts_with("\x1b]8;;\x1b\\\x1b[0m\x0f\x1b[H\x1b[2J"),
             "replay must not inherit state from the preceding stream: {text:?}",
         );
     }
