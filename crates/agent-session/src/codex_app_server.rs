@@ -2845,7 +2845,15 @@ struct SystemEphemeralThreadRegistry {
     schema_version: String,
     runtime_id: String,
     runtime_generation: u64,
-    provider_session_ids: Vec<String>,
+    identity_digests: Vec<String>,
+}
+
+fn projected_identity_digest_is_valid(value: &str) -> bool {
+    value.len() == 73
+        && value.starts_with("local:v1:")
+        && value[9..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn system_ephemeral_thread_registry_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
@@ -2883,24 +2891,18 @@ fn read_system_ephemeral_thread_registry(
         )
     })?;
     let unique = registry
-        .provider_session_ids
+        .identity_digests
         .iter()
         .collect::<BTreeSet<_>>()
         .len();
     if registry.schema_version != SYSTEM_EPHEMERAL_THREADS_VERSION
         || registry.runtime_id.is_empty()
-        || registry.provider_session_ids.len() > MAX_SYSTEM_EPHEMERAL_THREADS
-        || unique != registry.provider_session_ids.len()
+        || registry.identity_digests.len() > MAX_SYSTEM_EPHEMERAL_THREADS
+        || unique != registry.identity_digests.len()
         || registry
-            .provider_session_ids
+            .identity_digests
             .iter()
-            .any(|provider_session_id| {
-                provider_session_id.len() != 73
-                    || !provider_session_id.starts_with("local:v1:")
-                    || !provider_session_id[9..]
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            .any(|identity_digest| !projected_identity_digest_is_valid(identity_digest))
     {
         return Err(CliError::data(
             "codex-system-ephemeral-registry-invalid",
@@ -2955,18 +2957,18 @@ pub(crate) fn register_system_ephemeral_thread(
             schema_version: SYSTEM_EPHEMERAL_THREADS_VERSION.to_string(),
             runtime_id: runtime.launch_id.clone(),
             runtime_generation: runtime.generation,
-            provider_session_ids: Vec::new(),
+            identity_digests: Vec::new(),
         },
     };
-    let provider_session_id =
-        crate::activity::normalized_codex_session_identifier(&runtime.launch_id, thread_id)?;
-    if registry.provider_session_ids.contains(&provider_session_id) {
+    let identity_digest =
+        crate::activity::projected_codex_session_identifier(&runtime.launch_id, thread_id)?;
+    if registry.identity_digests.contains(&identity_digest) {
         return Ok(());
     }
-    if registry.provider_session_ids.len() >= MAX_SYSTEM_EPHEMERAL_THREADS {
-        registry.provider_session_ids.remove(0);
+    if registry.identity_digests.len() >= MAX_SYSTEM_EPHEMERAL_THREADS {
+        registry.identity_digests.remove(0);
     }
-    registry.provider_session_ids.push(provider_session_id);
+    registry.identity_digests.push(identity_digest);
     let bytes = serde_json::to_vec(&registry).map_err(|_| {
         CliError::runtime(
             "codex-system-ephemeral-registry-render-failed",
@@ -2980,12 +2982,12 @@ pub(crate) fn register_system_ephemeral_thread(
     )
 }
 
-pub(crate) fn system_ephemeral_hook_session_is_registered(
+fn system_ephemeral_identity_digest_is_registered(
     context: &CliContext,
     record: &SessionRecord,
-    provider_session_id: &str,
+    identity_digest: &str,
 ) -> Result<bool, CliError> {
-    if !runtime_is_supported(record) || !protocol_id_is_valid(provider_session_id) {
+    if !runtime_is_supported(record) || !projected_identity_digest_is_valid(identity_digest) {
         return Ok(false);
     }
     let Some(registry) = read_system_ephemeral_thread_registry(context, record)? else {
@@ -2998,11 +3000,36 @@ pub(crate) fn system_ephemeral_hook_session_is_registered(
     {
         return Ok(false);
     }
-    let provider_session_id = crate::activity::normalized_codex_session_identifier(
+    Ok(registry
+        .identity_digests
+        .iter()
+        .any(|candidate| candidate == identity_digest))
+}
+
+pub(crate) fn system_ephemeral_normalized_session_is_registered(
+    context: &CliContext,
+    record: &SessionRecord,
+    identity_digest: &str,
+) -> Result<bool, CliError> {
+    system_ephemeral_identity_digest_is_registered(context, record, identity_digest)
+}
+
+pub(crate) fn system_ephemeral_raw_session_is_registered(
+    context: &CliContext,
+    record: &SessionRecord,
+    raw_provider_session_id: &str,
+) -> Result<bool, CliError> {
+    if !runtime_is_supported(record) || !protocol_id_is_valid(raw_provider_session_id) {
+        return Ok(false);
+    }
+    let Some(runtime) = record.runtime.as_ref() else {
+        return Ok(false);
+    };
+    let identity_digest = crate::activity::projected_codex_session_identifier(
         &runtime.launch_id,
-        provider_session_id,
+        raw_provider_session_id,
     )?;
-    Ok(registry.provider_session_ids.contains(&provider_session_id))
+    system_ephemeral_identity_digest_is_registered(context, record, &identity_digest)
 }
 
 pub(crate) fn run_proxy(context: &CliContext, args: crate::cli::CodexAppServerProxyArgs) -> i32 {
@@ -7137,6 +7164,14 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             .await
             .unwrap();
 
+        let auxiliary_thread = concat!(
+            "local:v1:",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa"
+        );
+
         let auxiliary_start = client_observation(&json!({
             "id": 2,
             "method": "thread/start",
@@ -7160,21 +7195,37 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             .observe_server(
                 &context,
                 &record,
-                &json!({ "id": 2, "result": { "thread": { "id": "auxiliary-thread" } } }),
+                &json!({ "id": 2, "result": { "thread": { "id": auxiliary_thread } } }),
                 None,
             )
             .await
             .expect("an auxiliary thread/start must not replace or disable the primary projection");
-        let registry: SystemEphemeralThreadRegistry = serde_json::from_slice(
-            &fs::read(system_ephemeral_thread_registry_path(&context, &record))
-                .expect("system-ephemeral registry"),
+        let registry_bytes = fs::read(system_ephemeral_thread_registry_path(&context, &record))
+            .expect("system-ephemeral registry");
+        let registry_json: Value =
+            serde_json::from_slice(&registry_bytes).expect("valid registry json");
+        assert!(registry_json.get("identity_digests").is_some());
+        assert!(registry_json.get("provider_session_ids").is_none());
+        let registry: SystemEphemeralThreadRegistry =
+            serde_json::from_slice(&registry_bytes).expect("valid system-ephemeral registry");
+        let projected_auxiliary = crate::activity::projected_codex_session_identifier(
+            &record.runtime.as_ref().unwrap().launch_id,
+            auxiliary_thread,
         )
-        .expect("valid system-ephemeral registry");
+        .expect("unconditionally project the raw auxiliary identity");
+        assert_ne!(projected_auxiliary, auxiliary_thread);
+        assert_eq!(registry.identity_digests, vec![projected_auxiliary.clone()]);
         assert!(
-            registry
-                .provider_session_ids
-                .iter()
-                .all(|provider_session_id| provider_session_id != "auxiliary-thread"),
+            system_ephemeral_raw_session_is_registered(&context, &record, auxiliary_thread)
+                .expect("look up a raw auxiliary identity")
+        );
+        assert!(
+            system_ephemeral_normalized_session_is_registered(
+                &context,
+                &record,
+                &projected_auxiliary,
+            )
+            .expect("look up a projected auxiliary identity"),
             "the private registry must retain only projected provider identities"
         );
 
@@ -7191,7 +7242,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 &json!({
                     "id": 3,
                     "method": "turn/start",
-                    "params": { "threadId": "auxiliary-thread" }
+                    "params": { "threadId": auxiliary_thread }
                 }),
             )
             .expect("a turn on the confirmed system-ephemeral thread must be ignored");
