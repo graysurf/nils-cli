@@ -7608,6 +7608,12 @@ fn wait_process_with_timeout(
 /// Cursor home plus erase-display, so a replayed screen lands at a known origin
 /// instead of continuing from wherever the live cursor happened to be.
 const ATTACH_REPLAY_ORIGIN: &str = "\x1b[H\x1b[2J";
+/// Close any hyperlink and clear any attributes, so the replay neither inherits
+/// state from whatever was on the wire before it nor leaks state into the
+/// provider's own repaint underneath. A capture whose region ends inside an OSC 8
+/// hyperlink would otherwise make every byte the provider paints next part of
+/// that link, and a click anywhere would open its target.
+const ATTACH_REPLAY_RESET: &str = "\x1b]8;;\x1b\\\x1b[0m";
 
 /// Turn a `capture-pane -p -J` screen into bytes that are safe to inject into
 /// the raw PTY stream an attaching client reads. With `-J` each row is a joined
@@ -7630,20 +7636,77 @@ fn pty_ready_attach_replay(capture: &str) -> Option<Vec<u8>> {
         .map(|row| row.strip_suffix('\r').unwrap_or(row))
         .collect();
     // tmux pads the capture to the pane height; trailing blank rows would only
-    // push the provider's own repaint down the screen.
-    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+    // push the provider's own repaint down the screen. A padding row can carry
+    // attribute or hyperlink resets, which are not whitespace, so emptiness is
+    // judged on the visible text.
+    while rows
+        .last()
+        .is_some_and(|row| attach_replay_row_is_blank(row))
+    {
         rows.pop();
     }
     if rows.is_empty() {
         return None;
     }
-    let mut replay = String::with_capacity(ATTACH_REPLAY_ORIGIN.len() + capture.len() + rows.len());
+    let mut replay = String::with_capacity(
+        ATTACH_REPLAY_ORIGIN.len() + 2 * ATTACH_REPLAY_RESET.len() + capture.len() + rows.len(),
+    );
     replay.push_str(ATTACH_REPLAY_ORIGIN);
+    replay.push_str(ATTACH_REPLAY_RESET);
     for row in rows {
         replay.push_str(row);
         replay.push_str("\r\n");
     }
+    replay.push_str(ATTACH_REPLAY_RESET);
     Some(replay.into_bytes())
+}
+
+/// Whether a captured row carries no visible text, ignoring escape sequences.
+///
+/// Only used to decide which trailing rows are padding. `nils_common::strip_ansi`
+/// handles CSI but not OSC, and `-e` output carries OSC 8 hyperlinks, so this
+/// walks both forms.
+fn attach_replay_row_is_blank(row: &str) -> bool {
+    let bytes = row.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            if !bytes[i].is_ascii_whitespace() {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1) {
+            // CSI: parameters and intermediates, then a final byte.
+            Some(b'[') => {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // OSC: terminated by BEL or ST.
+            Some(b']') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Any other two-byte escape.
+            Some(_) => i += 2,
+            None => i += 1,
+        }
+    }
+    true
 }
 
 async fn capture_attach_snapshot(
@@ -7668,9 +7731,14 @@ async fn capture_attach_snapshot_with_timeout(
         // wrapped. Replayed wrapped URLs and commands then stay one logical
         // line for client-side selection and link detection, and scrollback
         // captured at an earlier pane width re-wraps at the current width.
+        // -e keeps the escape sequences tmux stored for the pane. `-p` alone
+        // prints plain text, so every re-attach replayed the scrollback with no
+        // attributes and no OSC 8 hyperlinks: a link whose visible label is not
+        // a URL stopped existing until the provider repainted that region.
         command
             .arg("capture-pane")
             .arg("-p")
+            .arg("-e")
             .arg("-J")
             .arg("-t")
             .arg(&tmux_session)
@@ -21659,7 +21727,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2Jfirst\r\nsecond\r\n",
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m",
         );
     }
 
@@ -21669,7 +21737,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2Jfirst\r\nsecond\r\n",
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\nsecond\r\n\x1b]8;;\x1b\\\x1b[0m",
         );
     }
 
@@ -21679,7 +21747,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2Jfirst\r\n",
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\x1b]8;;\x1b\\\x1b[0m",
         );
     }
 
@@ -21689,7 +21757,7 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2Jfirst\r\n\r\nthird\r\n",
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\r\nthird\r\n\x1b]8;;\x1b\\\x1b[0m",
         );
     }
 
@@ -21706,7 +21774,59 @@ exit 0
 
         assert_eq!(
             String::from_utf8(replay).expect("utf8"),
-            "\x1b[H\x1b[2J\x1b[32m✔ 測試通過\x1b[0m\r\n",
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0m\x1b[32m✔ 測試通過\x1b[0m\r\n\x1b]8;;\x1b\\\x1b[0m",
+        );
+    }
+
+    #[test]
+    fn attach_replay_keeps_an_osc8_hyperlink_intact() {
+        // The whole point of capturing with -e: a hyperlink whose visible label
+        // is not a URL survives re-attach. Without it the replayed scrollback
+        // is plain text and the link is gone until the provider repaints.
+        let replay = pty_ready_attach_replay(
+            "see \x1b]8;;https://example.test/issues/398\x1b\\#398\x1b]8;;\x1b\\ now\n",
+        )
+        .expect("replay");
+
+        let text = String::from_utf8(replay).expect("utf8");
+        assert!(
+            text.contains("\x1b]8;;https://example.test/issues/398\x1b\\#398\x1b]8;;\x1b\\"),
+            "replay must carry the hyperlink verbatim: {text:?}",
+        );
+    }
+
+    #[test]
+    fn attach_replay_trims_trailing_rows_that_only_carry_escapes() {
+        // tmux pads the capture to the pane height. With -e those padding rows
+        // can carry attribute or hyperlink resets, which are not whitespace, so
+        // a naive emptiness test would keep them and push the provider's own
+        // repaint down the screen.
+        let replay =
+            pty_ready_attach_replay("first\n\x1b[0m\n\x1b]8;;\x1b\\\n   \x1b[m\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0mfirst\r\n\x1b]8;;\x1b\\\x1b[0m",
+        );
+    }
+
+    #[test]
+    fn attach_replay_closes_state_left_open_by_the_captured_region() {
+        // A hyperlink that continues past the captured region leaves tmux's -e
+        // output mid-link. Everything the provider paints underneath would join
+        // that link and open the wrong target on a click, so the replay closes
+        // the hyperlink and clears attributes at both ends.
+        let replay = pty_ready_attach_replay("\x1b]8;;https://example.test/open\x1b\\dangling\n")
+            .expect("replay");
+
+        let text = String::from_utf8(replay).expect("utf8");
+        assert!(
+            text.ends_with("\x1b]8;;\x1b\\\x1b[0m"),
+            "replay must close hyperlink and attribute state: {text:?}",
+        );
+        assert!(
+            text.starts_with("\x1b[H\x1b[2J\x1b]8;;\x1b\\\x1b[0m"),
+            "replay must not inherit state from the preceding stream: {text:?}",
         );
     }
 
@@ -21751,7 +21871,9 @@ exit 0
             };
             assert_eq!(
                 bytes.as_ref(),
-                b"\x1b[H\x1b[2Jpane\r\n",
+                pty_ready_attach_replay("pane\n")
+                    .expect("replay")
+                    .as_slice(),
                 "{agent} attach snapshot must replay CRLF rows from a known origin",
             );
 
@@ -21856,6 +21978,12 @@ exit 0
         // client's terminal re-wraps them at its own width and marks the
         // continuation rows as wrapped. Without it, a wrapped URL or command in
         // the replayed scrollback arrives as unrelated hard rows.
+        //
+        // -e keeps the escape sequences. `capture-pane -p` alone prints plain
+        // text, so every re-attach repainted the scrollback with no attributes
+        // and — the reason this is a bug, not a cosmetic loss — no OSC 8
+        // hyperlinks. A link whose visible label is not a URL simply stopped
+        // existing until the provider repainted that region.
         let args: Vec<String> = std::fs::read_to_string(&args_log)
             .unwrap()
             .lines()
@@ -21866,6 +21994,7 @@ exit 0
             vec![
                 "capture-pane",
                 "-p",
+                "-e",
                 "-J",
                 "-t",
                 "hs-codex-joined",
@@ -22043,11 +22172,15 @@ exit 0
         let mut second = connect().await;
         assert_eq!(
             recv_websocket_binary(&mut first).await,
-            b"\x1b[H\x1b[2Jpane\r\n"
+            pty_ready_attach_replay("pane\n")
+                .expect("replay")
+                .as_slice()
         );
         assert_eq!(
             recv_websocket_binary(&mut second).await,
-            b"\x1b[H\x1b[2Jpane\r\n"
+            pty_ready_attach_replay("pane\n")
+                .expect("replay")
+                .as_slice()
         );
         wait_for_subscriber_count(&state.attach_brokers, "socket", 2).await;
 
@@ -22129,7 +22262,9 @@ exit 0
 
         assert_eq!(
             recv_websocket_binary(&mut socket).await,
-            b"\x1b[H\x1b[2Jpane\r\n"
+            pty_ready_attach_replay("pane\n")
+                .expect("replay")
+                .as_slice()
         );
         assert_eq!(recv_websocket_binary(&mut socket).await, b"during-capture");
         socket.close(None).await.unwrap();
