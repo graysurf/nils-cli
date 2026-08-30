@@ -1006,7 +1006,8 @@ distinctions that cannot be proven offline.
 - Output schema:
   `data = { provider, number, decision, submitted_review, head_sha?,
   pr_comment_url, issue_number, issue_comment_url, mirrored, lenses,
-  metadata_only?, native_review_url?,
+  metadata_only?, native_review_url?, native_review_author?,
+  native_review_verification_plan?,
   review_threads?, threads_skipped_idempotent? }`. `head_sha` is present for
   `--submit-review`; `threads_skipped_idempotent` is present (non-zero) when
   cross-run duplicates were skipped.

@@ -1420,7 +1420,32 @@ fn format_location(finding: &NormalizedFinding, context: &RenderContext) -> Stri
 }
 
 fn markdown_escape(input: &str) -> String {
-    input.replace('|', "\\|").replace('\n', " ")
+    let mut escaped = String::with_capacity(input.len());
+    let mut backslash_run = 0usize;
+    for ch in input.chars() {
+        match ch {
+            '|' => {
+                if backslash_run.is_multiple_of(2) {
+                    escaped.push('\\');
+                }
+                escaped.push('|');
+                backslash_run = 0;
+            }
+            '\n' | '\r' => {
+                escaped.push(' ');
+                backslash_run = 0;
+            }
+            '\\' => {
+                escaped.push(ch);
+                backslash_run += 1;
+            }
+            _ => {
+                escaped.push(ch);
+                backslash_run = 0;
+            }
+        }
+    }
+    escaped
 }
 
 fn read_merged(path: &Path) -> Result<MergeResult, CliError> {

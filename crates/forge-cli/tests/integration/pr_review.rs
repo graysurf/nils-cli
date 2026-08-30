@@ -332,6 +332,59 @@ fn pr_review_validate_specialist_report_accepts_the_canonical_table_shape() {
 }
 
 #[test]
+fn pr_review_validate_accepts_renderer_output_with_an_already_escaped_pipe() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        r#"{"severity":"medium","confidence":0.9,"path":"src/lib.rs","line":7,"category":"correctness","summary":"Existing \\| pipe","evidence":"The evidence keeps \\| source text.","recommendation":"Preserve \\| safely.","specialist":"testing","actionable":true}"#,
+    )
+    .expect("write findings");
+    let bundle = tmp.path().join("bundle");
+    let render_code = agent_workflow_primitives::review_specialists::run_with_args([
+        "review-specialists".to_string(),
+        "bundle".to_string(),
+        "--input".to_string(),
+        input.to_string_lossy().into_owned(),
+        "--out-dir".to_string(),
+        bundle.to_string_lossy().into_owned(),
+        "--profile".to_string(),
+        "provider-review".to_string(),
+        "--reviewable".to_string(),
+        "PR #44".to_string(),
+        "--lens".to_string(),
+        "testing".to_string(),
+        "--lens-verdict".to_string(),
+        "findings".to_string(),
+        "--scope".to_string(),
+        "renderer-validator parity".to_string(),
+        "--evidence-reviewed".to_string(),
+        "end-to-end regression".to_string(),
+    ]);
+    assert_eq!(render_code, 0);
+    let report = bundle.join("provider-review.md");
+    let report_arg = report.to_string_lossy().into_owned();
+
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment-file",
+            &report_arg,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+}
+
+#[test]
 fn pr_review_metadata_only_posts_concise_pr_and_issue_breadcrumbs() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
