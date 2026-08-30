@@ -1670,11 +1670,13 @@ pub(crate) fn loaded_threads_request(id: u64) -> Value {
     json!({ "id": id, "method": "thread/loaded/list", "params": {} })
 }
 
+/// Rejoin the bound thread for live control without hydrating its unbounded
+/// turn history into a single WebSocket response.
 pub(crate) fn resume_thread_request(id: u64, thread_id: &str, cwd: &str) -> Value {
     json!({
         "id": id,
         "method": "thread/resume",
-        "params": { "threadId": thread_id, "cwd": cwd }
+        "params": { "threadId": thread_id, "cwd": cwd, "excludeTurns": true }
     })
 }
 
@@ -8536,6 +8538,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             let resume = receive_json(&mut socket).await;
             assert_eq!(resume["method"], "thread/resume");
             assert_eq!(resume["params"]["threadId"], "raw-thread-a");
+            assert_eq!(resume["params"]["excludeTurns"], true);
             respond(&mut socket, &resume, json!({})).await;
             for _ in 0..2 {
                 let usage = receive_json(&mut socket).await;
