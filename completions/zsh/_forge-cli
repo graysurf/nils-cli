@@ -274,6 +274,7 @@ request-changes\:"Record a request-changes outcome in the posted review comment"
 '--expected-head=[Full PR head SHA that was reviewed. Required with \`--submit-review\` and bound to both the pending-review preflight and provider mutation]:SHA:_default' \
 '--thread-file=[Create or validate review threads from a JSON array of actionable findings (max 50 threads; 16 KiB body each). Requires --submit-review when posting; may be inherited by \`validate\` without posting. Omit this for summary-only reviews. Repair findings, then resolve via \`pr review-threads resolve\`]:PATH:_default' \
 '--native-review-url=[Authoritative native review URL. Required with --metadata-only]:URL:_default' \
+'--native-review-author=[Expected GitHub login that authored the authoritative native review. Required with --metadata-only and verified by provider read-back before the personal-identity metadata breadcrumb is posted]:LOGIN:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \

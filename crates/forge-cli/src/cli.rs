@@ -712,6 +712,15 @@ pub struct PrReviewArgs {
     /// Authoritative native review URL. Required with --metadata-only.
     #[arg(long = "native-review-url", value_name = "URL")]
     pub native_review_url: Option<String>,
+    /// Expected GitHub login that authored the authoritative native review.
+    /// Required with --metadata-only and verified by provider read-back before
+    /// the personal-identity metadata breadcrumb is posted.
+    #[arg(
+        long = "native-review-author",
+        value_name = "LOGIN",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub native_review_author: Option<String>,
 }
 
 /// `pr comments` arguments.

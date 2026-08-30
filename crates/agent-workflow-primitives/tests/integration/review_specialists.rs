@@ -463,6 +463,54 @@ fn review_specialists_provider_review_writes_canonical_body_and_line_file_thread
 }
 
 #[test]
+fn review_specialists_rejects_thread_output_before_writing_any_render_artifact() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let merged_path = tmp.path().join("merged.json");
+    fs::write(
+        &merged_path,
+        r#"{"schema":"review-specialists.merged.v1","input_files":[],"display_threshold":0.6,"counts":{"total":0,"displayed":0,"suppressed":0,"by_severity":{}},"findings":[]}"#,
+    )
+    .expect("merged");
+    let merged_arg = path_arg(&merged_path);
+    let body_path = tmp.path().join("report.md");
+    let body_arg = path_arg(&body_path);
+    let threads_path = tmp.path().join("threads.json");
+    let threads_arg = path_arg(&threads_path);
+
+    let render = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "render",
+            "--profile",
+            "report",
+            "--input",
+            &merged_arg,
+            "--out",
+            &body_arg,
+            "--thread-out",
+            &threads_arg,
+        ],
+    );
+
+    assert_eq!(render.code, 64, "stderr={}", render.stderr_text());
+    assert!(!body_path.exists(), "invalid render must not write --out");
+    assert!(
+        !threads_path.exists(),
+        "invalid render must not write --thread-out"
+    );
+}
+
+#[test]
+fn review_specialists_bundle_help_does_not_advertise_render_only_thread_out() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let help = run("review-specialists", tmp.path(), &["bundle", "--help"]);
+
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    assert!(!help.stdout_text().contains("--thread-out"));
+}
+
+#[test]
 fn review_specialists_skill_helper_parity_fixture_renders_report() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let input = path_arg(&fixture("skill-helper-parity.jsonl"));

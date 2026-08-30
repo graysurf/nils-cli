@@ -327,6 +327,7 @@ operations:
       - { name: --specialist-report, type: bool, default: false } # Opt-in canonical agent-kit specialist marker/fields/verdict/table validation.
       - { name: --metadata-only, type: bool, default: false } # GitHub-only concise personal metadata for an already-published authoritative native review; conflicts with body/thread/submission flags.
       - { name: --native-review-url, type: string, required: false } # Required with --metadata-only and must identify this exact repo/PR's #pullrequestreview- object.
+      - { name: --native-review-author, type: string, required: false } # Required with --metadata-only; exact expected App login, verified with provider read-back together with URL and decision state before mutation.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_agent_attribution # review comment body, thread spec bodies, AND the generated issue mirror, validated before any post (thread paths carry no prose)
@@ -341,7 +342,10 @@ operations:
     #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review mutation
     #   invalid_specialist_review_report (DATA 65) — --specialist-report body lacks the canonical marker, required fields/verdict, or findings table
     #   native_review_url_required (DATA 65) — --metadata-only without --native-review-url
+    #   native_review_author_required (DATA 65) — --metadata-only without --native-review-author
     #   invalid_native_review_url (DATA 65) — native review URL does not bind to this GitHub repository and PR
+    #   native_review_url_requires_metadata_only / native_review_author_requires_metadata_only (DATA 65) — native review identity input without --metadata-only
+    #   native_review_verification_failed (DATA 65) — provider read-back does not match the exact review id, URL, decision state, or expected App author
     #   metadata_only_conflict (DATA 65) — --metadata-only combined with body/thread/native submission inputs
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
     #   github_pending_review_exists (RUNTIME 1) — summary-only native review submission found a viewer-owned pending review. Threaded review transactions instead inspect an exact receipt-bound draft and resume it.
@@ -398,6 +402,8 @@ operations:
         lenses: list<string>
         metadata_only?: bool # true only for the concise existing-native-review metadata path
         native_review_url?: string # authoritative same-repo/same-PR native review URL supplied to --metadata-only
+        native_review_author?: string # expected App login verified by provider read-back for --metadata-only
+        native_review_verification_plan?: list<string> # dry-run only: exact native-review read-back argv
         review_threads?: "list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>"
         threads_skipped_idempotent?: integer # cross-run duplicates skipped: findings whose (path, body) already had a live (non-resolved, non-outdated) thread on the current head; omitted when 0. When every finding is a duplicate the review event is skipped, so submitted_review is false
 

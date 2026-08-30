@@ -233,6 +233,23 @@ fn command_merge(args: MergeArgs) -> i32 {
 
 fn command_render(args: RenderArgs) -> i32 {
     let format = args.common.format;
+    if args.thread_out.is_some()
+        && !matches!(
+            args.profile,
+            RenderProfile::ProviderReview | RenderProfile::PrComment
+        )
+    {
+        return render_error(
+            RENDER_SCHEMA_VERSION,
+            RENDER_COMMAND,
+            format,
+            CliError::usage(
+                "thread-out-requires-provider-review",
+                "--thread-out requires --profile provider-review or --profile pr-comment",
+                None,
+            ),
+        );
+    }
     match read_merged(&args.input).and_then(|merged| {
         let context = RenderContext::from_args(
             args.repo.as_deref(),
@@ -244,17 +261,7 @@ fn command_render(args: RenderArgs) -> i32 {
             if let Some(out) = &args.out {
                 write_text(out, &rendered.body)?;
             }
-            if let Some(thread_out) = &args.provider_review.thread_out {
-                if !matches!(
-                    args.profile,
-                    RenderProfile::ProviderReview | RenderProfile::PrComment
-                ) {
-                    return Err(CliError::usage(
-                        "thread-out-requires-provider-review",
-                        "--thread-out requires --profile provider-review or --profile pr-comment",
-                        None,
-                    ));
-                }
+            if let Some(thread_out) = &args.thread_out {
                 write_json_pretty(thread_out, &rendered.threads)?;
             }
             Ok(rendered)
@@ -1312,24 +1319,31 @@ fn render_provider_review_artifacts_with_render_context(
     let threads = merged
         .findings
         .iter()
-        .filter(|finding| finding.primary.actionable)
-        .map(|finding| ProviderReviewThread {
-            path: finding.primary.path.clone(),
-            line: finding.primary.line,
-            subject_type: if finding.primary.line.is_some() {
-                "LINE".to_string()
-            } else {
-                "FILE".to_string()
-            },
-            body: format!(
-                "**{}** ({}, {:.2})\n\n{}\n\nRecommendation: {}\n\n<!-- agent-kit:finding:{} -->",
-                finding.primary.summary,
-                finding.primary.severity,
-                finding.primary.confidence,
-                finding.primary.evidence,
-                finding.primary.recommendation,
-                finding.fingerprint,
-            ),
+        .filter_map(|finding| {
+            let source = finding.actionable_source.as_ref().or_else(|| {
+                finding
+                    .primary
+                    .actionable
+                    .then_some(&finding.primary)
+            })?;
+            Some(ProviderReviewThread {
+                path: source.path.clone(),
+                line: source.line,
+                subject_type: if source.line.is_some() {
+                    "LINE".to_string()
+                } else {
+                    "FILE".to_string()
+                },
+                body: format!(
+                    "**{}** ({}, {:.2})\n\n{}\n\nRecommendation: {}\n\n<!-- agent-kit:finding:{} -->",
+                    source.summary,
+                    source.severity,
+                    source.confidence,
+                    source.evidence,
+                    source.recommendation,
+                    finding.fingerprint,
+                ),
+            })
         })
         .collect();
     Ok(ProviderReviewArtifacts { body, threads })
@@ -1771,10 +1785,6 @@ struct ProviderReviewArgs {
     /// Compact validation, diff, or provider evidence summary.
     #[arg(long = "evidence-reviewed", value_name = "TEXT")]
     evidence_reviewed: Option<String>,
-
-    /// Write actionable GitHub review-thread specs derived from the same findings.
-    #[arg(long = "thread-out", value_name = "FILE", value_hint = ValueHint::FilePath)]
-    thread_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1853,6 +1863,10 @@ struct RenderArgs {
     /// Custom link base. Defaults to https://github.com/<repo>/blob when --repo is provided.
     #[arg(long)]
     link_base: Option<String>,
+
+    /// Write actionable GitHub review-thread specs derived from the same findings.
+    #[arg(long = "thread-out", value_name = "FILE", value_hint = ValueHint::FilePath)]
+    thread_out: Option<PathBuf>,
 
     #[command(flatten)]
     provider_review: ProviderReviewArgs,
@@ -2045,6 +2059,8 @@ struct MergedFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lifecycle_fingerprint: Option<String>,
     primary: NormalizedFinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actionable_source: Option<NormalizedFinding>,
     confirming_specialists: Vec<String>,
     confirming_count: usize,
     source_rows: Vec<SourceRow>,
@@ -2266,9 +2282,19 @@ impl MergedFindingBuilder {
     }
 
     fn finish(self) -> MergedFinding {
-        let actionable = self.rows.iter().any(|finding| finding.actionable);
-        let mut primary = self.primary;
-        primary.actionable = actionable;
+        let primary = self.primary;
+        let actionable_source = self
+            .rows
+            .iter()
+            .filter(|finding| finding.actionable)
+            .cloned()
+            .reduce(|current, candidate| {
+                if is_higher_priority(&candidate, &current) {
+                    candidate
+                } else {
+                    current
+                }
+            });
         let mut confirming: BTreeSet<String> = BTreeSet::new();
         let mut source_rows = Vec::new();
         for finding in self.rows {
@@ -2291,6 +2317,7 @@ impl MergedFindingBuilder {
             lifecycle_fingerprint: (self.mode == ReviewMode::Delivery)
                 .then_some(self.lifecycle_fingerprint),
             primary,
+            actionable_source,
             confirming_specialists: confirming.iter().cloned().collect(),
             confirming_count: confirming.len(),
             source_rows,
@@ -2577,6 +2604,7 @@ mod tests {
             fingerprint,
             lifecycle_fingerprint: None,
             primary,
+            actionable_source: None,
             confirming_specialists: vec![specialist.to_string()],
             confirming_count: 1,
             source_rows: vec![SourceRow {
@@ -2745,6 +2773,7 @@ mod tests {
     fn provider_review_artifacts_include_only_explicitly_actionable_findings() {
         let mut merged = mixed_merge_result();
         merged.findings[0].primary.actionable = true;
+        merged.findings[0].actionable_source = Some(merged.findings[0].primary.clone());
         merged.findings[1].primary.actionable = false;
         let context = ProviderReviewContext {
             reviewable: "PR #44".to_string(),
@@ -2784,6 +2813,7 @@ mod tests {
         merged.findings.truncate(1);
         merged.findings[0].primary.actionable = true;
         merged.findings[0].primary.line = None;
+        merged.findings[0].actionable_source = Some(merged.findings[0].primary.clone());
         let context = ProviderReviewContext {
             reviewable: "PR #44".to_string(),
             lens: "testing".to_string(),
@@ -2798,6 +2828,64 @@ mod tests {
         assert_eq!(artifacts.threads.len(), 1);
         assert_eq!(artifacts.threads[0].line, None);
         assert_eq!(artifacts.threads[0].subject_type, "FILE");
+    }
+
+    #[test]
+    fn provider_review_threads_preserve_the_explicitly_actionable_source_row() {
+        let mut primary = build_finding(
+            Severity::High,
+            0.95,
+            "maintainability",
+            "src/primary.rs",
+            Some(11),
+            "Higher confidence summary",
+            "Keep the primary recommendation.",
+        )
+        .primary;
+        primary.root_cause_fingerprint = Some("shared-root-cause".to_string());
+        let mut actionable = build_finding(
+            Severity::Medium,
+            0.80,
+            "testing",
+            "src/actionable.rs",
+            Some(22),
+            "Actionable summary",
+            "Fix the actionable row.",
+        )
+        .primary;
+        actionable.root_cause_fingerprint = Some("shared-root-cause".to_string());
+        actionable.actionable = true;
+
+        let mut builder = MergedFindingBuilder::new(
+            primary.clone(),
+            "shared-root-cause".to_string(),
+            ReviewMode::Delivery,
+        );
+        builder.push(primary);
+        builder.push(actionable);
+        let merged_finding = builder.finish();
+        assert_eq!(merged_finding.primary.path, "src/primary.rs");
+
+        let mut merged = empty_merge_result();
+        merged.schema = DELIVERY_MERGED_SCHEMA.to_string();
+        merged.input_files = vec!["findings.jsonl".to_string()];
+        merged.findings = vec![merged_finding];
+        let artifacts = render_provider_review_artifacts(
+            &merged,
+            &ProviderReviewContext {
+                reviewable: "PR #44".to_string(),
+                lens: "testing".to_string(),
+                verdict: "findings".to_string(),
+                scope: "merged source selection".to_string(),
+                evidence_reviewed: "unit regression".to_string(),
+            },
+        )
+        .expect("provider artifacts render");
+
+        assert_eq!(artifacts.threads.len(), 1);
+        assert_eq!(artifacts.threads[0].path, "src/actionable.rs");
+        assert_eq!(artifacts.threads[0].line, Some(22));
+        assert!(artifacts.threads[0].body.contains("Actionable summary"));
     }
 
     // -----------------------------------------------------------------

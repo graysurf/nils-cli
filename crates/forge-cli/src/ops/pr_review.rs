@@ -86,6 +86,8 @@ pub struct PrReviewPayload {
     pub metadata_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_review_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_review_author: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_threads: Vec<CreatedReviewThread>,
     /// Number of finding threads skipped as cross-run idempotent duplicates:
@@ -136,6 +138,10 @@ struct PrReviewDryRunPayload {
     metadata_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_review_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_review_author: Option<String>,
+    /// GitHub native-review read-back performed before metadata mutation.
+    native_review_verification_plan: Option<Vec<String>>,
     planned_review_threads: usize,
     target_plan: Option<Vec<String>>,
     thread_plan: Vec<Vec<String>>,
@@ -308,7 +314,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
     let id = args.id.ok_or_else(review_id_required_err)?;
 
-    let native_review_url = if args.metadata_only {
+    let (native_review_url, native_review_author, native_review_id) = if args.metadata_only {
         if ctx.provider != Provider::GitHub {
             return Err(ForgeError::provider_unsupported(
                 schema_err(),
@@ -338,8 +344,20 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 None,
             )
         })?;
-        validate_native_review_url(&ctx, id, native_review_url)?;
-        Some(native_review_url.to_string())
+        let native_review_author = args.native_review_author.as_deref().ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "native_review_author_required",
+                "--metadata-only requires --native-review-author <LOGIN>",
+                None,
+            )
+        })?;
+        let native_review_id = validate_native_review_url(&ctx, id, native_review_url)?;
+        (
+            Some(native_review_url.to_string()),
+            Some(native_review_author.to_string()),
+            Some(native_review_id),
+        )
     } else {
         if args.native_review_url.is_some() {
             return Err(ForgeError::validation(
@@ -349,7 +367,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 None,
             ));
         }
-        None
+        if args.native_review_author.is_some() {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "native_review_author_requires_metadata_only",
+                "--native-review-author is only valid with --metadata-only",
+                None,
+            ));
+        }
+        (None, None, None)
     };
 
     let thread_specs_requested = args.thread_file.is_some();
@@ -524,6 +550,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
             BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, id)).plan_argv()
         });
+        let native_review_verification_plan = native_review_id.map(|review_id| {
+            BackendCall::new(
+                BackendProgram::Gh,
+                github_native_review_lookup_argv(&ctx, id, review_id),
+            )
+            .plan_argv()
+        });
         let pending_review_guard_plan = if args.submit_review && ctx.provider == Provider::GitHub {
             let (owner, name) = github_owner_name(&ctx)?;
             Some(
@@ -598,6 +631,8 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 lenses: args.lenses.clone(),
                 metadata_only: args.metadata_only,
                 native_review_url: native_review_url.clone(),
+                native_review_author: native_review_author.clone(),
+                native_review_verification_plan,
                 planned_review_threads: thread_specs.len(),
                 target_plan,
                 thread_plan,
@@ -607,6 +642,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             |p| {
                 if let Some(guard) = p.guard_plan.as_ref() {
                     println!("would verify pull request: {plan}", plan = guard.join(" "));
+                }
+                if let Some(plan) = p.native_review_verification_plan.as_ref() {
+                    println!(
+                        "would verify authoritative native review: {plan}",
+                        plan = plan.join(" ")
+                    );
                 }
                 if let Some(guard) = p.pending_review_guard_plan.as_ref() {
                     println!(
@@ -671,6 +712,21 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
         ensure_github_pull_request(runner, &ctx, id)?;
+        if let (Some(review_id), Some(native_review_url), Some(native_review_author)) = (
+            native_review_id,
+            native_review_url.as_deref(),
+            native_review_author.as_deref(),
+        ) {
+            ensure_github_native_review(
+                runner,
+                &ctx,
+                id,
+                review_id,
+                native_review_url,
+                native_review_author,
+                args.decision,
+            )?;
+        }
         if args.submit_review && thread_specs.is_empty() {
             ensure_no_viewer_pending_github_review(
                 runner,
@@ -765,6 +821,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             lenses: args.lenses,
             metadata_only: args.metadata_only,
             native_review_url,
+            native_review_author,
             review_threads,
             threads_skipped_idempotent,
         },
@@ -3042,7 +3099,7 @@ fn validate_native_review_url(
     ctx: &ProviderContext,
     id: u64,
     native_review_url: &str,
-) -> Result<(), ForgeError> {
+) -> Result<u64, ForgeError> {
     let repo = ctx.repo.as_deref().ok_or_else(|| {
         ForgeError::validation(
             schema_err(),
@@ -3056,7 +3113,8 @@ fn validate_native_review_url(
         host = ctx.host
     );
     let suffix = native_review_url.strip_prefix(&prefix).unwrap_or_default();
-    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+    let review_id = suffix.parse::<u64>().ok().filter(|value| *value > 0);
+    if review_id.is_none() {
         return Err(ForgeError::validation(
             schema_err(),
             "invalid_native_review_url",
@@ -3064,7 +3122,67 @@ fn validate_native_review_url(
             None,
         ));
     }
+    Ok(review_id.expect("validated positive native review id"))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubNativeReviewReadback {
+    id: u64,
+    html_url: String,
+    state: String,
+    user: GithubNativeReviewAuthor,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubNativeReviewAuthor {
+    login: String,
+}
+
+fn ensure_github_native_review<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_id: u64,
+    review_id: u64,
+    expected_url: &str,
+    expected_author: &str,
+    decision: PrReviewDecision,
+) -> Result<(), ForgeError> {
+    let call = BackendCall::new(
+        BackendProgram::Gh,
+        github_native_review_lookup_argv(ctx, pr_id, review_id),
+    );
+    let output = runner.run(&call)?;
+    let review: GithubNativeReviewReadback =
+        serde_json::from_str(output.stdout.trim()).map_err(|error| {
+            native_review_verification_error(format!(
+                "GitHub returned an invalid native review document: {error}"
+            ))
+        })?;
+    let expected_state = match decision {
+        PrReviewDecision::CommentsOnly => "COMMENTED",
+        PrReviewDecision::Approve => "APPROVED",
+        PrReviewDecision::RequestChanges => "CHANGES_REQUESTED",
+    };
+    if review.id != review_id
+        || review.html_url != expected_url
+        || !review.user.login.eq_ignore_ascii_case(expected_author)
+        || !review.state.eq_ignore_ascii_case(expected_state)
+    {
+        return Err(native_review_verification_error(format!(
+            "expected id={review_id}, url={expected_url}, author={expected_author}, state={expected_state}; provider returned id={}, url={}, author={}, state={}",
+            review.id, review.html_url, review.user.login, review.state
+        )));
+    }
     Ok(())
+}
+
+fn native_review_verification_error(detail: String) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "native_review_verification_failed",
+        "the authoritative native review did not match the selected pull request, decision, and expected App author",
+        Some(detail),
+    )
 }
 
 fn validate_specialist_review_report(body: &str) -> Result<(), ForgeError> {
@@ -3116,17 +3234,46 @@ fn validate_specialist_review_report(body: &str) -> Result<(), ForgeError> {
             "specialist report requires the canonical findings table header",
         ));
     };
+    let rows = lines
+        .iter()
+        .skip(header_index + 2)
+        .take_while(|line| !line.is_empty())
+        .copied()
+        .collect::<Vec<_>>();
     if lines.get(header_index + 1).copied() != Some(TABLE_SEPARATOR)
-        || !lines
+        || rows.is_empty()
+        || rows
             .iter()
-            .skip(header_index + 2)
-            .any(|line| line.starts_with('|') && line.ends_with('|'))
+            .any(|row| markdown_table_cell_count(row) != Some(5))
     {
         return Err(invalid_specialist_review_report(
-            "specialist report requires the canonical table separator and at least one finding row",
+            "specialist report requires the canonical table separator and finding rows with exactly five cells",
         ));
     }
     Ok(())
+}
+
+fn markdown_table_cell_count(row: &str) -> Option<usize> {
+    if !row.starts_with('|') || !row.ends_with('|') {
+        return None;
+    }
+    let bytes = row.as_bytes();
+    let mut separators = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'|' {
+            continue;
+        }
+        let mut backslashes = 0usize;
+        let mut cursor = index;
+        while cursor > 0 && bytes[cursor - 1] == b'\\' {
+            backslashes += 1;
+            cursor -= 1;
+        }
+        if backslashes.is_multiple_of(2) {
+            separators += 1;
+        }
+    }
+    separators.checked_sub(1)
 }
 
 fn invalid_specialist_review_report(message: &str) -> ForgeError {
@@ -3334,6 +3481,24 @@ fn github_pull_lookup_argv(ctx: &ProviderContext, id: u64) -> Vec<OsString> {
     argv
 }
 
+/// Read one native review from the exact repository and pull request before
+/// metadata-only publication trusts its URL, state, or author.
+fn github_native_review_lookup_argv(
+    ctx: &ProviderContext,
+    pr_id: u64,
+    review_id: u64,
+) -> Vec<OsString> {
+    let endpoint = ctx
+        .repo
+        .as_deref()
+        .map(|repo| format!("repos/{repo}/pulls/{pr_id}/reviews/{review_id}"))
+        .unwrap_or_else(|| format!("repos/{{owner}}/{{repo}}/pulls/{pr_id}/reviews/{review_id}"));
+    let mut argv = vec![OsString::from("api")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.push(OsString::from(endpoint));
+    argv
+}
+
 fn first_url(stdout: &str) -> Option<String> {
     stdout.split_whitespace().find_map(|token| {
         let url = token.trim_matches(|ch: char| {
@@ -3429,6 +3594,7 @@ mod tests {
             specialist_report: false,
             metadata_only: false,
             native_review_url: None,
+            native_review_author: None,
         }
     }
 

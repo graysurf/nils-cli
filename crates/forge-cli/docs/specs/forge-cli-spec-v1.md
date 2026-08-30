@@ -868,17 +868,21 @@ distinctions that cannot be proven offline.
   forge-cli requires exactly one marker and `## Review Report` heading,
   non-empty Reviewable/Lens/Lens verdict/Scope/Evidence reviewed fields, the
   closed `pass|findings|blocked|follow-up-pass` verdict vocabulary, and the
-  canonical findings table with at least one row. Generic review comments omit
-  this flag and remain valid.
-- `--metadata-only --native-review-url <url>` (GitHub-only) records concise
+  canonical findings table with at least one exactly-five-cell row. Generic
+  review comments omit this flag and remain valid.
+- `--metadata-only --native-review-url <url> --native-review-author <login>`
+  (GitHub-only) records concise
   personal-identity metadata after an owner App has already published the
   authoritative native review. The URL must identify a
-  `#pullrequestreview-<id>` object on the selected repository and PR. The PR
+  `#pullrequestreview-<id>` object on the selected repository and PR. Before
+  mutation, forge-cli reads that exact review back and verifies its URL,
+  decision state, and App author login. The PR
   comment and optional issue mirror contain only PR, decision, lenses, and the
   native review link; they never include the native Review Report body.
   Metadata-only mode rejects caller bodies, `--specialist-report`, threads,
   `--submit-review`, and `--expected-head` before mutation. Output adds
-  `data.metadata_only=true` and `data.native_review_url`.
+  `data.metadata_only=true`, `data.native_review_url`, and
+  `data.native_review_author`.
 - With `--submit-review --expected-head <sha>` (GitHub-only in v1) the command
   instead submits a native
   pull request review event: it POSTs `gh api repos/{repo}/pulls/{id}/reviews`
