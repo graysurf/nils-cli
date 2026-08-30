@@ -90,7 +90,45 @@ struct IssueBodyView {
 
 #[derive(Debug, Serialize)]
 struct PrCommentView {
-    findings_block: String,
+    reviewable: String,
+    lens: String,
+    verdict: String,
+    scope: String,
+    evidence_reviewed: String,
+    findings: Vec<ProviderReviewFindingRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderReviewFindingRow {
+    severity: String,
+    confidence: String,
+    summary: String,
+    evidence: String,
+    recommendation: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderReviewContext {
+    reviewable: String,
+    lens: String,
+    verdict: String,
+    scope: String,
+    evidence_reviewed: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct ProviderReviewThread {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<u64>,
+    subject_type: String,
+    body: String,
+}
+
+#[derive(Debug)]
+struct ProviderReviewArtifacts {
+    body: String,
+    threads: Vec<ProviderReviewThread>,
 }
 
 const FINDINGS_SCHEMA: &str = "review-specialists.findings.v1";
@@ -201,9 +239,23 @@ fn command_render(args: RenderArgs) -> i32 {
             args.git_ref.as_deref(),
             args.link_base.as_deref(),
         );
-        render_profile(&merged, args.profile, context).and_then(|rendered| {
+        let provider_context = provider_review_context(&args.provider_review, &merged);
+        render_profile(&merged, args.profile, context, provider_context).and_then(|rendered| {
             if let Some(out) = &args.out {
                 write_text(out, &rendered.body)?;
+            }
+            if let Some(thread_out) = &args.provider_review.thread_out {
+                if !matches!(
+                    args.profile,
+                    RenderProfile::ProviderReview | RenderProfile::PrComment
+                ) {
+                    return Err(CliError::usage(
+                        "thread-out-requires-provider-review",
+                        "--thread-out requires --profile provider-review or --profile pr-comment",
+                        None,
+                    ));
+                }
+                write_json_pretty(thread_out, &rendered.threads)?;
             }
             Ok(rendered)
         })
@@ -402,6 +454,7 @@ fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
 
     let mut profile_artifact = None;
     if let Some(profile) = args.profile {
+        let provider_context = provider_review_context(&args.provider_review, &merged);
         let rendered = render_profile(
             &merged,
             profile,
@@ -410,12 +463,14 @@ fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
                 args.git_ref.as_deref(),
                 args.link_base.as_deref(),
             ),
+            provider_context,
         )?;
         let file_name = match profile {
             RenderProfile::Terminal => "terminal.txt",
             RenderProfile::Report => "specialist-review.md",
             RenderProfile::IssueBody => "issue-body.md",
             RenderProfile::PrComment => "pr-comment.md",
+            RenderProfile::ProviderReview => "provider-review.md",
             RenderProfile::Evidence => "evidence.json",
         };
         let path = args.out_dir.join(file_name);
@@ -423,6 +478,14 @@ fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
         profile_artifact = Some(display_path(&path));
         if !artifacts.iter().any(|item| item == &display_path(&path)) {
             artifacts.push(display_path(&path));
+        }
+        if matches!(
+            profile,
+            RenderProfile::ProviderReview | RenderProfile::PrComment
+        ) {
+            let threads_path = args.out_dir.join("review-threads.json");
+            write_json_pretty(&threads_path, &rendered.threads)?;
+            artifacts.push(display_path(&threads_path));
         }
     }
 
@@ -507,6 +570,7 @@ fn parse_finding_line(
         "root_cause_fingerprint",
         "specialist",
         "test_suggestion",
+        "actionable",
     ]
     .into_iter()
     .collect();
@@ -574,6 +638,8 @@ fn parse_finding_line(
         input,
         line_number,
     )?;
+    let actionable =
+        optional_bool(object.get("actionable"), "actionable", input, line_number)?.unwrap_or(false);
     let explicit_fingerprint =
         optional_string(object.get("fingerprint"), "fingerprint", input, line_number)?;
     let root_cause_fingerprint = optional_string(
@@ -628,6 +694,7 @@ fn parse_finding_line(
         root_cause_fingerprint,
         specialist,
         test_suggestion,
+        actionable,
         source_file: display_path(input),
         source_line: line_number,
     })
@@ -709,6 +776,23 @@ fn optional_positive_u64(
             display_path(input),
             line_number,
             "line must be a positive integer when present".to_string(),
+        )),
+    }
+}
+
+fn optional_bool(
+    value: Option<&Value>,
+    key: &str,
+    input: &Path,
+    line_number: usize,
+) -> Result<Option<bool>, RowError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        _ => Err(RowError::new(
+            display_path(input),
+            line_number,
+            format!("{key} must be a boolean when present"),
         )),
     }
 }
@@ -979,17 +1063,26 @@ fn render_profile(
     merged: &MergeResult,
     profile: RenderProfile,
     context: RenderContext,
+    provider_context: ProviderReviewContext,
 ) -> Result<RenderResult, CliError> {
-    let body = match profile {
-        RenderProfile::Terminal => render_terminal(merged, context),
-        RenderProfile::Report => render_report(merged, context),
-        RenderProfile::IssueBody => render_issue_body(merged, context),
-        RenderProfile::PrComment => render_pr_comment(merged, context),
-        RenderProfile::Evidence => render_evidence_json(merged)?,
+    let (body, threads) = match profile {
+        RenderProfile::Terminal => (render_terminal(merged, context), Vec::new()),
+        RenderProfile::Report => (render_report(merged, context), Vec::new()),
+        RenderProfile::IssueBody => (render_issue_body(merged, context), Vec::new()),
+        RenderProfile::PrComment | RenderProfile::ProviderReview => {
+            let artifacts = render_provider_review_artifacts_with_render_context(
+                merged,
+                &provider_context,
+                &context,
+            )?;
+            (artifacts.body, artifacts.threads)
+        }
+        RenderProfile::Evidence => (render_evidence_json(merged)?, Vec::new()),
     };
     Ok(RenderResult {
         profile,
         body,
+        threads,
         counts: merged.counts.clone(),
     })
 }
@@ -1145,35 +1238,101 @@ fn render_issue_body(merged: &MergeResult, context: RenderContext) -> String {
         .expect("issue_body template renders")
 }
 
+#[cfg(test)]
 fn render_pr_comment(merged: &MergeResult, context: RenderContext) -> String {
-    let findings_block = if merged.findings.is_empty() {
-        "No displayed specialist findings.".to_string()
-    } else {
-        let mut lines = Vec::new();
-        for finding in &merged.findings {
-            lines.push(format!(
-                "- **{}** {}: {} ({:.2}, {})",
-                finding.primary.severity,
-                format_location(&finding.primary, &context),
-                finding.primary.summary,
-                finding.primary.confidence,
-                finding.primary.specialist,
-            ));
-            lines.push(format!(
-                "  Recommendation: {}",
-                finding.primary.recommendation
-            ));
-        }
-        lines.join("\n")
+    let provider_context = ProviderReviewContext {
+        reviewable: "not provided".to_string(),
+        lens: "unspecified".to_string(),
+        verdict: if merged.findings.is_empty() {
+            "pass".to_string()
+        } else {
+            "findings".to_string()
+        },
+        scope: "not provided".to_string(),
+        evidence_reviewed: if merged.input_files.is_empty() {
+            "no input files".to_string()
+        } else {
+            merged.input_files.join(", ")
+        },
     };
-    let view = PrCommentView { findings_block };
+    render_provider_review_artifacts_with_render_context(merged, &provider_context, &context)
+        .expect("provider review template renders")
+        .body
+}
+
+#[cfg(test)]
+fn render_provider_review_artifacts(
+    merged: &MergeResult,
+    context: &ProviderReviewContext,
+) -> Result<ProviderReviewArtifacts, CliError> {
+    render_provider_review_artifacts_with_render_context(merged, context, &RenderContext::default())
+}
+
+fn render_provider_review_artifacts_with_render_context(
+    merged: &MergeResult,
+    context: &ProviderReviewContext,
+    render_context: &RenderContext,
+) -> Result<ProviderReviewArtifacts, CliError> {
+    let findings = merged
+        .findings
+        .iter()
+        .map(|finding| ProviderReviewFindingRow {
+            severity: finding.primary.severity.to_string(),
+            confidence: format!("{:.2}", finding.primary.confidence),
+            summary: markdown_escape(&finding.primary.summary),
+            evidence: markdown_escape(&format!(
+                "{} — {}",
+                format_location(&finding.primary, render_context),
+                finding.primary.evidence
+            )),
+            recommendation: markdown_escape(&finding.primary.recommendation),
+        })
+        .collect();
+    let view = PrCommentView {
+        reviewable: markdown_escape(&context.reviewable),
+        lens: markdown_escape(&context.lens),
+        verdict: markdown_escape(&context.verdict),
+        scope: markdown_escape(&context.scope),
+        evidence_reviewed: markdown_escape(&context.evidence_reviewed),
+        findings,
+    };
     let mut engine = Engine::builder().build();
     engine
         .register_template(PR_COMMENT_TEMPLATE_NAME, PR_COMMENT_TEMPLATE)
         .expect("pr_comment template registers");
-    engine
+    let body = engine
         .render(PR_COMMENT_TEMPLATE_NAME, &view)
-        .expect("pr_comment template renders")
+        .map_err(|err| {
+            CliError::runtime(
+                "provider-review-render-failed",
+                format!("failed to render provider review: {err}"),
+                None,
+            )
+        })?;
+    let threads = merged
+        .findings
+        .iter()
+        .filter(|finding| finding.primary.actionable)
+        .map(|finding| ProviderReviewThread {
+            path: finding.primary.path.clone(),
+            line: finding.primary.line,
+            subject_type: if finding.primary.line.is_some() {
+                "LINE".to_string()
+            } else {
+                "FILE".to_string()
+            },
+            body: format!(
+                "**{}** ({}, {:.2})\n\n{}\n\nRecommendation: {}\n\n<!-- agent-kit:finding:{} -->",
+                finding.primary.summary,
+                finding.primary.severity,
+                finding.primary.confidence,
+                finding.primary.evidence,
+                finding.primary.recommendation,
+                finding.fingerprint,
+            ),
+        })
+        .collect();
+    Ok(ProviderReviewArtifacts { body, threads })
 }
 
 fn render_evidence_json(merged: &MergeResult) -> Result<String, CliError> {
@@ -1591,6 +1750,33 @@ struct CommonArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug, Args, Default)]
+struct ProviderReviewArgs {
+    /// PR/MR identifier or URL shown in the provider review body.
+    #[arg(long, value_name = "REVIEWABLE")]
+    reviewable: Option<String>,
+
+    /// Exactly one reviewer lens represented by this report.
+    #[arg(long, value_name = "LENS")]
+    lens: Option<String>,
+
+    /// Single-lens verdict represented by this report.
+    #[arg(long = "lens-verdict", value_enum)]
+    lens_verdict: Option<ProviderLensVerdict>,
+
+    /// Compact description of files or behavior reviewed.
+    #[arg(long, value_name = "TEXT")]
+    scope: Option<String>,
+
+    /// Compact validation, diff, or provider evidence summary.
+    #[arg(long = "evidence-reviewed", value_name = "TEXT")]
+    evidence_reviewed: Option<String>,
+
+    /// Write actionable GitHub review-thread specs derived from the same findings.
+    #[arg(long = "thread-out", value_name = "FILE", value_hint = ValueHint::FilePath)]
+    thread_out: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct ValidateArgs {
     #[command(flatten)]
@@ -1667,6 +1853,9 @@ struct RenderArgs {
     /// Custom link base. Defaults to https://github.com/<repo>/blob when --repo is provided.
     #[arg(long)]
     link_base: Option<String>,
+
+    #[command(flatten)]
+    provider_review: ProviderReviewArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1705,6 +1894,9 @@ struct BundleArgs {
     /// Custom link base. Defaults to https://github.com/<repo>/blob when --repo is provided.
     #[arg(long)]
     link_base: Option<String>,
+
+    #[command(flatten)]
+    provider_review: ProviderReviewArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1768,7 +1960,28 @@ enum RenderProfile {
     Report,
     IssueBody,
     PrComment,
+    ProviderReview,
     Evidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum ProviderLensVerdict {
+    Pass,
+    Findings,
+    Blocked,
+    FollowUpPass,
+}
+
+impl ProviderLensVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Findings => "findings",
+            Self::Blocked => "blocked",
+            Self::FollowUpPass => "follow-up-pass",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -1820,6 +2033,8 @@ struct NormalizedFinding {
     specialist: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_suggestion: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    actionable: bool,
     source_file: String,
     source_line: usize,
 }
@@ -1833,6 +2048,10 @@ struct MergedFinding {
     confirming_specialists: Vec<String>,
     confirming_count: usize,
     source_rows: Vec<SourceRow>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1914,6 +2133,8 @@ impl ValidateResult {
 struct RenderResult {
     profile: RenderProfile,
     body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    threads: Vec<ProviderReviewThread>,
     counts: FindingCounts,
 }
 
@@ -2045,6 +2266,9 @@ impl MergedFindingBuilder {
     }
 
     fn finish(self) -> MergedFinding {
+        let actionable = self.rows.iter().any(|finding| finding.actionable);
+        let mut primary = self.primary;
+        primary.actionable = actionable;
         let mut confirming: BTreeSet<String> = BTreeSet::new();
         let mut source_rows = Vec::new();
         for finding in self.rows {
@@ -2063,10 +2287,10 @@ impl MergedFindingBuilder {
                 .then_with(|| left.specialist.cmp(&right.specialist))
         });
         MergedFinding {
-            fingerprint: self.primary.fingerprint.clone(),
+            fingerprint: primary.fingerprint.clone(),
             lifecycle_fingerprint: (self.mode == ReviewMode::Delivery)
                 .then_some(self.lifecycle_fingerprint),
-            primary: self.primary,
+            primary,
             confirming_specialists: confirming.iter().cloned().collect(),
             confirming_count: confirming.len(),
             source_rows,
@@ -2099,6 +2323,44 @@ impl RenderContext {
             link_base: resolved_base,
             git_ref: git_ref.map(ToOwned::to_owned),
         }
+    }
+}
+
+fn provider_review_context(
+    args: &ProviderReviewArgs,
+    merged: &MergeResult,
+) -> ProviderReviewContext {
+    ProviderReviewContext {
+        reviewable: args
+            .reviewable
+            .clone()
+            .unwrap_or_else(|| "not provided".to_string()),
+        lens: args
+            .lens
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_string()),
+        verdict: args
+            .lens_verdict
+            .map(ProviderLensVerdict::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if merged.findings.is_empty() {
+                    "pass".to_string()
+                } else {
+                    "findings".to_string()
+                }
+            }),
+        scope: args
+            .scope
+            .clone()
+            .unwrap_or_else(|| "not provided".to_string()),
+        evidence_reviewed: args.evidence_reviewed.clone().unwrap_or_else(|| {
+            if merged.input_files.is_empty() {
+                "no input files".to_string()
+            } else {
+                merged.input_files.join(", ")
+            }
+        }),
     }
 }
 
@@ -2306,6 +2568,7 @@ mod tests {
             root_cause_fingerprint: None,
             specialist: specialist.to_string(),
             test_suggestion: None,
+            actionable: false,
             source_file: "fixture.jsonl".to_string(),
             source_line: 1,
         };
@@ -2476,6 +2739,65 @@ mod tests {
     fn pr_comment_mixed_matches_golden() {
         let out = render_pr_comment(&mixed_merge_result(), RenderContext::default());
         assert_or_bless("pr_comment_mixed.md", &out);
+    }
+
+    #[test]
+    fn provider_review_artifacts_include_only_explicitly_actionable_findings() {
+        let mut merged = mixed_merge_result();
+        merged.findings[0].primary.actionable = true;
+        merged.findings[1].primary.actionable = false;
+        let context = ProviderReviewContext {
+            reviewable: "PR #44".to_string(),
+            lens: "testing".to_string(),
+            verdict: "findings".to_string(),
+            scope: "changed review publication paths".to_string(),
+            evidence_reviewed: "focused tests and diff".to_string(),
+        };
+
+        let artifacts =
+            render_provider_review_artifacts(&merged, &context).expect("provider artifacts render");
+
+        assert!(
+            artifacts
+                .body
+                .contains("<!-- agent-kit:specialist-review-report:v1 -->")
+        );
+        assert!(
+            artifacts
+                .body
+                .contains("| Finding | Severity | Confidence | Evidence | Recommendation |")
+        );
+        assert_eq!(artifacts.threads.len(), 1);
+        assert_eq!(artifacts.threads[0].path, "src/lib.rs");
+        assert_eq!(artifacts.threads[0].line, Some(42));
+        assert_eq!(artifacts.threads[0].subject_type, "LINE");
+        assert!(
+            artifacts.threads[0]
+                .body
+                .contains(&merged.findings[0].fingerprint)
+        );
+    }
+
+    #[test]
+    fn provider_review_artifacts_emit_file_threads_without_a_line_anchor() {
+        let mut merged = mixed_merge_result();
+        merged.findings.truncate(1);
+        merged.findings[0].primary.actionable = true;
+        merged.findings[0].primary.line = None;
+        let context = ProviderReviewContext {
+            reviewable: "PR #44".to_string(),
+            lens: "testing".to_string(),
+            verdict: "findings".to_string(),
+            scope: "src/lib.rs".to_string(),
+            evidence_reviewed: "diff".to_string(),
+        };
+
+        let artifacts =
+            render_provider_review_artifacts(&merged, &context).expect("provider artifacts render");
+
+        assert_eq!(artifacts.threads.len(), 1);
+        assert_eq!(artifacts.threads[0].line, None);
+        assert_eq!(artifacts.threads[0].subject_type, "FILE");
     }
 
     // -----------------------------------------------------------------
@@ -2754,6 +3076,7 @@ mod tests {
             root_cause_fingerprint: None,
             specialist: "reviewer-testing".to_string(),
             test_suggestion: None,
+            actionable: false,
             source_file: "/repo/findings.jsonl".to_string(),
             source_line: 1,
         };

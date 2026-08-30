@@ -1,5 +1,18 @@
-## Specialist Review Findings
+<!-- agent-kit:specialist-review-report:v1 -->
+## Review Report
 
-{{ findings_block }}
+- Reviewable: {{ reviewable }}
+- Lens: {{ lens }}
+- Lens verdict: {{ verdict }}
+- Scope: {{ scope }}
+- Evidence reviewed: {{ evidence_reviewed }}
 
-This is a deterministic render of specialist findings, not a merge or close decision.
+| Finding | Severity | Confidence | Evidence | Recommendation |
+| --- | --- | ---: | --- | --- |
+{%- if findings %}
+{%- for finding in findings %}
+| {{ finding.summary }} | {{ finding.severity }} | {{ finding.confidence }} | {{ finding.evidence }} | {{ finding.recommendation }} |
+{%- endfor %}
+{%- else %}
+| No findings | none | 0.00 | No actionable or informational findings. | none |
+{%- endif %}

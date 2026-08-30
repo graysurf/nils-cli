@@ -23,12 +23,15 @@ provider workflow for live PR or issue actions.
 Each finding is one JSON object per line:
 
 ```json
-{"severity":"high","confidence":0.82,"path":"src/api/users.rs","line":42,"category":"api-contract","summary":"Response shape changed without migration guidance.","evidence":"Diff removes a field while callers still read it.","recommendation":"Add compatibility handling or update callers and tests.","specialist":"api-contract","test_suggestion":"Add a contract test."}
+{"severity":"high","confidence":0.82,"path":"src/api/users.rs","line":42,"category":"api-contract","summary":"Response shape changed without migration guidance.","evidence":"Diff removes a field while callers still read it.","recommendation":"Add compatibility handling or update callers and tests.","specialist":"api-contract","test_suggestion":"Add a contract test.","actionable":true}
 ```
 
 Required fields are `severity`, `confidence`, `path`, `summary`, `evidence`,
 `recommendation`, and `specialist`. Optional fields are `line`, `category`,
-`fingerprint`, `root_cause_fingerprint`, and `test_suggestion`.
+`fingerprint`, `root_cause_fingerprint`, `test_suggestion`, and `actionable`.
+`actionable` defaults to `false`; set it only when the owner must make a code,
+doc, test, or config change and the provider flow should create a resolvable
+line/file thread.
 
 Severity aliases normalize to `critical`, `high`, `medium`, `low`, and `info`.
 Confidence must be `0.0..=1.0`. Unknown fields are rejected so fixture drift is
@@ -44,6 +47,10 @@ review-specialists scope --base main --format json
 review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
 review-specialists merge --mode delivery --input findings.jsonl --format json
+review-specialists render --profile provider-review --input findings.merged.json \
+  --reviewable 'PR #123' --lens testing --lens-verdict findings \
+  --scope 'changed test paths' --evidence-reviewed 'focused tests and diff' \
+  --out review.md --thread-out review-threads.json
 review-specialists render --profile issue-body --input findings.merged.json \
   --repo sympoies/nils-cli --ref HEAD --out issue.md
 review-specialists bundle --input findings.jsonl --out-dir target/review-specialists/bundle \
@@ -80,6 +87,8 @@ not a disposition; `forge-cli` requires the explicit field or a repaired head.
 - `findings.merged.json`
 - `specialist-review.md`
 - one optional profile artifact such as `issue-body.md`
+- `review-threads.json` whenever the optional profile is `provider-review` or
+  its `pr-comment` compatibility alias
 
 Invalid input fails before bundle artifacts are written.
 
@@ -88,7 +97,10 @@ Invalid input fails before bundle artifacts are written.
 - `terminal`: compact summary for chat or local terminal output.
 - `report`: full specialist report sections.
 - `issue-body`: follow-up-oriented issue body.
-- `pr-comment`: review-oriented comment body.
+- `provider-review`: canonical marker, Review Report fields, findings table,
+  and optional actionable line/file thread artifact.
+- `pr-comment`: compatibility alias to `provider-review`; it cannot render the
+  retired bullet body.
 - `evidence`: compact JSON summary for evidence linking.
 
 Provider profiles are local renderers only. They do not post anything.

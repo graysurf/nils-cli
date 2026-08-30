@@ -82,6 +82,10 @@ pub struct PrReviewPayload {
     pub issue_comment_url: Option<String>,
     pub mirrored: bool,
     pub lenses: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub metadata_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_review_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_threads: Vec<CreatedReviewThread>,
     /// Number of finding threads skipped as cross-run idempotent duplicates:
@@ -95,6 +99,10 @@ pub struct PrReviewPayload {
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
+}
+
+fn is_false_bool(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -125,6 +133,9 @@ struct PrReviewDryRunPayload {
     issue_plan: Option<Vec<String>>,
     mirror_issue: bool,
     lenses: Vec<String>,
+    metadata_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_review_url: Option<String>,
     planned_review_threads: usize,
     target_plan: Option<Vec<String>>,
     thread_plan: Vec<Vec<String>>,
@@ -147,6 +158,7 @@ struct ReviewCommentValidation {
     present: bool,
     bytes: usize,
     lines: usize,
+    specialist_report: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -296,6 +308,50 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     }
     let id = args.id.ok_or_else(review_id_required_err)?;
 
+    let native_review_url = if args.metadata_only {
+        if ctx.provider != Provider::GitHub {
+            return Err(ForgeError::provider_unsupported(
+                schema_err(),
+                "--metadata-only is GitHub-only because it records an existing native pull-request review",
+                None,
+            ));
+        }
+        if args.submit_review
+            || args.thread_file.is_some()
+            || args.comment.is_some()
+            || args.comment_file.is_some()
+            || args.expected_head.is_some()
+            || args.specialist_report
+        {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "metadata_only_conflict",
+                "--metadata-only cannot be combined with a review body, specialist validation, native submission, expected head, or thread file",
+                None,
+            ));
+        }
+        let native_review_url = args.native_review_url.as_deref().ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "native_review_url_required",
+                "--metadata-only requires --native-review-url <URL>",
+                None,
+            )
+        })?;
+        validate_native_review_url(&ctx, id, native_review_url)?;
+        Some(native_review_url.to_string())
+    } else {
+        if args.native_review_url.is_some() {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "native_review_url_requires_metadata_only",
+                "--native-review-url is only valid with --metadata-only",
+                None,
+            ));
+        }
+        None
+    };
+
     let thread_specs_requested = args.thread_file.is_some();
     if thread_specs_requested && !args.submit_review {
         return Err(ForgeError::validation(
@@ -342,11 +398,21 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         Vec::new()
     };
 
-    let body = pr_comment::read_body_with_file_flag(
-        args.comment.as_deref(),
-        args.comment_file.as_deref(),
-        "--comment-file",
-    )?;
+    let body = if let Some(native_review_url) = native_review_url.as_deref() {
+        build_review_metadata_body(
+            ctx.provider,
+            id,
+            args.decision,
+            &args.lenses,
+            native_review_url,
+        )
+    } else {
+        pr_comment::read_body_with_file_flag(
+            args.comment.as_deref(),
+            args.comment_file.as_deref(),
+            "--comment-file",
+        )?
+    };
     let body_present = !body.trim().is_empty();
     // GitHub permits a body-less APPROVE review, so the empty-body guard is
     // relaxed only for a native approve submission. Every other case — outcome
@@ -366,6 +432,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         no_agent_attribution(&body, "review comment")?;
         no_escaped_control_markdown(&body)?;
     }
+    if args.specialist_report {
+        validate_specialist_review_report(&body)?;
+    }
 
     // Validate the generated issue-mirror body BEFORE any backend mutation
     // (validate-before-side-effect). It embeds user-controlled `--lens` values,
@@ -374,13 +443,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // provider issue or fails only after the PR comment was already posted,
     // leaving an outcome comment with no mirror.
     let mirror_issue = if let Some(issue_number) = mirror_issue_number {
-        let preview = build_issue_mirror_body(
-            ctx.provider,
-            id,
-            args.decision,
-            &args.lenses,
-            MIRROR_URL_PENDING,
-        );
+        let preview_url = native_review_url.as_deref().unwrap_or(MIRROR_URL_PENDING);
+        let preview =
+            build_issue_mirror_body(ctx.provider, id, args.decision, &args.lenses, preview_url);
         no_local_path(&preview, "issue mirror")?;
         no_agent_attribution(&preview, "issue mirror")?;
         no_escaped_control_markdown(&preview)?;
@@ -506,13 +571,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             (None, None, None)
         };
         let issue_plan = mirror_issue.map(|issue| {
-            let mirror_body = build_issue_mirror_body(
-                ctx.provider,
-                id,
-                args.decision,
-                &args.lenses,
-                "<pr-comment-url-unavailable-in-dry-run>",
-            );
+            let mirror_url = native_review_url
+                .as_deref()
+                .unwrap_or("<pr-comment-url-unavailable-in-dry-run>");
+            let mirror_body =
+                build_issue_mirror_body(ctx.provider, id, args.decision, &args.lenses, mirror_url);
             build_issue_comment_call(&ctx, issue, &mirror_body).plan_argv()
         });
         return Ok(emit_success(
@@ -533,6 +596,8 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 issue_plan,
                 mirror_issue: args.mirror_issue,
                 lenses: args.lenses.clone(),
+                metadata_only: args.metadata_only,
+                native_review_url: native_review_url.clone(),
                 planned_review_threads: thread_specs.len(),
                 target_plan,
                 thread_plan,
@@ -675,13 +740,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             // validated up front against MIRROR_URL_PENDING; the only difference
             // here is the provider-returned `pr_comment_url`, which is never
             // user-controlled, so it needs no re-validation after the post.
-            let mirror_body = build_issue_mirror_body(
-                ctx.provider,
-                id,
-                args.decision,
-                &args.lenses,
-                &pr_comment_url,
-            );
+            let mirror_url = native_review_url.as_deref().unwrap_or(&pr_comment_url);
+            let mirror_body =
+                build_issue_mirror_body(ctx.provider, id, args.decision, &args.lenses, mirror_url);
             let issue_call = build_issue_comment_call(&ctx, issue_number, &mirror_body);
             let issue_output = runner.run(&issue_call)?;
             first_url(&issue_output.stdout)
@@ -702,6 +763,8 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             issue_comment_url,
             mirrored: args.mirror_issue,
             lenses: args.lenses,
+            metadata_only: args.metadata_only,
+            native_review_url,
             review_threads,
             threads_skipped_idempotent,
         },
@@ -754,6 +817,9 @@ fn run_validate_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         no_agent_attribution(&body, "review comment")?;
         no_escaped_control_markdown(&body)?;
     }
+    if args.specialist_report {
+        validate_specialist_review_report(&body)?;
+    }
 
     let mut diff_plan = None;
     let diff_checked = args.check_diff && !global.dry_run;
@@ -775,6 +841,7 @@ fn run_validate_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             present: body_present,
             bytes: body.len(),
             lines: body.lines().count(),
+            specialist_report: args.specialist_report,
         },
         review_threads: ReviewThreadValidation {
             count: thread_specs.len(),
@@ -825,6 +892,9 @@ fn validate_args_with_parent_fallbacks(
     }
     if validate_args.thread_file.is_none() {
         validate_args.thread_file = parent.thread_file.clone();
+    }
+    if !validate_args.specialist_report {
+        validate_args.specialist_report = parent.specialist_report;
     }
     validate_args
 }
@@ -2946,6 +3016,128 @@ fn build_issue_mirror_body(
     )
 }
 
+fn build_review_metadata_body(
+    provider: Provider,
+    pr_number: u64,
+    decision: PrReviewDecision,
+    lenses: &[String],
+    native_review_url: &str,
+) -> String {
+    let lenses = if lenses.is_empty() {
+        "unspecified".to_string()
+    } else {
+        lenses.join(", ")
+    };
+    let pr_ref = match provider {
+        Provider::GitLab => format!("!{pr_number}"),
+        _ => format!("#{pr_number}"),
+    };
+    format!(
+        "## Review metadata\n\n- pr: {pr_ref}\n- decision: {decision}\n- lenses: {lenses}\n- authoritative native review: {native_review_url}\n",
+        decision = decision.as_str(),
+    )
+}
+
+fn validate_native_review_url(
+    ctx: &ProviderContext,
+    id: u64,
+    native_review_url: &str,
+) -> Result<(), ForgeError> {
+    let repo = ctx.repo.as_deref().ok_or_else(|| {
+        ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "--metadata-only requires --repo owner/name or a recognised GitHub remote",
+            None,
+        )
+    })?;
+    let prefix = format!(
+        "https://{host}/{repo}/pull/{id}#pullrequestreview-",
+        host = ctx.host
+    );
+    let suffix = native_review_url.strip_prefix(&prefix).unwrap_or_default();
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "invalid_native_review_url",
+            "--native-review-url must identify a native review on the selected GitHub repository and pull request",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_specialist_review_report(body: &str) -> Result<(), ForgeError> {
+    const MARKER: &str = "<!-- agent-kit:specialist-review-report:v1 -->";
+    const TABLE_HEADER: &str = "| Finding | Severity | Confidence | Evidence | Recommendation |";
+    const TABLE_SEPARATOR: &str = "| --- | --- | ---: | --- | --- |";
+    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+    let marker_count = body.matches(MARKER).count();
+    let heading_count = lines
+        .iter()
+        .filter(|line| **line == "## Review Report")
+        .count();
+    if marker_count != 1 || heading_count != 1 {
+        return Err(invalid_specialist_review_report(
+            "specialist report requires exactly one v1 marker and one Review Report heading",
+        ));
+    }
+
+    for field in [
+        "- Reviewable:",
+        "- Lens:",
+        "- Lens verdict:",
+        "- Scope:",
+        "- Evidence reviewed:",
+    ] {
+        let values = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix(field).map(str::trim))
+            .collect::<Vec<_>>();
+        if values.len() != 1 || values[0].is_empty() {
+            return Err(invalid_specialist_review_report(&format!(
+                "specialist report requires exactly one non-empty {field} field"
+            )));
+        }
+    }
+
+    let verdict = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("- Lens verdict:").map(str::trim))
+        .unwrap_or_default();
+    if !matches!(verdict, "pass" | "findings" | "blocked" | "follow-up-pass") {
+        return Err(invalid_specialist_review_report(
+            "specialist report lens verdict must be pass, findings, blocked, or follow-up-pass",
+        ));
+    }
+
+    let Some(header_index) = lines.iter().position(|line| *line == TABLE_HEADER) else {
+        return Err(invalid_specialist_review_report(
+            "specialist report requires the canonical findings table header",
+        ));
+    };
+    if lines.get(header_index + 1).copied() != Some(TABLE_SEPARATOR)
+        || !lines
+            .iter()
+            .skip(header_index + 2)
+            .any(|line| line.starts_with('|') && line.ends_with('|'))
+    {
+        return Err(invalid_specialist_review_report(
+            "specialist report requires the canonical table separator and at least one finding row",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_specialist_review_report(message: &str) -> ForgeError {
+    ForgeError::validation(
+        schema_err(),
+        "invalid_specialist_review_report",
+        message,
+        None,
+    )
+}
+
 /// Validation error raised when `--mirror-issue` is requested without the
 /// `--issue <ISSUE_NUMBER>` it mirrors into. Raised up front, before any
 /// backend mutation, so the failure can never leave a posted PR comment with no
@@ -3234,6 +3426,9 @@ mod tests {
             submit_review,
             expected_head: submit_review.then(|| "head-44".to_string()),
             thread_file: None,
+            specialist_report: false,
+            metadata_only: false,
+            native_review_url: None,
         }
     }
 

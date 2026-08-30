@@ -215,6 +215,146 @@ fn pr_review_posts_outcome_and_mirrors_issue_activity() {
 }
 
 #[test]
+fn pr_review_validate_specialist_report_rejects_the_old_bullet_shape() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            "## Specialist Review Findings\n\n- **high** src/lib.rs:42: old bullet",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_validate_specialist_report_accepts_the_canonical_table_shape() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: testing\n- Lens verdict: pass\n- Scope: review publication\n- Evidence reviewed: focused tests\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| No findings | none | 0.00 | No actionable or informational findings. | none |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["comment"]["specialist_report"], true);
+}
+
+#[test]
+fn pr_review_metadata_only_posts_concise_pr_and_issue_breadcrumbs() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+    let native_review = "https://github.com/acme/widgets/pull/44#pullrequestreview-440";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--lens",
+            "testing",
+            "--metadata-only",
+            "--native-review-url",
+            native_review,
+            "--issue",
+            "101",
+            "--mirror-issue",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["metadata_only"], true);
+    assert_eq!(env["data"]["native_review_url"], native_review);
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("repos/acme/widgets/issues/44/comments"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("repos/acme/widgets/issues/101/comments"),
+        "{calls}"
+    );
+    assert!(calls.contains("Review metadata"), "{calls}");
+    assert!(calls.contains(native_review), "{calls}");
+    assert!(!calls.contains("## Review Report"), "{calls}");
+    assert!(
+        !calls.contains("agent-kit:specialist-review-report:v1"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn pr_review_metadata_only_rejects_a_different_pr_review_url_before_backend() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--metadata-only",
+            "--native-review-url",
+            "https://github.com/acme/widgets/pull/45#pullrequestreview-440",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_native_review_url");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
 fn pr_review_posts_gitlab_outcome_and_issue_mirror() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("glab-args.log");

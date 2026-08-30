@@ -324,6 +324,9 @@ operations:
       - { name: --submit-review,  type: bool,    default: false } # GitHub-only: submit a native review event (#pullrequestreview-) instead of an outcome comment; --decision maps to event (comments-only->COMMENT, approve->APPROVE, request-changes->REQUEST_CHANGES); body required for COMMENT/REQUEST_CHANGES, optional for APPROVE
       - { name: --expected-head,  type: string,  required: false } # Required with --submit-review and invalid without it; compared with the complete pending-review snapshot head before mutation and bound to the REST commit_id / GraphQL commitOID
       - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review; max 256 KiB, 50 specs, 1024-byte paths, 16 KiB bodies. Use only for findings that should be repaired then resolved via pr review-threads resolve.
+      - { name: --specialist-report, type: bool, default: false } # Opt-in canonical agent-kit specialist marker/fields/verdict/table validation.
+      - { name: --metadata-only, type: bool, default: false } # GitHub-only concise personal metadata for an already-published authoritative native review; conflicts with body/thread/submission flags.
+      - { name: --native-review-url, type: string, required: false } # Required with --metadata-only and must identify this exact repo/PR's #pullrequestreview- object.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_agent_attribution # review comment body, thread spec bodies, AND the generated issue mirror, validated before any post (thread paths carry no prose)
@@ -336,6 +339,10 @@ operations:
     #   expected_review_head_required (DATA 65) — --submit-review without --expected-head
     #   expected_review_head_requires_submit_review (DATA 65) — --expected-head without --submit-review
     #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review mutation
+    #   invalid_specialist_review_report (DATA 65) — --specialist-report body lacks the canonical marker, required fields/verdict, or findings table
+    #   native_review_url_required (DATA 65) — --metadata-only without --native-review-url
+    #   invalid_native_review_url (DATA 65) — native review URL does not bind to this GitHub repository and PR
+    #   metadata_only_conflict (DATA 65) — --metadata-only combined with body/thread/native submission inputs
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
     #   github_pending_review_exists (RUNTIME 1) — summary-only native review submission found a viewer-owned pending review. Threaded review transactions instead inspect an exact receipt-bound draft and resume it.
     #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
@@ -389,6 +396,8 @@ operations:
         issue_comment_url: string?
         mirrored: bool
         lenses: list<string>
+        metadata_only?: bool # true only for the concise existing-native-review metadata path
+        native_review_url?: string # authoritative same-repo/same-PR native review URL supplied to --metadata-only
         review_threads?: "list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>"
         threads_skipped_idempotent?: integer # cross-run duplicates skipped: findings whose (path, body) already had a live (non-resolved, non-outdated) thread on the current head; omitted when 0. When every finding is a duplicate the review event is skipped, so submitted_review is false
 
@@ -401,12 +410,14 @@ operations:
       - { name: --comment-file, type: path,    required: false }
       - { name: --thread-file,  type: path,    required: false }
       - { name: --check-diff,   type: bool,    default: false } # GitHub-only in v1; validates thread paths/lines against live PR diff
+      - { name: --specialist-report, type: bool, default: false } # Require the canonical agent-kit specialist Review Report shape.
     validations:
       - no_local_path # review comment body plus thread spec bodies/paths
       - no_agent_attribution # review comment body plus thread spec bodies
       - no_escaped_control_markdown # review comment body plus thread spec bodies/paths
     # Op-specific error kinds:
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
+    #   invalid_specialist_review_report (DATA 65) — body lacks the canonical specialist marker, fields/verdict, or findings table
     #   review_validate_id_required (DATA 65) — --check-diff without <id>
     #   review_thread_file_not_changed (DATA 65) — a thread spec path is absent from the live GitHub PR file list
     #   review_thread_line_not_in_diff (DATA 65) — a line thread points at a line that is not commentable on the requested diff side
@@ -426,7 +437,7 @@ operations:
         number: integer?
         check_diff: bool
         diff_plan: list<string>? # dry-run only when --check-diff is set
-        comment: { present: bool, bytes: integer, lines: integer }
+        comment: { present: bool, bytes: integer, lines: integer, specialist_report: bool }
         review_threads:
           count: integer
           diff_checked: bool

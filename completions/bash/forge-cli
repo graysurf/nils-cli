@@ -4846,7 +4846,7 @@ _forge__cli() {
             return 0
             ;;
         forge__cli__pr__review)
-            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --expected-head --thread-file --format --remote --provider --host --repo --store-root --dry-run --help validate help"
+            opts="-h --decision --comment --comment-file --lens --issue --mirror-issue --submit-review --expected-head --thread-file --specialist-report --metadata-only --native-review-url --format --remote --provider --host --repo --store-root --dry-run --help validate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4877,6 +4877,10 @@ _forge__cli() {
                     return 0
                     ;;
                 --thread-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --native-review-url)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -5526,7 +5530,7 @@ _forge__cli() {
             return 0
             ;;
         forge__cli__pr__review__validate)
-            opts="-h --comment --comment-file --thread-file --check-diff --format --remote --provider --host --repo --store-root --dry-run --help"
+            opts="-h --comment --comment-file --thread-file --check-diff --specialist-report --format --remote --provider --host --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

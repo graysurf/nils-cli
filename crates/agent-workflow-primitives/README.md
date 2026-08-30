@@ -62,6 +62,10 @@ review-evidence init --out /tmp/review --subject "PR #123"
 review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
 review-specialists merge --mode delivery --input findings.jsonl --format json
+review-specialists render --profile provider-review --input findings.merged.json \
+  --reviewable 'PR #123' --lens testing --lens-verdict findings \
+  --scope 'changed test paths' --evidence-reviewed 'focused tests and diff' \
+  --out review.md --thread-out review-threads.json
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 skill-usage init --out /tmp/workflow --owner-kind workflow --owner-id deliver-pr --intent "deliver change" --user-request-summary "deliver this PR"
@@ -132,6 +136,15 @@ review-specialists render --profile issue-body --input findings.merged.json \
 review-specialists bundle --input findings.jsonl --out-dir target/review-specialists/bundle \
   --profile issue-body
 ```
+
+`provider-review` is the canonical provider-visible specialist profile. It
+always emits the `agent-kit:specialist-review-report:v1` marker, one
+`## Review Report` summary, and the findings table. Set `actionable: true` on a
+finding only when the owner must make a code, doc, test, or config change;
+`--thread-out` writes one GitHub line thread when `line` is present or one file
+thread when it is absent. Summary and thread artifacts are derived from the
+same merged input. The older `pr-comment` profile is a compatibility alias to
+the same renderer and can no longer produce the bullet format.
 
 ## `heuristic-inbox verify` redaction guardrail
 

@@ -55,7 +55,7 @@ _review__specialists() {
             return 0
             ;;
         review__specialists__bundle)
-            opts="-h --format --mode --input --out-dir --display-threshold --profile --repo --ref --link-base --help"
+            opts="-h --format --mode --input --out-dir --display-threshold --profile --repo --ref --link-base --reviewable --lens --lens-verdict --scope --evidence-reviewed --thread-out --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -96,7 +96,7 @@ _review__specialists() {
                     return 0
                     ;;
                 --profile)
-                    COMPREPLY=($(compgen -W "terminal report issue-body pr-comment evidence" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "terminal report issue-body pr-comment provider-review evidence" -- "${cur}"))
                     return 0
                     ;;
                 --repo)
@@ -109,6 +109,41 @@ _review__specialists() {
                     ;;
                 --link-base)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reviewable)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lens)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lens-verdict)
+                    COMPREPLY=($(compgen -W "pass findings blocked follow-up-pass" -- "${cur}"))
+                    return 0
+                    ;;
+                --scope)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --evidence-reviewed)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --thread-out)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 *)
@@ -189,7 +224,7 @@ _review__specialists() {
             return 0
             ;;
         review__specialists__render)
-            opts="-h --format --profile --input --out --repo --ref --link-base --help"
+            opts="-h --format --profile --input --out --repo --ref --link-base --reviewable --lens --lens-verdict --scope --evidence-reviewed --thread-out --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -200,7 +235,7 @@ _review__specialists() {
                     return 0
                     ;;
                 --profile)
-                    COMPREPLY=($(compgen -W "terminal report issue-body pr-comment evidence" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "terminal report issue-body pr-comment provider-review evidence" -- "${cur}"))
                     return 0
                     ;;
                 --input)
@@ -243,6 +278,41 @@ _review__specialists() {
                     ;;
                 --link-base)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reviewable)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lens)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lens-verdict)
+                    COMPREPLY=($(compgen -W "pass findings blocked follow-up-pass" -- "${cur}"))
+                    return 0
+                    ;;
+                --scope)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --evidence-reviewed)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --thread-out)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 *)
