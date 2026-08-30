@@ -29,10 +29,10 @@ if [ "$1" != "api" ]; then
 fi
 case "$2" in
   repos/acme/widgets/pulls/44)
-    echo "44"
+    echo "head-44"
     ;;
   repos/acme/widgets/pulls/44/reviews/440)
-    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"APPROVED","user":{{"login":"review-bot[bot]"}}}}'
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"APPROVED","commit_id":"head-44","user":{{"login":"review-bot[bot]"}}}}'
     ;;
   repos/acme/widgets/issues/44/comments)
     echo "https://github.com/acme/widgets/pull/44#issuecomment-440"
@@ -56,13 +56,34 @@ set -eu
 printf '%s\n' "$*" >> {capture:?}
 case "$2" in
   repos/acme/widgets/pulls/44)
-    echo "44"
+    echo "head-44"
     ;;
   repos/acme/widgets/pulls/44/reviews/440)
-    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"{state}","user":{{"login":"{author}"}}}}'
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"{state}","commit_id":"head-44","user":{{"login":"{author}"}}}}'
     ;;
   *)
     echo "stub: mutation must not run after failed native review verification: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
+fn github_native_review_head_stub(capture: &str, current_head: &str, review_head: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "{current_head}"
+    ;;
+  repos/acme/widgets/pulls/44/reviews/440)
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"APPROVED","commit_id":"{review_head}","user":{{"login":"review-bot[bot]"}}}}'
+    ;;
+  *)
+    echo "stub: mutation must not run after failed native review head verification: $*" >&2
     exit 99
     ;;
 esac
@@ -408,6 +429,8 @@ fn pr_review_metadata_only_posts_concise_pr_and_issue_breadcrumbs() {
             "--lens",
             "testing",
             "--metadata-only",
+            "--expected-head",
+            "head-44",
             "--native-review-url",
             native_review,
             "--native-review-author",
@@ -507,6 +530,8 @@ fn pr_review_metadata_only_rejects_a_mismatched_provider_review_before_mutation(
                 "--decision",
                 "approve",
                 "--metadata-only",
+                "--expected-head",
+                "head-44",
                 "--native-review-url",
                 "https://github.com/acme/widgets/pull/44#pullrequestreview-440",
                 "--native-review-author",
@@ -522,6 +547,51 @@ fn pr_review_metadata_only_rejects_a_mismatched_provider_review_before_mutation(
             calls.contains("repos/acme/widgets/pulls/44/reviews/440"),
             "{calls}"
         );
+        assert!(!calls.contains("/comments"), "{calls}");
+    }
+}
+
+#[test]
+fn pr_review_metadata_only_rejects_stale_review_or_advanced_pr_head_before_mutation() {
+    for (current_head, review_head, expected_code) in [
+        ("head-44", "head-old", "native_review_verification_failed"),
+        ("head-new", "head-44", "github_review_head_changed"),
+    ] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join("gh-args.log");
+        let stub = stub.gh_stub(&github_native_review_head_stub(
+            &capture.to_string_lossy(),
+            current_head,
+            review_head,
+        ));
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "approve",
+                "--metadata-only",
+                "--expected-head",
+                "head-44",
+                "--native-review-url",
+                "https://github.com/acme/widgets/pull/44#pullrequestreview-440",
+                "--native-review-author",
+                "review-bot[bot]",
+            ],
+        );
+
+        assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["error"]["code"], expected_code);
+        let calls = fs::read_to_string(&capture).unwrap_or_default();
         assert!(!calls.contains("/comments"), "{calls}");
     }
 }

@@ -322,12 +322,12 @@ operations:
       - { name: --issue,          type: integer, required: false }
       - { name: --mirror-issue,   type: bool,    default: false }
       - { name: --submit-review,  type: bool,    default: false } # GitHub-only: submit a native review event (#pullrequestreview-) instead of an outcome comment; --decision maps to event (comments-only->COMMENT, approve->APPROVE, request-changes->REQUEST_CHANGES); body required for COMMENT/REQUEST_CHANGES, optional for APPROVE
-      - { name: --expected-head,  type: string,  required: false } # Required with --submit-review and invalid without it; compared with the complete pending-review snapshot head before mutation and bound to the REST commit_id / GraphQL commitOID
+      - { name: --expected-head,  type: string,  required: false } # Required with --submit-review or --metadata-only and invalid without either; compared with the provider PR head before mutation and bound to the submitted/read-back native review commit
       - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review; max 256 KiB, 50 specs, 1024-byte paths, 16 KiB bodies. Use only for findings that should be repaired then resolved via pr review-threads resolve.
       - { name: --specialist-report, type: bool, default: false } # Opt-in canonical agent-kit specialist marker/fields/verdict/table validation.
-      - { name: --metadata-only, type: bool, default: false } # GitHub-only concise personal metadata for an already-published authoritative native review; conflicts with body/thread/submission flags.
+      - { name: --metadata-only, type: bool, default: false } # GitHub-only concise personal metadata for an already-published authoritative native review; requires --expected-head and conflicts with body/thread/submission flags.
       - { name: --native-review-url, type: string, required: false } # Required with --metadata-only and must identify this exact repo/PR's #pullrequestreview- object.
-      - { name: --native-review-author, type: string, required: false } # Required with --metadata-only; exact expected App login, verified with provider read-back together with URL and decision state before mutation.
+      - { name: --native-review-author, type: string, required: false } # Required with --metadata-only; exact expected App login, verified with provider read-back together with URL, decision state, and commit_id before mutation.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
       - no_agent_attribution # review comment body, thread spec bodies, AND the generated issue mirror, validated before any post (thread paths carry no prose)
@@ -337,15 +337,15 @@ operations:
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
-    #   expected_review_head_required (DATA 65) — --submit-review without --expected-head
-    #   expected_review_head_requires_submit_review (DATA 65) — --expected-head without --submit-review
-    #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review mutation
+    #   expected_review_head_required (DATA 65) — --submit-review or --metadata-only without --expected-head
+    #   expected_review_head_requires_submit_review (DATA 65) — --expected-head without --submit-review or --metadata-only
+    #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review or metadata mutation
     #   invalid_specialist_review_report (DATA 65) — --specialist-report body lacks the canonical marker, required fields/verdict, or findings table
     #   native_review_url_required (DATA 65) — --metadata-only without --native-review-url
     #   native_review_author_required (DATA 65) — --metadata-only without --native-review-author
     #   invalid_native_review_url (DATA 65) — native review URL does not bind to this GitHub repository and PR
     #   native_review_url_requires_metadata_only / native_review_author_requires_metadata_only (DATA 65) — native review identity input without --metadata-only
-    #   native_review_verification_failed (DATA 65) — provider read-back does not match the exact review id, URL, decision state, or expected App author
+    #   native_review_verification_failed (DATA 65) — provider read-back does not match the exact review id, URL, decision state, expected App author, or --expected-head commit
     #   metadata_only_conflict (DATA 65) — --metadata-only combined with body/thread/native submission inputs
     #   provider_unsupported (USAGE 64) — --submit-review, --thread-file, or --metadata-only on gitlab/local (native review/thread creation and existing-review metadata are GitHub-only in v1)
     #   github_pending_review_exists (RUNTIME 1) — summary-only native review submission found a viewer-owned pending review. Threaded review transactions instead inspect an exact receipt-bound draft and resume it.
@@ -360,8 +360,8 @@ operations:
     # not id_not_pull_request, since it may have hit a valid PR.
     backends:
       github:
-        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
-        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews/{review_id}"] } # with --metadata-only: read back the exact review and require matching id, html_url, decision state, and --native-review-author before any comment mutation (rendered in --dry-run as native_review_verification_plan)
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number|.head.sha"] } # PR-existence guard; metadata-only selects .head.sha and requires it to equal --expected-head before posting (rendered in --dry-run as guard_plan)
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews/{review_id}"] } # with --metadata-only: read back the exact review and require matching id, html_url, decision state, --native-review-author, and commit_id=--expected-head before any comment mutation (rendered in --dry-run as native_review_verification_plan)
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] } # default (outcome comment)
         - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # summary-only --submit-review: a viewer-owned pending review returns github_pending_review_exists. Threaded transactions use this as the complete membership read before exact-node inspection/resume.
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --raw-field, "commit_id={expected_head}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; commit_id binds the mutation to --expected-head; review authored by the inherited gh token's identity
@@ -403,7 +403,7 @@ operations:
         lenses: list<string>
         metadata_only?: bool # true only for the concise existing-native-review metadata path
         native_review_url?: string # authoritative same-repo/same-PR native review URL supplied to --metadata-only
-        native_review_author?: string # expected App login verified by provider read-back for --metadata-only
+        native_review_author?: string # expected App login verified with URL, decision state, and commit_id by provider read-back for --metadata-only
         native_review_verification_plan?: list<string> # dry-run only: exact native-review read-back argv
         review_threads?: "list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>"
         threads_skipped_idempotent?: integer # cross-run duplicates skipped: findings whose (path, body) already had a live (non-resolved, non-outdated) thread on the current head; omitted when 0. When every finding is a duplicate the review event is skipped, so submitted_review is false

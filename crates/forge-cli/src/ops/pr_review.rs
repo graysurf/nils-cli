@@ -326,13 +326,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             || args.thread_file.is_some()
             || args.comment.is_some()
             || args.comment_file.is_some()
-            || args.expected_head.is_some()
             || args.specialist_report
         {
             return Err(ForgeError::validation(
                 schema_err(),
                 "metadata_only_conflict",
-                "--metadata-only cannot be combined with a review body, specialist validation, native submission, expected head, or thread file",
+                "--metadata-only cannot be combined with a review body, specialist validation, native submission, or thread file",
                 None,
             ));
         }
@@ -480,12 +479,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         None
     };
 
-    let expected_review_head = if args.submit_review {
+    let expected_review_head = if args.submit_review || args.metadata_only {
         Some(args.expected_head.as_deref().ok_or_else(|| {
             ForgeError::validation(
                 schema_err(),
                 "expected_review_head_required",
-                "--submit-review requires --expected-head <SHA> so the native review cannot attach to an unreviewed PR head",
+                "--submit-review and --metadata-only require --expected-head <SHA> so review publication cannot attach to an unreviewed PR head",
                 None,
             )
         })?)
@@ -494,7 +493,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             return Err(ForgeError::validation(
                 schema_err(),
                 "expected_review_head_requires_submit_review",
-                "--expected-head is only valid with --submit-review",
+                "--expected-head is only valid with --submit-review or --metadata-only",
                 None,
             ));
         }
@@ -548,7 +547,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         // The GitHub PR-existence guard is a live backend read; surface it in the
         // dry-run plan so wrappers inspecting dry-run output see every call.
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
-            BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, id)).plan_argv()
+            BackendCall::new(
+                BackendProgram::Gh,
+                github_pull_lookup_argv(&ctx, id, args.metadata_only),
+            )
+            .plan_argv()
         });
         let native_review_verification_plan = native_review_id.map(|review_id| {
             BackendCall::new(
@@ -711,7 +714,16 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // issue. GitLab's `glab mr note` already fails on a non-MR id, so this guard
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
-        ensure_github_pull_request(runner, &ctx, id)?;
+        ensure_github_pull_request(
+            runner,
+            &ctx,
+            id,
+            if args.metadata_only {
+                Some(expected_review_head.expect("validated metadata-only review head"))
+            } else {
+                None
+            },
+        )?;
         if let (Some(review_id), Some(native_review_url), Some(native_review_author)) = (
             native_review_id,
             native_review_url.as_deref(),
@@ -721,10 +733,13 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 runner,
                 &ctx,
                 id,
-                review_id,
-                native_review_url,
-                native_review_author,
-                args.decision,
+                NativeReviewExpectation {
+                    review_id,
+                    url: native_review_url,
+                    author: native_review_author,
+                    decision: args.decision,
+                    head: expected_review_head.expect("validated metadata-only review head"),
+                },
             )?;
         }
         if args.submit_review && thread_specs.is_empty() {
@@ -3130,6 +3145,7 @@ struct GithubNativeReviewReadback {
     id: u64,
     html_url: String,
     state: String,
+    commit_id: String,
     user: GithubNativeReviewAuthor,
 }
 
@@ -3138,18 +3154,23 @@ struct GithubNativeReviewAuthor {
     login: String,
 }
 
+struct NativeReviewExpectation<'a> {
+    review_id: u64,
+    url: &'a str,
+    author: &'a str,
+    decision: PrReviewDecision,
+    head: &'a str,
+}
+
 fn ensure_github_native_review<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
     pr_id: u64,
-    review_id: u64,
-    expected_url: &str,
-    expected_author: &str,
-    decision: PrReviewDecision,
+    expected: NativeReviewExpectation<'_>,
 ) -> Result<(), ForgeError> {
     let call = BackendCall::new(
         BackendProgram::Gh,
-        github_native_review_lookup_argv(ctx, pr_id, review_id),
+        github_native_review_lookup_argv(ctx, pr_id, expected.review_id),
     );
     let output = runner.run(&call)?;
     let review: GithubNativeReviewReadback =
@@ -3158,19 +3179,28 @@ fn ensure_github_native_review<R: BackendRunner>(
                 "GitHub returned an invalid native review document: {error}"
             ))
         })?;
-    let expected_state = match decision {
+    let expected_state = match expected.decision {
         PrReviewDecision::CommentsOnly => "COMMENTED",
         PrReviewDecision::Approve => "APPROVED",
         PrReviewDecision::RequestChanges => "CHANGES_REQUESTED",
     };
-    if review.id != review_id
-        || review.html_url != expected_url
-        || !review.user.login.eq_ignore_ascii_case(expected_author)
+    if review.id != expected.review_id
+        || review.html_url != expected.url
+        || !review.user.login.eq_ignore_ascii_case(expected.author)
         || !review.state.eq_ignore_ascii_case(expected_state)
+        || review.commit_id != expected.head
     {
         return Err(native_review_verification_error(format!(
-            "expected id={review_id}, url={expected_url}, author={expected_author}, state={expected_state}; provider returned id={}, url={}, author={}, state={}",
-            review.id, review.html_url, review.user.login, review.state
+            "expected id={}, url={}, author={}, state={expected_state}, commit_id={}; provider returned id={}, url={}, author={}, state={}, commit_id={}",
+            expected.review_id,
+            expected.url,
+            expected.author,
+            expected.head,
+            review.id,
+            review.html_url,
+            review.user.login,
+            review.state,
+            review.commit_id
         )));
     }
     Ok(())
@@ -3328,10 +3358,27 @@ fn ensure_github_pull_request<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
     id: u64,
+    expected_head: Option<&str>,
 ) -> Result<(), ForgeError> {
-    let call = BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(ctx, id));
+    let call = BackendCall::new(
+        BackendProgram::Gh,
+        github_pull_lookup_argv(ctx, id, expected_head.is_some()),
+    );
     let probe = runner.run_raw(&call)?;
     if probe.status_success {
+        if let Some(expected_head) = expected_head {
+            let provider_head = probe.stdout.trim();
+            if provider_head != expected_head {
+                return Err(ForgeError::validation(
+                    schema_err(),
+                    "github_review_head_changed",
+                    "the provider PR head differs from the head supplied for review publication",
+                    Some(format!(
+                        "expected_head={expected_head}; provider_head={provider_head}"
+                    )),
+                ));
+            }
+        }
         return Ok(());
     }
     let detail = probe.stderr.trim();
@@ -3462,10 +3509,11 @@ fn glab_note_form<R: BackendRunner>(runner: &R) -> GlabNoteForm {
     }
 }
 
-/// `gh api repos/{repo}/pulls/{id} --jq .number` — the read used to confirm
-/// `<id>` is a pull request. Mirrors [`github_issue_comment_argv`]'s endpoint
-/// shape (repo embedded in the path, hostname pushed for GitHub Enterprise).
-fn github_pull_lookup_argv(ctx: &ProviderContext, id: u64) -> Vec<OsString> {
+/// `gh api repos/{repo}/pulls/{id}` — confirm `<id>` is a pull request and,
+/// for metadata-only publication, read its current head SHA. Mirrors
+/// [`github_issue_comment_argv`]'s endpoint shape (repo embedded in the path,
+/// hostname pushed for GitHub Enterprise).
+fn github_pull_lookup_argv(ctx: &ProviderContext, id: u64, include_head: bool) -> Vec<OsString> {
     let endpoint = ctx
         .repo
         .as_deref()
@@ -3476,7 +3524,7 @@ fn github_pull_lookup_argv(ctx: &ProviderContext, id: u64) -> Vec<OsString> {
     argv.extend([
         OsString::from(endpoint),
         OsString::from("--jq"),
-        OsString::from(".number"),
+        OsString::from(if include_head { ".head.sha" } else { ".number" }),
     ]);
     argv
 }

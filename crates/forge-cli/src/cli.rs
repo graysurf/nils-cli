@@ -687,8 +687,8 @@ pub struct PrReviewArgs {
     /// REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1.
     #[arg(long = "submit-review", action = ArgAction::SetTrue)]
     pub submit_review: bool,
-    /// Full PR head SHA that was reviewed. Required with `--submit-review` and
-    /// bound to both the pending-review preflight and provider mutation.
+    /// Full PR head SHA that was reviewed. Required with `--submit-review` or
+    /// `--metadata-only`; bound to the provider head and native review commit.
     #[arg(
         long = "expected-head",
         value_name = "SHA",
