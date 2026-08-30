@@ -1018,22 +1018,43 @@ fn parse_github_pending_review_snapshot_page(
             let body_digest = review_state::sha256_digest(semantic_body.as_bytes());
             let line = optional_u32(comment, "/line");
             let original_line = optional_u32(comment, "/originalLine");
-            let start_line = optional_u32(comment, "/startLine");
-            let original_start_line = optional_u32(comment, "/originalStartLine");
             let subject_type = optional_string(comment, "/subjectType")
                 .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string());
+            let raw_start_line = optional_u32(comment, "/startLine");
+            let raw_original_start_line = optional_u32(comment, "/originalStartLine");
             let diff_side = normalized_comment_side(
                 comment,
                 "/diffSide",
                 line.or(original_line),
                 &subject_type,
             )?;
-            let start_diff_side = normalized_comment_side(
+            let raw_start_diff_side = normalized_comment_side(
                 comment,
                 "/startDiffSide",
-                start_line.or(original_start_line),
+                raw_start_line.or(raw_original_start_line),
                 &subject_type,
             )?;
+            let start_line = canonical_review_start_line(
+                Some(subject_type.as_str()),
+                line,
+                diff_side.as_deref(),
+                raw_start_line,
+                raw_start_diff_side.as_deref(),
+                false,
+            );
+            let original_start_line = canonical_review_start_line(
+                Some(subject_type.as_str()),
+                original_line,
+                diff_side.as_deref(),
+                raw_original_start_line,
+                raw_start_diff_side.as_deref(),
+                false,
+            );
+            let start_diff_side = if start_line.is_none() && original_start_line.is_none() {
+                None
+            } else {
+                raw_start_diff_side
+            };
             Ok(PendingReviewInlineComment {
                 id: required_string(comment, "/id", "review.comment.id")?,
                 url: required_string(comment, "/url", "review.comment.url")?,
@@ -1099,6 +1120,27 @@ fn parse_github_pending_review_snapshot_page(
             snapshot_digest: String::new(),
         },
     }))
+}
+
+pub(super) fn canonical_review_start_line(
+    subject_type: Option<&str>,
+    line: Option<u32>,
+    diff_side: Option<&str>,
+    start_line: Option<u32>,
+    start_diff_side: Option<&str>,
+    allow_missing_start_side: bool,
+) -> Option<u32> {
+    let same_known_side = start_diff_side.is_some() && start_diff_side == diff_side;
+    let provider_omitted_start_side = allow_missing_start_side && start_diff_side.is_none();
+    if subject_type == Some("LINE")
+        && line.is_some()
+        && start_line == line
+        && (same_known_side || provider_omitted_start_side)
+    {
+        None
+    } else {
+        start_line
+    }
 }
 
 fn normalized_comment_side(
@@ -1195,11 +1237,43 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
                 Some(format!("comment_id={}", comment.id)),
             ));
         }
+        let anchor_start_line = canonical_review_start_line(
+            anchor.subject_type.as_deref(),
+            anchor.line,
+            anchor.diff_side.as_deref(),
+            anchor.start_line,
+            anchor.start_diff_side.as_deref(),
+            true,
+        );
+        let anchor_original_start_line = canonical_review_start_line(
+            anchor.subject_type.as_deref(),
+            anchor.original_line,
+            anchor.diff_side.as_deref(),
+            anchor.original_start_line,
+            anchor.start_diff_side.as_deref(),
+            true,
+        );
+        let comment_start_line = canonical_review_start_line(
+            Some(comment.subject_type.as_str()),
+            comment.line,
+            anchor.diff_side.as_deref(),
+            comment.start_line,
+            anchor.start_diff_side.as_deref(),
+            true,
+        );
+        let comment_original_start_line = canonical_review_start_line(
+            Some(comment.subject_type.as_str()),
+            comment.original_line,
+            anchor.diff_side.as_deref(),
+            comment.original_start_line,
+            anchor.start_diff_side.as_deref(),
+            true,
+        );
         if anchor.path != comment.path
             || anchor.line != comment.line
             || anchor.original_line != comment.original_line
-            || anchor.start_line != comment.start_line
-            || anchor.original_start_line != comment.original_start_line
+            || anchor_start_line != comment_start_line
+            || anchor_original_start_line != comment_original_start_line
             || anchor.subject_type.as_deref() != Some(comment.subject_type.as_str())
         {
             return Err(snapshot_incomplete(
@@ -1209,6 +1283,11 @@ fn hydrate_deferred_comment_sides<R: BackendRunner>(
         }
         if comment.subject_type != "LINE" {
             continue;
+        }
+        comment.start_line = comment_start_line;
+        comment.original_start_line = comment_original_start_line;
+        if comment.start_line.is_none() && comment.original_start_line.is_none() {
+            comment.start_diff_side = None;
         }
         let diff_side = anchor.diff_side.as_deref().ok_or_else(|| {
             snapshot_incomplete(
@@ -1855,6 +1934,61 @@ mod tests {
         assert_eq!(page.snapshot.inline_comments[0].diff_side, None);
     }
 
+    #[test]
+    fn pending_snapshot_preserves_equal_number_cross_side_ranges() {
+        let mut range = pending_snapshot_page(PendingSnapshotPageSpec {
+            head: "head-7",
+            id: "PRRC_cross_side",
+            path: "src/replaced.rs",
+            line: 10,
+            diff_side: "RIGHT",
+            start_line: Some(10),
+            start_diff_side: Some("LEFT"),
+            has_next_page: false,
+            end_cursor: None,
+        });
+        let mut range_value: serde_json::Value =
+            serde_json::from_str(&range.stdout).expect("snapshot fixture");
+        range_value["data"]["node"]["comments"]["totalCount"] = 1.into();
+        let comment = range_value
+            .pointer_mut("/data/node/comments/nodes/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("comment object");
+        comment.remove("diffSide");
+        comment.remove("startDiffSide");
+        comment.insert(
+            "diffHunk".into(),
+            "@@ -10,1 +10,1 @@\n-old value\n+new value".into(),
+        );
+        range.stdout = range_value.to_string();
+
+        let mut thread = truncated_comment_thread("src/replaced.rs", "PRRC_cross_side");
+        let mut thread_value: serde_json::Value =
+            serde_json::from_str(&thread.stdout).expect("thread fixture");
+        let anchor =
+            &mut thread_value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0];
+        anchor["line"] = 10.into();
+        anchor["originalLine"] = 10.into();
+        anchor["startLine"] = 10.into();
+        anchor["originalStartLine"] = 10.into();
+        anchor["diffSide"] = "RIGHT".into();
+        anchor["startDiffSide"] = "LEFT".into();
+        anchor["comments"]["nodes"][0]["body"] = "finding PRRC_cross_side".into();
+        anchor["comments"]["nodes"][0]["url"] =
+            "https://github.com/acme/widgets/pull/7#discussion_PRRC_cross_side".into();
+        thread.stdout = thread_value.to_string();
+        let runner = ScriptedRunner::new(vec![range, thread]);
+
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("cross-side range recovers from the authoritative thread")
+            .expect("pending snapshot");
+        let comment = &snapshot.inline_comments[0];
+
+        assert_eq!(comment.start_line, Some(10));
+        assert_eq!(comment.start_diff_side.as_deref(), Some("LEFT"));
+        assert_eq!(comment.diff_side.as_deref(), Some("RIGHT"));
+    }
+
     fn truncated_pending_snapshot_page() -> BackendSuccess {
         let mut truncated = pending_snapshot_page(PendingSnapshotPageSpec {
             head: "head-7",
@@ -2021,6 +2155,51 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("reviewThreads(first: 100")),
             "the exact provider thread snapshot must own the fallback side"
+        );
+    }
+
+    #[test]
+    fn pending_snapshot_recovery_accepts_github_normalized_single_line_starts() {
+        let mut thread_response = truncated_comment_thread("src/new.rs", "PRRC_truncated");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&thread_response.stdout).expect("thread fixture");
+        let thread = &mut value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0];
+        thread["startLine"] = 982.into();
+        thread["originalStartLine"] = 982.into();
+        thread_response.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![truncated_pending_snapshot_page(), thread_response]);
+
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("equivalent single-line anchors recover from review threads")
+            .expect("pending snapshot");
+
+        assert_eq!(snapshot.inline_comments[0].start_line, None);
+        assert_eq!(snapshot.inline_comments[0].original_start_line, None);
+        assert_eq!(
+            snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("RIGHT")
+        );
+    }
+
+    #[test]
+    fn pending_snapshot_recovery_rejects_a_genuine_range_mismatch() {
+        let mut thread_response = truncated_comment_thread("src/new.rs", "PRRC_truncated");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&thread_response.stdout).expect("thread fixture");
+        let thread = &mut value["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0];
+        thread["startLine"] = 970.into();
+        thread["originalStartLine"] = 970.into();
+        thread["startDiffSide"] = "RIGHT".into();
+        thread_response.stdout = value.to_string();
+        let runner = ScriptedRunner::new(vec![truncated_pending_snapshot_page(), thread_response]);
+
+        let error = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect_err("non-single-line range mismatches must remain fail-closed");
+
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+        assert!(
+            error.to_string().contains("anchor differs"),
+            "unexpected error: {error}"
         );
     }
 

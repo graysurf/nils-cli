@@ -813,6 +813,73 @@ esac
 }
 
 #[test]
+fn pr_pending_review_inspect_accepts_github_normalized_single_line_starts() {
+    let stub = StubEnv::new();
+    let capture = stub
+        .tempdir
+        .path()
+        .join("normalized-single-line-inspect.log");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"reviewThreads(first: 100"*)
+        printf '%s\n' '{{"data":{{"review":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Summary","viewerDidAuthor":true,"viewerCanDelete":true,"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}},"repository":{{"pullRequest":{{"headRefOid":"head-new","reviewThreads":{{"nodes":[{{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","diffSide":"RIGHT","line":10,"originalLine":10,"startLine":10,"originalStartLine":10,"startDiffSide":null,"subjectType":"LINE","comments":{{"nodes":[{{"id":"PRRC_1","author":{{"login":"review-bot"}},"body":"first","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/42#discussion_r1"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        ;;
+      *)
+        printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"PENDING","commit":{{"oid":"head-new"}},"body":"Summary","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{{"totalCount":1,"nodes":[{{"id":"PRRC_1","url":"https://github.com/acme/widgets/pull/42#discussion_r1","author":{{"login":"review-bot"}},"body":"first","createdAt":"2026-07-20T12:00:00Z","path":"src/lib.rs","diffHunk":"@@ -1,1 +1,1 @@\n-old\n+new","line":10,"originalLine":10,"startLine":null,"originalStartLine":null,"subjectType":"LINE"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}},"pullRequest":{{"number":42,"url":"https://github.com/acme/widgets/pull/42","headRefOid":"head-new"}}}}}}}}'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    );
+    let stub = stub.gh_stub(&script);
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "inspect",
+            "42",
+            "--review",
+            "PRR_pending",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(
+        env["data"]["snapshot"]["inline_comments"][0]["diff_side"],
+        "RIGHT"
+    );
+    assert_eq!(
+        env["data"]["snapshot"]["inline_comments"][0]["start_line"],
+        serde_json::Value::Null
+    );
+    let calls = fs::read_to_string(capture).expect("read gh calls");
+    assert!(calls.contains("reviewThreads(first: 100"), "{calls}");
+}
+
+#[test]
 fn pr_pending_review_resume_submit_rejects_an_incomplete_receipt_manifest() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("resume-submit-calls.log");
