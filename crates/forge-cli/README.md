@@ -23,8 +23,10 @@ cargo run -p nils-forge-cli -- label audit --catalog labels.yaml --format json
 cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-file review.md --mirror-issue --issue 456 --format json
 cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thread-file review-threads.json --format json
+cargo run -p nils-forge-cli -- pr review validate --specialist-report --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --expected-head <sha> --comment-file review.md --thread-file review-threads.json --format json
+cargo run -p nils-forge-cli -- pr review 123 --decision approve --metadata-only --native-review-url <review-url> --native-review-author <app-login> --issue 456 --mirror-issue --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
 cargo run -p nils-forge-cli -- pr pending-review inspect 123 --review PRR_pending --format json
 cargo run -p nils-forge-cli -- pr pending-review resume-submit 123 --review PRR_pending --review-run-id <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot <digest> --decision comments-only --format json
@@ -68,6 +70,16 @@ This source boundary does not itself publish or authorize a release.
 each. Use `pr review validate` for local schema/privacy checks, and add
 `--check-diff` with a PR id when you want GitHub changed-file/line validation
 before posting. Put non-blocking notes in the review body.
+
+Add `--specialist-report` when the body must satisfy the canonical specialist
+Review Report marker, fields, verdict vocabulary, and findings table. This is
+opt-in so generic review comments remain valid. When an owner App has already
+published the authoritative native review, use `--metadata-only` with that
+same-PR `--native-review-url` and its expected `--native-review-author` App
+login; forge-cli reads the review back and verifies its URL, decision state,
+and author before posting a concise personal metadata breadcrumb and, when
+requested, an issue mirror. Metadata-only mode rejects bodies, threads, native
+submission, or a mismatched provider review before mutation.
 
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
 `--format text|json` exclusively.

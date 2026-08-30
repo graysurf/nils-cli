@@ -863,6 +863,30 @@ distinctions that cannot be proven offline.
 - By default `--decision` is recorded in the envelope and generated issue mirror
   body only (the outcome-comment form); it does not call provider-native
   approve/request-changes APIs.
+- `--specialist-report` opts the supplied body into the canonical
+  `agent-kit:specialist-review-report:v1` contract. Before any provider call,
+  forge-cli requires exactly one marker and `## Review Report` heading,
+  non-empty Reviewable/Lens/Lens verdict/Scope/Evidence reviewed fields, the
+  closed `pass|findings|blocked|follow-up-pass` verdict vocabulary, and the
+  canonical findings table with at least one exactly-five-cell row. Generic
+  review comments omit this flag and remain valid.
+- `--metadata-only --expected-head <sha> --native-review-url <url>
+  --native-review-author <login>`
+  (GitHub-only) records concise
+  personal-identity metadata after an owner App has already published the
+  authoritative native review. The URL must identify a
+  `#pullrequestreview-<id>` object on the selected repository and PR. Before
+  mutation, forge-cli verifies the PR still has `--expected-head`, then reads
+  that exact review back and verifies its URL, decision state, App author
+  login, and `commit_id`. The PR
+  comment and optional issue mirror contain only PR, decision, lenses, and the
+  native review link; they never include the native Review Report body.
+  Metadata-only mode rejects caller bodies, `--specialist-report`, threads, and
+  `--submit-review` before mutation. Omitting the expected head returns
+  `expected_review_head_required`; provider-head drift returns
+  `github_review_head_changed`; a review bound to another commit returns
+  `native_review_verification_failed`. Output adds `data.metadata_only=true`,
+  `data.head_sha`, `data.native_review_url`, and `data.native_review_author`.
 - With `--submit-review --expected-head <sha>` (GitHub-only in v1) the command
   instead submits a native
   pull request review event: it POSTs `gh api repos/{repo}/pulls/{id}/reviews`
@@ -889,8 +913,8 @@ distinctions that cannot be proven offline.
   rendered in `--dry-run` as
   `data.pending_review_guard_plan` and `data.plan`. Omitting the expected head
   returns `expected_review_head_required` (`DATA 65`); supplying it without
-  `--submit-review` returns `expected_review_head_requires_submit_review`
-  (`DATA 65`). `--submit-review` on
+  `--submit-review` or `--metadata-only` returns
+  `expected_review_head_requires_submit_review` (`DATA 65`). `--submit-review` on
   GitLab / Local returns `provider_unsupported` (`USAGE 64`).
   If GitHub rejects the native review submission with HTTP 422, the command
   returns `github_native_review_rejected` (`RUNTIME 1`) and preserves the raw
@@ -986,8 +1010,10 @@ distinctions that cannot be proven offline.
 - Output schema:
   `data = { provider, number, decision, submitted_review, head_sha?,
   pr_comment_url, issue_number, issue_comment_url, mirrored, lenses,
+  metadata_only?, native_review_url?, native_review_author?,
+  native_review_verification_plan?,
   review_threads?, threads_skipped_idempotent? }`. `head_sha` is present for
-  `--submit-review`; `threads_skipped_idempotent` is present (non-zero) when
+  `--submit-review` and `--metadata-only`; `threads_skipped_idempotent` is present (non-zero) when
   cross-run duplicates were skipped.
 
 ### `pr review validate`
@@ -997,6 +1023,10 @@ distinctions that cannot be proven offline.
   activity. It accepts `--comment <text>` / `--comment-file <path>` and
   `--thread-file <path>` using the same body limits, JSON shape, local-path
   guard, escaped-control guard, and size limits as `pr review`.
+- With `--specialist-report`, the preflight also applies the canonical marker,
+  field, verdict, and findings-table validation described above. A mismatch
+  returns `invalid_specialist_review_report` (`DATA 65`) before diff or provider
+  access.
 - Without `--check-diff`, validation is local-only and works for GitHub, GitLab,
   and Local provider contexts. This is the format/content dry-run path for
   agents that want to validate `review-report.md` and `review-threads.json`
@@ -1015,7 +1045,7 @@ distinctions that cannot be proven offline.
   `data.review_threads.diff_checked=false`.
 - JSON output includes
   `data = { provider, number?, check_diff, comment, review_threads }`, where
-  `comment = { present, bytes, lines }` and
+  `comment = { present, bytes, lines, specialist_report }` and
   `review_threads = { count, diff_checked, specs[] }`. Each normalized
   `specs[]` entry includes `{ index, path, line?, side, start_line?, start_side?,
   subject_type, body_bytes }`.

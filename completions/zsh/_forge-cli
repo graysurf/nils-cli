@@ -271,8 +271,10 @@ request-changes\:"Record a request-changes outcome in the posted review comment"
 '--comment-file=[Read review outcome comment body from a file. Use \`-\` for stdin]:PATH:_default' \
 '*--lens=[Review lens name to include in output and issue mirror metadata]:LENS:_default' \
 '--issue=[Issue number that should receive the optional activity mirror]:ISSUE_NUMBER:_default' \
-'--expected-head=[Full PR head SHA that was reviewed. Required with \`--submit-review\` and bound to both the pending-review preflight and provider mutation]:SHA:_default' \
+'--expected-head=[Full PR head SHA that was reviewed. Required with \`--submit-review\` or \`--metadata-only\`; bound to the provider head and native review commit]:SHA:_default' \
 '--thread-file=[Create or validate review threads from a JSON array of actionable findings (max 50 threads; 16 KiB body each). Requires --submit-review when posting; may be inherited by \`validate\` without posting. Omit this for summary-only reviews. Repair findings, then resolve via \`pr review-threads resolve\`]:PATH:_default' \
+'--native-review-url=[Authoritative native review URL. Required with --metadata-only]:URL:_default' \
+'--native-review-author=[Expected GitHub login that authored the authoritative native review. Required with --metadata-only and verified by provider read-back before the personal-identity metadata breadcrumb is posted]:LOGIN:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
@@ -282,6 +284,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--mirror-issue[Mirror a compact activity note to \`--issue\` (required; omitting it returns the \`issue_required\` envelope at runtime)]' \
 '--submit-review[Submit a native provider review event instead of posting an outcome comment. On GitHub this POSTs \`.../pulls/<id>/reviews\`, creating the \`#pullrequestreview-\` object; \`--decision\` maps to the review event (comments-only→COMMENT, approve→APPROVE, request-changes→REQUEST_CHANGES). The review is authored by the invoking token'\''s identity (e.g. a reviewer bot via FORGE_BOT_PROFILE). A body is required for COMMENT and REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1]' \
+'--specialist-report[Validate the body as the canonical specialist Review Report shape]' \
+'--metadata-only[Post only a concise personal-identity metadata breadcrumb for an already-published authoritative native review]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -309,6 +313,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--check-diff[Check thread path / line coordinates against the live GitHub PR diff]' \
+'--specialist-report[Enforce the canonical specialist Review Report marker, fields, and table]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \

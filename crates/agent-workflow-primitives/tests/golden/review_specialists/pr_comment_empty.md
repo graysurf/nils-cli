@@ -1,5 +1,12 @@
-## Specialist Review Findings
+<!-- agent-kit:specialist-review-report:v1 -->
+## Review Report
 
-No displayed specialist findings.
+- Reviewable: not provided
+- Lens: unspecified
+- Lens verdict: pass
+- Scope: not provided
+- Evidence reviewed: no input files
 
-This is a deterministic render of specialist findings, not a merge or close decision.
+| Finding | Severity | Confidence | Evidence | Recommendation |
+| --- | --- | ---: | --- | --- |
+| No findings | none | 0.00 | No actionable or informational findings. | none |

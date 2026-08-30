@@ -362,6 +362,155 @@ fn review_specialists_render_evidence_includes_traceability_metadata() {
 }
 
 #[test]
+fn review_specialists_provider_review_writes_canonical_body_and_line_file_threads() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":42,"category":"correctness","summary":"Line defect","evidence":"The changed branch is wrong.","recommendation":"Fix the branch.","specialist":"testing","actionable":true}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/config.rs","category":"maintainability","summary":"File defect","evidence":"The file violates its invariant.","recommendation":"Restore the invariant.","specialist":"testing","actionable":true}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+    let merge = run(
+        "review-specialists",
+        tmp.path(),
+        &["merge", "--input", &input_arg, "--format", "json"],
+    );
+    assert_eq!(merge.code, 0, "stderr={}", merge.stderr_text());
+    let merged_path = tmp.path().join("merged.json");
+    fs::write(&merged_path, merge.stdout_text()).expect("merged");
+    let merged_arg = path_arg(&merged_path);
+    let body_path = tmp.path().join("review.md");
+    let body_arg = path_arg(&body_path);
+    let threads_path = tmp.path().join("threads.json");
+    let threads_arg = path_arg(&threads_path);
+
+    let render = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "render",
+            "--profile",
+            "provider-review",
+            "--input",
+            &merged_arg,
+            "--out",
+            &body_arg,
+            "--thread-out",
+            &threads_arg,
+            "--reviewable",
+            "PR #44",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "review publication",
+            "--evidence-reviewed",
+            "focused tests",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(render.code, 0, "stderr={}", render.stderr_text());
+    let body = fs::read_to_string(&body_path).expect("body");
+    assert!(body.contains("<!-- agent-kit:specialist-review-report:v1 -->"));
+    assert!(body.contains("| Finding | Severity | Confidence | Evidence | Recommendation |"));
+    assert!(!body.contains("## Specialist Review Findings"));
+    let threads: Value = serde_json::from_str(&fs::read_to_string(&threads_path).expect("threads"))
+        .expect("thread json");
+    assert_eq!(threads[0]["subject_type"], "LINE");
+    assert_eq!(threads[0]["line"], 42);
+    assert_eq!(threads[1]["subject_type"], "FILE");
+    assert!(threads[1].get("line").is_none());
+
+    let alias_body_path = tmp.path().join("alias.md");
+    let alias_body_arg = path_arg(&alias_body_path);
+    let alias = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "render",
+            "--profile",
+            "pr-comment",
+            "--input",
+            &merged_arg,
+            "--out",
+            &alias_body_arg,
+            "--reviewable",
+            "PR #44",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "review publication",
+            "--evidence-reviewed",
+            "focused tests",
+        ],
+    );
+    assert_eq!(alias.code, 0, "stderr={}", alias.stderr_text());
+    assert_eq!(
+        fs::read_to_string(alias_body_path).expect("alias body"),
+        body
+    );
+}
+
+#[test]
+fn review_specialists_rejects_thread_output_before_writing_any_render_artifact() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let merged_path = tmp.path().join("merged.json");
+    fs::write(
+        &merged_path,
+        r#"{"schema":"review-specialists.merged.v1","input_files":[],"display_threshold":0.6,"counts":{"total":0,"displayed":0,"suppressed":0,"by_severity":{}},"findings":[]}"#,
+    )
+    .expect("merged");
+    let merged_arg = path_arg(&merged_path);
+    let body_path = tmp.path().join("report.md");
+    let body_arg = path_arg(&body_path);
+    let threads_path = tmp.path().join("threads.json");
+    let threads_arg = path_arg(&threads_path);
+
+    let render = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "render",
+            "--profile",
+            "report",
+            "--input",
+            &merged_arg,
+            "--out",
+            &body_arg,
+            "--thread-out",
+            &threads_arg,
+        ],
+    );
+
+    assert_eq!(render.code, 64, "stderr={}", render.stderr_text());
+    assert!(!body_path.exists(), "invalid render must not write --out");
+    assert!(
+        !threads_path.exists(),
+        "invalid render must not write --thread-out"
+    );
+}
+
+#[test]
+fn review_specialists_bundle_help_does_not_advertise_render_only_thread_out() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let help = run("review-specialists", tmp.path(), &["bundle", "--help"]);
+
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    assert!(!help.stdout_text().contains("--thread-out"));
+}
+
+#[test]
 fn review_specialists_skill_helper_parity_fixture_renders_report() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let input = path_arg(&fixture("skill-helper-parity.jsonl"));

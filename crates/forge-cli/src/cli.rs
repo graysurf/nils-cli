@@ -642,6 +642,9 @@ pub struct PrReviewValidateArgs {
     /// Check thread path / line coordinates against the live GitHub PR diff.
     #[arg(long = "check-diff", action = ArgAction::SetTrue)]
     pub check_diff: bool,
+    /// Enforce the canonical specialist Review Report marker, fields, and table.
+    #[arg(long = "specialist-report", action = ArgAction::SetTrue)]
+    pub specialist_report: bool,
 }
 
 /// `pr review` arguments. This is a provider posting primitive: callers pass
@@ -684,8 +687,8 @@ pub struct PrReviewArgs {
     /// REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1.
     #[arg(long = "submit-review", action = ArgAction::SetTrue)]
     pub submit_review: bool,
-    /// Full PR head SHA that was reviewed. Required with `--submit-review` and
-    /// bound to both the pending-review preflight and provider mutation.
+    /// Full PR head SHA that was reviewed. Required with `--submit-review` or
+    /// `--metadata-only`; bound to the provider head and native review commit.
     #[arg(
         long = "expected-head",
         value_name = "SHA",
@@ -699,6 +702,25 @@ pub struct PrReviewArgs {
     /// `pr review-threads resolve`.
     #[arg(long = "thread-file", value_name = "PATH")]
     pub thread_file: Option<String>,
+    /// Validate the body as the canonical specialist Review Report shape.
+    #[arg(long = "specialist-report", action = ArgAction::SetTrue)]
+    pub specialist_report: bool,
+    /// Post only a concise personal-identity metadata breadcrumb for an
+    /// already-published authoritative native review.
+    #[arg(long = "metadata-only", action = ArgAction::SetTrue)]
+    pub metadata_only: bool,
+    /// Authoritative native review URL. Required with --metadata-only.
+    #[arg(long = "native-review-url", value_name = "URL")]
+    pub native_review_url: Option<String>,
+    /// Expected GitHub login that authored the authoritative native review.
+    /// Required with --metadata-only and verified by provider read-back before
+    /// the personal-identity metadata breadcrumb is posted.
+    #[arg(
+        long = "native-review-author",
+        value_name = "LOGIN",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub native_review_author: Option<String>,
 }
 
 /// `pr comments` arguments.

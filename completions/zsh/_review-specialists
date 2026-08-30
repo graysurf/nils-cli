@@ -57,12 +57,18 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
-'--profile=[Render profile]:PROFILE:(terminal report issue-body pr-comment evidence)' \
+'--profile=[Render profile]:PROFILE:(terminal report issue-body pr-comment provider-review evidence)' \
 '--input=[Merged findings JSON from \`review-specialists merge --format json\`]:FILE:_files' \
 '--out=[Output path. If omitted, text profiles print the rendered body]:FILE:_files' \
 '--repo=[Repository slug for GitHub source links, e.g. owner/repo]:REPO:_default' \
 '--ref=[Ref for source links]:GIT_REF:_default' \
 '--link-base=[Custom link base. Defaults to https\://github.com/<repo>/blob when --repo is provided]:LINK_BASE:_default' \
+'--thread-out=[Write actionable GitHub review-thread specs derived from the same findings]:FILE:_files' \
+'--reviewable=[PR/MR identifier or URL shown in the provider review body]:REVIEWABLE:_default' \
+'--lens=[Exactly one reviewer lens represented by this report]:LENS:_default' \
+'--lens-verdict=[Single-lens verdict represented by this report]:LENS_VERDICT:(pass findings blocked follow-up-pass)' \
+'--scope=[Compact description of files or behavior reviewed]:TEXT:_default' \
+'--evidence-reviewed=[Compact validation, diff, or provider evidence summary]:TEXT:_default' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -75,10 +81,15 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '*--input=[Specialist finding JSONL input file]:FILE:_files' \
 '--out-dir=[Bundle output directory]:DIR:_files -/' \
 '--display-threshold=[Minimum confidence for displayed findings]:DISPLAY_THRESHOLD:_default' \
-'--profile=[Optional additional render profile to write]:PROFILE:(terminal report issue-body pr-comment evidence)' \
+'--profile=[Optional additional render profile to write]:PROFILE:(terminal report issue-body pr-comment provider-review evidence)' \
 '--repo=[Repository slug for GitHub source links, e.g. owner/repo]:REPO:_default' \
 '--ref=[Ref for source links]:GIT_REF:_default' \
 '--link-base=[Custom link base. Defaults to https\://github.com/<repo>/blob when --repo is provided]:LINK_BASE:_default' \
+'--reviewable=[PR/MR identifier or URL shown in the provider review body]:REVIEWABLE:_default' \
+'--lens=[Exactly one reviewer lens represented by this report]:LENS:_default' \
+'--lens-verdict=[Single-lens verdict represented by this report]:LENS_VERDICT:(pass findings blocked follow-up-pass)' \
+'--scope=[Compact description of files or behavior reviewed]:TEXT:_default' \
+'--evidence-reviewed=[Compact validation, diff, or provider evidence summary]:TEXT:_default' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0

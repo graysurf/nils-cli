@@ -29,7 +29,10 @@ if [ "$1" != "api" ]; then
 fi
 case "$2" in
   repos/acme/widgets/pulls/44)
-    echo "44"
+    echo "head-44"
+    ;;
+  repos/acme/widgets/pulls/44/reviews/440)
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"APPROVED","commit_id":"head-44","user":{{"login":"review-bot[bot]"}}}}'
     ;;
   repos/acme/widgets/issues/44/comments)
     echo "https://github.com/acme/widgets/pull/44#issuecomment-440"
@@ -39,6 +42,48 @@ case "$2" in
     ;;
   *)
     echo "stub: unexpected gh api endpoint: $2" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
+fn github_native_review_mismatch_stub(capture: &str, state: &str, author: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "head-44"
+    ;;
+  repos/acme/widgets/pulls/44/reviews/440)
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"{state}","commit_id":"head-44","user":{{"login":"{author}"}}}}'
+    ;;
+  *)
+    echo "stub: mutation must not run after failed native review verification: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    )
+}
+
+fn github_native_review_head_stub(capture: &str, current_head: &str, review_head: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$2" in
+  repos/acme/widgets/pulls/44)
+    echo "{current_head}"
+    ;;
+  repos/acme/widgets/pulls/44/reviews/440)
+    printf '%s\n' '{{"id":440,"html_url":"https://github.com/acme/widgets/pull/44#pullrequestreview-440","state":"APPROVED","commit_id":"{review_head}","user":{{"login":"review-bot[bot]"}}}}'
+    ;;
+  *)
+    echo "stub: mutation must not run after failed native review head verification: $*" >&2
     exit 99
     ;;
 esac
@@ -212,6 +257,343 @@ fn pr_review_posts_outcome_and_mirrors_issue_activity() {
         calls.contains("review_url=https://github.com/acme/widgets/pull/44#issuecomment-440"),
         "mirror body should link the PR review comment: {calls}"
     );
+}
+
+#[test]
+fn pr_review_validate_specialist_report_rejects_the_old_bullet_shape() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            "## Specialist Review Findings\n\n- **high** src/lib.rs:42: old bullet",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_validate_specialist_report_rejects_malformed_table_rows() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+    let prefix = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: testing\n- Lens verdict: findings\n- Scope: validation\n- Evidence reviewed: focused test\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n";
+
+    for row in [
+        "| malformed |\n",
+        "| finding | medium | 0.90 | evidence | recommendation | extra |\n",
+    ] {
+        let report = format!("{prefix}{row}");
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "validate",
+                "--specialist-report",
+                "--comment",
+                &report,
+            ],
+        );
+
+        assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+    }
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_validate_specialist_report_accepts_the_canonical_table_shape() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: testing\n- Lens verdict: pass\n- Scope: review publication\n- Evidence reviewed: focused tests\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| No findings | none | 0.00 | No actionable \\| informational findings. | none |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["comment"]["specialist_report"], true);
+}
+
+#[test]
+fn pr_review_validate_accepts_renderer_output_with_an_already_escaped_pipe() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        r#"{"severity":"medium","confidence":0.9,"path":"src/lib.rs","line":7,"category":"correctness","summary":"Existing \\| pipe","evidence":"The evidence keeps \\| source text.","recommendation":"Preserve \\| safely.","specialist":"testing","actionable":true}"#,
+    )
+    .expect("write findings");
+    let bundle = tmp.path().join("bundle");
+    let render_code = agent_workflow_primitives::review_specialists::run_with_args([
+        "review-specialists".to_string(),
+        "bundle".to_string(),
+        "--input".to_string(),
+        input.to_string_lossy().into_owned(),
+        "--out-dir".to_string(),
+        bundle.to_string_lossy().into_owned(),
+        "--profile".to_string(),
+        "provider-review".to_string(),
+        "--reviewable".to_string(),
+        "PR #44".to_string(),
+        "--lens".to_string(),
+        "testing".to_string(),
+        "--lens-verdict".to_string(),
+        "findings".to_string(),
+        "--scope".to_string(),
+        "renderer-validator parity".to_string(),
+        "--evidence-reviewed".to_string(),
+        "end-to-end regression".to_string(),
+    ]);
+    assert_eq!(render_code, 0);
+    let report = bundle.join("provider-review.md");
+    let report_arg = report.to_string_lossy().into_owned();
+
+    let out = run_forge_cli(
+        &StubEnv::new(),
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment-file",
+            &report_arg,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+}
+
+#[test]
+fn pr_review_metadata_only_posts_concise_pr_and_issue_breadcrumbs() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+    let native_review = "https://github.com/acme/widgets/pull/44#pullrequestreview-440";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--lens",
+            "testing",
+            "--metadata-only",
+            "--expected-head",
+            "head-44",
+            "--native-review-url",
+            native_review,
+            "--native-review-author",
+            "review-bot[bot]",
+            "--issue",
+            "101",
+            "--mirror-issue",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["metadata_only"], true);
+    assert_eq!(env["data"]["native_review_url"], native_review);
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(
+        calls.contains("repos/acme/widgets/issues/44/comments"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("repos/acme/widgets/issues/101/comments"),
+        "{calls}"
+    );
+    assert!(calls.contains("Review metadata"), "{calls}");
+    assert!(calls.contains(native_review), "{calls}");
+    let verification = calls
+        .find("repos/acme/widgets/pulls/44/reviews/440")
+        .expect("native review verification call");
+    let mutation = calls
+        .find("repos/acme/widgets/issues/44/comments")
+        .expect("metadata mutation call");
+    assert!(verification < mutation, "{calls}");
+    assert!(!calls.contains("## Review Report"), "{calls}");
+    assert!(
+        !calls.contains("agent-kit:specialist-review-report:v1"),
+        "{calls}"
+    );
+}
+
+#[test]
+fn pr_review_metadata_only_rejects_a_different_pr_review_url_before_backend() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--metadata-only",
+            "--native-review-url",
+            "https://github.com/acme/widgets/pull/45#pullrequestreview-440",
+            "--native-review-author",
+            "review-bot[bot]",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_native_review_url");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_metadata_only_rejects_a_mismatched_provider_review_before_mutation() {
+    for (state, author) in [
+        ("COMMENTED", "review-bot[bot]"),
+        ("APPROVED", "unexpected-bot[bot]"),
+    ] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join("gh-args.log");
+        let stub = stub.gh_stub(&github_native_review_mismatch_stub(
+            &capture.to_string_lossy(),
+            state,
+            author,
+        ));
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "approve",
+                "--metadata-only",
+                "--expected-head",
+                "head-44",
+                "--native-review-url",
+                "https://github.com/acme/widgets/pull/44#pullrequestreview-440",
+                "--native-review-author",
+                "review-bot[bot]",
+            ],
+        );
+
+        assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["error"]["code"], "native_review_verification_failed");
+        let calls = fs::read_to_string(&capture).expect("read captured calls");
+        assert!(
+            calls.contains("repos/acme/widgets/pulls/44/reviews/440"),
+            "{calls}"
+        );
+        assert!(!calls.contains("/comments"), "{calls}");
+    }
+}
+
+#[test]
+fn pr_review_metadata_only_rejects_stale_review_or_advanced_pr_head_before_mutation() {
+    for (current_head, review_head, expected_code) in [
+        ("head-44", "head-old", "native_review_verification_failed"),
+        ("head-new", "head-44", "github_review_head_changed"),
+    ] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join("gh-args.log");
+        let stub = stub.gh_stub(&github_native_review_head_stub(
+            &capture.to_string_lossy(),
+            current_head,
+            review_head,
+        ));
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "approve",
+                "--metadata-only",
+                "--expected-head",
+                "head-44",
+                "--native-review-url",
+                "https://github.com/acme/widgets/pull/44#pullrequestreview-440",
+                "--native-review-author",
+                "review-bot[bot]",
+            ],
+        );
+
+        assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["error"]["code"], expected_code);
+        let calls = fs::read_to_string(&capture).unwrap_or_default();
+        assert!(!calls.contains("/comments"), "{calls}");
+    }
 }
 
 #[test]
