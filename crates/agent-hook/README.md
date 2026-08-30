@@ -204,8 +204,9 @@ or override an outcome.
 
 On Linux, every exact or ordinary execution uses the trusted fixed
 `/usr/bin/systemd-run` and `/usr/bin/systemctl` paths and a transient user unit.
-`open` first verifies those binaries, unified cgroup v2, enabled unprivileged
-user namespaces, and a responsive systemd user manager.
+`open` first verifies those binaries, unified cgroup v2, and a responsive
+systemd user manager. A confined runner additionally requires enabled
+unprivileged user namespaces when it executes.
 Nils serializes the runner configuration into an immutable sealed memfd.
 Systemd `OpenFile` hands the unit the exact current agent-hook executable inode
 as descriptor 3, the sealed config as descriptor 4, and an unlinked control
@@ -224,15 +225,20 @@ therefore remain ordinary exits, while provider signals remain canonical
 It also holds a pidfd for the original nils supervisor and kills its workload if
 that supervisor disappears.
 
-The unit uses a private user namespace, control-group kill semantics with
-immediate `SIGKILL`, a bounded `RuntimeMax`, no `AF_UNIX`, and denied localhost
-access. Nils does not record the result until `systemctl` reports the unit
-inactive or failed.
-This tracks descendants that call `setsid` or double-fork and denies the tested
-parent-cgroup/user-manager escape paths. It is not a general network namespace
-or a guarantee against every network or IPC delegation mechanism. Authoritative
-execution fails closed on non-Linux platforms or when the trusted systemd
-boundary is unavailable.
+Every runner keeps control-group kill semantics with immediate `SIGKILL` and a
+bounded `RuntimeMax`; nils does not record the result until `systemctl` reports
+the unit inactive or failed. `unsandboxed` and `danger-full-access` use those
+lifecycle controls without changing the host user's namespace, IPC, network,
+group, localhost, or user-bus authority. A `confined` runner additionally uses
+a private user namespace, excludes `AF_UNIX`, denies localhost, and restricts
+SUID/SGID changes. This tracks descendants that call `setsid` or double-fork;
+the confined profile also denies the tested parent-cgroup/user-manager escape
+paths. It is not a general network namespace or a guarantee against every
+network or IPC delegation mechanism. Authoritative execution fails closed on
+non-Linux platforms or when the trusted systemd lifecycle boundary is
+unavailable. In full-host mode, a command may deliberately ask the user manager
+to create a separate unit; that unit is outside the command cgroup and is not
+claimed as a descendant-cleanup target.
 
 For DSH cancellation or failed-execution cleanup, a pending operation durably
 retains its exact transient unit identifier; a `run` error does not discard that

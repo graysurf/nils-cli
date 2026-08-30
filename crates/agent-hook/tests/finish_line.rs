@@ -1180,27 +1180,59 @@ fn ordinary_shell_cannot_escape_with_a_new_session_or_double_fork_after_return()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn ordinary_shell_cannot_delegate_a_late_mutation_to_the_user_manager() {
+fn confined_shell_cannot_delegate_a_late_mutation_to_the_user_manager() {
     let fixture = fixture();
-    one_contract(&fixture, ":");
-    let command = "systemd-run --user --quiet --collect --unit=finish-line-escape-${BASHPID} -- sh -c 'sleep 0.2; printf escaped > manager-mutation'";
-    let (code, envelope) = run_validation(
-        &fixture,
-        "session-a",
-        "turn-1",
-        "ordinary-manager-escape",
-        "project-dev",
-        command,
-        5_000,
+    let command = "systemd-run --user --quiet --collect --unit=finish-line-confined-${BASHPID} -- sh -c 'sleep 0.2; printf escaped > manager-mutation'";
+    one_contract(&fixture, command);
+    begin_edit(&fixture, "session-a", "turn-1", "edit-1");
+    let runner_capability = open_runner(&fixture, "session-a", "turn-1");
+    let provider = fixture.root.join("provider-runner");
+    fs::write(
+        &provider,
+        "#!/bin/sh\n[ \"$1\" = -- ] || exit 125\nshift\nexec \"$@\"\n",
+    )
+    .expect("provider runner");
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))
+        .expect("provider permissions");
+
+    let mut request = common(&fixture, "session-a", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.run.v1");
+    request["operation_id"] = json!("validation-confined-manager-escape");
+    request["intent"] = json!("project-dev");
+    request["command"] = json!(command);
+    request["runner_capability"] = json!(runner_capability);
+    request["timeout_ms"] = json!(5_000);
+    request["execution"] = json!({
+        "kind": "bash-v1",
+        "workdir": fixture.root,
+        "output_max_bytes": 64 * 1024,
+        "runner": {
+            "kind": "confined",
+            "argv": [provider, "--", "bash", "-c", command],
+            "mode": "workspace-write",
+            "enforcement": "full",
+            "denial_signatures": ["address family not supported"],
+            "runner_failure_rules": [],
+        },
+    });
+    let output = fixture.run(
+        &["finish-line", "run", "--format", "json"],
+        Some(&request.to_string()),
     );
-    assert_eq!(code, 0, "envelope={envelope}");
-    assert_eq!(envelope["data"]["status"], "ordinary-applied");
+    assert_eq!(
+        output.code,
+        0,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text(),
+    );
+    let envelope = output.stdout_json();
     assert_ne!(envelope["data"]["execution"]["exit_code"], 0);
 
     std::thread::sleep(std::time::Duration::from_millis(400));
     assert!(
         !fixture.root.join("manager-mutation").exists(),
-        "ordinary shell delegated a late mutation outside its execution unit",
+        "confined shell delegated a late mutation outside its execution unit",
     );
 }
 
@@ -1376,6 +1408,66 @@ fn an_edit_in_another_session_invalidates_prior_repository_generation_evidence()
     );
     assert_eq!(code, 0, "envelope={refreshed}");
     assert_eq!(stop(&fixture, "session-a").0, 0);
+}
+
+#[test]
+fn danger_full_access_preserves_the_host_user_systemd_bus() {
+    let fixture = fixture();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("localhost listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let host_groups = Command::new("/usr/bin/id")
+        .arg("-G")
+        .output()
+        .expect("host group inventory");
+    assert!(host_groups.status.success(), "host group inventory failed");
+    let host_groups = String::from_utf8(host_groups.stdout)
+        .expect("host groups are utf8")
+        .trim()
+        .to_string();
+    let command = "/usr/bin/systemctl --user show-environment >/dev/null";
+    one_contract(&fixture, command);
+
+    let (code, exact) = run_validation(
+        &fixture,
+        "session-a",
+        "turn-1",
+        "full-host-exact",
+        "project-dev",
+        command,
+        5_000,
+    );
+    assert_eq!(code, 0, "envelope={exact}");
+    assert_eq!(
+        exact["data"]["execution"]["exit_code"], 0,
+        "danger-full-access exact validation lost the host user bus: {exact}",
+    );
+
+    let ordinary_command = format!(
+        "/usr/bin/systemctl --user show-environment >/dev/null; \
+         : >/dev/tcp/127.0.0.1/{port}; /usr/bin/id -G",
+    );
+    let (code, ordinary) = run_validation(
+        &fixture,
+        "session-a",
+        "turn-2",
+        "full-host-ordinary",
+        "project-dev",
+        &ordinary_command,
+        5_000,
+    );
+    assert_eq!(code, 0, "envelope={ordinary}");
+    assert_eq!(
+        ordinary["data"]["execution"]["exit_code"], 0,
+        "danger-full-access ordinary Bash lost the host user bus: {ordinary}",
+    );
+    assert_eq!(
+        ordinary["data"]["execution"]["stdout"]["text"]
+            .as_str()
+            .expect("ordinary stdout")
+            .trim(),
+        host_groups,
+        "danger-full-access changed the host user's supplementary groups",
+    );
 }
 
 #[test]
