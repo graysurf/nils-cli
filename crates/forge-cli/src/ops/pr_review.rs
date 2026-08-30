@@ -2440,6 +2440,31 @@ fn validate_submitted_review_manifest<R: BackendRunner>(
     for expected in manifest {
         let matched = threads.threads.iter().any(|thread| {
             let marker = review_state::parse_finding_marker(&thread.body);
+            let thread_start_line = pr_reviews::canonical_review_start_line(
+                thread.subject_type.as_deref(),
+                thread.line,
+                thread.diff_side.as_deref(),
+                thread.start_line,
+                thread.start_diff_side.as_deref(),
+                true,
+            );
+            let expected_start_line = pr_reviews::canonical_review_start_line(
+                Some(expected.subject_type.as_str()),
+                expected.line,
+                Some(expected.side.as_str()),
+                expected.start_line,
+                expected.start_side.as_deref(),
+                false,
+            );
+            let start_side_matches = if thread.subject_type.as_deref() == Some("LINE")
+                && expected.subject_type == "LINE"
+                && thread_start_line.is_none()
+                && expected_start_line.is_none()
+            {
+                true
+            } else {
+                thread.start_diff_side == expected.start_side
+            };
             thread.author == viewer_login
                 && marker.as_ref().is_some_and(|(run_id, digest)| {
                     run_id == review_run_id && digest == &expected.body_digest
@@ -2447,8 +2472,8 @@ fn validate_submitted_review_manifest<R: BackendRunner>(
                 && thread.path == expected.path
                 && thread.line == expected.line
                 && thread.diff_side.as_deref() == Some(expected.side.as_str())
-                && thread.start_line == expected.start_line
-                && thread.start_diff_side == expected.start_side
+                && thread_start_line == expected_start_line
+                && start_side_matches
                 && thread.subject_type.as_deref() == Some(expected.subject_type.as_str())
         });
         if !matched {

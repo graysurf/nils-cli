@@ -652,7 +652,14 @@ distinctions that cannot be proven offline.
   pending-snapshot-unverified`; a live submit reports its guarded digest with
   `snapshot_provenance: pending-cas+submitted-reconciled`. Provider-null
   side/range values on a `FILE` comment are normalized away when matching a
-  receipt; `LINE` and range anchors remain exact.
+  receipt. For a single-line `LINE` comment, GitHub's equivalent `startLine`
+  encodings (omitted or equal to `line` with no distinct start side, and
+  likewise for the original line) are canonicalized to omitted before snapshot
+  output, receipt matching, and `snapshot_digest` calculation. Non-equal range
+  starts, equal-number cross-side ranges, and all other `LINE` anchors remain
+  exact. When the pending-comment response cannot establish the line sides,
+  canonicalization is deferred until the exact review-thread recovery supplies
+  the authoritative sides.
 - `pr pending-review submit <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> --expected-snapshot <digest> --decision <decision>
   --confirm-unmarked-submit` emits `cli.forge-cli.pr.pending-review.submit.v1`.
@@ -919,7 +926,14 @@ distinctions that cannot be proven offline.
   every finding carry owned run/digest markers. An exact pending manifest must
   be an ordered prefix of the receipt manifest; the command adds only the
   missing suffix and performs a final complete snapshot before
-  `submitPullRequestReview`. Success requires an immediate exact-node read-back
+  `submitPullRequestReview`. During snapshot recovery, GitHub's equivalent
+  single-line encodings (`startLine` omitted or equal to `line` without a
+  distinct start side, and likewise for the original line) are canonicalized
+  before comparing the comment with its review thread; genuine ranges,
+  including equal-number cross-side ranges, must still match exactly. Success
+  requires an immediate exact-node read-back. Unknown sides in the pending
+  comment never prove a single-line anchor; the exact thread read owns that
+  decision.
   whose submitted state and complete receipt-bound manifest reconcile.
 
   Every interrupted stage is resumable: a lost create response, any lost inline

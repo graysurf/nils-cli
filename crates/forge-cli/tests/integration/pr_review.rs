@@ -934,12 +934,26 @@ case "$*" in
     printf '%s\n' 'https://github.com/acme/widgets/issues/101#issuecomment-review'
     ;;
   *"reviewThreads(first: 100"*)
-    if [ -f "$submitted" ] && [ -f "$finding_body_0" ]; then
+    if [ -f "$finding_body_0" ] \
+      && { [ -f "$submitted" ] || [ "$failure" = "normalized-single-line" ]; }; then
       body=$(json_escape "$finding_body_0")
       path=$(json_escape "$finding_path_0")
       line=$(sed -n '1p' "$finding_line_0")
       [ -n "$line" ] || line=null
-      printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_created","isResolved":false,"isOutdated":false,"path":"%s","diffSide":"RIGHT","line":%s,"originalLine":%s,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_created","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r42"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$path" "$line" "$line" "$body"
+      thread_start_line=null
+      if [ "$failure" = "normalized-single-line" ]; then
+        thread_start_line=$line
+        review_body=$(json_escape "$pending_body")
+        review_state=PENDING
+        review_can_delete=true
+        if [ -f "$submitted" ]; then
+          review_state=COMMENTED
+          review_can_delete=false
+        fi
+        printf '{"data":{"review":{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"%s","commit":{"oid":"head-44"},"body":"%s","viewerDidAuthor":true,"viewerCanDelete":%s,"pullRequest":{"number":44,"url":"https://github.com/acme/widgets/pull/44","headRefOid":"head-44"}},"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_created","isResolved":false,"isOutdated":false,"path":"%s","diffSide":"RIGHT","line":%s,"originalLine":%s,"originalStartLine":null,"startDiffSide":null,"startLine":%s,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_created_0","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r42"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$review_state" "$review_body" "$review_can_delete" "$path" "$line" "$line" "$thread_start_line" "$body"
+      else
+        printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_created","isResolved":false,"isOutdated":false,"path":"%s","diffSide":"RIGHT","line":%s,"originalLine":%s,"originalStartLine":null,"startDiffSide":null,"startLine":%s,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_created","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r42"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$path" "$line" "$line" "$thread_start_line" "$body"
+      fi
     elif [ "@EXISTING_THREAD@" = "true" ]; then
       printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_existing","isResolved":@EXISTING_RESOLVED@,"isOutdated":@EXISTING_OUTDATED@,"path":"src/lib.rs","diffSide":"RIGHT","line":42,"originalLine":42,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_existing","author":{"login":"quality-bot"},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
     else
@@ -981,7 +995,11 @@ case "$*" in
       path=$(json_escape "$finding_path_0")
       line=$(sed -n '1p' "$finding_line_0")
       [ -n "$line" ] || line=null
-      comments=$(printf '{"id":"PRRC_created_0","url":"https://github.com/acme/widgets/pull/44#discussion_r42","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","path":"%s","line":%s,"originalLine":%s,"diffSide":"RIGHT","startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line")
+      anchor_fields='"diffSide":"RIGHT",'
+      if [ "$failure" = "normalized-single-line" ]; then
+        anchor_fields='"diffHunk":"@@ -42,1 +42,1 @@\n-old\n+new",'
+      fi
+      comments=$(printf '{"id":"PRRC_created_0","url":"https://github.com/acme/widgets/pull/44#discussion_r42","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","path":"%s","line":%s,"originalLine":%s,%s"startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line" "$anchor_fields")
       total=1
     fi
     if [ -f "$finding_body_1" ]; then
@@ -1334,6 +1352,44 @@ fn pr_review_thread_file_creates_resolvable_github_review_thread() {
             && calls.contains("Add coverage for the rejected profile URL path."),
         "{calls}"
     );
+}
+
+#[test]
+fn pr_review_accepts_github_normalized_single_line_thread_start() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("normalized-single-line.log");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"side":"RIGHT","body":"Single-line finding."}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "normalized-single-line",
+        false,
+    ));
+
+    let out = run_resumable_thread_review(&stub, &thread_file);
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["ok"], true);
+    assert_eq!(env["data"]["submitted_review"], true);
+
+    let rerun = run_resumable_thread_review(&stub, &thread_file);
+
+    assert_eq!(
+        rerun.code, 0,
+        "stdout={}\nstderr={}",
+        rerun.stdout, rerun.stderr
+    );
+    let rerun_env = parse_envelope(&rerun.stdout);
+    assert_eq!(rerun_env["ok"], true);
+    assert_eq!(rerun_env["data"]["submitted_review"], false);
 }
 
 #[test]
