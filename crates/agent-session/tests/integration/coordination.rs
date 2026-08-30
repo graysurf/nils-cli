@@ -35585,9 +35585,11 @@ AGENT_SESSION_CAPABILITY_FILE={main_capability} \
 
 #[test]
 fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
-    // Coverage-instrumented same-release subprocess startup can take longer
-    // than ten seconds on macOS. Keep fixture synchronization generous while
-    // preserving the four-second readiness deadline exercised below.
+    // Coverage-instrumented same-release subprocess startup can consume most
+    // of a four-second readiness window on macOS before this fixture can add
+    // its deliberately late bootstrap. This case owns post-failure bootstrap
+    // convergence, so give that second phase room; the adjacent definitive
+    // recovery-failure tests retain the exact four-second deadline boundary.
     let synchronization_timeout = Duration::from_secs(120);
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -35656,7 +35658,7 @@ fn main_agent_worker_start_waits_for_late_bootstrap_after_recovery_failure() {
             "--assignment-file",
             assignment_path.to_str().expect("assignment path"),
             "--await-ready",
-            "4s",
+            "30s",
             "--idempotency-key",
             "worker-start-late-bootstrap-0001",
             "--format",
