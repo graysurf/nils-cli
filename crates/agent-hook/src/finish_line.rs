@@ -70,7 +70,7 @@ const CONTAINED_RUNNER_MAX_BYTES: u64 = 256 * 1024;
 const CONTAINED_RUNNER_CONTROL_MAX_BYTES: usize = 4 * 1024;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-/// Fixed containment properties for one transient validation unit.
+/// Fixed lifecycle properties for one transient finish-line unit.
 ///
 /// `TimeoutStopSec` must stay a positive bounded duration. Systemd reads `0` as
 /// a stop deadline that has already expired, not as "no stop timeout", so a
@@ -86,7 +86,7 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// final-kill signal; the bound only limits how long the manager waits for the
 /// cgroup to empty before reporting a genuine teardown failure.
 #[cfg(target_os = "linux")]
-const CONTAINED_UNIT_PROPERTIES: [&str; 11] = [
+const CONTAINED_UNIT_PROPERTIES: [&str; 7] = [
     "--property=Type=exec",
     "--property=KillMode=control-group",
     "--property=KillSignal=SIGKILL",
@@ -94,6 +94,15 @@ const CONTAINED_UNIT_PROPERTIES: [&str; 11] = [
     "--property=TimeoutStopSec=2s",
     "--property=SendSIGKILL=yes",
     "--property=Delegate=no",
+];
+
+/// Permission restrictions owned only by a DSH confined runner.
+///
+/// `unsandboxed` and `danger-full-access` deliberately retain the host user's
+/// normal namespace, IPC, network, group, and localhost authority. Their
+/// transient unit is a lifecycle supervisor, not a second permission model.
+#[cfg(target_os = "linux")]
+const CONFINED_UNIT_PROPERTIES: [&str; 4] = [
     "--property=PrivateUsers=yes",
     "--property=RestrictSUIDSGID=yes",
     "--property=RestrictAddressFamilies=AF_INET AF_INET6",
@@ -222,6 +231,15 @@ enum ValidationRunner {
         denial_signatures: Vec<String>,
         runner_failure_rules: Vec<RunnerFailureRule>,
     },
+}
+
+#[cfg(target_os = "linux")]
+fn contained_unit_properties(runner: &ValidationRunner) -> Vec<&'static str> {
+    let mut properties = CONTAINED_UNIT_PROPERTIES.to_vec();
+    if matches!(runner, ValidationRunner::Confined { .. }) {
+        properties.extend(CONFINED_UNIT_PROPERTIES);
+    }
+    properties
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1992,6 +2010,8 @@ fn execute_validation_command_platform(
 ) -> Result<ValidationExecution, HookError> {
     if !matches!(runner, ValidationRunner::Confined { .. }) {
         validate_trusted_bash()?;
+    } else {
+        validate_confined_runner_host()?;
     }
     validate_trusted_systemd()?;
     let _signals = ValidationSignalGuard::install()?;
@@ -2025,7 +2045,7 @@ fn execute_validation_command_platform(
     process
         .args(["--user", "--quiet", "--wait", "--pipe"])
         .arg(format!("--unit={unit}"))
-        .args(CONTAINED_UNIT_PROPERTIES)
+        .args(contained_unit_properties(runner))
         .arg(format!(
             "--property=OpenFile={executable_source}:nils-runner:read-only"
         ))
@@ -3179,6 +3199,18 @@ fn validate_containment_host() -> Result<(), HookError> {
             "finish-line requires a unified cgroup v2 host",
         ));
     }
+    let status = bounded_systemctl(&["--user", "show-environment"], false)?.0;
+    if !status.success() {
+        return Err(finish_line_unavailable(
+            "finish-line-containment-unavailable",
+            "finish-line systemd user manager is unavailable",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_confined_runner_host() -> Result<(), HookError> {
     let namespaces = fs::read_to_string("/proc/sys/user/max_user_namespaces")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -3186,14 +3218,7 @@ fn validate_containment_host() -> Result<(), HookError> {
     if namespaces == 0 {
         return Err(finish_line_unavailable(
             "finish-line-containment-unavailable",
-            "finish-line requires unprivileged user namespaces for contained execution",
-        ));
-    }
-    let status = bounded_systemctl(&["--user", "show-environment"], false)?.0;
-    if !status.success() {
-        return Err(finish_line_unavailable(
-            "finish-line-containment-unavailable",
-            "finish-line systemd user manager is unavailable",
+            "finish-line confined execution requires unprivileged user namespaces",
         ));
     }
     Ok(())
@@ -3683,6 +3708,43 @@ mod tests {
             assert!(
                 CONTAINED_UNIT_PROPERTIES.contains(&required),
                 "missing containment property {required}",
+            );
+        }
+    }
+
+    #[test]
+    fn only_confined_runners_receive_permission_sandbox_properties() {
+        let full_host = contained_unit_properties(&ValidationRunner::DangerFullAccess);
+        for property in CONFINED_UNIT_PROPERTIES {
+            assert!(
+                !full_host.contains(&property),
+                "full-host runner retained permission restriction {property}",
+            );
+        }
+        for property in CONTAINED_UNIT_PROPERTIES {
+            assert!(
+                full_host.contains(&property),
+                "full-host runner lost lifecycle property {property}",
+            );
+        }
+
+        let confined = contained_unit_properties(&ValidationRunner::Confined {
+            argv: vec![
+                "bwrap".to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "-c".to_string(),
+                ":".to_string(),
+            ],
+            mode: ConfinedMode::ReadOnly,
+            enforcement: SandboxEnforcement::Full,
+            denial_signatures: Vec::new(),
+            runner_failure_rules: Vec::new(),
+        });
+        for property in CONFINED_UNIT_PROPERTIES {
+            assert!(
+                confined.contains(&property),
+                "confined runner lost permission restriction {property}",
             );
         }
     }
