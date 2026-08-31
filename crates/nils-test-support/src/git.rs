@@ -217,7 +217,19 @@ pub fn init_repo_at_with(dir: &Path, options: InitRepoOptions) {
     if options.isolate_hooks {
         // Keep fixture repositories independent from developer-global hooks while
         // preserving the normal repository-local hook location for hook tests.
-        git(dir, &["config", "core.hooksPath", ".git/hooks"]);
+        let common_dir = PathBuf::from(git(dir, &["rev-parse", "--git-common-dir"]).trim());
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            dir.join(common_dir)
+        };
+        let hooks_dir = common_dir.join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create fixture hooks dir");
+        let hooks_dir = fs::canonicalize(hooks_dir).expect("resolve fixture hooks dir");
+        git(
+            dir,
+            &["config", "core.hooksPath", &hooks_dir.to_string_lossy()],
+        );
     }
 
     if let Some(branch) = options.branch.as_deref() {
