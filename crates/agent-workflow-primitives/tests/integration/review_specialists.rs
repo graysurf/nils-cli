@@ -815,7 +815,17 @@ fn review_specialists_delivery_normalized_findings_round_trip_true_and_false() {
         ],
     );
     assert_eq!(validate.code, 0, "stdout={}", validate.stdout_text());
-    assert_eq!(validate.stdout_json()["data"]["findings_count"], 2);
+    let validated = validate.stdout_json();
+    assert_eq!(validated["data"]["findings_count"], 2);
+    assert_eq!(
+        validated["data"]["findings"][0]["fingerprint"],
+        "testing:review-actionability:roundtrip-true"
+    );
+    assert_eq!(validated["data"]["findings"][0]["actionable"], true);
+    assert_eq!(
+        validated["data"]["findings"][1]["fingerprint"],
+        "testing:review-actionability:roundtrip-false"
+    );
 
     let merge = run(
         "review-specialists",
@@ -831,7 +841,21 @@ fn review_specialists_delivery_normalized_findings_round_trip_true_and_false() {
         ],
     );
     assert_eq!(merge.code, 0, "stdout={}", merge.stdout_text());
-    assert_eq!(merge.stdout_json()["data"]["counts"]["input_rows"], 2);
+    let merged = merge.stdout_json();
+    assert_eq!(merged["data"]["counts"]["input_rows"], 2);
+    assert_eq!(
+        merged["data"]["findings"][0]["actionable_source"]["fingerprint"],
+        "testing:review-actionability:roundtrip-true"
+    );
+    assert_eq!(
+        merged["data"]["findings"][0]["actionable_source"]["actionable"],
+        true
+    );
+    assert!(
+        merged["data"]["findings"][1]
+            .get("actionable_source")
+            .is_none()
+    );
 
     let round_trip_dir = tmp.path().join("round-trip-bundle");
     let round_trip_arg = path_arg(&round_trip_dir);
@@ -846,12 +870,53 @@ fn review_specialists_delivery_normalized_findings_round_trip_true_and_false() {
             &normalized_arg,
             "--out-dir",
             &round_trip_arg,
+            "--profile",
+            "provider-review",
+            "--reviewable",
+            "PR #1582",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "normalized delivery artifacts",
+            "--evidence-reviewed",
+            "round-trip fixture",
             "--format",
             "json",
         ],
     );
     assert_eq!(rebundle.code, 0, "stdout={}", rebundle.stdout_text());
-    assert!(round_trip_dir.join("findings.normalized.jsonl").is_file());
+    let provider_review =
+        fs::read_to_string(round_trip_dir.join("provider-review.md")).expect("provider review");
+    assert!(provider_review.contains("Owner change required"));
+    assert!(provider_review.contains("Summary only"));
+
+    let thread_body =
+        fs::read_to_string(round_trip_dir.join("review-threads.json")).expect("thread artifact");
+    let threads: Value = serde_json::from_str(&thread_body).expect("thread json");
+    let threads = threads.as_array().expect("thread array");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["path"], "src/actionable.rs");
+    assert_eq!(threads[0]["subject_type"], "FILE");
+    assert_eq!(
+        threads[0]["body"],
+        concat!(
+            "**Owner change required** (high, 0.90)\n\n",
+            "The owner must change this finding.\n\n",
+            "Recommendation: Apply the repair.\n\n",
+            "<!-- agent-kit:finding:testing:review-actionability:roundtrip-true -->",
+        )
+    );
+    for false_material in [
+        "src/informational.rs",
+        "Summary only",
+        "No owner change is required.",
+        "Retain the evidence.",
+        "testing:review-actionability:roundtrip-false",
+    ] {
+        assert!(!thread_body.contains(false_material));
+    }
 }
 
 #[test]
