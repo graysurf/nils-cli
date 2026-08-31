@@ -234,6 +234,22 @@ fn request_binding_changes_with_every_governed_dimension() {
         changed_rule_id_envelope["data"]["audit"]["binding_digest"],
         "binding digest must bind rule IDs"
     );
+    let mut changed_class_id = first.clone();
+    changed_class_id["rules"][0]["class_id"] = json!("machine-local-path");
+    let (_, _, changed_class_id_envelope) = evaluate(&changed_class_id);
+    assert_ne!(
+        first_envelope["data"]["audit"]["binding_digest"],
+        changed_class_id_envelope["data"]["audit"]["binding_digest"],
+        "binding digest must bind rule class IDs"
+    );
+    let mut changed_payload = first.clone();
+    changed_payload["payload"] = json!({"safe":false});
+    let (_, _, changed_payload_envelope) = evaluate(&changed_payload);
+    assert_ne!(
+        first_envelope["data"]["audit"]["binding_digest"],
+        changed_payload_envelope["data"]["audit"]["binding_digest"],
+        "binding digest must bind payloads"
+    );
     let mut reordered = first.clone();
     reordered["rules"].as_array_mut().expect("rules").reverse();
     let (_, _, reordered_envelope) = evaluate(&reordered);
