@@ -645,8 +645,6 @@ fn parse_finding_line(
         input,
         line_number,
     )?;
-    let actionable =
-        optional_bool(object.get("actionable"), "actionable", input, line_number)?.unwrap_or(false);
     let explicit_fingerprint =
         optional_string(object.get("fingerprint"), "fingerprint", input, line_number)?;
     let root_cause_fingerprint = optional_string(
@@ -683,6 +681,19 @@ fn parse_finding_line(
     {
         validate_stable_fingerprint(root, "root_cause_fingerprint", input, line_number)?;
     }
+    let actionable =
+        match optional_bool(object.get("actionable"), "actionable", input, line_number)? {
+            Some(actionable) => actionable,
+            None if mode == ReviewMode::Delivery => {
+                return Err(RowError::typed(
+                    display_path(input),
+                    line_number,
+                    "review_actionable_required",
+                    "delivery findings require an explicit actionable boolean",
+                ));
+            }
+            None => false,
+        };
     let fingerprint = explicit_fingerprint
         .unwrap_or_else(|| computed_fingerprint(&path, line_value, &category, &summary));
 
@@ -902,10 +913,24 @@ fn validation_error(errors: Vec<RowError>) -> CliError {
         .iter()
         .find_map(|error| error.code.as_deref())
         .unwrap_or("invalid-findings");
+    let details = if typed_code == "review_actionable_required" {
+        json!({
+            "errors": errors,
+            "retryable": true,
+            "next_action": "add an explicit actionable boolean to each reported delivery finding and retry",
+            "recovery": {
+                "kind": "edit-findings",
+                "field": "actionable",
+                "accepted_values": [true, false],
+            },
+        })
+    } else {
+        json!({ "errors": errors })
+    };
     CliError::data(
         typed_code,
         format!("{} finding row(s) failed validation", errors.len()),
-        Some(json!({ "errors": errors })),
+        Some(details),
     )
 }
 
@@ -1817,7 +1842,7 @@ struct ValidateArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 
@@ -1843,7 +1868,7 @@ struct MergeArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 
@@ -1902,7 +1927,7 @@ struct BundleArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 

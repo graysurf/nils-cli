@@ -68,6 +68,52 @@ fn review_specialists_validate_accepts_the_dsh_quick_specialist() {
         output.stdout_json()["data"]["findings"][0]["specialist"],
         "quick"
     );
+    assert!(
+        output.stdout_json()["data"]["findings"][0]
+            .get("actionable")
+            .is_none(),
+        "advisory mode must keep the existing missing-actionable default"
+    );
+}
+
+#[test]
+fn review_specialists_delivery_requires_explicit_actionable_classification() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"Missing actionability","evidence":"The delivery row does not classify whether an owner change is required.","recommendation":"Classify the finding explicitly.","specialist":"testing","fingerprint":"correctness:review-publishing:explicit-actionability"}"#,
+    )
+    .expect("write finding");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stdout={}", output.stdout_text());
+    let value = output.stdout_json();
+    assert_eq!(value["error"]["code"], "review_actionable_required");
+    assert_eq!(
+        value["error"]["details"]["errors"][0]["code"],
+        "review_actionable_required"
+    );
+    assert_eq!(value["error"]["details"]["retryable"], true);
+    assert_eq!(value["error"]["details"]["recovery"]["field"], "actionable");
+    assert_eq!(
+        value["error"]["details"]["recovery"]["accepted_values"],
+        serde_json::json!([true, false])
+    );
+    assert!(
+        value["error"]["details"]["errors"][0]["message"]
+            .as_str()
+            .expect("typed row message")
+            .contains("explicit actionable boolean")
+    );
 }
 
 #[test]
@@ -179,9 +225,9 @@ fn review_specialists_delivery_merges_distinct_lenses_by_root_cause() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":10,"category":"correctness","summary":"First lens","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":10,"category":"correctness","summary":"First lens","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:shared-root","actionable":true}"#,
             "\n",
-            r#"{"severity":"medium","confidence":0.8,"path":"src/lib.rs","line":12,"category":"correctness","summary":"Second lens","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:maintainable-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            r#"{"severity":"medium","confidence":0.8,"path":"src/lib.rs","line":12,"category":"correctness","summary":"Second lens","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:maintainable-state","root_cause_fingerprint":"correctness:review-loop:shared-root","actionable":false}"#,
             "\n",
         ),
     )
@@ -220,9 +266,9 @@ fn review_specialists_delivery_identity_survives_line_and_prose_drift() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/old.rs","line":10,"category":"correctness","summary":"Original prose","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/old.rs","line":10,"category":"correctness","summary":"Original prose","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","actionable":true}"#,
             "\n",
-            r#"{"severity":"high","confidence":0.8,"path":"src/new.rs","line":24,"category":"correctness","summary":"Reworded after the code moved","evidence":"new evidence","recommendation":"same fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state"}"#,
+            r#"{"severity":"high","confidence":0.8,"path":"src/new.rs","line":24,"category":"correctness","summary":"Reworded after the code moved","evidence":"new evidence","recommendation":"same fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","actionable":false}"#,
             "\n",
         ),
     )
@@ -253,9 +299,9 @@ fn review_specialists_delivery_rejects_incompatible_root_reuse() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"First","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:first-root"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"First","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:first-root","actionable":true}"#,
             "\n",
-            r#"{"severity":"high","confidence":0.8,"path":"src/lib.rs","category":"correctness","summary":"Second","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:second-root"}"#,
+            r#"{"severity":"high","confidence":0.8,"path":"src/lib.rs","category":"correctness","summary":"Second","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:second-root","actionable":false}"#,
             "\n",
         ),
     )
