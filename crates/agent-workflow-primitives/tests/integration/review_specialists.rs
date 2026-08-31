@@ -617,6 +617,87 @@ fn review_specialists_bundle_writes_stable_artifacts() {
 }
 
 #[test]
+fn review_specialists_delivery_bundle_threads_only_explicitly_actionable_findings() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/actionable.rs","line":42,"category":"testing","summary":"Owner change required","evidence":"The owner must change this line.","recommendation":"Apply the repair.","specialist":"testing","fingerprint":"testing:review-actionability:delivery-thread-artifact","actionable":true}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/informational.rs","line":17,"category":"testing","summary":"Informational tradeoff","evidence":"The current behavior is acceptable.","recommendation":"Keep the summary evidence.","specialist":"testing","fingerprint":"testing:review-actionability:summary-only-artifact","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write delivery findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--profile",
+            "provider-review",
+            "--reviewable",
+            "PR #1582",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "delivery thread artifacts",
+            "--evidence-reviewed",
+            "fixture findings",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let report = fs::read_to_string(out_dir.join("specialist-review.md")).expect("report");
+    assert!(report.contains("Owner change required"));
+    assert!(report.contains("Informational tradeoff"));
+    let provider_review =
+        fs::read_to_string(out_dir.join("provider-review.md")).expect("provider review");
+    assert!(provider_review.contains("Owner change required"));
+    assert!(provider_review.contains("Informational tradeoff"));
+
+    let threads: Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("review-threads.json")).expect("thread artifact"),
+    )
+    .expect("thread json");
+    let threads = threads.as_array().expect("thread array");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["path"], "src/actionable.rs");
+    assert_eq!(threads[0]["line"], 42);
+    assert_eq!(threads[0]["subject_type"], "LINE");
+    assert_eq!(
+        threads[0]["body"],
+        concat!(
+            "**Owner change required** (high, 0.90)\n\n",
+            "The owner must change this line.\n\n",
+            "Recommendation: Apply the repair.\n\n",
+            "<!-- agent-kit:finding:testing:review-actionability:delivery-thread-artifact -->",
+        )
+    );
+    assert!(
+        !threads[0]["body"]
+            .as_str()
+            .expect("thread body")
+            .contains("summary-only-artifact")
+    );
+}
+
+#[test]
 fn review_specialists_scope_classifies_git_diff() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     init_git_fixture(tmp.path());
