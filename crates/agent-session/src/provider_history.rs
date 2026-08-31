@@ -450,26 +450,6 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
         }
     }
 
-    for archive in archives.values() {
-        if seen.insert(archive.history_id.clone()) {
-            sessions.push(HistorySession {
-                id: archive.history_id.clone(),
-                provider: archive.provider.clone(),
-                provider_session_id: archive.provider_session_id.clone(),
-                agent_profile: archive.agent_profile.clone(),
-                title: archive.title.clone(),
-                prompt_preview: None,
-                cwd: archive.cwd.clone(),
-                repo_name: repo_name(&archive.cwd),
-                created_at: archive.created_at.clone(),
-                updated_at: archive.updated_at.clone(),
-                archived_at: Some(archive.archived_at.clone()),
-                resumable: false,
-                transcript_path: PathBuf::new(),
-            });
-        }
-    }
-
     CatalogSnapshot {
         sessions,
         truncated,
@@ -1232,6 +1212,33 @@ mod tests {
                 .text,
             "profile b transcript"
         );
+    }
+
+    #[test]
+    fn archive_without_provider_transcript_is_not_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archives = tmp.path().join("archives");
+        write_archive(
+            &archives,
+            &ArchivedSession {
+                schema_version: "agent-session.history-archive.v1".into(),
+                history_id: stable_history_id("codex", None, "missing"),
+                provider: "codex".into(),
+                provider_session_id: "missing".into(),
+                agent_profile: None,
+                title: Some("Orphaned archive".into()),
+                cwd: "/work/example".into(),
+                created_at: "2026-08-31T00:00:00Z".into(),
+                updated_at: "2026-08-31T00:00:01Z".into(),
+                archived_at: "2026-08-31T00:00:02Z".into(),
+            },
+        )
+        .unwrap()
+        .commit();
+
+        let page = list(&[], &archives, "test", None, None, None, 10).unwrap();
+
+        assert!(page.sessions.is_empty());
     }
 
     #[test]
