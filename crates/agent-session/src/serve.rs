@@ -56,6 +56,7 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::codex_app_server::{self, ControlHandle};
 use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
+use crate::provider_history::{self, ArchivedSession, HistoryCatalog, HistoryError, HistorySource};
 use crate::provider_prompt::{
     LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
     ProviderLastPromptRefresh, ProviderLastPromptTracker, ProviderPromptEvent,
@@ -176,6 +177,7 @@ struct ServeState {
     codex_account_switches: CodexAccountSwitchRegistry,
     session_collector: SessionCollector,
     launch_profiles: AgentLaunchProfiles,
+    history_catalog: Arc<HistoryCatalog>,
     coordination_wait_workers: Arc<tokio::sync::Semaphore>,
     coordination_notification_wake: Arc<tokio::sync::Notify>,
 }
@@ -438,6 +440,48 @@ impl AgentLaunchProfiles {
         self.entries.iter().find(|profile| profile.id == id)
     }
 
+    fn history_sources(&self) -> Vec<HistorySource> {
+        let mut sources = Vec::new();
+        for profile in &self.entries {
+            let Some(config_dir) = profile.provider_config_dir.as_ref() else {
+                continue;
+            };
+            let (provider, child) = match profile.agent {
+                AgentKind::Codex => ("codex", "sessions"),
+                AgentKind::Claude => ("claude", "projects"),
+                _ => continue,
+            };
+            sources.push(HistorySource {
+                provider: provider.to_string(),
+                agent_profile: Some(profile.id.clone()),
+                root: config_dir.join(child),
+            });
+        }
+        if let Some(root) = crate::codex_sessions_root()
+            && !sources
+                .iter()
+                .any(|source| source.provider == "codex" && source.root == root)
+        {
+            sources.push(HistorySource {
+                provider: "codex".to_string(),
+                agent_profile: None,
+                root,
+            });
+        }
+        if let Some(root) = crate::claude_projects_root()
+            && !sources
+                .iter()
+                .any(|source| source.provider == "claude" && source.root == root)
+        {
+            sources.push(HistorySource {
+                provider: "claude".to_string(),
+                agent_profile: None,
+                root,
+            });
+        }
+        sources
+    }
+
     fn ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
         let (readiness, completed) = &*self.readiness_probe;
         let mut state = readiness
@@ -692,6 +736,10 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             session_collector.clone(),
         )
         .await;
+        let history_catalog = Arc::new(HistoryCatalog::new(
+            launch_profiles.history_sources(),
+            provider_history::archive_root(&context.state_dir),
+        ));
         let state = Arc::new(ServeState {
             context: context.clone(),
             machine,
@@ -704,6 +752,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
             launch_profiles,
+            history_catalog,
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
@@ -749,6 +798,11 @@ fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
+        .route("/history/sessions", get(history_list_handler))
+        .route(
+            "/history/sessions/{id}/messages",
+            get(history_messages_handler),
+        )
         .route("/codex/accounts", get(codex_accounts_handler))
         .route("/activity/events", get(activity_events_handler))
         .route("/usage", get(usage_handler))
@@ -844,6 +898,7 @@ fn router(state: Arc<ServeState>) -> Router {
             post(fenced_structured_prompt_handler),
         )
         .route("/sessions/{id}/resume", post(resume_handler))
+        .route("/sessions/{id}/archive", post(archive_handler))
         .route("/sessions/{id}/maintenance", get(maintenance_handler))
         .route(
             "/sessions/{id}/maintenance/actions",
@@ -2869,6 +2924,26 @@ struct RepoRemoteUrlQuery {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HistoryListQuery {
+    q: Option<String>,
+    provider: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryMessagesQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveBody {
+    expected_session_incarnation: String,
+}
+
 // --- handlers -----------------------------------------------------------------
 
 /// Registry-epoch slack used only to screen protected-session candidates.
@@ -3099,12 +3174,99 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
                     "managed_resume_command": false,
                     "resume_blocked_reason": true,
                     "last_prompt": true,
+                    "history": true,
+                    "archive": true,
                     "managed_account_handoff": crate::codex_app_server::MANAGED_ACCOUNT_HANDOFF_CAPABILITY,
                 },
             }))
         }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
+    }
+}
+
+async fn history_list_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryListQuery>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let catalog = state.history_catalog.clone();
+    let machine = state.machine.clone();
+    let response_machine = machine.clone();
+    match tokio::task::spawn_blocking(move || {
+        catalog.list(
+            &machine,
+            query.q.as_deref(),
+            query.provider.as_deref(),
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+    })
+    .await
+    {
+        Ok(Ok(page)) => envelope_ok(json!({
+            "machine": response_machine,
+            "observed_at": activity_observed_at(),
+            "sessions": page.sessions,
+            "next_cursor": page.next_cursor,
+            "truncated": page.truncated,
+            "capabilities": {
+                "metadata_search": true,
+                "full_text_search": false,
+                "transcript_messages": true,
+                "archive": true,
+            },
+        })),
+        Ok(Err(error)) => history_error_response(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn history_messages_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Query(query): Query<HistoryMessagesQuery>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let catalog = state.history_catalog.clone();
+    match tokio::task::spawn_blocking(move || {
+        catalog.messages(&id, query.cursor.as_deref(), query.limit.unwrap_or(50))
+    })
+    .await
+    {
+        Ok(Ok(page)) => envelope_ok(json!({
+            "machine": state.machine,
+            "messages": page.messages,
+            "next_cursor": page.next_cursor,
+        })),
+        Ok(Err(error)) => history_error_response(error),
+        Err(_) => join_err(),
+    }
+}
+
+fn history_error_response(error: HistoryError) -> Response {
+    match error {
+        HistoryError::NotFound => status_json(
+            StatusCode::NOT_FOUND,
+            "history-session-not-found",
+            "history session was not found",
+        ),
+        HistoryError::InvalidCursor => status_json(
+            StatusCode::BAD_REQUEST,
+            "invalid-history-cursor",
+            "history cursor is invalid",
+        ),
+        HistoryError::Io => status_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history-read-failed",
+            "history could not be read",
+        ),
     }
 }
 
@@ -6553,6 +6715,108 @@ async fn delete_handler(
             envelope_ok(json!({ "machine": state.machine, "deleted": result }))
         }
         Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn archive_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<ArchiveBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-json-body",
+                "archive request requires expected_session_incarnation",
+                None,
+            ));
+        }
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    let machine = state.machine.clone();
+    let response_machine = machine.clone();
+    match tokio::task::spawn_blocking(move || {
+        let record = load_session_record(&context, &id)?;
+        let actual = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .filter(|launch_id| !launch_id.is_empty());
+        if actual != Some(body.expected_session_incarnation.as_str()) {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "session runtime changed before archive",
+                Some(json!({
+                    "id": record.id,
+                    "expected_session_incarnation": body.expected_session_incarnation,
+                    "actual_session_incarnation": actual,
+                })),
+            ));
+        }
+        let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
+            CliError::data(
+                "provider-session-unavailable",
+                "session does not have a captured provider session id",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        let agent_profile = crate::session_agent_profile(&record).map(str::to_string);
+        let history_id = provider_history::stable_history_id(
+            &provider_resume.provider,
+            agent_profile.as_deref(),
+            &provider_resume.session_id,
+        );
+        let archived_at = activity_observed_at();
+        let archive = ArchivedSession {
+            schema_version: "agent-session.history-archive.v1".to_string(),
+            history_id,
+            provider: provider_resume.provider.clone(),
+            provider_session_id: provider_resume.session_id.clone(),
+            agent_profile,
+            title: record.title.clone(),
+            cwd: record.cwd.clone(),
+            created_at: record.created_at.clone(),
+            updated_at: record.updated_at.clone(),
+            archived_at,
+        };
+        let archive_path = provider_history::write_archive(
+            &provider_history::archive_root(&context.state_dir),
+            &archive,
+        )
+        .map_err(|_| {
+            CliError::runtime(
+                "history-archive-write-failed",
+                "failed to write session archive metadata",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        match delete_session(&context, &id, tmux) {
+            Ok(deleted) => Ok((archive, deleted)),
+            Err(error) => {
+                provider_history::remove_archive(&archive_path);
+                Err(error)
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok((archive, deleted))) => {
+            state.history_catalog.invalidate();
+            cleanup_deleted_session_registries(&state, &deleted.registry_fence).await;
+            envelope_ok(json!({
+                "machine": response_machine,
+                "archived": archive,
+                "deleted": deleted,
+            }))
+        }
+        Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
     }
 }
@@ -11004,6 +11268,11 @@ mod tests {
         activity_broker: Arc<ActivityBroker>,
         session_collector: SessionCollector,
     ) -> Arc<ServeState> {
+        let launch_profiles = AgentLaunchProfiles::default();
+        let history_catalog = Arc::new(HistoryCatalog::new(
+            launch_profiles.history_sources(),
+            provider_history::archive_root(state_dir),
+        ));
         Arc::new(ServeState {
             context: CliContext {
                 state_dir: state_dir.to_path_buf(),
@@ -11018,7 +11287,8 @@ mod tests {
             codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
-            launch_profiles: AgentLaunchProfiles::default(),
+            launch_profiles,
+            history_catalog,
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
@@ -13992,6 +14262,80 @@ esac
             ])
         );
         assert!(session["provider_resume"].get("storage_only").is_none());
+    }
+
+    #[tokio::test]
+    async fn history_routes_require_token_and_advertise_metadata_only_search() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+
+        let (status, body) = call(router(st.clone()), get("/history/sessions")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+
+        let (status, body) = call(
+            router(st),
+            get_auth("/history/sessions?limit=25&provider=unknown", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["sessions"], json!([]));
+        assert_eq!(body["data"]["capabilities"]["metadata_search"], true);
+        assert_eq!(body["data"]["capabilities"]["full_text_search"], false);
+    }
+
+    #[tokio::test]
+    async fn archive_is_incarnation_fenced_and_preserves_history_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "archive-me",
+            "codex",
+            "hs-codex-archive-me",
+            tmp.path(),
+            &["resume", "resume-session-id"],
+        );
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-me/archive",
+                Some(TOKEN),
+                json!({ "expected_session_incarnation": "replacement" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert!(
+            tmp.path()
+                .join("sessions/archive-me/session.json")
+                .is_file()
+        );
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/archive-me/archive",
+                Some(TOKEN),
+                json!({ "expected_session_incarnation": "never-launched-fixture" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body["data"]["archived"]["provider_session_id"],
+            "resume-session-id"
+        );
+        assert!(!tmp.path().join("sessions/archive-me").exists());
+        let archive = tmp.path().join("history/archives").join(format!(
+            "{}.json",
+            body["data"]["archived"]["history_id"].as_str().unwrap()
+        ));
+        assert!(archive.is_file());
+        assert_eq!(
+            std::fs::metadata(archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]

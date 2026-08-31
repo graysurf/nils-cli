@@ -10,6 +10,7 @@ mod dsh_external;
 mod main_agent;
 mod maintenance;
 mod orchestration;
+mod provider_history;
 mod provider_prompt;
 mod serve;
 

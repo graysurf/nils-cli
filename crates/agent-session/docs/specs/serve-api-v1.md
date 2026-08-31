@@ -16,6 +16,8 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `GET /healthz` | Open | This specification |
 | `GET /sessions` | Open | This specification |
 | `POST /sessions` | Bearer | This specification |
+| `GET /history/sessions` | Bearer | This specification |
+| `GET /history/sessions/{history_id}/messages` | Bearer | This specification |
 | `GET /codex/accounts` | Bearer | This specification |
 | `GET /activity/events` | Bearer | [Activity stream v1](activity-stream-v1.md) |
 | `GET /usage` | Open | This specification |
@@ -36,6 +38,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `GET /sessions/{id}/messages/{message_id}/wait/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
 | `GET /sessions/{id}/buffer` | Open | This specification |
 | `POST /sessions/{id}/{send,prompt,prompt/v2,resume}` | Bearer | This specification |
+| `POST /sessions/{id}/archive` | Bearer | This specification |
 | `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints), successor [v2](session-maintenance-v2.md#negotiation) |
 | `GET and POST /sessions/{id}/orchestration/group-cleanup` | Bearer | [Main Agent orchestration v1](main-agent-orchestration-v1.md#daemon-owned-group-cleanup) |
 | `PUT /sessions/{id}/account` | Bearer | This specification |
@@ -50,6 +53,35 @@ comma-separated route segments below are exact alternatives, not wildcards.
 `agent-session serve` exposes the session control plane over loopback HTTP for a per-machine edge (e.g. the agent-console
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
 is no second state model.
+
+### Provider session history
+
+`GET /history/sessions` returns a bounded, cursor-paged catalog of resumable
+Codex and Claude provider sessions. Optional `q` searches only the returned
+metadata fields: archived title, bounded first-prompt preview, provider session
+id, provider, launch-profile id, cwd/repository label, machine, and timestamps.
+It never searches arbitrary conversation text. Optional `provider`, `cursor`,
+and `limit` further bound the result. `data.capabilities` explicitly advertises
+`metadata_search: true`, `full_text_search: false`, `transcript_messages: true`,
+and `archive: true`.
+
+`GET /history/sessions/{history_id}/messages` resolves the opaque history id
+inside the daemon and returns normalized `user`/`assistant` text messages in
+bounded pages. The browser receives neither provider transcript paths nor raw
+provider JSONL records. Both history reads require the server bearer because
+conversation content is more sensitive than the live list projection.
+
+`POST /sessions/{id}/archive` requires
+`expected_session_incarnation`. It writes private, mode-0600 Console metadata
+for the captured provider session and then runs the existing verified session
+deletion path. A changed incarnation returns a conflict. If verified deletion
+fails, the new archive metadata is rolled back and the live record remains
+retryable. Archive never deletes or rewrites the provider transcript. Existing
+`DELETE /sessions/{id}` remains the distinct permanent Console-record removal
+operation and likewise does not delete provider history.
+
+`GET /sessions` advertises additive `history` and `archive` capabilities. Older
+daemons omit them and do not serve these routes.
 
 ### Operator provider-turn reconciliation
 
