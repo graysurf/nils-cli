@@ -25,6 +25,10 @@ fn request(payload: Value, source_id: &str, rules: Value) -> Value {
 }
 
 fn evaluate(input: &Value) -> (i32, String, Value) {
+    evaluate_raw(&serde_json::to_vec(input).expect("request"))
+}
+
+fn evaluate_raw(input: &[u8]) -> (i32, String, Value) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hook"))
         .args(["data-policy", "evaluate", "--format", "json"])
         .stdin(Stdio::piped())
@@ -36,12 +40,21 @@ fn evaluate(input: &Value) -> (i32, String, Value) {
         .stdin
         .take()
         .expect("stdin")
-        .write_all(serde_json::to_vec(input).expect("request").as_slice())
+        .write_all(input)
         .expect("write request");
     let output = child.wait_with_output().expect("wait");
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     let envelope = serde_json::from_str(&stdout).expect("json envelope");
     (output.status.code().expect("exit code"), stdout, envelope)
+}
+
+#[test]
+fn rejects_input_above_one_mib_before_deserialization() {
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    let (code, stdout, envelope) = evaluate_raw(&oversized);
+    assert_eq!(code, 65);
+    assert_eq!(envelope["error"]["code"], "provider-input-too-large");
+    assert!(!stdout.contains(&"x".repeat(64)));
 }
 
 #[test]
@@ -156,8 +169,11 @@ fn corpus_covers_structured_binary_streamed_and_portable_path_boundaries() {
 }
 
 #[test]
-fn request_binding_changes_with_every_execution_identity_dimension() {
-    let rules = json!([{"rule_id":"data.sensitive.deny", "class_id":"sensitive", "action":"deny"}]);
+fn request_binding_changes_with_every_governed_dimension() {
+    let rules = json!([
+        {"rule_id":"data.sensitive.deny", "class_id":"sensitive", "action":"deny"},
+        {"rule_id":"data.machine-path.allow", "class_id":"machine-local-path", "action":"allow"}
+    ]);
     let first = request(json!({"safe":true}), "tool.native", rules.clone());
     let (_, _, first_envelope) = evaluate(&first);
     let variants = [
@@ -187,6 +203,45 @@ fn request_binding_changes_with_every_execution_identity_dimension() {
             "binding digest must bind {field}"
         );
     }
+    let variants = [
+        ("phase", json!("pre-call")),
+        ("source_id", json!("tool.web")),
+        ("sink_id", json!("tool.execute")),
+    ];
+    for (field, value) in variants {
+        let mut changed = first.clone();
+        changed[field] = value;
+        let (_, _, changed_envelope) = evaluate(&changed);
+        assert_ne!(
+            first_envelope["data"]["audit"]["binding_digest"],
+            changed_envelope["data"]["audit"]["binding_digest"],
+            "binding digest must bind {field}"
+        );
+    }
+    let mut changed_action = first.clone();
+    changed_action["rules"][0]["action"] = json!("redact");
+    let (_, _, changed_action_envelope) = evaluate(&changed_action);
+    assert_ne!(
+        first_envelope["data"]["audit"]["binding_digest"],
+        changed_action_envelope["data"]["audit"]["binding_digest"],
+        "binding digest must bind rule actions"
+    );
+    let mut changed_rule_id = first.clone();
+    changed_rule_id["rules"][0]["rule_id"] = json!("data.sensitive.alternate");
+    let (_, _, changed_rule_id_envelope) = evaluate(&changed_rule_id);
+    assert_ne!(
+        first_envelope["data"]["audit"]["binding_digest"],
+        changed_rule_id_envelope["data"]["audit"]["binding_digest"],
+        "binding digest must bind rule IDs"
+    );
+    let mut reordered = first.clone();
+    reordered["rules"].as_array_mut().expect("rules").reverse();
+    let (_, _, reordered_envelope) = evaluate(&reordered);
+    assert_ne!(
+        first_envelope["data"]["audit"]["binding_digest"],
+        reordered_envelope["data"]["audit"]["binding_digest"],
+        "binding digest must bind rule order"
+    );
 }
 
 #[test]

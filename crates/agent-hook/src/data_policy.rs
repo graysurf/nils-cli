@@ -14,7 +14,7 @@ const MAX_ID_BYTES: usize = 256;
 const REDACTED_SENSITIVE: &str = "[redacted:sensitive]";
 const REDACTED_PATH: &str = "[redacted:machine-local-path]";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum DataClass {
     Sensitive,
@@ -63,7 +63,7 @@ impl std::fmt::Display for Action {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Rule {
     rule_id: String,
@@ -85,7 +85,7 @@ struct Identity {
     step: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Phase {
     PreCall,
@@ -103,6 +103,16 @@ struct Request {
     identity: Identity,
     rules: Vec<Rule>,
     payload: Value,
+}
+
+#[derive(Serialize)]
+struct Binding<'a> {
+    phase: &'a Phase,
+    source_id: &'a str,
+    sink_id: &'a str,
+    identity: &'a Identity,
+    rules: &'a [Rule],
+    payload_digest: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -372,14 +382,20 @@ pub(crate) fn evaluate(raw: &[u8]) -> Result<Decision, HookError> {
         )
     })?;
     let payload_digest = digest(b"agent-hook.data-policy.payload.v1", &payload_bytes);
-    let identity_bytes = serde_json::to_vec(&request.identity).map_err(|_| {
+    let binding_material = serde_json::to_vec(&Binding {
+        phase: &request.phase,
+        source_id: &request.source_id,
+        sink_id: &request.sink_id,
+        identity: &request.identity,
+        rules: &request.rules,
+        payload_digest: &payload_digest,
+    })
+    .map_err(|_| {
         data_error(
-            "data-policy-identity-invalid",
-            "data-policy identity is not serializable",
+            "data-policy-request-invalid",
+            "data-policy binding is not serializable",
         )
     })?;
-    let mut binding_material = identity_bytes;
-    binding_material.extend_from_slice(payload_digest.as_bytes());
     let binding_digest = digest(b"agent-hook.data-policy.binding.v1", &binding_material);
 
     let mut classes = BTreeSet::new();
