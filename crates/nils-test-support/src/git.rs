@@ -12,6 +12,7 @@ static GIT_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct InitRepoOptions {
     pub branch: Option<String>,
+    pub isolate_hooks: bool,
     pub initial_commit: bool,
     pub initial_commit_name: String,
     pub initial_commit_contents: String,
@@ -33,6 +34,11 @@ impl InitRepoOptions {
         self
     }
 
+    pub fn with_inherited_hooks(mut self) -> Self {
+        self.isolate_hooks = false;
+        self
+    }
+
     pub fn with_initial_commit(mut self) -> Self {
         self.initial_commit = true;
         self
@@ -43,6 +49,7 @@ impl Default for InitRepoOptions {
     fn default() -> Self {
         Self {
             branch: Some("main".to_string()),
+            isolate_hooks: true,
             initial_commit: false,
             initial_commit_name: "README.md".to_string(),
             initial_commit_contents: "init".to_string(),
@@ -206,6 +213,12 @@ fn windows_pathext_extensions() -> Vec<std::ffi::OsString> {
 
 pub fn init_repo_at_with(dir: &Path, options: InitRepoOptions) {
     git(dir, &["init", "-q"]);
+
+    if options.isolate_hooks {
+        // Keep fixture repositories independent from developer-global hooks while
+        // preserving the normal repository-local hook location for hook tests.
+        git(dir, &["config", "core.hooksPath", ".git/hooks"]);
+    }
 
     if let Some(branch) = options.branch.as_deref() {
         // Make the initial branch deterministic across environments.

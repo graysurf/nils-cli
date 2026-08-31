@@ -697,12 +697,27 @@ fn commit_dry_run_validates_and_checks_staged_without_committing() {
 #[test]
 fn commit_json_outputs_result_metadata() {
     let repo = common::init_repo();
+    let ambient = tempfile::TempDir::new().expect("ambient git config");
+    let hooks_dir = ambient.path().join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("create ambient hooks dir");
+    common::write_executable(
+        ambient.path(),
+        "hooks/pre-commit",
+        "#!/bin/sh\nprintf 'inherited pre-commit hook ran\\n' >&2\n",
+    );
+    common::write_file(
+        ambient.path(),
+        ".gitconfig",
+        &format!("[core]\n\thooksPath = {}\n", hooks_dir.to_string_lossy()),
+    );
+    let ambient_config = ambient.path().join(".gitconfig");
+    let ambient_config = ambient_config.to_string_lossy();
     stage_file(repo.path(), "a.txt", "hello\n");
 
     let output = common::run_semantic_commit_output(
         repo.path(),
         &["commit", "--json", "--message", "feat(core): add thing"],
-        &[],
+        &[("GIT_CONFIG_GLOBAL", ambient_config.as_ref())],
         None,
     );
 

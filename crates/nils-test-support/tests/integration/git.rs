@@ -10,6 +10,21 @@ fn init_repo_with_default_branch_and_config() {
 
     let email = git::git(repo.path(), &["config", "user.email"]);
     assert_eq!(email.trim_end(), "test@example.com");
+
+    let hooks_path = git::git(repo.path(), &["config", "--local", "core.hooksPath"]);
+    assert_eq!(hooks_path.trim_end(), ".git/hooks");
+}
+
+#[test]
+fn init_repo_can_explicitly_inherit_hooks() {
+    let repo = git::init_repo_with(git::InitRepoOptions::new().with_inherited_hooks());
+
+    let output = git::git_output(
+        repo.path(),
+        &["config", "--local", "--get", "core.hooksPath"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
