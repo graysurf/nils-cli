@@ -37,6 +37,8 @@ pub struct Cli {
 pub enum Command {
     /// Normalize one provider request, evaluate policy, and render one decision.
     Dispatch(DispatchArgs),
+    /// Evaluate one bounded typed data-policy candidate without provider adaptation.
+    DataPolicy(DataPolicyArgs),
     /// Validate strict config, selected policy, overrides, and digests.
     Validate(FormatArgs),
     /// List public rule metadata and effective modes.
@@ -55,6 +57,25 @@ pub enum Command {
     WorkspaceRecovery(WorkspaceRecoveryArgs),
     /// Print a shell completion script.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DataPolicyArgs {
+    #[command(subcommand)]
+    pub command: DataPolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DataPolicyCommand {
+    /// Classify one pre-call or final-result payload from standard input.
+    Evaluate(DataPolicyFormatArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DataPolicyFormatArgs {
+    /// Automation-safe output format. Data policy defaults to strict JSON.
+    #[arg(long, value_enum, default_value_t = WorkspaceLeaseOutputFormat::Json)]
+    pub format: WorkspaceLeaseOutputFormat,
 }
 
 #[derive(Debug, Args)]

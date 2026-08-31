@@ -48,6 +48,38 @@ json\:"Versioned service JSON envelope"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(data-policy)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-hook__subcmd__data-policy_commands" \
+"*::: :->data-policy" \
+&& ret=0
+
+    case $state in
+    (data-policy)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-data-policy-command-$line[1]:"
+        case $line[1] in
+            (evaluate)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Data policy defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (validate)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
@@ -454,6 +486,7 @@ esac
 _agent-hook_commands() {
     local commands; commands=(
 'dispatch:Normalize one provider request, evaluate policy, and render one decision' \
+'data-policy:Evaluate one bounded typed data-policy candidate without provider adaptation' \
 'validate:Validate strict config, selected policy, overrides, and digests' \
 'inventory:List public rule metadata and effective modes' \
 'doctor:Inspect policy, provider registrations, compatibility residue, and recovery state' \
@@ -470,6 +503,18 @@ _agent-hook_commands() {
 _agent-hook__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook completion commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__data-policy_commands] )) ||
+_agent-hook__subcmd__data-policy_commands() {
+    local commands; commands=(
+'evaluate:Classify one pre-call or final-result payload from standard input' \
+    )
+    _describe -t commands 'agent-hook data-policy commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__data-policy__subcmd__evaluate_commands] )) ||
+_agent-hook__subcmd__data-policy__subcmd__evaluate_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook data-policy evaluate commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__dispatch_commands] )) ||
 _agent-hook__subcmd__dispatch_commands() {

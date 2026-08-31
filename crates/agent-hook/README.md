@@ -44,6 +44,7 @@ agent-hook setup --product claude --remove \
   --expected-plan-digest sha256:<digest> --format json
 printf '%s' "$PROVIDER_HOOK_JSON" | agent-hook dispatch --product codex
 printf '%s' "$DSH_INGRESS_JSON" | agent-hook dispatch --product dsh --format json
+printf '%s' "$DATA_POLICY_JSON" | agent-hook data-policy evaluate --format json
 printf '%s' "$FINISH_LINE_OPEN_JSON" | agent-hook finish-line open
 printf '%s' "$FINISH_LINE_JSON" | agent-hook finish-line begin --format json
 printf '%s' "$FINISH_LINE_RUN_JSON" | agent-hook finish-line run --format json
