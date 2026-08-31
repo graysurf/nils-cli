@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -13,9 +13,12 @@ use sha2::{Digest, Sha256};
 const SCAN_MAX_ENTRIES: usize = 10_000;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024;
 const MAX_PREVIEW_LINES: usize = 128;
 const MAX_PREVIEW_CHARS: usize = 240;
 const MAX_MESSAGE_CHARS: usize = 64 * 1024;
+const MAX_MESSAGE_SCAN_LINES: usize = 10_000;
+const MESSAGE_SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
 const CATALOG_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +96,41 @@ pub(crate) enum HistoryError {
     NotFound,
     InvalidCursor,
     Io,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingArchive {
+    archive: ArchivedSession,
+    path: PathBuf,
+    backup: Option<PathBuf>,
+    committed: bool,
+}
+
+impl PendingArchive {
+    pub(crate) fn commit(mut self) -> ArchivedSession {
+        if let Some(backup) = self.backup.take() {
+            let _ = fs::remove_file(backup);
+        }
+        self.committed = true;
+        self.archive.clone()
+    }
+
+    fn rollback(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = fs::remove_file(&self.path);
+        if let Some(backup) = self.backup.take() {
+            let _ = fs::rename(backup, &self.path);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingArchive {
+    fn drop(&mut self) {
+        self.rollback();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -202,7 +240,7 @@ pub(crate) fn archive_root(state_dir: &Path) -> PathBuf {
 pub(crate) fn write_archive(
     root: &Path,
     archive: &ArchivedSession,
-) -> Result<PathBuf, HistoryError> {
+) -> Result<PendingArchive, HistoryError> {
     fs::create_dir_all(root).map_err(|_| HistoryError::Io)?;
     if fs::symlink_metadata(root)
         .map_err(|_| HistoryError::Io)?
@@ -218,6 +256,11 @@ pub(crate) fn write_archive(
         archive.history_id,
         uuid::Uuid::new_v4()
     ));
+    let backup = root.join(format!(
+        ".{}.backup-{}",
+        archive.history_id,
+        uuid::Uuid::new_v4()
+    ));
     let bytes = serde_json::to_vec_pretty(archive).map_err(|_| HistoryError::Io)?;
     let result = (|| {
         let mut options = fs::OpenOptions::new();
@@ -225,17 +268,38 @@ pub(crate) fn write_archive(
         let mut file = options.open(&temp).map_err(|_| HistoryError::Io)?;
         std::io::Write::write_all(&mut file, &bytes).map_err(|_| HistoryError::Io)?;
         file.sync_all().map_err(|_| HistoryError::Io)?;
-        fs::rename(&temp, &path).map_err(|_| HistoryError::Io)
+        let previous = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(HistoryError::Io);
+            }
+            Ok(_) => {
+                fs::rename(&path, &backup).map_err(|_| HistoryError::Io)?;
+                Some(backup.clone())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(HistoryError::Io),
+        };
+        if fs::rename(&temp, &path).is_err() {
+            if let Some(previous) = previous {
+                let _ = fs::rename(previous, &path);
+            }
+            return Err(HistoryError::Io);
+        }
+        Ok(previous)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-        return Err(HistoryError::Io);
-    }
-    Ok(path)
-}
-
-pub(crate) fn remove_archive(path: &Path) {
-    let _ = fs::remove_file(path);
+    let previous = match result {
+        Ok(previous) => previous,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    };
+    Ok(PendingArchive {
+        archive: archive.clone(),
+        path,
+        backup: previous,
+        committed: false,
+    })
 }
 
 #[cfg(test)]
@@ -266,11 +330,7 @@ fn paginate_snapshot(
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<HistoryPage, HistoryError> {
-    let offset = cursor
-        .map(str::parse::<usize>)
-        .transpose()
-        .map_err(|_| HistoryError::InvalidCursor)?
-        .unwrap_or(0);
+    let cursor = cursor.map(parse_list_cursor).transpose()?;
     let limit = limit.clamp(1, 100);
     let mut sessions = snapshot.sessions;
     sessions.retain(|session| {
@@ -284,13 +344,14 @@ fn paginate_snapshot(
             .then_with(|| right.created_at.cmp(&left.created_at))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let end = offset.saturating_add(limit).min(sessions.len());
-    let page = if offset < sessions.len() {
-        sessions[offset..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    let next_cursor = (end < sessions.len()).then(|| end.to_string());
+    if let Some(cursor) = cursor {
+        sessions.retain(|session| session_is_after_cursor(session, &cursor));
+    }
+    let has_more = sessions.len() > limit;
+    let page = sessions.into_iter().take(limit).collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| page.last().map(encode_list_cursor))
+        .flatten();
     Ok(HistoryPage {
         sessions: page,
         next_cursor,
@@ -298,11 +359,68 @@ fn paginate_snapshot(
     })
 }
 
+#[derive(Debug)]
+struct ListCursor {
+    updated_at: String,
+    created_at: String,
+    id: String,
+}
+
+fn encode_list_cursor(session: &HistorySession) -> String {
+    format!(
+        "v1|{}|{}|{}",
+        session.updated_at, session.created_at, session.id
+    )
+}
+
+fn parse_list_cursor(value: &str) -> Result<ListCursor, HistoryError> {
+    let mut parts = value.split('|');
+    let cursor = ListCursor {
+        updated_at: match parts.next() {
+            Some("v1") => parts.next().unwrap_or_default().to_string(),
+            _ => return Err(HistoryError::InvalidCursor),
+        },
+        created_at: parts.next().unwrap_or_default().to_string(),
+        id: parts.next().unwrap_or_default().to_string(),
+    };
+    if cursor.updated_at.is_empty()
+        || cursor.created_at.is_empty()
+        || cursor.id.is_empty()
+        || parts.next().is_some()
+    {
+        return Err(HistoryError::InvalidCursor);
+    }
+    Ok(cursor)
+}
+
+fn session_is_after_cursor(session: &HistorySession, cursor: &ListCursor) -> bool {
+    session.updated_at < cursor.updated_at
+        || (session.updated_at == cursor.updated_at
+            && (session.created_at < cursor.created_at
+                || (session.created_at == cursor.created_at && session.id > cursor.id)))
+}
+
 fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnapshot {
-    let archives = read_archives(archives_root);
     let deadline = Instant::now() + SCAN_MAX_DURATION;
-    let mut visited = 0usize;
     let mut truncated = false;
+    let archives = read_archives(archives_root, deadline, &mut truncated);
+    let archives_by_provider_id = archives.values().fold(
+        HashMap::<(String, String), &ArchivedSession>::new(),
+        |mut index, archive| {
+            let key = (
+                archive.provider.clone(),
+                archive.provider_session_id.clone(),
+            );
+            let replace = index
+                .get(&key)
+                .is_none_or(|current| current.archived_at < archive.archived_at);
+            if replace {
+                index.insert(key, archive);
+            }
+            index
+        },
+    );
+    let mut visited = 0usize;
     let mut sessions = Vec::new();
     let mut seen = HashSet::new();
 
@@ -318,17 +436,20 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
             &mut truncated,
         );
         for path in paths {
-            let Some(mut session) = inspect_history_file(source, &path) else {
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let Some(mut session) = inspect_history_file(source, &path, deadline) else {
                 continue;
             };
             let archive = archives.get(&session.id).or_else(|| {
-                archives
-                    .values()
-                    .filter(|archive| {
-                        archive.provider == session.provider
-                            && archive.provider_session_id == session.provider_session_id
-                    })
-                    .max_by(|left, right| left.archived_at.cmp(&right.archived_at))
+                archives_by_provider_id
+                    .get(&(
+                        session.provider.clone(),
+                        session.provider_session_id.clone(),
+                    ))
+                    .copied()
             });
             if let Some(archive) = archive {
                 session.id = archive.history_id.clone();
@@ -342,6 +463,10 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
                 continue;
             }
             sessions.push(session);
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
         }
         if truncated {
             break;
@@ -412,7 +537,11 @@ fn find_session(sources: &[HistorySource], history_id: &str) -> Option<HistorySe
             &mut truncated,
         );
         for path in paths {
-            let Some(session) = inspect_history_file(source, &path) else {
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            let Some(session) = inspect_history_file(source, &path, deadline) else {
                 continue;
             };
             if session.id == history_id {
@@ -468,7 +597,14 @@ fn collect_jsonl(
     }
 }
 
-fn inspect_history_file(source: &HistorySource, path: &Path) -> Option<HistorySession> {
+fn inspect_history_file(
+    source: &HistorySource,
+    path: &Path,
+    deadline: Instant,
+) -> Option<HistorySession> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     let metadata = fs::metadata(path).ok()?;
     let updated_at = format_system_time(metadata.modified().ok()?);
     let (provider_session_id, cwd, created_at) = match source.provider.as_str() {
@@ -498,7 +634,7 @@ fn inspect_history_file(source: &HistorySource, path: &Path) -> Option<HistorySe
         provider_session_id,
         agent_profile: source.agent_profile.clone(),
         title: None,
-        prompt_preview: first_prompt(path, &source.provider),
+        prompt_preview: first_prompt(path, &source.provider, deadline),
         repo_name: repo_name(&cwd),
         cwd,
         created_at,
@@ -509,12 +645,19 @@ fn inspect_history_file(source: &HistorySource, path: &Path) -> Option<HistorySe
     })
 }
 
-fn first_prompt(path: &Path, provider: &str) -> Option<String> {
+fn first_prompt(path: &Path, provider: &str, deadline: Instant) -> Option<String> {
     let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for line in reader.split(b'\n').take(MAX_PREVIEW_LINES) {
-        let Ok(line) = line else { continue };
-        if line.len() > MAX_LINE_BYTES {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    for _ in 0..MAX_PREVIEW_LINES {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let bounded = read_bounded_line(&mut reader, &mut line).ok()?;
+        if bounded == BoundedLine::Eof {
+            return None;
+        }
+        if bounded == BoundedLine::Oversized {
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
@@ -530,6 +673,57 @@ fn first_prompt(path: &Path, provider: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+) -> std::io::Result<BoundedLine> {
+    output.clear();
+    let mut read_any = false;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if !read_any {
+                BoundedLine::Eof
+            } else if oversized {
+                BoundedLine::Oversized
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        let ends_line = available.get(end.saturating_sub(1)) == Some(&b'\n');
+        read_any = true;
+        if !oversized {
+            let remaining = MAX_LINE_BYTES.saturating_sub(output.len());
+            if end <= remaining {
+                output.extend_from_slice(&available[..end]);
+            } else {
+                output.extend_from_slice(&available[..remaining]);
+                oversized = true;
+            }
+        }
+        reader.consume(end);
+        if ends_line {
+            return Ok(if oversized {
+                BoundedLine::Oversized
+            } else {
+                BoundedLine::Line
+            });
+        }
+    }
+}
+
 fn read_messages(
     session: &HistorySession,
     offset: u64,
@@ -543,18 +737,26 @@ fn read_messages(
     let mut messages = Vec::new();
     let mut line = Vec::new();
     let mut ordinal = 0usize;
+    let mut scanned = 0usize;
+    let deadline = Instant::now() + MESSAGE_SCAN_MAX_DURATION;
     while messages.len() < limit {
+        if scanned >= MAX_MESSAGE_SCAN_LINES || Instant::now() >= deadline {
+            let next = reader.stream_position().map_err(|_| HistoryError::Io)?;
+            return Ok(HistoryMessagesPage {
+                messages,
+                next_cursor: Some(next.to_string()),
+            });
+        }
         line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|_| HistoryError::Io)?;
-        if read == 0 {
+        let bounded = read_bounded_line(&mut reader, &mut line).map_err(|_| HistoryError::Io)?;
+        if bounded == BoundedLine::Eof {
             return Ok(HistoryMessagesPage {
                 messages,
                 next_cursor: None,
             });
         }
-        if line.len() > MAX_LINE_BYTES {
+        scanned += 1;
+        if bounded == BoundedLine::Oversized {
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
@@ -660,14 +862,28 @@ fn matches_metadata(session: &HistorySession, machine: &str, query: Option<&str>
     .any(|value| value.to_lowercase().contains(&query))
 }
 
-fn read_archives(root: &Path) -> BTreeMap<String, ArchivedSession> {
+fn read_archives(
+    root: &Path,
+    deadline: Instant,
+    truncated: &mut bool,
+) -> BTreeMap<String, ArchivedSession> {
     let mut archives = BTreeMap::new();
     let Ok(entries) = fs::read_dir(root) else {
         return archives;
     };
     for entry in entries.flatten().take(SCAN_MAX_ENTRIES) {
+        if Instant::now() >= deadline {
+            *truncated = true;
+            break;
+        }
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.len() > MAX_ARCHIVE_BYTES {
             continue;
         }
         let Ok(bytes) = fs::read(path) else { continue };
@@ -705,6 +921,24 @@ fn truncate_chars(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_session(id: &str, updated_at: &str) -> HistorySession {
+        HistorySession {
+            id: id.to_string(),
+            provider: "codex".to_string(),
+            provider_session_id: id.to_string(),
+            agent_profile: None,
+            title: None,
+            prompt_preview: None,
+            cwd: "/work/example".to_string(),
+            repo_name: Some("example".to_string()),
+            created_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+            archived_at: None,
+            resumable: true,
+            transcript_path: PathBuf::new(),
+        }
+    }
 
     #[test]
     fn metadata_search_does_not_match_non_preview_transcript_text() {
@@ -828,5 +1062,143 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn bounded_line_reader_discards_overflow_before_the_next_record() {
+        let mut input = vec![b'x'; MAX_LINE_BYTES + 4096];
+        input.extend_from_slice(b"\n{\"ok\":true}\n");
+        let mut reader = BufReader::new(input.as_slice());
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLine::Oversized
+        );
+        assert!(line.len() <= MAX_LINE_BYTES);
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLine::Line
+        );
+        assert_eq!(line, b"{\"ok\":true}\n");
+    }
+
+    #[test]
+    fn list_cursor_is_stable_when_a_newer_session_is_inserted() {
+        let original = CatalogSnapshot {
+            sessions: vec![
+                history_session("a", "2026-08-31T03:00:00Z"),
+                history_session("b", "2026-08-31T02:00:00Z"),
+                history_session("c", "2026-08-31T01:00:00Z"),
+            ],
+            truncated: false,
+        };
+        let first = paginate_snapshot(original, "test", None, None, None, 2).unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let refreshed = CatalogSnapshot {
+            sessions: vec![
+                history_session("new", "2026-08-31T04:00:00Z"),
+                history_session("a", "2026-08-31T03:00:00Z"),
+                history_session("b", "2026-08-31T02:00:00Z"),
+                history_session("c", "2026-08-31T01:00:00Z"),
+            ],
+            truncated: false,
+        };
+        let second = paginate_snapshot(
+            refreshed,
+            "test",
+            None,
+            None,
+            first.next_cursor.as_deref(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+    }
+
+    #[test]
+    fn claude_history_excludes_sidechains_and_pages_visible_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects/repo");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("claude-id.jsonl"),
+            concat!(
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"message\":{\"content\":\"first\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"content\":\"hidden\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let sources = [HistorySource {
+            provider: "claude".into(),
+            agent_profile: None,
+            root: tmp.path().join("projects"),
+        }];
+
+        let page = list(
+            &sources,
+            &tmp.path().join("archives"),
+            "test",
+            Some("first"),
+            Some("claude"),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        let first = messages(&sources, &page.sessions[0].id, None, 1).unwrap();
+        assert_eq!(first.messages[0].text, "first");
+        let second = messages(
+            &sources,
+            &page.sessions[0].id,
+            first.next_cursor.as_deref(),
+            10,
+        )
+        .unwrap();
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.messages[0].text, "second");
+    }
+
+    #[test]
+    fn failed_rearchive_restores_previously_committed_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("archives");
+        let mut archive = ArchivedSession {
+            schema_version: "agent-session.history-archive.v1".to_string(),
+            history_id: stable_history_id("codex", None, "abc"),
+            provider: "codex".to_string(),
+            provider_session_id: "abc".to_string(),
+            agent_profile: None,
+            title: Some("original".to_string()),
+            cwd: "/work/example".to_string(),
+            created_at: "2026-08-31T00:00:00Z".to_string(),
+            updated_at: "2026-08-31T00:00:01Z".to_string(),
+            archived_at: "2026-08-31T00:00:02Z".to_string(),
+        };
+        write_archive(&root, &archive).unwrap().commit();
+        let path = root.join(format!("{}.json", archive.history_id));
+        let original = fs::read(&path).unwrap();
+
+        archive.title = Some("replacement".to_string());
+        let pending = write_archive(&root, &archive).unwrap();
+        drop(pending);
+
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 }

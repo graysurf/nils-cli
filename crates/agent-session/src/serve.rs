@@ -66,11 +66,12 @@ use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
     SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
-    delete_session, glance_session, load_session_record, non_empty_env, profile_unavailable,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title_if_revision, write_session_attachment,
+    delete_session, delete_session_with_expected_incarnation_and_prepare, glance_session,
+    load_session_record, non_empty_env, profile_unavailable, repo_remote_url_from_cwd,
+    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_auto_resume_input,
+    send_input_serialized, session_clipboard_buffer, session_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title_if_revision,
+    write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -6743,67 +6744,50 @@ async fn archive_handler(
     let machine = state.machine.clone();
     let response_machine = machine.clone();
     match tokio::task::spawn_blocking(move || {
-        let record = load_session_record(&context, &id)?;
-        let actual = record
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.launch_id.as_str())
-            .filter(|launch_id| !launch_id.is_empty());
-        if actual != Some(body.expected_session_incarnation.as_str()) {
-            return Err(CliError::data(
-                "session-incarnation-conflict",
-                "session runtime changed before archive",
-                Some(json!({
-                    "id": record.id,
-                    "expected_session_incarnation": body.expected_session_incarnation,
-                    "actual_session_incarnation": actual,
-                })),
-            ));
-        }
-        let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
-            CliError::data(
-                "provider-session-unavailable",
-                "session does not have a captured provider session id",
-                Some(json!({ "id": record.id })),
-            )
-        })?;
-        let agent_profile = crate::session_agent_profile(&record).map(str::to_string);
-        let history_id = provider_history::stable_history_id(
-            &provider_resume.provider,
-            agent_profile.as_deref(),
-            &provider_resume.session_id,
-        );
-        let archived_at = activity_observed_at();
-        let archive = ArchivedSession {
-            schema_version: "agent-session.history-archive.v1".to_string(),
-            history_id,
-            provider: provider_resume.provider.clone(),
-            provider_session_id: provider_resume.session_id.clone(),
-            agent_profile,
-            title: record.title.clone(),
-            cwd: record.cwd.clone(),
-            created_at: record.created_at.clone(),
-            updated_at: record.updated_at.clone(),
-            archived_at,
-        };
-        let archive_path = provider_history::write_archive(
-            &provider_history::archive_root(&context.state_dir),
-            &archive,
-        )
-        .map_err(|_| {
-            CliError::runtime(
-                "history-archive-write-failed",
-                "failed to write session archive metadata",
-                Some(json!({ "id": record.id })),
-            )
-        })?;
-        match delete_session(&context, &id, tmux) {
-            Ok(deleted) => Ok((archive, deleted)),
-            Err(error) => {
-                provider_history::remove_archive(&archive_path);
-                Err(error)
-            }
-        }
+        let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
+            &context,
+            &id,
+            tmux,
+            &body.expected_session_incarnation,
+            |record| {
+                let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
+                    CliError::data(
+                        "provider-session-unavailable",
+                        "session does not have a captured provider session id",
+                        Some(json!({ "id": record.id })),
+                    )
+                })?;
+                let agent_profile = crate::session_agent_profile(record).map(str::to_string);
+                let archive = ArchivedSession {
+                    schema_version: "agent-session.history-archive.v1".to_string(),
+                    history_id: provider_history::stable_history_id(
+                        &provider_resume.provider,
+                        agent_profile.as_deref(),
+                        &provider_resume.session_id,
+                    ),
+                    provider: provider_resume.provider.clone(),
+                    provider_session_id: provider_resume.session_id.clone(),
+                    agent_profile,
+                    title: record.title.clone(),
+                    cwd: record.cwd.clone(),
+                    created_at: record.created_at.clone(),
+                    updated_at: record.updated_at.clone(),
+                    archived_at: activity_observed_at(),
+                };
+                provider_history::write_archive(
+                    &provider_history::archive_root(&context.state_dir),
+                    &archive,
+                )
+                .map_err(|_| {
+                    CliError::runtime(
+                        "history-archive-write-failed",
+                        "failed to write session archive metadata",
+                        Some(json!({ "id": record.id })),
+                    )
+                })
+            },
+        )?;
+        Ok((pending_archive.commit(), deleted))
     })
     .await
     {
