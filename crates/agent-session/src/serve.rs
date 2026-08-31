@@ -14270,6 +14270,10 @@ esac
     #[tokio::test]
     async fn archive_is_incarnation_fenced_and_preserves_history_metadata() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = executable(
+            &tmp.path().join("archive-tmux"),
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message|has-session) printf '%s\\n' \"can't find session: archive-me\" >&2; exit 1 ;;\n  *) exit 42 ;;\nesac\n",
+        );
         seed_resumable_session(
             tmp.path(),
             "archive-me",
@@ -14278,7 +14282,7 @@ esac
             tmp.path(),
             &["resume", "resume-session-id"],
         );
-        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let st = state(tmp.path(), Some(TOKEN), tmux);
 
         let (status, body) = call(
             router(st.clone()),

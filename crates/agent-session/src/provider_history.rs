@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -404,22 +404,6 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
     let deadline = Instant::now() + SCAN_MAX_DURATION;
     let mut truncated = false;
     let archives = read_archives(archives_root, deadline, &mut truncated);
-    let archives_by_provider_id = archives.values().fold(
-        HashMap::<(String, String), &ArchivedSession>::new(),
-        |mut index, archive| {
-            let key = (
-                archive.provider.clone(),
-                archive.provider_session_id.clone(),
-            );
-            let replace = index
-                .get(&key)
-                .is_none_or(|current| current.archived_at < archive.archived_at);
-            if replace {
-                index.insert(key, archive);
-            }
-            index
-        },
-    );
     let mut visited = 0usize;
     let mut sessions = Vec::new();
     let mut seen = HashSet::new();
@@ -443,14 +427,7 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
             let Some(mut session) = inspect_history_file(source, &path, deadline) else {
                 continue;
             };
-            let archive = archives.get(&session.id).or_else(|| {
-                archives_by_provider_id
-                    .get(&(
-                        session.provider.clone(),
-                        session.provider_session_id.clone(),
-                    ))
-                    .copied()
-            });
+            let archive = archives.get(&session.id);
             if let Some(archive) = archive {
                 session.id = archive.history_id.clone();
                 session.agent_profile = archive.agent_profile.clone();
@@ -1173,6 +1150,88 @@ mod tests {
         .unwrap();
         assert_eq!(second.messages.len(), 1);
         assert_eq!(second.messages[0].text, "second");
+    }
+
+    #[test]
+    fn archives_do_not_cross_profile_identity_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_a_root = tmp.path().join("profile-a/2026/08/31");
+        let profile_b_root = tmp.path().join("profile-b/2026/08/31");
+        fs::create_dir_all(&profile_a_root).unwrap();
+        fs::create_dir_all(&profile_b_root).unwrap();
+        fs::write(
+            profile_a_root.join("rollout.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"shared-id\",\"cwd\":\"/work/profile-a\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n",
+                "{\"timestamp\":\"2026-08-31T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"profile a transcript\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            profile_b_root.join("rollout.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"shared-id\",\"cwd\":\"/work/profile-b\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n",
+                "{\"timestamp\":\"2026-08-31T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"profile b transcript\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let sources = [
+            HistorySource {
+                provider: "codex".into(),
+                agent_profile: Some("profile-a".into()),
+                root: tmp.path().join("profile-a"),
+            },
+            HistorySource {
+                provider: "codex".into(),
+                agent_profile: Some("profile-b".into()),
+                root: tmp.path().join("profile-b"),
+            },
+        ];
+        let archives = tmp.path().join("archives");
+        let profile_a_id = stable_history_id("codex", Some("profile-a"), "shared-id");
+        let profile_b_id = stable_history_id("codex", Some("profile-b"), "shared-id");
+        write_archive(
+            &archives,
+            &ArchivedSession {
+                schema_version: "agent-session.history-archive.v1".into(),
+                history_id: profile_a_id.clone(),
+                provider: "codex".into(),
+                provider_session_id: "shared-id".into(),
+                agent_profile: Some("profile-a".into()),
+                title: Some("Archived profile A".into()),
+                cwd: "/work/profile-a".into(),
+                created_at: "2026-08-31T00:00:00Z".into(),
+                updated_at: "2026-08-31T00:00:01Z".into(),
+                archived_at: "2026-08-31T00:00:02Z".into(),
+            },
+        )
+        .unwrap()
+        .commit();
+
+        let page = list(&sources, &archives, "test", None, None, None, 10).unwrap();
+        assert_eq!(page.sessions.len(), 2);
+        let profile_a = page
+            .sessions
+            .iter()
+            .find(|session| session.id == profile_a_id)
+            .unwrap();
+        assert_eq!(profile_a.title.as_deref(), Some("Archived profile A"));
+        assert!(profile_a.archived_at.is_some());
+        let profile_b = page
+            .sessions
+            .iter()
+            .find(|session| session.id == profile_b_id)
+            .unwrap();
+        assert_eq!(profile_b.agent_profile.as_deref(), Some("profile-b"));
+        assert_eq!(profile_b.cwd, "/work/profile-b");
+        assert!(profile_b.archived_at.is_none());
+        assert_eq!(
+            messages(&sources, &profile_b_id, None, 10)
+                .unwrap()
+                .messages[0]
+                .text,
+            "profile b transcript"
+        );
     }
 
     #[test]
