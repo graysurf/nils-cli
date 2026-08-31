@@ -80,7 +80,8 @@ Inputs:
   - `--skip-local-brew-upgrade` (do not run `brew update` + `brew upgrade/install <formula>` after a successful tap update)
   - `NILS_CLI_HOMEBREW_TAP_DIR` (env var; optional local tap checkout path)
   - `NILS_CLI_HOMEBREW_TAP_REPO` (env var; tap repo slug)
-  - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 1200)
+  - `NILS_CLI_RELEASE_WAIT_SECONDS` (env var; max seconds to wait for source `release.yml`, default 3600;
+    this covers the required full-CI fallback before release assets are published)
   - `NILS_CLI_TAP_WAIT_SECONDS` (env var; max seconds to wait for tap formula update, default 1200)
   - `NILS_CLI_TAP_POLL_SECONDS` (env var; seconds between tap formula polls, default 15)
 
@@ -213,6 +214,8 @@ Failure modes:
 - Tap stage failures (only when the tap stage runs):
   - `--from-tap` requested without a matching local `v<version>` tag or without a resolvable source repo slug.
   - `release.yml` wait exceeds `NILS_CLI_RELEASE_WAIT_SECONDS` (or the run finishes non-success).
+    A timeout after the local tag exists reports the exact `--version <version> --from-tap`
+    continuation to run after the source workflow succeeds.
   - Source release workflow cannot dispatch `sympoies/homebrew-tap` because `HOMEBREW_TAP_DISPATCH_TOKEN` is missing or unauthorized.
   - Tap `update-nils-cli-formula.yml` wait exceeds `NILS_CLI_TAP_WAIT_SECONDS` or finishes non-success.
   - Local Homebrew upgrade fails, or the installed local formula version remains different from `X.Y.Z`.

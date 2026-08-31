@@ -243,6 +243,95 @@ EOF
   chmod +x "${bin_dir}/gh"
 }
 
+create_mock_gh_source_wait() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log_file="${MOCK_LOG:?}"
+count_file="${MOCK_GH_COUNT_FILE:?}"
+count=0
+[[ ! -f "$count_file" ]] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf 'gh:%s\n' "$*" >> "$log_file"
+
+if [[ "$*" != *"run list"* || "$*" != *"release.yml"* ]]; then
+  echo "unexpected gh command: $*" >&2
+  exit 1
+fi
+
+case "${MOCK_RELEASE_RUN_MODE:?}" in
+  delayed-success)
+    if ((count == 1)); then
+      printf '[{"databaseId":42,"status":"in_progress","conclusion":null,"url":"https://example.test/source/42","headBranch":"v0.6.5","headSha":""}]\n'
+    else
+      printf '[{"databaseId":42,"status":"completed","conclusion":"success","url":"https://example.test/source/42","headBranch":"v0.6.5","headSha":""}]\n'
+    fi
+    ;;
+  in-progress)
+    printf '[{"databaseId":43,"status":"in_progress","conclusion":null,"url":"https://example.test/source/43","headBranch":"v0.6.5","headSha":""}]\n'
+    ;;
+  cancelled)
+    printf '[{"databaseId":44,"status":"completed","conclusion":"cancelled","url":"https://example.test/source/44","headBranch":"v0.6.5","headSha":""}]\n'
+    ;;
+  *)
+    echo "unexpected MOCK_RELEASE_RUN_MODE: ${MOCK_RELEASE_RUN_MODE}" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "${bin_dir}/gh"
+}
+
+create_virtual_release_wait_clock() {
+  local env_file="$1"
+  cat > "$env_file" <<'EOF'
+release_wait_now_seconds() {
+  local now remaining
+  now="$(head -n 1 "${MOCK_CLOCK_FILE:?}")"
+  [[ -n "$now" ]] || {
+    echo "virtual release wait clock exhausted" >&2
+    return 1
+  }
+  remaining="${MOCK_CLOCK_FILE}.remaining"
+  tail -n +2 "$MOCK_CLOCK_FILE" > "$remaining"
+  mv "$remaining" "$MOCK_CLOCK_FILE"
+  printf '%s\n' "$now"
+}
+
+sleep() {
+  printf 'sleep:%s\n' "${1:-}" >> "${MOCK_LOG:?}"
+}
+EOF
+}
+
+prepare_source_wait_fixture() {
+  source_wait_tmp="$(mktemp -d)"
+  source_wait_repo="${source_wait_tmp}/repo"
+  source_wait_remote="${source_wait_tmp}/repo.git"
+  source_wait_bin="${source_wait_tmp}/bin"
+  source_wait_log="${source_wait_tmp}/mock.log"
+  source_wait_stderr="${source_wait_tmp}/stderr.log"
+  source_wait_clock="${source_wait_tmp}/clock"
+  source_wait_env="${source_wait_tmp}/bash-env"
+  source_wait_gh_count="${source_wait_tmp}/gh-count"
+
+  mkdir -p "$source_wait_repo" "$source_wait_bin"
+  create_temp_repo "$source_wait_repo" "v0.6.4"
+  create_mock_cargo "$source_wait_bin"
+  create_mock_semantic_commit "$source_wait_bin"
+  create_mock_git_scope "$source_wait_bin"
+  create_mock_gh_source_wait "$source_wait_bin"
+  create_virtual_release_wait_clock "$source_wait_env"
+
+  git init --bare "$source_wait_remote" >/dev/null
+  git -C "$source_wait_repo" remote add origin git@github.com:test-org/test-repo.git
+  git -C "$source_wait_repo" remote set-url --push origin "$source_wait_remote"
+  git -C "$source_wait_repo" push -u origin main >/dev/null
+}
+
 # gh stub for the tap-wait gate with the two facts it must separate made
 # independently settable:
 #   MOCK_TAP_RUN_TITLE       displayTitle of the tap formula-update run, i.e. a
@@ -1455,6 +1544,159 @@ EOF
   assert_contains "$stderr_file" "must start with 'chore/'"
 }
 
+test_source_release_wait_continues_after_1200_seconds() {
+  prepare_source_wait_fixture
+  printf '0\n1301\n1302\n' > "$source_wait_clock"
+
+  (
+    cd "$source_wait_repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${source_wait_bin}:$PATH" \
+      BASH_ENV="$source_wait_env" \
+      MOCK_LOG="$source_wait_log" \
+      MOCK_CLOCK_FILE="$source_wait_clock" \
+      MOCK_GH_COUNT_FILE="$source_wait_gh_count" \
+      MOCK_RELEASE_RUN_MODE="delayed-success" \
+      "$entrypoint" --version 0.6.5 --direct-push --skip-ci-wait \
+      --tap-repo custom-org/custom-tap --tap-formula alternate \
+      --skip-tap-wait --skip-tap-tag --skip-dev-clean \
+      --skip-local-brew-upgrade
+  ) >"${source_wait_tmp}/stdout.log" 2>"$source_wait_stderr"
+
+  assert_contains "$source_wait_stderr" 'release.yml run 42 completed'
+  assert_contains "$source_wait_stderr" '--skip-tap-wait set; not waiting for custom-org/custom-tap formula update'
+  assert_contains "$source_wait_log" 'sleep:20'
+  [[ "$(<"$source_wait_gh_count")" == "2" ]] ||
+    fail "delayed source release should be polled twice"
+}
+
+test_source_release_wait_short_override_times_out_before_tap() {
+  prepare_source_wait_fixture
+  printf '0\n10\n61\n' > "$source_wait_clock"
+  local custom_tap_dir="${source_wait_tmp}/custom tap"
+
+  set +e
+  (
+    cd "$source_wait_repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${source_wait_bin}:$PATH" \
+      BASH_ENV="$source_wait_env" \
+      MOCK_LOG="$source_wait_log" \
+      MOCK_CLOCK_FILE="$source_wait_clock" \
+      MOCK_GH_COUNT_FILE="$source_wait_gh_count" \
+      MOCK_RELEASE_RUN_MODE="in-progress" \
+      NILS_CLI_RELEASE_WAIT_SECONDS=60 \
+      "$entrypoint" --version 0.6.5 --direct-push --skip-ci-wait \
+      --tap-dir "$custom_tap_dir" --tap-repo custom-org/custom-tap \
+      --tap-formula alternate --skip-tap-wait --skip-tap-tag \
+      --skip-dev-clean --skip-local-brew-upgrade \
+      >"${source_wait_tmp}/stdout.log" 2>"$source_wait_stderr"
+  )
+  local rc=$?
+  set -e
+
+  [[ "$rc" -ne 0 ]] || fail "short source release wait should time out"
+  assert_contains "$source_wait_stderr" 'timed out after 60s waiting for release.yml'
+  assert_contains "$source_wait_stderr" 'resume after release.yml succeeds with:'
+  assert_contains "$source_wait_stderr" '--version 0.6.5 --from-tap'
+  assert_contains "$source_wait_stderr" '--tap-repo custom-org/custom-tap'
+  assert_contains "$source_wait_stderr" '--tap-formula alternate'
+  assert_contains "$source_wait_stderr" '--skip-tap-wait'
+  assert_contains "$source_wait_stderr" '--skip-tap-tag'
+  assert_contains "$source_wait_stderr" '--skip-dev-clean'
+  assert_contains "$source_wait_stderr" '--skip-local-brew-upgrade'
+  local escaped_tap_dir
+  printf -v escaped_tap_dir '%q' "$custom_tap_dir"
+  if ! rg -Fq -- "--tap-dir ${escaped_tap_dir}" "$source_wait_stderr"; then
+    fail "resume command did not preserve the shell-escaped custom tap directory"
+  fi
+  assert_not_contains "$source_wait_stderr" '--skip-tap-wait set; not waiting for'
+  [[ "$(<"$source_wait_gh_count")" == "1" ]] ||
+    fail "short source release wait should stop after one poll"
+}
+
+test_source_release_wait_cancelled_fails_immediately() {
+  prepare_source_wait_fixture
+  printf '0\n10\n' > "$source_wait_clock"
+
+  set +e
+  (
+    cd "$source_wait_repo"
+    env -u RUSTC_WRAPPER -u NILS_CLI_HOMEBREW_TAP_DIR \
+      PATH="${source_wait_bin}:$PATH" \
+      BASH_ENV="$source_wait_env" \
+      MOCK_LOG="$source_wait_log" \
+      MOCK_CLOCK_FILE="$source_wait_clock" \
+      MOCK_GH_COUNT_FILE="$source_wait_gh_count" \
+      MOCK_RELEASE_RUN_MODE="cancelled" \
+      "$entrypoint" --version 0.6.5 --direct-push --skip-ci-wait \
+      --tap-repo custom-org/custom-tap --skip-tap-wait --skip-dev-clean \
+      --skip-local-brew-upgrade \
+      >"${source_wait_tmp}/stdout.log" 2>"$source_wait_stderr"
+  )
+  local rc=$?
+  set -e
+
+  [[ "$rc" -ne 0 ]] || fail "cancelled source release should fail"
+  assert_contains "$source_wait_stderr" "conclusion='cancelled'"
+  assert_contains "$source_wait_stderr" 'https://example.test/source/44'
+  assert_not_contains "$source_wait_log" 'sleep:'
+  assert_not_contains "$source_wait_stderr" '--skip-tap-wait set; not waiting for'
+}
+
+test_source_release_wait_timeout_materializes_env_tap_options() {
+  prepare_source_wait_fixture
+  printf '0\n10\n61\n' > "$source_wait_clock"
+  local env_tap_dir="${source_wait_tmp}/environment tap"
+
+  set +e
+  (
+    cd "$source_wait_repo"
+    env -u RUSTC_WRAPPER \
+      PATH="${source_wait_bin}:$PATH" \
+      BASH_ENV="$source_wait_env" \
+      MOCK_LOG="$source_wait_log" \
+      MOCK_CLOCK_FILE="$source_wait_clock" \
+      MOCK_GH_COUNT_FILE="$source_wait_gh_count" \
+      MOCK_RELEASE_RUN_MODE="in-progress" \
+      NILS_CLI_RELEASE_WAIT_SECONDS=60 \
+      NILS_CLI_HOMEBREW_TAP_DIR="$env_tap_dir" \
+      NILS_CLI_HOMEBREW_TAP_REPO="environment-org/homebrew-environment" \
+      "$entrypoint" --version 0.6.5 --direct-push --skip-ci-wait \
+      --skip-tap-wait --skip-dev-clean --skip-local-brew-upgrade \
+      >"${source_wait_tmp}/stdout.log" 2>"$source_wait_stderr"
+  )
+  local rc=$?
+  set -e
+
+  [[ "$rc" -ne 0 ]] || fail "environment-configured source release wait should time out"
+  local escaped_tap_dir
+  printf -v escaped_tap_dir '%q' "$env_tap_dir"
+  if ! rg -Fq -- "--tap-dir ${escaped_tap_dir}" "$source_wait_stderr"; then
+    fail "resume command did not materialize the environment tap directory"
+  fi
+  assert_contains "$source_wait_stderr" '--tap-repo environment-org/homebrew-environment'
+  assert_not_contains "$source_wait_stderr" '--tap-repo sympoies/homebrew-tap'
+}
+
+test_source_release_wait_default_covers_full_ci() {
+  local release_default
+  release_default="$(
+    sed -n 's/.*NILS_CLI_RELEASE_WAIT_SECONDS:-\([0-9][0-9]*\).*/\1/p' "$entrypoint"
+  )"
+
+  [[ -n "$release_default" ]] || fail "source release wait default is missing"
+  ((release_default >= 3600)) ||
+    fail "source release wait default must be at least 3600 seconds (got: $release_default)"
+  assert_contains "${skill_root}/SKILL.md" 'NILS_CLI_RELEASE_WAIT_SECONDS.*default 3600'
+  assert_contains "$entrypoint" 'resume after release.yml succeeds with:'
+  assert_contains "$entrypoint" 'release_resume_args=.*--from-tap'
+
+  # Source release completion must have enough time for required full CI, while
+  # the independently configurable tap wait keeps its existing default.
+  assert_contains "$entrypoint" 'NILS_CLI_TAP_WAIT_SECONDS:-1200'
+}
+
 run_all() {
   if [[ ! -f "${skill_root}/SKILL.md" ]]; then
     fail "missing SKILL.md"
@@ -1483,6 +1725,11 @@ run_all() {
     test_pr_mode_carries_the_observed_ledger_tip_on_a_resumed_chain
     test_pr_mode_from_linked_worktree_tags_without_checkout_main
     test_pr_mode_rejects_non_chore_release_branch
+    test_source_release_wait_continues_after_1200_seconds
+    test_source_release_wait_short_override_times_out_before_tap
+    test_source_release_wait_cancelled_fails_immediately
+    test_source_release_wait_timeout_materializes_env_tap_options
+    test_source_release_wait_default_covers_full_ci
   )
 
   # `test_full_checks...` drives the real toolchain: it probes the active

@@ -350,23 +350,33 @@ print(match.group(1))
 PY
 }
 
+# Keep the elapsed-time source behind a function so the shell regression suite
+# can advance a virtual clock without making production waits shorter.
+if ! declare -F release_wait_now_seconds >/dev/null; then
+  release_wait_now_seconds() {
+    printf '%s\n' "$SECONDS"
+  }
+fi
+
 # Wait for a workflow run on a given commit/tag-ref to finish.
-# Args: repo, workflow_filename, head_ref (tag name or commit sha), max_seconds
+# Args: repo, workflow_filename, head_ref (tag name or commit sha), max_seconds,
+# optional timeout recovery hint
 wait_for_release_run() {
   local repo="$1"
   local workflow="$2"
   local head_ref="$3"
   local max_seconds="${4:-1200}"
+  local timeout_hint="${5:-}"
 
   command -v gh >/dev/null 2>&1 || die "gh is required to wait for ${workflow} runs"
 
-  local deadline=$((SECONDS + max_seconds))
+  local deadline=$(( $(release_wait_now_seconds) + max_seconds ))
   local run_id=""
   local last_status=""
   local conclusion=""
   local url=""
 
-  while (( SECONDS < deadline )); do
+  while (( $(release_wait_now_seconds) < deadline )); do
     local runs_json
     runs_json="$(gh -R "$repo" run list --workflow "$workflow" --limit 20 \
       --json databaseId,status,conclusion,url,headBranch,headSha 2>/dev/null)" \
@@ -416,7 +426,11 @@ PY
     sleep 20
   done
 
-  die "timed out after ${max_seconds}s waiting for ${workflow} on ${repo} for ${head_ref}"
+  local timeout_message="timed out after ${max_seconds}s waiting for ${workflow} on ${repo} for ${head_ref}"
+  if [[ -n "$timeout_hint" ]]; then
+    timeout_message="${timeout_message}; ${timeout_hint}"
+  fi
+  die "$timeout_message"
 }
 
 assert_release_assets_available() {
@@ -1743,7 +1757,38 @@ if [[ -z "$source_repo_slug" || "$source_repo_slug" == *"/"*"/"* ]]; then
 fi
 
 note "waiting for ${source_repo_slug} release.yml on tag ${tag}"
-wait_for_release_run "$source_repo_slug" "release.yml" "$tag" "${NILS_CLI_RELEASE_WAIT_SECONDS:-1200}"
+release_resume_args=("$0" "--version" "$version" "--from-tap")
+release_resume_tap_dir="${tap_dir_arg:-${NILS_CLI_HOMEBREW_TAP_DIR:-}}"
+release_resume_tap_repo="${tap_repo_arg:-${NILS_CLI_HOMEBREW_TAP_REPO:-}}"
+if [[ -n "$release_resume_tap_dir" ]]; then
+  release_resume_args+=("--tap-dir" "$release_resume_tap_dir")
+fi
+if [[ -n "$release_resume_tap_repo" ]]; then
+  release_resume_args+=("--tap-repo" "$release_resume_tap_repo")
+fi
+if [[ "$tap_formula" != "nils-cli" ]]; then
+  release_resume_args+=("--tap-formula" "$tap_formula")
+fi
+if [[ "$skip_tap_wait" -eq 1 ]]; then
+  release_resume_args+=("--skip-tap-wait")
+fi
+if [[ "$skip_tap_tag" -eq 1 ]]; then
+  release_resume_args+=("--skip-tap-tag")
+fi
+if [[ "$skip_dev_clean" -eq 1 ]]; then
+  release_resume_args+=("--skip-dev-clean")
+fi
+if [[ "$skip_local_brew_upgrade" -eq 1 ]]; then
+  release_resume_args+=("--skip-local-brew-upgrade")
+fi
+printf -v release_resume_command '%q ' "${release_resume_args[@]}"
+release_resume_command="${release_resume_command% }"
+wait_for_release_run \
+  "$source_repo_slug" \
+  "release.yml" \
+  "$tag" \
+  "${NILS_CLI_RELEASE_WAIT_SECONDS:-3600}" \
+  "resume after release.yml succeeds with: ${release_resume_command}"
 
 tap_repo_slug="$(resolve_tap_repo_slug "$tap_repo_arg")"
 if [[ "$skip_tap_wait" -eq 0 ]]; then
