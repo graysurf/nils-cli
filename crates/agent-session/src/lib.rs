@@ -10,6 +10,7 @@ mod dsh_external;
 mod main_agent;
 mod maintenance;
 mod orchestration;
+mod provider_history;
 mod provider_prompt;
 mod serve;
 
@@ -12158,6 +12159,54 @@ fn delete_session(
     tmux_bin: PathBuf,
 ) -> Result<DeleteResult, CliError> {
     delete_session_for_terminal_assignment(context, id, tmux_bin, None)
+}
+
+fn delete_session_with_expected_incarnation_and_prepare<T, F>(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    expected_session_incarnation: &str,
+    prepare: F,
+) -> Result<(T, DeleteResult), CliError>
+where
+    F: FnOnce(&SessionRecord) -> Result<T, CliError>,
+{
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
+    let resolved = resolve_session_record_path(context, &canonical_id)?;
+    let record = read_session_record(&resolved.record_path)?;
+    ensure_same_session_identity(&observed, &record)?;
+    validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
+    let actual = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty());
+    if actual != Some(expected_session_incarnation) {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "session runtime changed before archive",
+            Some(json!({
+                "id": record.id,
+                "expected_session_incarnation": expected_session_incarnation,
+                "actual_session_incarnation": actual,
+            })),
+        ));
+    }
+    orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
+        context, &record, None,
+    )?;
+    let prepared = prepare(&record)?;
+    let deleted = delete_session_locked_with_timeouts(
+        context,
+        record,
+        resolved.session_dir,
+        &tmux_bin,
+        PANE_INPUT_COMMAND_TIMEOUT,
+        DELETE_TERMINATION_VERIFY_TIMEOUT,
+    )?;
+    Ok((prepared, deleted))
 }
 
 fn delete_session_for_terminal_assignment(
