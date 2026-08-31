@@ -756,6 +756,105 @@ fn review_specialists_delivery_bundle_threads_only_explicitly_actionable_finding
 }
 
 #[test]
+fn review_specialists_delivery_normalized_findings_round_trip_true_and_false() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/actionable.rs","category":"testing","summary":"Owner change required","evidence":"The owner must change this finding.","recommendation":"Apply the repair.","specialist":"testing","fingerprint":"testing:review-actionability:roundtrip-true","actionable":true}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/informational.rs","category":"testing","summary":"Summary only","evidence":"No owner change is required.","recommendation":"Retain the evidence.","specialist":"testing","fingerprint":"testing:review-actionability:roundtrip-false","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write delivery findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let bundle = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(bundle.code, 0, "stderr={}", bundle.stderr_text());
+
+    let normalized = out_dir.join("findings.normalized.jsonl");
+    let normalized_body = fs::read_to_string(&normalized).expect("normalized findings");
+    let normalized_rows: Vec<Value> = normalized_body
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("normalized row"))
+        .collect();
+    assert_eq!(normalized_rows.len(), 2);
+    assert_eq!(normalized_rows[0]["actionable"], true);
+    assert_eq!(normalized_rows[1]["actionable"], false);
+
+    let normalized_arg = path_arg(&normalized);
+    let validate = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(validate.code, 0, "stdout={}", validate.stdout_text());
+    assert_eq!(validate.stdout_json()["data"]["findings_count"], 2);
+
+    let merge = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(merge.code, 0, "stdout={}", merge.stdout_text());
+    assert_eq!(merge.stdout_json()["data"]["counts"]["input_rows"], 2);
+
+    let round_trip_dir = tmp.path().join("round-trip-bundle");
+    let round_trip_arg = path_arg(&round_trip_dir);
+    let rebundle = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--out-dir",
+            &round_trip_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(rebundle.code, 0, "stdout={}", rebundle.stdout_text());
+    assert!(round_trip_dir.join("findings.normalized.jsonl").is_file());
+}
+
+#[test]
 fn review_specialists_scope_classifies_git_diff() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     init_git_fixture(tmp.path());
