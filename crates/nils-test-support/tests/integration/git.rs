@@ -14,7 +14,7 @@ fn init_repo_with_default_branch_and_config() {
     let hooks_path = git::git(repo.path(), &["config", "--local", "core.hooksPath"]);
     assert_eq!(
         std::path::Path::new(hooks_path.trim_end()),
-        repo.path().join(".git/hooks")
+        fs::canonicalize(repo.path().join(".git/hooks")).expect("canonical hooks path")
     );
 }
 
