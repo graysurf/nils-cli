@@ -48,6 +48,21 @@ fn evaluate_raw(input: &[u8]) -> (i32, String, Value) {
     (output.status.code().expect("exit code"), stdout, envelope)
 }
 
+fn successful_binding(input: &Value) -> (String, String) {
+    let (code, _, envelope) = evaluate(input);
+    assert_eq!(code, 0, "binding variant must remain a valid request");
+    (
+        envelope["data"]["request_id"]
+            .as_str()
+            .expect("request ID")
+            .to_owned(),
+        envelope["data"]["audit"]["binding_digest"]
+            .as_str()
+            .expect("binding digest")
+            .to_owned(),
+    )
+}
+
 #[test]
 fn rejects_input_above_one_mib_before_deserialization() {
     let oversized = vec![b'x'; 1024 * 1024 + 1];
@@ -175,7 +190,7 @@ fn request_binding_changes_with_every_governed_dimension() {
         {"rule_id":"data.machine-path.allow", "class_id":"machine-local-path", "action":"allow"}
     ]);
     let first = request(json!({"safe":true}), "tool.native", rules.clone());
-    let (_, _, first_envelope) = evaluate(&first);
+    let (first_request_id, first_binding_digest) = successful_binding(&first);
     let variants = [
         ("session_id", json!("session-2")),
         (
@@ -192,14 +207,13 @@ fn request_binding_changes_with_every_governed_dimension() {
     for (field, value) in variants {
         let mut changed = first.clone();
         changed["identity"][field] = value;
-        let (_, _, changed_envelope) = evaluate(&changed);
+        let (changed_request_id, changed_binding_digest) = successful_binding(&changed);
         assert_ne!(
-            first_envelope["data"]["request_id"], changed_envelope["data"]["request_id"],
+            first_request_id, changed_request_id,
             "request id must bind {field}"
         );
         assert_ne!(
-            first_envelope["data"]["audit"]["binding_digest"],
-            changed_envelope["data"]["audit"]["binding_digest"],
+            first_binding_digest, changed_binding_digest,
             "binding digest must bind {field}"
         );
     }
@@ -211,51 +225,45 @@ fn request_binding_changes_with_every_governed_dimension() {
     for (field, value) in variants {
         let mut changed = first.clone();
         changed[field] = value;
-        let (_, _, changed_envelope) = evaluate(&changed);
+        let (_, changed_binding_digest) = successful_binding(&changed);
         assert_ne!(
-            first_envelope["data"]["audit"]["binding_digest"],
-            changed_envelope["data"]["audit"]["binding_digest"],
+            first_binding_digest, changed_binding_digest,
             "binding digest must bind {field}"
         );
     }
     let mut changed_action = first.clone();
     changed_action["rules"][0]["action"] = json!("redact");
-    let (_, _, changed_action_envelope) = evaluate(&changed_action);
+    let (_, changed_action_digest) = successful_binding(&changed_action);
     assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        changed_action_envelope["data"]["audit"]["binding_digest"],
+        first_binding_digest, changed_action_digest,
         "binding digest must bind rule actions"
     );
     let mut changed_rule_id = first.clone();
     changed_rule_id["rules"][0]["rule_id"] = json!("data.sensitive.alternate");
-    let (_, _, changed_rule_id_envelope) = evaluate(&changed_rule_id);
+    let (_, changed_rule_id_digest) = successful_binding(&changed_rule_id);
     assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        changed_rule_id_envelope["data"]["audit"]["binding_digest"],
+        first_binding_digest, changed_rule_id_digest,
         "binding digest must bind rule IDs"
     );
     let mut changed_class_id = first.clone();
-    changed_class_id["rules"][0]["class_id"] = json!("machine-local-path");
-    let (_, _, changed_class_id_envelope) = evaluate(&changed_class_id);
+    changed_class_id["rules"][0]["class_id"] = json!("protected-root");
+    let (_, changed_class_id_digest) = successful_binding(&changed_class_id);
     assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        changed_class_id_envelope["data"]["audit"]["binding_digest"],
+        first_binding_digest, changed_class_id_digest,
         "binding digest must bind rule class IDs"
     );
     let mut changed_payload = first.clone();
     changed_payload["payload"] = json!({"safe":false});
-    let (_, _, changed_payload_envelope) = evaluate(&changed_payload);
+    let (_, changed_payload_digest) = successful_binding(&changed_payload);
     assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        changed_payload_envelope["data"]["audit"]["binding_digest"],
+        first_binding_digest, changed_payload_digest,
         "binding digest must bind payloads"
     );
     let mut reordered = first.clone();
     reordered["rules"].as_array_mut().expect("rules").reverse();
-    let (_, _, reordered_envelope) = evaluate(&reordered);
+    let (_, reordered_digest) = successful_binding(&reordered);
     assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        reordered_envelope["data"]["audit"]["binding_digest"],
+        first_binding_digest, reordered_digest,
         "binding digest must bind rule order"
     );
 }
