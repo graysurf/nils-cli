@@ -913,7 +913,10 @@ fn validation_error(errors: Vec<RowError>) -> CliError {
         .iter()
         .find_map(|error| error.code.as_deref())
         .unwrap_or("invalid-findings");
-    let details = if typed_code == "review_actionable_required" {
+    let actionable_only = errors
+        .iter()
+        .all(|error| error.code.as_deref() == Some("review_actionable_required"));
+    let details = if actionable_only {
         json!({
             "errors": errors,
             "retryable": true,
@@ -925,7 +928,15 @@ fn validation_error(errors: Vec<RowError>) -> CliError {
             },
         })
     } else {
-        json!({ "errors": errors })
+        json!({
+            "errors": errors,
+            "retryable": true,
+            "next_action": "correct every reported finding row and retry",
+            "recovery": {
+                "kind": "edit-findings",
+                "strategy": "correct-all-reported-errors",
+            },
+        })
     };
     CliError::data(
         typed_code,
@@ -1842,7 +1853,7 @@ struct ValidateArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 
@@ -1868,7 +1879,7 @@ struct MergeArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 
@@ -1927,7 +1938,7 @@ struct BundleArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Validation policy. Delivery requires stable lifecycle identities and explicit actionability.
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
     #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
     mode: ReviewMode,
 

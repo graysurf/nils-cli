@@ -28,8 +28,11 @@ Each finding is one JSON object per line:
 
 Required fields are `severity`, `confidence`, `path`, `summary`, `evidence`,
 `recommendation`, and `specialist`. Optional fields are `line`, `category`,
-`fingerprint`, `root_cause_fingerprint`, `test_suggestion`, and `actionable`.
-`actionable` defaults to `false`; set it only when the owner must make a code,
+`fingerprint`, `root_cause_fingerprint`, and `test_suggestion`. In advisory
+mode, `actionable` is also optional and defaults to `false`. Delivery mode
+requires every finding to declare the boolean explicitly as `actionable: true`
+or `actionable: false`; missing or null actionability fails as
+`review_actionable_required`. Use `true` only when the owner must make a code,
 doc, test, or config change and the provider flow should create a resolvable
 line/file thread.
 
@@ -67,14 +70,30 @@ present and otherwise computes one from `path`, `line`, `category`, and
 `summary`.
 
 Delivery mode requires every row to declare a stable
-`<category>:<component>:<invariant>` fingerprint. Its first segment must match
-the finding category. An optional `root_cause_fingerprint` groups multiple lens
+`<category>:<component>:<invariant>` fingerprint and an explicit boolean
+`actionable` classification. Its first fingerprint segment must match the
+finding category. An optional `root_cause_fingerprint` groups multiple lens
 observations under one lifecycle identity without dropping their `source_rows`.
 Incompatible reuse fails as `review_fingerprint_collision`; missing explicit
-identity fails as `review_fingerprint_required`. Delivery output uses the v2
-finding/merge schemas and exposes `lifecycle_fingerprint` for the downstream
-review-loop ledger. The highest-confidence row becomes the primary finding,
-with confirming specialists retained in deterministic order.
+identity fails as `review_fingerprint_required`; missing explicit actionability
+fails as `review_actionable_required`. Delivery output uses the v2 finding/merge
+schemas and exposes `lifecycle_fingerprint` for the downstream review-loop
+ledger. The highest-confidence row becomes the primary finding, with confirming
+specialists retained in deterministic order.
+
+### Migrating advisory findings to delivery
+
+Before switching a producer to `--mode delivery`, add both an explicit stable
+fingerprint and `actionable: true` or `actionable: false` to every JSONL row.
+Do not infer actionability from severity: a material informational finding may
+remain summary-only with `false`, while any finding that requires an owner
+change uses `true` and becomes eligible for a native provider thread. Classify
+all rows before retrying; a mixed validation batch receives generic
+correct-all-errors recovery rather than actionability-only guidance.
+
+```json
+{"severity":"medium","confidence":0.8,"path":"src/config.rs","category":"maintainability","summary":"Document the retained tradeoff.","evidence":"The behavior is intentional.","recommendation":"Keep the evidence in the review summary.","specialist":"maintainability","fingerprint":"maintainability:review-output:retained-tradeoff","actionable":false}
+```
 
 The downstream observation array may attach an explicit `status` or
 `disposition` of `open`, `fixed`, `accepted`, `preference`, or `follow-up` to a

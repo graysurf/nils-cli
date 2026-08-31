@@ -117,6 +117,64 @@ fn review_specialists_delivery_requires_explicit_actionable_classification() {
 }
 
 #[test]
+fn review_specialists_mixed_validation_errors_use_generic_recovery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"Missing actionability","evidence":"The row has no owner-change classification.","recommendation":"Classify the finding.","specialist":"testing","fingerprint":"correctness:review-publishing:explicit-actionability"}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":"invalid","path":"src/config.rs","category":"correctness","summary":"Invalid confidence","evidence":"The confidence value is not numeric.","recommendation":"Correct every invalid field.","specialist":"testing","fingerprint":"correctness:review-publishing:valid-confidence","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write mixed findings");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stdout={}", output.stdout_text());
+    let value = output.stdout_json();
+    assert_eq!(value["error"]["code"], "review_actionable_required");
+    assert_eq!(
+        value["error"]["details"]["errors"]
+            .as_array()
+            .expect("row errors")
+            .len(),
+        2
+    );
+    assert_eq!(
+        value["error"]["details"]["recovery"]["strategy"],
+        "correct-all-reported-errors"
+    );
+    assert!(value["error"]["details"]["recovery"].get("field").is_none());
+    assert!(
+        value["error"]["details"]["recovery"]
+            .get("accepted_values")
+            .is_none()
+    );
+}
+
+#[test]
+fn review_specialists_published_contract_requires_delivery_actionability() {
+    let runbook = include_str!("../../../../docs/runbooks/review-specialists-primitive.md");
+    let readme = include_str!("../../README.md");
+
+    for document in [runbook, readme] {
+        assert!(document.contains("`actionable: true` or `actionable: false`"));
+        assert!(document.contains("`review_actionable_required`"));
+        assert!(document.to_ascii_lowercase().contains("do not infer"));
+    }
+}
+
+#[test]
 fn review_specialists_validate_rejects_bad_rows_with_data_exit() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let input = path_arg(&fixture("findings.invalid.jsonl"));

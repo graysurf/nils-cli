@@ -120,12 +120,22 @@ multi-specialist initial wave.
 
 For delivery workflows, pass `--mode delivery` to `validate`, `merge`, or
 `bundle`. Delivery mode requires an explicit stable
-`<category>:<component>:<invariant>` fingerprint per finding, supports an
-optional `root_cause_fingerprint` for cross-lens grouping, preserves all source
-rows, and emits lifecycle identities consumable by `forge-cli pr review-loop`.
-The review-loop observation array may then record an explicit `status` or
-`disposition` (`open`, `fixed`, `accepted`, `preference`, or `follow-up`) for
-auditable agent or maintainer judgement.
+`<category>:<component>:<invariant>` fingerprint and an explicit boolean
+`actionable` classification per finding. Missing or null actionability fails as
+`review_actionable_required`; advisory mode continues to treat a missing field
+as `false`. Delivery also supports an optional `root_cause_fingerprint` for
+cross-lens grouping, preserves all source rows, and emits lifecycle identities
+consumable by `forge-cli pr review-loop`. The review-loop observation array may
+then record an explicit `status` or `disposition` (`open`, `fixed`, `accepted`,
+`preference`, or `follow-up`) for auditable agent or maintainer judgement.
+
+Before migrating an advisory producer to delivery, classify every row as
+`actionable: true` or `actionable: false`; do not infer the value from severity.
+For example, a summary-only delivery finding is still explicit:
+
+```json
+{"severity":"medium","confidence":0.8,"path":"src/config.rs","category":"maintainability","summary":"Document the retained tradeoff.","evidence":"The behavior is intentional.","recommendation":"Keep the evidence in the review summary.","specialist":"maintainability","fingerprint":"maintainability:review-output:retained-tradeoff","actionable":false}
+```
 
 ```bash
 review-specialists scope --base main --format json
@@ -139,12 +149,13 @@ review-specialists bundle --input findings.jsonl --out-dir target/review-special
 
 `provider-review` is the canonical provider-visible specialist profile. It
 always emits the `agent-kit:specialist-review-report:v1` marker, one
-`## Review Report` summary, and the findings table. Set `actionable: true` on a
-finding only when the owner must make a code, doc, test, or config change;
-`--thread-out` writes one GitHub line thread when `line` is present or one file
-thread when it is absent. Summary and thread artifacts are derived from the
-same merged input. The older `pr-comment` profile is a compatibility alias to
-the same renderer and can no longer produce the bullet format.
+`## Review Report` summary, and the findings table. Delivery producers must set
+`actionable: true` when the owner must make a code, doc, test, or config change,
+and `actionable: false` when the finding remains summary-only. `--thread-out`
+writes one GitHub line thread when an actionable finding has `line`, or one file
+thread when it does not. Summary and thread artifacts are derived from the same
+merged input. The older `pr-comment` profile is a compatibility alias to the
+same renderer and can no longer produce the bullet format.
 
 ## `heuristic-inbox verify` redaction guardrail
 
