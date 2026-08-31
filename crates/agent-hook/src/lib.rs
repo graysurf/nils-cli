@@ -2,6 +2,7 @@ mod adapter;
 mod cli;
 mod completion;
 mod contract;
+mod data_policy;
 mod degradation;
 mod degraded;
 #[cfg(target_os = "linux")]
@@ -47,8 +48,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use cli::{
-    Cli, Command, DispatchFormat, FinishLineCommand, RecoveryCommand, WorkspaceLeaseCommand,
-    WorkspaceRecoveryCommand,
+    Cli, Command, DataPolicyCommand, DispatchFormat, FinishLineCommand, RecoveryCommand,
+    WorkspaceLeaseCommand, WorkspaceRecoveryCommand,
 };
 use error::HookError;
 use model::{
@@ -164,6 +165,7 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
         Command::WorkspaceLease(args) => run_workspace_lease(&layout, args.command),
         Command::WorkspaceRecovery(args) => run_workspace_recovery(args.command),
         Command::Dispatch(args) => run_dispatch(&layout, policy_override, args),
+        Command::DataPolicy(args) => run_data_policy(args.command),
         Command::Validate(args) => {
             let loaded = match contract::load(&layout, policy_override) {
                 Ok(loaded) => loaded,
@@ -333,6 +335,28 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
             }
         }
         Command::Recovery(args) => run_recovery(&layout, policy_override, args.command),
+    }
+}
+
+fn run_data_policy(command: DataPolicyCommand) -> i32 {
+    match command {
+        DataPolicyCommand::Evaluate(args) => {
+            let name = "agent-hook data-policy evaluate";
+            let format = OutputFormat::from(args.format);
+            let raw = match adapter::read_stdin() {
+                Ok(raw) => raw,
+                Err(error) => return emit_error(name, &error, format == OutputFormat::Json),
+            };
+            match data_policy::evaluate(&raw) {
+                Ok(result) => emit_success(name, format, &result, || {
+                    format!(
+                        "agent-hook data-policy: {} ({})\n",
+                        result.action, result.code
+                    )
+                }),
+                Err(error) => emit_error(name, &error, format == OutputFormat::Json),
+            }
+        }
     }
 }
 
