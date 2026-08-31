@@ -451,7 +451,7 @@ fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
     let report_md = args.out_dir.join("specialist-review.md");
     let mut artifacts = Vec::new();
 
-    let normalized_body = render_normalized_jsonl(&validated.findings)?;
+    let normalized_body = render_normalized_jsonl(&validated.findings, args.mode)?;
     write_text(&normalized_jsonl, &normalized_body)?;
     artifacts.push(display_path(&normalized_jsonl));
     write_json_pretty(&merged_json, &merged)?;
@@ -564,6 +564,8 @@ fn parse_finding_line(
         )
     })?;
 
+    // Generated normalized rows carry provenance. Accept it for round trips,
+    // but bind fresh provenance to the current input below.
     let allowed: BTreeSet<&str> = [
         "severity",
         "confidence",
@@ -578,6 +580,8 @@ fn parse_finding_line(
         "specialist",
         "test_suggestion",
         "actionable",
+        "source_file",
+        "source_line",
     ]
     .into_iter()
     .collect();
@@ -645,8 +649,6 @@ fn parse_finding_line(
         input,
         line_number,
     )?;
-    let actionable =
-        optional_bool(object.get("actionable"), "actionable", input, line_number)?.unwrap_or(false);
     let explicit_fingerprint =
         optional_string(object.get("fingerprint"), "fingerprint", input, line_number)?;
     let root_cause_fingerprint = optional_string(
@@ -683,6 +685,19 @@ fn parse_finding_line(
     {
         validate_stable_fingerprint(root, "root_cause_fingerprint", input, line_number)?;
     }
+    let actionable =
+        match optional_bool(object.get("actionable"), "actionable", input, line_number)? {
+            Some(actionable) => actionable,
+            None if mode == ReviewMode::Delivery => {
+                return Err(RowError::typed(
+                    display_path(input),
+                    line_number,
+                    "review_actionable_required",
+                    "delivery findings require an explicit actionable boolean",
+                ));
+            }
+            None => false,
+        };
     let fingerprint = explicit_fingerprint
         .unwrap_or_else(|| computed_fingerprint(&path, line_value, &category, &summary));
 
@@ -902,10 +917,35 @@ fn validation_error(errors: Vec<RowError>) -> CliError {
         .iter()
         .find_map(|error| error.code.as_deref())
         .unwrap_or("invalid-findings");
+    let actionable_only = errors
+        .iter()
+        .all(|error| error.code.as_deref() == Some("review_actionable_required"));
+    let details = if actionable_only {
+        json!({
+            "errors": errors,
+            "retryable": true,
+            "next_action": "add an explicit actionable boolean to each reported delivery finding and retry",
+            "recovery": {
+                "kind": "edit-findings",
+                "field": "actionable",
+                "accepted_values": [true, false],
+            },
+        })
+    } else {
+        json!({
+            "errors": errors,
+            "retryable": true,
+            "next_action": "correct every reported finding row and retry",
+            "recovery": {
+                "kind": "edit-findings",
+                "strategy": "correct-all-reported-errors",
+            },
+        })
+    };
     CliError::data(
         typed_code,
         format!("{} finding row(s) failed validation", errors.len()),
-        Some(json!({ "errors": errors })),
+        Some(details),
     )
 }
 
@@ -1482,10 +1522,19 @@ fn read_merged(path: &Path) -> Result<MergeResult, CliError> {
     })
 }
 
-fn render_normalized_jsonl(findings: &[NormalizedFinding]) -> Result<String, CliError> {
+fn render_normalized_jsonl(
+    findings: &[NormalizedFinding],
+    mode: ReviewMode,
+) -> Result<String, CliError> {
     let mut lines = Vec::new();
     for finding in findings {
-        lines.push(serde_json::to_string(finding).map_err(|err| {
+        let serialized = match mode {
+            ReviewMode::Advisory => serde_json::to_string(finding),
+            ReviewMode::Delivery => {
+                serde_json::to_string(&DeliveryNormalizedFinding::from(finding))
+            }
+        };
+        lines.push(serialized.map_err(|err| {
             CliError::runtime(
                 "serialize-failed",
                 format!("failed to serialize normalized finding: {err}"),
@@ -2076,6 +2125,50 @@ struct NormalizedFinding {
     actionable: bool,
     source_file: String,
     source_line: usize,
+}
+
+#[derive(Serialize)]
+struct DeliveryNormalizedFinding<'a> {
+    severity: &'a Severity,
+    confidence: f64,
+    path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<u64>,
+    category: &'a str,
+    summary: &'a str,
+    evidence: &'a str,
+    recommendation: &'a str,
+    fingerprint: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_cause_fingerprint: Option<&'a str>,
+    specialist: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_suggestion: Option<&'a str>,
+    actionable: bool,
+    source_file: &'a str,
+    source_line: usize,
+}
+
+impl<'a> From<&'a NormalizedFinding> for DeliveryNormalizedFinding<'a> {
+    fn from(finding: &'a NormalizedFinding) -> Self {
+        Self {
+            severity: &finding.severity,
+            confidence: finding.confidence,
+            path: &finding.path,
+            line: finding.line,
+            category: &finding.category,
+            summary: &finding.summary,
+            evidence: &finding.evidence,
+            recommendation: &finding.recommendation,
+            fingerprint: &finding.fingerprint,
+            root_cause_fingerprint: finding.root_cause_fingerprint.as_deref(),
+            specialist: &finding.specialist,
+            test_suggestion: finding.test_suggestion.as_deref(),
+            actionable: finding.actionable,
+            source_file: &finding.source_file,
+            source_line: finding.source_line,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

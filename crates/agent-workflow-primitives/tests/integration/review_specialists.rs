@@ -68,6 +68,110 @@ fn review_specialists_validate_accepts_the_dsh_quick_specialist() {
         output.stdout_json()["data"]["findings"][0]["specialist"],
         "quick"
     );
+    assert!(
+        output.stdout_json()["data"]["findings"][0]
+            .get("actionable")
+            .is_none(),
+        "advisory mode must keep the existing missing-actionable default"
+    );
+}
+
+#[test]
+fn review_specialists_delivery_requires_explicit_actionable_classification() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"Missing actionability","evidence":"The delivery row does not classify whether an owner change is required.","recommendation":"Classify the finding explicitly.","specialist":"testing","fingerprint":"correctness:review-publishing:explicit-actionability"}"#,
+    )
+    .expect("write finding");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stdout={}", output.stdout_text());
+    let value = output.stdout_json();
+    assert_eq!(value["error"]["code"], "review_actionable_required");
+    assert_eq!(
+        value["error"]["details"]["errors"][0]["code"],
+        "review_actionable_required"
+    );
+    assert_eq!(value["error"]["details"]["retryable"], true);
+    assert_eq!(value["error"]["details"]["recovery"]["field"], "actionable");
+    assert_eq!(
+        value["error"]["details"]["recovery"]["accepted_values"],
+        serde_json::json!([true, false])
+    );
+    assert!(
+        value["error"]["details"]["errors"][0]["message"]
+            .as_str()
+            .expect("typed row message")
+            .contains("explicit actionable boolean")
+    );
+}
+
+#[test]
+fn review_specialists_mixed_validation_errors_use_generic_recovery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"Missing actionability","evidence":"The row has no owner-change classification.","recommendation":"Classify the finding.","specialist":"testing","fingerprint":"correctness:review-publishing:explicit-actionability"}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":"invalid","path":"src/config.rs","category":"correctness","summary":"Invalid confidence","evidence":"The confidence value is not numeric.","recommendation":"Correct every invalid field.","specialist":"testing","fingerprint":"correctness:review-publishing:valid-confidence","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write mixed findings");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stdout={}", output.stdout_text());
+    let value = output.stdout_json();
+    assert_eq!(value["error"]["code"], "review_actionable_required");
+    assert_eq!(
+        value["error"]["details"]["errors"]
+            .as_array()
+            .expect("row errors")
+            .len(),
+        2
+    );
+    assert_eq!(
+        value["error"]["details"]["recovery"]["strategy"],
+        "correct-all-reported-errors"
+    );
+    assert!(value["error"]["details"]["recovery"].get("field").is_none());
+    assert!(
+        value["error"]["details"]["recovery"]
+            .get("accepted_values")
+            .is_none()
+    );
+}
+
+#[test]
+fn review_specialists_published_contract_requires_delivery_actionability() {
+    let runbook = include_str!("../../../../docs/runbooks/review-specialists-primitive.md");
+    let readme = include_str!("../../README.md");
+
+    for document in [runbook, readme] {
+        assert!(document.contains("`actionable: true` or `actionable: false`"));
+        assert!(document.contains("`review_actionable_required`"));
+        assert!(document.to_ascii_lowercase().contains("do not infer"));
+    }
 }
 
 #[test]
@@ -179,9 +283,9 @@ fn review_specialists_delivery_merges_distinct_lenses_by_root_cause() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":10,"category":"correctness","summary":"First lens","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":10,"category":"correctness","summary":"First lens","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:shared-root","actionable":true}"#,
             "\n",
-            r#"{"severity":"medium","confidence":0.8,"path":"src/lib.rs","line":12,"category":"correctness","summary":"Second lens","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:maintainable-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            r#"{"severity":"medium","confidence":0.8,"path":"src/lib.rs","line":12,"category":"correctness","summary":"Second lens","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:maintainable-state","root_cause_fingerprint":"correctness:review-loop:shared-root","actionable":false}"#,
             "\n",
         ),
     )
@@ -220,9 +324,9 @@ fn review_specialists_delivery_identity_survives_line_and_prose_drift() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/old.rs","line":10,"category":"correctness","summary":"Original prose","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/old.rs","line":10,"category":"correctness","summary":"Original prose","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","actionable":true}"#,
             "\n",
-            r#"{"severity":"high","confidence":0.8,"path":"src/new.rs","line":24,"category":"correctness","summary":"Reworded after the code moved","evidence":"new evidence","recommendation":"same fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state"}"#,
+            r#"{"severity":"high","confidence":0.8,"path":"src/new.rs","line":24,"category":"correctness","summary":"Reworded after the code moved","evidence":"new evidence","recommendation":"same fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","actionable":false}"#,
             "\n",
         ),
     )
@@ -253,9 +357,9 @@ fn review_specialists_delivery_rejects_incompatible_root_reuse() {
     fs::write(
         &input,
         concat!(
-            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"First","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:first-root"}"#,
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"First","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:first-root","actionable":true}"#,
             "\n",
-            r#"{"severity":"high","confidence":0.8,"path":"src/lib.rs","category":"correctness","summary":"Second","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:second-root"}"#,
+            r#"{"severity":"high","confidence":0.8,"path":"src/lib.rs","category":"correctness","summary":"Second","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:second-root","actionable":false}"#,
             "\n",
         ),
     )
@@ -568,6 +672,251 @@ fn review_specialists_bundle_writes_stable_artifacts() {
     assert!(out_dir.join("findings.merged.json").is_file());
     assert!(out_dir.join("specialist-review.md").is_file());
     assert!(out_dir.join("issue-body.md").is_file());
+}
+
+#[test]
+fn review_specialists_delivery_bundle_threads_only_explicitly_actionable_findings() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/actionable.rs","line":42,"category":"testing","summary":"Owner change required","evidence":"The owner must change this line.","recommendation":"Apply the repair.","specialist":"testing","fingerprint":"testing:review-actionability:delivery-thread-artifact","actionable":true}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/informational.rs","line":17,"category":"testing","summary":"Informational tradeoff","evidence":"The current behavior is acceptable.","recommendation":"Keep the summary evidence.","specialist":"testing","fingerprint":"testing:review-actionability:summary-only-artifact","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write delivery findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--profile",
+            "provider-review",
+            "--reviewable",
+            "PR #1582",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "delivery thread artifacts",
+            "--evidence-reviewed",
+            "fixture findings",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let report = fs::read_to_string(out_dir.join("specialist-review.md")).expect("report");
+    assert!(report.contains("Owner change required"));
+    assert!(report.contains("Informational tradeoff"));
+    let provider_review =
+        fs::read_to_string(out_dir.join("provider-review.md")).expect("provider review");
+    assert!(provider_review.contains("Owner change required"));
+    assert!(provider_review.contains("Informational tradeoff"));
+
+    let threads: Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("review-threads.json")).expect("thread artifact"),
+    )
+    .expect("thread json");
+    let threads = threads.as_array().expect("thread array");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["path"], "src/actionable.rs");
+    assert_eq!(threads[0]["line"], 42);
+    assert_eq!(threads[0]["subject_type"], "LINE");
+    assert_eq!(
+        threads[0]["body"],
+        concat!(
+            "**Owner change required** (high, 0.90)\n\n",
+            "The owner must change this line.\n\n",
+            "Recommendation: Apply the repair.\n\n",
+            "<!-- agent-kit:finding:testing:review-actionability:delivery-thread-artifact -->",
+        )
+    );
+    assert!(
+        !threads[0]["body"]
+            .as_str()
+            .expect("thread body")
+            .contains("summary-only-artifact")
+    );
+}
+
+#[test]
+fn review_specialists_delivery_normalized_findings_round_trip_true_and_false() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/actionable.rs","category":"testing","summary":"Owner change required","evidence":"The owner must change this finding.","recommendation":"Apply the repair.","specialist":"testing","fingerprint":"testing:review-actionability:roundtrip-true","actionable":true}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/informational.rs","category":"testing","summary":"Summary only","evidence":"No owner change is required.","recommendation":"Retain the evidence.","specialist":"testing","fingerprint":"testing:review-actionability:roundtrip-false","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write delivery findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let bundle = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(bundle.code, 0, "stderr={}", bundle.stderr_text());
+
+    let normalized = out_dir.join("findings.normalized.jsonl");
+    let normalized_body = fs::read_to_string(&normalized).expect("normalized findings");
+    let normalized_rows: Vec<Value> = normalized_body
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("normalized row"))
+        .collect();
+    assert_eq!(normalized_rows.len(), 2);
+    assert_eq!(normalized_rows[0]["actionable"], true);
+    assert_eq!(normalized_rows[1]["actionable"], false);
+
+    let normalized_arg = path_arg(&normalized);
+    let validate = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "validate",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(validate.code, 0, "stdout={}", validate.stdout_text());
+    let validated = validate.stdout_json();
+    assert_eq!(validated["data"]["findings_count"], 2);
+    assert_eq!(
+        validated["data"]["findings"][0]["fingerprint"],
+        "testing:review-actionability:roundtrip-true"
+    );
+    assert_eq!(validated["data"]["findings"][0]["actionable"], true);
+    assert_eq!(
+        validated["data"]["findings"][1]["fingerprint"],
+        "testing:review-actionability:roundtrip-false"
+    );
+
+    let merge = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(merge.code, 0, "stdout={}", merge.stdout_text());
+    let merged = merge.stdout_json();
+    assert_eq!(merged["data"]["counts"]["input_rows"], 2);
+    assert_eq!(
+        merged["data"]["findings"][0]["actionable_source"]["fingerprint"],
+        "testing:review-actionability:roundtrip-true"
+    );
+    assert_eq!(
+        merged["data"]["findings"][0]["actionable_source"]["actionable"],
+        true
+    );
+    assert!(
+        merged["data"]["findings"][1]
+            .get("actionable_source")
+            .is_none()
+    );
+
+    let round_trip_dir = tmp.path().join("round-trip-bundle");
+    let round_trip_arg = path_arg(&round_trip_dir);
+    let rebundle = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &normalized_arg,
+            "--out-dir",
+            &round_trip_arg,
+            "--profile",
+            "provider-review",
+            "--reviewable",
+            "PR #1582",
+            "--lens",
+            "testing",
+            "--lens-verdict",
+            "findings",
+            "--scope",
+            "normalized delivery artifacts",
+            "--evidence-reviewed",
+            "round-trip fixture",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(rebundle.code, 0, "stdout={}", rebundle.stdout_text());
+    let provider_review =
+        fs::read_to_string(round_trip_dir.join("provider-review.md")).expect("provider review");
+    assert!(provider_review.contains("Owner change required"));
+    assert!(provider_review.contains("Summary only"));
+
+    let thread_body =
+        fs::read_to_string(round_trip_dir.join("review-threads.json")).expect("thread artifact");
+    let threads: Value = serde_json::from_str(&thread_body).expect("thread json");
+    let threads = threads.as_array().expect("thread array");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["path"], "src/actionable.rs");
+    assert_eq!(threads[0]["subject_type"], "FILE");
+    assert_eq!(
+        threads[0]["body"],
+        concat!(
+            "**Owner change required** (high, 0.90)\n\n",
+            "The owner must change this finding.\n\n",
+            "Recommendation: Apply the repair.\n\n",
+            "<!-- agent-kit:finding:testing:review-actionability:roundtrip-true -->",
+        )
+    );
+    for false_material in [
+        "src/informational.rs",
+        "Summary only",
+        "No owner change is required.",
+        "Retain the evidence.",
+        "testing:review-actionability:roundtrip-false",
+    ] {
+        assert!(!thread_body.contains(false_material));
+    }
 }
 
 #[test]
