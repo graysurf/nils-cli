@@ -12,6 +12,7 @@ static GIT_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct InitRepoOptions {
     pub branch: Option<String>,
+    pub isolate_hooks: bool,
     pub initial_commit: bool,
     pub initial_commit_name: String,
     pub initial_commit_contents: String,
@@ -33,6 +34,11 @@ impl InitRepoOptions {
         self
     }
 
+    pub fn with_inherited_hooks(mut self) -> Self {
+        self.isolate_hooks = false;
+        self
+    }
+
     pub fn with_initial_commit(mut self) -> Self {
         self.initial_commit = true;
         self
@@ -43,6 +49,7 @@ impl Default for InitRepoOptions {
     fn default() -> Self {
         Self {
             branch: Some("main".to_string()),
+            isolate_hooks: true,
             initial_commit: false,
             initial_commit_name: "README.md".to_string(),
             initial_commit_contents: "init".to_string(),
@@ -206,6 +213,24 @@ fn windows_pathext_extensions() -> Vec<std::ffi::OsString> {
 
 pub fn init_repo_at_with(dir: &Path, options: InitRepoOptions) {
     git(dir, &["init", "-q"]);
+
+    if options.isolate_hooks {
+        // Keep fixture repositories independent from developer-global hooks while
+        // preserving the normal repository-local hook location for hook tests.
+        let common_dir = PathBuf::from(git(dir, &["rev-parse", "--git-common-dir"]).trim());
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            dir.join(common_dir)
+        };
+        let hooks_dir = common_dir.join("hooks");
+        fs::create_dir_all(&hooks_dir).expect("create fixture hooks dir");
+        let hooks_dir = fs::canonicalize(hooks_dir).expect("resolve fixture hooks dir");
+        git(
+            dir,
+            &["config", "core.hooksPath", &hooks_dir.to_string_lossy()],
+        );
+    }
 
     if let Some(branch) = options.branch.as_deref() {
         // Make the initial branch deterministic across environments.

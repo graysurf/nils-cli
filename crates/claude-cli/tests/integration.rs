@@ -106,11 +106,22 @@ impl RefreshCooldown {
 }
 
 fn base_options(cache_dir: &Path) -> CmdOptions {
+    let missing_claude = path_str(&cache_dir.join("missing-claude"));
     CmdOptions::default()
         .with_env_remove_prefix("CLAUDE_CLI_")
         .with_env_remove_prefix("CLAUDE_PROMPT")
+        .with_env_remove_many(&[
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ])
         .with_env_remove("NO_COLOR")
         .with_env_remove("TZ")
+        .with_env("NO_PROXY", "127.0.0.1,localhost")
+        .with_env("no_proxy", "127.0.0.1,localhost")
         .with_env(
             "CLAUDE_CONFIG_DIR",
             &path_str(&cache_dir.join("claude-config")),
@@ -122,6 +133,21 @@ fn base_options(cache_dir: &Path) -> CmdOptions {
             "CLAUDE_PROMPT_SEGMENT_MAX_TIME_SECONDS",
             FAST_FAIL_MAX_TIME_SECONDS,
         )
+        .with_env("CLAUDE_CLI_BIN", &missing_claude)
+        .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN", &missing_claude)
+}
+
+trait ClaudeFixtureOptions {
+    fn with_fake_claude(self, bin_dir: &Path) -> Self;
+}
+
+impl ClaudeFixtureOptions for CmdOptions {
+    fn with_fake_claude(self, bin_dir: &Path) -> Self {
+        let claude = path_str(&bin_dir.join("claude"));
+        self.with_path_prepend(bin_dir)
+            .with_env("CLAUDE_CLI_BIN", &claude)
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN", &claude)
+    }
 }
 
 fn path_str(path: &Path) -> String {
@@ -429,7 +455,7 @@ OUT
     let output = run(
         &["usage", "--format", "json", "--source", "auto"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token-usage")
             .with_env(
                 "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
@@ -514,7 +540,7 @@ printf '%s\n' 'Your organization has disabled Claude subscription access for Cla
     let output = run(
         &["usage", "--format", "json", "--source", "cli"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
     );
 
@@ -547,7 +573,7 @@ fn usage_auto_prefers_recent_structured_api_error_over_generic_usage_failure() {
     let output = run(
         &["usage", "--format", "json", "--source", "auto"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
             .with_env(
                 "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
@@ -594,7 +620,7 @@ fn usage_auto_ignores_structured_api_error_after_newer_assistant_success() {
     let output = run(
         &["usage", "--format", "json", "--source", "auto"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
             .with_env(
                 "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
@@ -651,7 +677,7 @@ fn usage_auto_ignores_older_error_after_newer_success_in_another_transcript() {
     let output = run(
         &["usage", "--format", "json", "--source", "auto"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_CONFIG_DIR", &path_str(&config_dir))
             .with_env(
                 "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
@@ -1060,7 +1086,7 @@ fn usage_auto_keeps_live_rate_limit_reason_when_expired_cache_is_omitted() {
     let output = run(
         &["usage", "--format", "json", "--source", "auto"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token")
             .with_env(
                 "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
@@ -1092,6 +1118,7 @@ fn usage_auto_keeps_live_rate_limit_reason_when_expired_cache_is_omitted() {
 fn base_options_pins_containment_defaults_as_the_effective_values() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let options = base_options(tmp.path());
+    let missing_claude = path_str(&tmp.path().join("missing-claude"));
 
     let effective = |key: &str| {
         assert!(
@@ -1120,6 +1147,27 @@ fn base_options_pins_containment_defaults_as_the_effective_values() {
          drops rather than refuses loopback traffic; envs={:?}",
         options.envs
     );
+    assert_eq!(effective("NO_PROXY"), Some("127.0.0.1,localhost"));
+    assert_eq!(effective("no_proxy"), Some("127.0.0.1,localhost"));
+    assert_eq!(effective("CLAUDE_CLI_BIN"), Some(missing_claude.as_str()));
+    assert_eq!(
+        effective("CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN"),
+        Some(missing_claude.as_str())
+    );
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        assert!(
+            options.env_remove.iter().any(|removed| removed == key),
+            "base_options must remove ambient {key}; removed={:?}",
+            options.env_remove
+        );
+    }
 }
 
 #[test]
@@ -1231,7 +1279,11 @@ fn agent_resume_launches_claude_in_recorded_cwd_from_unrelated_dir() {
     let options = CmdOptions::default()
         .with_cwd(&elsewhere)
         .with_env("CLAUDE_CONFIG_DIR", &path_str(&config))
-        .with_path_prepend(&stub_dir);
+        .with_env(
+            "CLAUDE_CLI_BIN",
+            &path_str(&tmp.path().join("ambient-claude-must-not-run")),
+        )
+        .with_fake_claude(&stub_dir);
     let output = run(&["agent", "resume", "cl-x"], &options);
 
     assert_exit(&output, 5);
@@ -1303,7 +1355,7 @@ fn agent_resume_cd_override_bypasses_resolution() {
     let options = CmdOptions::default()
         .with_cwd(tmp.path())
         .with_env("CLAUDE_CONFIG_DIR", &path_str(&config))
-        .with_path_prepend(&stub_dir);
+        .with_fake_claude(&stub_dir);
     let output = run(
         &[
             "agent",
@@ -1379,7 +1431,7 @@ done
         ],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_ARGV_LOG", &path_str(&claude_argv))
             .with_env("CLAUDE_TEST_STDIN_LOG", &path_str(&claude_stdin))
             .with_env("SEMANTIC_TEST_LOG", &path_str(&semantic_log))
@@ -1457,7 +1509,7 @@ exit 97
         &["agent", "commit"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("SEMANTIC_TEST_LOG", &path_str(&semantic_log))
             .with_env("CLAUDE_TEST_REPO", &path_str(&repo))
             .with_env("REAL_GIT", &path_str(&real_git)),
@@ -1538,7 +1590,7 @@ esac
     let output = run(
         &["agent", "doctor", "--format", "json"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_DOCTOR_LOG", &path_str(&invoked)),
     );
 
@@ -1608,7 +1660,7 @@ fn agent_commit_auto_stages_and_pushes_the_verified_commit_to_its_captured_upstr
         &["agent", "commit", "--auto-stage", "--push"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("REAL_GIT", &path_str(&real_git)),
     );
 
@@ -1674,7 +1726,7 @@ fn agent_commit_refuses_push_when_the_captured_endpoint_is_retargeted() {
         &["agent", "commit", "--push"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("REAL_GIT", &path_str(&real_git))
             .with_env(
                 "SEMANTIC_TEST_RETARGET_URL",
@@ -1782,7 +1834,7 @@ fn agent_commit_pins_the_captured_endpoint_against_chained_url_rewrites() {
         &["agent", "commit", "--push"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("REAL_GIT", &path_str(&real_git)),
     );
 
@@ -1850,7 +1902,7 @@ fn agent_commit_preserves_the_local_commit_when_push_fails() {
         &["agent", "commit", "--push"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("REAL_GIT", &path_str(&real_git)),
     );
 
@@ -1912,7 +1964,7 @@ exit 97
         &["agent", "commit"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("SEMANTIC_TEST_LOG", &path_str(&semantic_log)),
     );
 
@@ -1975,7 +2027,7 @@ exit 97
         &["agent", "commit"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_LAUNCHED", &path_str(&launched)),
     );
 
@@ -2021,7 +2073,7 @@ exit 91
         &["agent", "commit", "--effort", "high"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_LAUNCHED", &path_str(&launched)),
     );
 
@@ -2075,7 +2127,7 @@ printf '%s\n' 'unexpected' > "$repo/injected.txt"
         &["agent", "commit"],
         &base_options(tmp.path())
             .with_cwd(&repo)
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("REAL_GIT", &path_str(&real_git)),
     );
 
@@ -2108,7 +2160,7 @@ exit 91
     nils_test_support::write_exe(&bin_dir, "semantic-commit", "#!/bin/sh\nexit 0\n");
     let output = run(
         &["agent", "doctor", "--format", "json"],
-        &base_options(tmp.path()).with_path_prepend(&bin_dir),
+        &base_options(tmp.path()).with_fake_claude(&bin_dir),
     );
 
     assert_exit(&output, 1);
@@ -2143,7 +2195,7 @@ exit 91
     let started = Instant::now();
     let output = run(
         &["agent", "doctor", "--format", "json"],
-        &base_options(tmp.path()).with_path_prepend(&bin_dir),
+        &base_options(tmp.path()).with_fake_claude(&bin_dir),
     );
 
     assert_exit(&output, 1);
@@ -2190,7 +2242,7 @@ esac
     let output = run(
         &["agent", "doctor", "--format", "json"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_CLI_EFFORT", "high"),
     );
 
@@ -2244,7 +2296,7 @@ printf '%s\n' 'safe model result'
     let output = run(
         &["agent", "prompt", prompt],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_CLI_NO_SESSION_PERSISTENCE", "false")
             .with_env("CLAUDE_TEST_ARGV_LOG", &path_str(&argv_log))
             .with_env("CLAUDE_TEST_STDIN_LOG", &path_str(&stdin_log)),
@@ -2298,7 +2350,7 @@ exit 99
     let output = run(
         &["agent", "prompt"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_stdin_str("stdin prompt\n"),
     );
 
@@ -2328,7 +2380,7 @@ exit 99
     let output = run(
         &["agent", "prompt", "hello"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_LAUNCHED", &path_str(&launched)),
     );
 
@@ -2358,7 +2410,7 @@ printf '%s\n' ok
 "#,
     );
     let options = base_options(tmp.path())
-        .with_path_prepend(&bin_dir)
+        .with_fake_claude(&bin_dir)
         .with_env("CLAUDE_TEST_ARGV_LOG", &path_str(&argv_log))
         .with_env("CLAUDE_TEST_STDIN_LOG", &path_str(&stdin_log));
 
@@ -2402,7 +2454,7 @@ cat >/dev/null
 "#,
     );
     let base = base_options(tmp.path())
-        .with_path_prepend(&bin_dir)
+        .with_fake_claude(&bin_dir)
         .with_env("CLAUDE_TEST_ARGV_LOG", &path_str(&argv_log));
 
     let default = run(
@@ -2456,7 +2508,7 @@ exit 99
     let output = run(
         &["agent", "prompt"],
         &base_options(tmp.path())
-            .with_path_prepend(&bin_dir)
+            .with_fake_claude(&bin_dir)
             .with_env("CLAUDE_TEST_LAUNCHED", &path_str(&launched))
             .with_stdin_str(&oversized),
     );
@@ -2485,7 +2537,7 @@ exit 98
 
     let output = run(
         &["auth", "status", "--format", "json"],
-        &base_options(tmp.path()).with_path_prepend(&bin_dir),
+        &base_options(tmp.path()).with_fake_claude(&bin_dir),
     );
 
     assert_exit(&output, 0);
@@ -2526,7 +2578,7 @@ esac
 exit 99
 "#,
     );
-    let base = base_options(tmp.path()).with_path_prepend(&bin_dir);
+    let base = base_options(tmp.path()).with_fake_claude(&bin_dir);
 
     let logged_out = run(
         &["auth", "status", "--format", "json"],
@@ -2588,7 +2640,7 @@ exit 99
 "#,
     );
     let options = base_options(tmp.path())
-        .with_path_prepend(&bin_dir)
+        .with_fake_claude(&bin_dir)
         .with_env("CLAUDE_TEST_ARGV_LOG", &path_str(&argv_log));
 
     let login = run(

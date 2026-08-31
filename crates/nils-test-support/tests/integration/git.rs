@@ -1,4 +1,4 @@
-use nils_test_support::{EnvGuard, GlobalStateLock, git};
+use nils_test_support::{EnvGuard, GlobalStateLock, fs as test_fs, git};
 use pretty_assertions::assert_eq;
 use std::fs;
 
@@ -10,6 +10,24 @@ fn init_repo_with_default_branch_and_config() {
 
     let email = git::git(repo.path(), &["config", "user.email"]);
     assert_eq!(email.trim_end(), "test@example.com");
+
+    let hooks_path = git::git(repo.path(), &["config", "--local", "core.hooksPath"]);
+    assert_eq!(
+        std::path::Path::new(hooks_path.trim_end()),
+        fs::canonicalize(repo.path().join(".git/hooks")).expect("canonical hooks path")
+    );
+}
+
+#[test]
+fn init_repo_can_explicitly_inherit_hooks() {
+    let repo = git::init_repo_with(git::InitRepoOptions::new().with_inherited_hooks());
+
+    let output = git::git_output(
+        repo.path(),
+        &["config", "--local", "--get", "core.hooksPath"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
@@ -59,6 +77,25 @@ fn worktree_add_branch_creates_linked_worktree() {
 
     let branch = git::git(&linked, &["symbolic-ref", "--short", "HEAD"]);
     assert_eq!(branch.trim_end(), "linked-worktree");
+}
+
+#[test]
+fn linked_worktree_commits_run_repository_common_hooks() {
+    let repo = git::init_repo_with(git::InitRepoOptions::new().with_initial_commit());
+    let workspace = tempfile::TempDir::new().expect("tempdir");
+    let linked = workspace.path().join("linked");
+    git::worktree_add_branch(repo.path(), &linked, "linked-worktree");
+
+    let hooks_path = git::git(repo.path(), &["config", "--local", "core.hooksPath"]);
+    let hook = std::path::Path::new(hooks_path.trim()).join("pre-commit");
+    let marker = std::path::Path::new(hooks_path.trim()).join("pre-commit.ran");
+    test_fs::write_executable(&hook, "#!/bin/sh\nprintf 'ran' > \"$0.ran\"\n");
+
+    fs::write(linked.join("linked.txt"), "linked").expect("write linked file");
+    git::git(&linked, &["add", "linked.txt"]);
+    git::git(&linked, &["commit", "-m", "linked commit"]);
+
+    assert_eq!(fs::read_to_string(marker).expect("hook marker"), "ran");
 }
 
 #[test]

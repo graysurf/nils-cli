@@ -36,8 +36,7 @@ impl fmt::Display for UsageFetchError {
 impl std::error::Error for UsageFetchError {}
 
 pub fn fetch_usage(access_token: &str) -> Result<String, UsageFetchError> {
-    let endpoint = shared_env::env_non_empty("CLAUDE_PROMPT_SEGMENT_ENDPOINT")
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    let endpoint = resolve_endpoint(shared_env::env_non_empty("CLAUDE_PROMPT_SEGMENT_ENDPOINT"));
     let max_time_seconds = env_u64("CLAUDE_PROMPT_SEGMENT_MAX_TIME_SECONDS", 5);
     let user_agent = shared_env::env_non_empty("CLAUDE_PROMPT_SEGMENT_USER_AGENT")
         .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
@@ -73,10 +72,37 @@ pub fn fetch_usage(access_token: &str) -> Result<String, UsageFetchError> {
     Ok(body)
 }
 
+fn resolve_endpoint(configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_ENDPOINT, resolve_endpoint};
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn endpoint_resolver_preserves_an_explicit_override() {
+        assert_eq!(
+            resolve_endpoint(Some("http://127.0.0.1:9/usage".to_string())),
+            "http://127.0.0.1:9/usage"
+        );
+    }
+
+    #[test]
+    fn endpoint_resolver_uses_the_production_default_when_unset() {
+        assert_eq!(resolve_endpoint(None), DEFAULT_ENDPOINT);
+        assert_eq!(
+            DEFAULT_ENDPOINT,
+            "https://api.anthropic.com/api/oauth/usage"
+        );
+    }
 }
