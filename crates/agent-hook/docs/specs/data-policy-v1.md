@@ -7,12 +7,14 @@ Unknown fields, invalid identities or digests, duplicate class rules, and
 unsupported schemas fail closed with exit 65.
 
 The request binds the phase, public source and sink IDs, exact session and call
-lineage, workspace digest and generation, turn and step, rules, and candidate.
+lineage, workspace digest and generation, turn and step, stable rule IDs, rule
+actions, and candidate.
 The response echoes a `request:<32-lowercase-hex>` digest of the exact input.
 Consumers must match that value to their own request before accepting the
 decision. Audit output contains only action, stable code, class/source/sink
 IDs, and payload/binding digests; candidate content and execution IDs are never
-copied into the response.
+copied into the response. `matched_rule_ids` identifies the exact rules that
+contributed to the decision without retaining their governed input.
 
 ## Classifier corpus
 

@@ -66,6 +66,7 @@ impl std::fmt::Display for Action {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Rule {
+    rule_id: String,
     class_id: DataClass,
     action: Action,
 }
@@ -109,6 +110,7 @@ struct Audit {
     action: Action,
     code: String,
     classes: Vec<&'static str>,
+    matched_rule_ids: Vec<String>,
     source_id: String,
     sink_id: String,
     payload_digest: String,
@@ -336,9 +338,16 @@ fn validate(request: &Request) -> Result<(), HookError> {
             "data-policy rules must contain 1 through 16 entries",
         ));
     }
-    let mut seen = BTreeSet::new();
+    let mut seen_classes = BTreeSet::new();
+    let mut seen_rule_ids = BTreeSet::new();
     for rule in &request.rules {
-        if !seen.insert(rule.class_id) {
+        if !valid_id(&rule.rule_id) || !seen_rule_ids.insert(rule.rule_id.as_str()) {
+            return Err(data_error(
+                "data-policy-rules-invalid",
+                "data-policy rule identities must be valid and unique",
+            ));
+        }
+        if !seen_classes.insert(rule.class_id) {
             return Err(data_error(
                 "data-policy-rules-invalid",
                 "data-policy class rules must be unique",
@@ -382,13 +391,21 @@ pub(crate) fn evaluate(raw: &[u8]) -> Result<Decision, HookError> {
         classes.remove(&DataClass::MachineLocalPath);
     }
 
-    let action = request
+    let matched_rules = request
         .rules
         .iter()
         .filter(|rule| classes.contains(&rule.class_id))
+        .collect::<Vec<_>>();
+    let action = matched_rules
+        .iter()
         .map(|rule| rule.action)
         .max_by_key(|action| action.rank())
         .unwrap_or(Action::Allow);
+    let mut matched_rule_ids = matched_rules
+        .iter()
+        .map(|rule| rule.rule_id.clone())
+        .collect::<Vec<_>>();
+    matched_rule_ids.sort();
     let class_names = classes
         .iter()
         .copied()
@@ -417,6 +434,7 @@ pub(crate) fn evaluate(raw: &[u8]) -> Result<Decision, HookError> {
             action,
             code,
             classes: class_names,
+            matched_rule_ids,
             source_id: request.source_id,
             sink_id: request.sink_id,
             payload_digest,

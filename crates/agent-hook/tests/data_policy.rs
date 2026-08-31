@@ -50,7 +50,7 @@ fn redacts_sensitive_fields_without_echoing_the_candidate() {
     let input = request(
         json!({"token": sentinel, "safe": "kept"}),
         "tool.shell",
-        json!([{"class_id":"sensitive", "action":"redact"}]),
+        json!([{"rule_id":"data.sensitive.redact", "class_id":"sensitive", "action":"redact"}]),
     );
     let (code, stdout, envelope) = evaluate(&input);
     assert_eq!(code, 0);
@@ -70,6 +70,10 @@ fn redacts_sensitive_fields_without_echoing_the_candidate() {
     );
     assert_eq!(envelope["data"]["action"], "redact");
     assert_eq!(
+        envelope["data"]["audit"]["matched_rule_ids"],
+        json!(["data.sensitive.redact"])
+    );
+    assert_eq!(
         envelope["data"]["replacement"]["token"],
         "[redacted:sensitive]"
     );
@@ -79,8 +83,8 @@ fn redacts_sensitive_fields_without_echoing_the_candidate() {
 #[test]
 fn corpus_covers_structured_binary_streamed_and_portable_path_boundaries() {
     let rules = json!([
-        {"class_id":"sensitive", "action":"deny"},
-        {"class_id":"machine-local-path", "action":"quarantine"}
+        {"rule_id":"data.sensitive.deny", "class_id":"sensitive", "action":"deny"},
+        {"rule_id":"data.machine-path.quarantine", "class_id":"machine-local-path", "action":"quarantine"}
     ]);
     let cases = [
         (
@@ -152,26 +156,42 @@ fn corpus_covers_structured_binary_streamed_and_portable_path_boundaries() {
 }
 
 #[test]
-fn request_binding_changes_with_execution_identity() {
-    let rules = json!([{"class_id":"sensitive", "action":"deny"}]);
+fn request_binding_changes_with_every_execution_identity_dimension() {
+    let rules = json!([{"rule_id":"data.sensitive.deny", "class_id":"sensitive", "action":"deny"}]);
     let first = request(json!({"safe":true}), "tool.native", rules.clone());
-    let mut second = first.clone();
-    second["identity"]["call_id"] = json!("call-2");
     let (_, _, first_envelope) = evaluate(&first);
-    let (_, _, second_envelope) = evaluate(&second);
-    assert_ne!(
-        first_envelope["data"]["request_id"],
-        second_envelope["data"]["request_id"]
-    );
-    assert_ne!(
-        first_envelope["data"]["audit"]["binding_digest"],
-        second_envelope["data"]["audit"]["binding_digest"]
-    );
+    let variants = [
+        ("session_id", json!("session-2")),
+        (
+            "workspace_digest",
+            json!(format!("sha256:{}", "b".repeat(64))),
+        ),
+        ("workspace_generation", json!("generation-2")),
+        ("call_id", json!("call-2")),
+        ("root_call_id", json!("root-call-2")),
+        ("parent_call_id", json!("parent-call-2")),
+        ("turn", json!(2)),
+        ("step", json!(2)),
+    ];
+    for (field, value) in variants {
+        let mut changed = first.clone();
+        changed["identity"][field] = value;
+        let (_, _, changed_envelope) = evaluate(&changed);
+        assert_ne!(
+            first_envelope["data"]["request_id"], changed_envelope["data"]["request_id"],
+            "request id must bind {field}"
+        );
+        assert_ne!(
+            first_envelope["data"]["audit"]["binding_digest"],
+            changed_envelope["data"]["audit"]["binding_digest"],
+            "binding digest must bind {field}"
+        );
+    }
 }
 
 #[test]
 fn quarantines_machine_paths_but_allows_provider_opaque_references() {
-    let rules = json!([{"class_id":"machine-local-path", "action":"quarantine"}]);
+    let rules = json!([{"rule_id":"data.machine-path.quarantine", "class_id":"machine-local-path", "action":"quarantine"}]);
     let path = "/home/fixture/project/result.txt";
     let (code, stdout, envelope) = evaluate(&request(
         json!({"artifact": path}),
@@ -196,7 +216,7 @@ fn denies_protected_root_and_rejects_identity_or_rule_drift() {
     let mut protected = request(
         json!({"path_digest": format!("sha256:{}", "b".repeat(64))}),
         "filesystem.canonical-target",
-        json!([{"class_id":"protected-root", "action":"deny"}]),
+        json!([{"rule_id":"data.protected-root.deny", "class_id":"protected-root", "action":"deny"}]),
     );
     protected["phase"] = json!("protected-root");
     let (_, stdout, envelope) = evaluate(&protected);
@@ -211,8 +231,8 @@ fn denies_protected_root_and_rejects_identity_or_rule_drift() {
 
     let mut duplicate = protected;
     duplicate["rules"] = json!([
-        {"class_id":"protected-root", "action":"deny"},
-        {"class_id":"protected-root", "action":"allow"}
+        {"rule_id":"data.protected-root.deny", "class_id":"protected-root", "action":"deny"},
+        {"rule_id":"data.protected-root.allow", "class_id":"protected-root", "action":"allow"}
     ]);
     let (code, _, envelope) = evaluate(&duplicate);
     assert_eq!(code, 65);
