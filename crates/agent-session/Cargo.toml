@@ -41,11 +41,11 @@ futures-util = { workspace = true }
 tokio-tungstenite = "0.29"
 libc = "0.2"
 notify = "8"
+tempfile = "3"
 
 [dev-dependencies]
 nils-test-support = { version = "1.27.32", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
-tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 # `tower::ServiceExt::oneshot` drives the serve Router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }

@@ -1646,7 +1646,7 @@ struct AttachmentResult {
     id: String,
     filename: String,
     path: String,
-    bytes: usize,
+    bytes: u64,
     content_type: Option<String>,
 }
 
@@ -10616,24 +10616,93 @@ fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleS
     }
 }
 
-fn write_session_attachment(
+struct PendingAttachment {
+    id: String,
+    filename: String,
+    dir: PathBuf,
+    content_type: Option<String>,
+    file: tempfile::NamedTempFile,
+}
+
+impl PendingAttachment {
+    fn reopen(&self) -> Result<std::fs::File, CliError> {
+        self.file.reopen().map_err(|err| {
+            CliError::runtime(
+                "file-write-failed",
+                format!("failed to open the attachment temporary file: {err}"),
+                None,
+            )
+        })
+    }
+
+    fn publish(self, bytes: u64) -> Result<AttachmentResult, CliError> {
+        let Self {
+            id,
+            filename,
+            dir,
+            content_type,
+            file,
+        } = self;
+        let mut file = file;
+        for attempt in 0..1000 {
+            let path = attachment_candidate_path(&dir, &filename, attempt);
+            match file.persist_noclobber(&path) {
+                Ok(_) => {
+                    return Ok(AttachmentResult {
+                        id,
+                        filename,
+                        path: display_path(&path),
+                        bytes,
+                        content_type,
+                    });
+                }
+                Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
+                    file = err.file;
+                }
+                Err(err) => {
+                    return Err(CliError::runtime(
+                        "file-write-failed",
+                        format!("failed to publish the attachment file: {}", err.error),
+                        None,
+                    ));
+                }
+            }
+        }
+        Err(CliError::runtime(
+            "attachment-name-exhausted",
+            "failed to allocate a unique attachment filename",
+            Some(json!({ "filename": filename })),
+        ))
+    }
+}
+
+fn prepare_session_attachment(
     context: &CliContext,
     id: &str,
     filename: Option<&str>,
     content_type: Option<String>,
-    bytes: &[u8],
-) -> Result<AttachmentResult, CliError> {
+) -> Result<PendingAttachment, CliError> {
     let record = load_session_record(context, id)?;
     let filename = sanitize_attachment_filename(filename.unwrap_or("attachment.bin"));
     let dir = session_dir(context, &record.id).join("attachments");
     ensure_private_dir(&dir)?;
-    let path = write_unique_attachment_file(&dir, &filename, bytes)?;
-    Ok(AttachmentResult {
+    let file = tempfile::Builder::new()
+        .prefix(".upload-")
+        .suffix(".part")
+        .tempfile_in(&dir)
+        .map_err(|err| {
+            CliError::runtime(
+                "file-write-failed",
+                format!("failed to create the attachment temporary file: {err}"),
+                None,
+            )
+        })?;
+    Ok(PendingAttachment {
         id: record.id,
         filename,
-        path: display_path(&path),
-        bytes: bytes.len(),
+        dir,
         content_type,
+        file,
     })
 }
 
@@ -10671,48 +10740,6 @@ fn attachment_candidate_path(dir: &Path, filename: &str, attempt: usize) -> Path
     } else {
         dir.join(format!("{stamp}-{attempt}-{filename}"))
     }
-}
-
-fn write_unique_attachment_file(
-    dir: &Path,
-    filename: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, CliError> {
-    for attempt in 0..1000 {
-        let path = attachment_candidate_path(dir, filename, attempt);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(SECRET_FILE_MODE);
-        }
-        let mut file = match options.open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(CliError::runtime(
-                    "file-write-failed",
-                    format!("failed to write {}: {err}", path.display()),
-                    Some(json!({ "path": display_path(&path) })),
-                ));
-            }
-        };
-        if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&path);
-            return Err(CliError::runtime(
-                "file-write-failed",
-                format!("failed to write {}: {err}", path.display()),
-                Some(json!({ "path": display_path(&path) })),
-            ));
-        }
-        return Ok(path);
-    }
-    Err(CliError::runtime(
-        "attachment-name-exhausted",
-        "failed to allocate a unique attachment filename",
-        Some(json!({ "filename": filename })),
-    ))
 }
 
 const WORKDIR_SEARCH_MAX_DEPTH: usize = 4;

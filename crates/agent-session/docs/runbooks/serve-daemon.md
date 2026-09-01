@@ -157,6 +157,14 @@ by `--machine`, `AGENT_SESSION_MACHINE`, `--host`, or the hostname fallback;
 current error envelopes omit it. The activity SSE stream and WebSocket attach
 use their own streaming protocols rather than that JSON envelope.
 
+Attachment upload is a raw binary stream. The daemon defaults to a 1 GiB
+per-file ceiling and writes request chunks to a private temporary file before
+syncing and atomically publishing the final attachment. Set
+`AGENT_SESSION_MAX_ATTACHMENT_BYTES` before startup to an integer from 1 byte
+through 16 GiB when a deployment needs a different bound. A rejected,
+disconnected, or failed request never returns an attachment path and removes
+its temporary file.
+
 Use `POST /sessions/{id}/prompt/v2` when a client needs a cross-version fence.
 It requires both exact prompt text and the expected session incarnation,
 rejects unknown fields, and is absent from older daemons. A replaced runtime
