@@ -30,11 +30,11 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::body::{Body, Bytes, to_bytes};
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -47,6 +47,7 @@ use nils_common::usage_time::{
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
@@ -69,11 +70,11 @@ use crate::{
     SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
     delete_session, delete_session_with_expected_incarnation_and_prepare, glance_session,
-    load_session_record, non_empty_env, profile_unavailable, repo_remote_url_from_cwd,
-    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_auto_resume_input,
-    send_input_serialized, session_clipboard_buffer, session_dir, session_status, short_hostname,
-    start_provider_resume_session, start_session, update_session_title_if_revision,
-    write_session_attachment,
+    load_session_record, non_empty_env, prepare_session_attachment, profile_unavailable,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
+    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title_if_revision,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -85,7 +86,9 @@ const ATTACH_TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_RESIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_CONFIGURED_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES_ENV: &str = "AGENT_SESSION_MAX_ATTACHMENT_BYTES";
 const MAX_STDIN_TOKEN_BYTES: u64 = 8 * 1024;
 const USAGE_SCHEMA_VERSION: &str = "agent-session.usage.v1";
 const DEFAULT_USAGE_TIMEOUT_MS: u64 = 45_000;
@@ -176,6 +179,7 @@ struct ServeState {
     context: CliContext,
     machine: String,
     token: Option<String>,
+    max_attachment_bytes: u64,
     tmux_bin: PathBuf,
     attach_brokers: AttachBrokerRegistry,
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
@@ -700,6 +704,14 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         );
     }
 
+    let max_attachment_bytes = match resolve_max_attachment_bytes() {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return exit::USAGE;
+        }
+    };
+
     let machine = args
         .machine
         .clone()
@@ -759,6 +771,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             context: context.clone(),
             machine,
             token,
+            max_attachment_bytes,
             tmux_bin,
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
@@ -974,6 +987,23 @@ fn resolve_serve_token(args: &cli::ServeArgs) -> Result<Option<String>, ServeTok
         return read_token_from_stdin(io::stdin().lock()).map(Some);
     }
     Ok(sanitize_token(args.token.clone()).or_else(|| non_empty_env("AGENT_SESSION_TOKEN")))
+}
+
+fn resolve_max_attachment_bytes() -> Result<u64, String> {
+    let Some(raw) = non_empty_env(MAX_ATTACHMENT_BYTES_ENV) else {
+        return Ok(DEFAULT_MAX_ATTACHMENT_BYTES);
+    };
+    let value = raw.parse::<u64>().map_err(|_| {
+        format!(
+            "{MAX_ATTACHMENT_BYTES_ENV} must be an integer from 1 to {MAX_CONFIGURED_ATTACHMENT_BYTES}"
+        )
+    })?;
+    if value == 0 || value > MAX_CONFIGURED_ATTACHMENT_BYTES {
+        return Err(format!(
+            "{MAX_ATTACHMENT_BYTES_ENV} must be an integer from 1 to {MAX_CONFIGURED_ATTACHMENT_BYTES}"
+        ));
+    }
+    Ok(value)
 }
 
 fn read_token_from_stdin<R: Read>(reader: R) -> Result<String, ServeTokenError> {
@@ -6769,35 +6799,82 @@ async fn upload_attachment_handler(
     if let Some(resp) = deny_unauthorized(&state, &headers) {
         return resp;
     }
-    let content_type = headers
-        .get(CONTENT_TYPE)
+    if headers
+        .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let bytes = match to_bytes(body, MAX_ATTACHMENT_BYTES + 1).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return status_json(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "attachment-too-large",
-                "attachment exceeds the maximum allowed size",
-            );
-        }
-    };
-    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|value| value > state.max_attachment_bytes)
+    {
         return status_json(
             StatusCode::PAYLOAD_TOO_LARGE,
             "attachment-too-large",
             "attachment exceeds the maximum allowed size",
         );
     }
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let context = state.context.clone();
     let filename = query.filename.clone();
-    let bytes = bytes.to_vec();
-    match tokio::task::spawn_blocking(move || {
-        write_session_attachment(&context, &id, filename.as_deref(), content_type, &bytes)
+    let pending = match tokio::task::spawn_blocking(move || {
+        prepare_session_attachment(&context, &id, filename.as_deref(), content_type)
     })
     .await
     {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(err)) => return envelope_err(err),
+        Err(_) => return join_err(),
+    };
+    let file = match pending.reopen() {
+        Ok(file) => file,
+        Err(err) => return envelope_err(err),
+    };
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut bytes = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                drop(file);
+                return status_json(
+                    StatusCode::BAD_REQUEST,
+                    "attachment-read-failed",
+                    "failed to read the attachment request body",
+                );
+            }
+        };
+        bytes = match bytes.checked_add(chunk.len() as u64) {
+            Some(total) if total <= state.max_attachment_bytes => total,
+            _ => {
+                drop(file);
+                return status_json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "attachment-too-large",
+                    "attachment exceeds the maximum allowed size",
+                );
+            }
+        };
+        if let Err(err) = file.write_all(&chunk).await {
+            drop(file);
+            return envelope_err(CliError::runtime(
+                "file-write-failed",
+                format!("failed to write the attachment temporary file: {err}"),
+                None,
+            ));
+        }
+    }
+    if let Err(err) = file.sync_all().await {
+        drop(file);
+        return envelope_err(CliError::runtime(
+            "file-write-failed",
+            format!("failed to sync the attachment temporary file: {err}"),
+            None,
+        ));
+    }
+    drop(file);
+    match tokio::task::spawn_blocking(move || pending.publish(bytes)).await {
         Ok(Ok(attachment)) => {
             envelope_ok(json!({ "machine": state.machine, "attachment": attachment }))
         }
@@ -9042,6 +9119,22 @@ mod tests {
 
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
+
+    #[test]
+    fn attachment_limit_environment_is_bounded() {
+        let lock = GlobalStateLock::new();
+        let valid = EnvGuard::set(&lock, MAX_ATTACHMENT_BYTES_ENV, "1073741824");
+        assert_eq!(resolve_max_attachment_bytes().unwrap(), 1024 * 1024 * 1024);
+        drop(valid);
+
+        let zero = EnvGuard::set(&lock, MAX_ATTACHMENT_BYTES_ENV, "0");
+        assert!(resolve_max_attachment_bytes().is_err());
+        drop(zero);
+
+        let over_max = (MAX_CONFIGURED_ATTACHMENT_BYTES + 1).to_string();
+        let _over_max = EnvGuard::set(&lock, MAX_ATTACHMENT_BYTES_ENV, &over_max);
+        assert!(resolve_max_attachment_bytes().is_err());
+    }
 
     #[test]
     fn shadow_sidecar_replacements_do_not_trigger_activity_refresh_feedback() {
@@ -11424,6 +11517,7 @@ mod tests {
             },
             machine: MACHINE.to_string(),
             token: token.map(str::to_string),
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
             tmux_bin,
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
@@ -21061,11 +21155,244 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
     }
 
     #[tokio::test]
+    async fn upload_attachment_streams_before_request_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "stream", "codex", "hs-codex-stream");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Bytes, io::Error>>(2);
+        let request_stream = futures_util::stream::unfold(chunk_rx, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/stream/attachments?filename=recording.mp4")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(CONTENT_TYPE, "video/mp4")
+            .body(Body::from_stream(request_stream))
+            .expect("streaming attachment request");
+        let upload = tokio::spawn(call(router(st), request));
+
+        chunk_tx
+            .send(Ok(Bytes::from_static(b"first chunk")))
+            .await
+            .expect("send first chunk");
+        let attachments = tmp.path().join("sessions/stream/attachments");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&attachments) {
+                    let entries = entries.collect::<Result<Vec<_>, _>>().unwrap();
+                    if entries.len() == 1
+                        && entries[0].file_name().to_string_lossy().ends_with(".part")
+                        && std::fs::read(entries[0].path()).ok().as_deref() == Some(b"first chunk")
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first request chunk must reach a temporary file before completion");
+
+        chunk_tx
+            .send(Ok(Bytes::from_static(b" and second chunk")))
+            .await
+            .expect("send second chunk");
+        drop(chunk_tx);
+        let (status, body) = upload.await.expect("upload task");
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let path = PathBuf::from(body["data"]["attachment"]["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"first chunk and second chunk"
+        );
+        assert!(std::fs::read_dir(attachments).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part")
+        }));
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_cleans_up_after_request_body_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "broken", "codex", "hs-codex-broken");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request_stream = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"partial recording")),
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client disconnected",
+            )),
+        ]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/broken/attachments?filename=broken.mp4")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(CONTENT_TYPE, "video/mp4")
+            .body(Body::from_stream(request_stream))
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["error"]["code"], "attachment-read-failed");
+        let attachments = tmp.path().join("sessions/broken/attachments");
+        assert_eq!(std::fs::read_dir(attachments).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_cleans_up_when_handler_is_cancelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "cancelled", "codex", "hs-codex-cancelled");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Bytes, io::Error>>(1);
+        let request_stream = futures_util::stream::unfold(chunk_rx, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/cancelled/attachments?filename=cancelled.mp4")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(request_stream))
+            .unwrap();
+        let upload = tokio::spawn(call(router(st), request));
+
+        chunk_tx
+            .send(Ok(Bytes::from_static(b"partial recording")))
+            .await
+            .unwrap();
+        let attachments = tmp.path().join("sessions/cancelled/attachments");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if std::fs::read_dir(&attachments)
+                    .ok()
+                    .is_some_and(|mut entries| entries.next().is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the temporary attachment must exist before cancellation");
+
+        upload.abort();
+        let _ = upload.await;
+        assert_eq!(std::fs::read_dir(attachments).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_authenticates_and_resolves_session_before_polling_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "ordered", "codex", "hs-codex-ordered");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        for (uri, token, expected) in [
+            (
+                "/sessions/ordered/attachments?filename=unauthorized.bin",
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/sessions/missing/attachments?filename=missing.bin",
+                Some(TOKEN),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let request_stream = futures_util::stream::once(async {
+                panic!("the body must not be polled before request admission");
+                #[allow(unreachable_code)]
+                Ok::<Bytes, io::Error>(Bytes::new())
+            });
+            let mut request = Request::builder().method("POST").uri(uri);
+            if let Some(token) = token {
+                request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let (status, _) = call(
+                router(st.clone()),
+                request.body(Body::from_stream(request_stream)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
+        assert!(!tmp.path().join("sessions/ordered/attachments").exists());
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_rejects_declared_oversize_before_polling_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "declared", "codex", "hs-codex-declared");
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().max_attachment_bytes = 64;
+        let request_stream = futures_util::stream::once(async {
+            panic!("an oversized declared body must not be polled");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, io::Error>(Bytes::new())
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/declared/attachments?filename=oversize.mp4")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(CONTENT_TYPE, "video/mp4")
+            .header(CONTENT_LENGTH, "65")
+            .body(Body::from_stream(request_stream))
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body={body}");
+        assert_eq!(body["error"]["code"], "attachment-too-large");
+        assert!(!tmp.path().join("sessions/declared/attachments").exists());
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_accepts_observed_body_at_exact_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "exact", "codex", "hs-codex-exact");
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().max_attachment_bytes = 64;
+        let payload = Bytes::from(vec![7_u8; 64]);
+        let request_stream = futures_util::stream::once({
+            let payload = payload.clone();
+            async move { Ok::<Bytes, io::Error>(payload) }
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions/exact/attachments?filename=exact.bin")
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::from_stream(request_stream))
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["attachment"]["bytes"], 64);
+        let path = PathBuf::from(body["data"]["attachment"]["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), payload);
+        assert!(
+            std::fs::read_dir(tmp.path().join("sessions/exact/attachments"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".part"))
+        );
+    }
+
+    #[tokio::test]
     async fn upload_attachment_writes_private_session_file_with_safe_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tmux = minimal_tmux(tmp.path());
         seed_session(tmp.path(), "steer", "codex", "hs-codex-steer");
-        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().max_attachment_bytes = 64;
         let payload = b"not actually a png";
 
         let (status, body) = call(
@@ -21118,7 +21445,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         let before_oversize = std::fs::read_dir(tmp.path().join("sessions/steer/attachments"))
             .unwrap()
             .count();
-        let oversize = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let oversize = vec![0u8; 65];
         let (status, body) = call(
             router(st.clone()),
             post_bytes(

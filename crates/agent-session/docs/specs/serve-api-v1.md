@@ -508,8 +508,16 @@ recorded in `sympoies/nils-cli#1409`.
   allocation from the request. Every accepted name resolves to one of the nine
   canonical `SpecialKey` values, so the bound is far above any real caller. An
   unknown name still fails the whole request with `400 invalid-key`.
-- Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
-  session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
+- Attachment upload uses a raw binary request body (not multipart). The daemon
+  streams it into a private same-directory temporary file, enforces the declared
+  and observed byte ceiling, syncs it, and publishes it without replacing an
+  existing attachment. The default ceiling is 1 GiB;
+  `AGENT_SESSION_MAX_ATTACHMENT_BYTES` may set an integer from 1 byte through
+  16 GiB before daemon startup. Oversize input returns
+  `413 attachment-too-large`; a request-body failure returns
+  `400 attachment-read-failed`; neither leaves a partial file. The returned
+  serve envelope contains the sanitized filename, exact byte count, and remote
+  path under the session's private `attachments/` directory.
   Empty or null titles clear the custom session title so clients can fall back to the session id.
 - `GET /sessions/{id}/attach` — a WebSocket PTY attach: a `capture-pane` snapshot then a live byte stream from one
   daemon-owned `tmux pipe-pane` broker per session (binary frames, renderable by xterm.js). Concurrent clients fan out
