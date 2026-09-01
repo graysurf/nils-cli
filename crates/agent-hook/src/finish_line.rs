@@ -1899,11 +1899,13 @@ fn has_git_boundary(start: &Path) -> Result<bool, HookError> {
         if git_boundary_entry_exists(&ancestor.join(".git"))? {
             return Ok(true);
         }
-        let bare_markers = ["HEAD", "objects", "refs", "config"]
-            .iter()
-            .map(|entry| git_boundary_entry_exists(&ancestor.join(entry)))
-            .collect::<Result<Vec<_>, _>>()?;
-        if bare_markers.into_iter().filter(|exists| *exists).count() >= 2 {
+        let has_objects = git_boundary_directory_exists(&ancestor.join("objects"))?;
+        let has_refs = git_boundary_directory_exists(&ancestor.join("refs"))?;
+        let head = read_git_boundary_file(&ancestor.join("HEAD"), has_objects || has_refs)?;
+        let config = read_git_boundary_file(&ancestor.join("config"), has_objects && has_refs)?;
+        if config.as_deref().is_some_and(git_config_declares_bare)
+            || (head.as_deref().is_some_and(is_git_head) && (has_objects || has_refs))
+        {
             return Ok(true);
         }
     }
@@ -1919,6 +1921,101 @@ fn git_boundary_entry_exists(path: &Path) -> Result<bool, HookError> {
             "finish-line Git boundary cannot be inspected",
         )),
     }
+}
+
+fn read_git_boundary_file(path: &Path, strict: bool) -> Result<Option<Vec<u8>>, HookError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if strict => {
+            return Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ));
+        }
+        Err(_) => return Ok(None),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let mut contents = Vec::new();
+    if File::open(path)
+        .and_then(|file| file.take(4097).read_to_end(&mut contents))
+        .is_err()
+    {
+        return if strict {
+            Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    if contents.len() > 4096 {
+        return if strict {
+            Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(Some(contents))
+}
+
+fn git_boundary_directory_exists(path: &Path) -> Result<bool, HookError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git boundary cannot be inspected",
+        )),
+    }
+}
+
+fn is_git_head(contents: &[u8]) -> bool {
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    value.strip_prefix(b"ref: refs/").is_some_and(|reference| {
+        !reference.is_empty()
+            && reference
+                .iter()
+                .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace())
+    }) || matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn git_config_declares_bare(contents: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            if line.eq_ignore_ascii_case("bare") {
+                return true;
+            }
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("bare")
+            && matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_identifier(value: &str) -> Result<(), HookError> {

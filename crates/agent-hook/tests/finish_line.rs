@@ -266,6 +266,97 @@ fn open_distinguishes_the_exact_bare_marker_threshold_in_ancestors() {
 }
 
 #[test]
+fn open_does_not_treat_ordinary_bare_marker_names_as_git_evidence() {
+    let fixture = Fixture::new(POLICY);
+    let application = fixture.root.join("application");
+    fs::create_dir_all(application.join("config")).expect("create application config");
+    fs::create_dir(application.join("objects")).expect("create application objects");
+    let cwd = application.join("nested/cwd");
+    fs::create_dir_all(&cwd).expect("create nested cwd");
+    let mut request = common(&fixture, "session-marker-collision", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:marker-collision");
+    request["cwd"] = json!(cwd);
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "finish-line-not-in-repository"
+    );
+}
+
+#[test]
+fn open_ignores_an_oversized_generic_config_without_git_evidence() {
+    let fixture = Fixture::new(POLICY);
+    let application = fixture.root.join("application");
+    fs::create_dir_all(application.join("objects")).expect("create application objects");
+    fs::write(application.join("config"), vec![b'x'; 4097])
+        .expect("create oversized application config");
+    let cwd = application.join("nested/cwd");
+    fs::create_dir_all(&cwd).expect("create nested cwd");
+    let mut request = common(&fixture, "session-oversized-config", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:oversized-config");
+    request["cwd"] = json!(cwd);
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "finish-line-not-in-repository"
+    );
+}
+
+#[test]
+fn open_recognizes_every_git_true_spelling_for_a_damaged_bare_repository() {
+    for (name, declaration) in [
+        ("true", "bare = true"),
+        ("yes", "bare = yes"),
+        ("on", "bare = on"),
+        ("one", "bare = 1"),
+        ("implicit", "bare"),
+    ] {
+        let fixture = Fixture::new(POLICY);
+        let bare = fixture.root.join("bare.git");
+        let status = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare)
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare failed");
+        fs::remove_file(bare.join("HEAD")).expect("remove bare HEAD");
+        fs::remove_dir_all(bare.join("refs")).expect("remove bare refs");
+        fs::write(bare.join("config"), format!("[core]\n\t{declaration}\n"))
+            .expect("write bare config spelling");
+        let mut request = common(&fixture, &format!("session-bare-{name}"), "turn-1");
+        request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+        request["attempt_token"] = json!(format!("open-token:bare-{name}"));
+        request["cwd"] = json!(bare);
+
+        let output = fixture.run(
+            &["finish-line", "open", "--format", "json"],
+            Some(&request.to_string()),
+        );
+
+        assert_eq!(output.code, 65, "case={name}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "finish-line-repository-invalid",
+            "case={name}"
+        );
+    }
+}
+
+#[test]
 fn open_keeps_unprovable_cwd_boundaries_fail_closed() {
     let fixture = Fixture::new(POLICY);
     let symlink = fixture.root.join("cwd-link");
