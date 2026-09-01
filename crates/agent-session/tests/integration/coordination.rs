@@ -710,6 +710,39 @@ fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Optio
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).expect("registry mode");
 }
 
+fn set_context_for_recorded_cwd(root: &Path, recorded_cwd: &Path, command_cwd: &Path) -> CmdOutput {
+    let state_dir = root.join("state");
+    fs::create_dir_all(&state_dir).expect("state");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            recorded_cwd,
+            Some("advisory"),
+        )],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    run_with_env(
+        command_cwd,
+        &[
+            "work-context",
+            "set",
+            "--summary",
+            "boundary classification",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_ID", "alpha"),
+            ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+            ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+        ],
+    )
+}
+
 fn grant_checkout_shell(state_dir: &Path, session_ids: &[&str]) {
     rewrite_registry(state_dir, |registry| {
         for claim in registry["claims"].as_array_mut().expect("claims") {
@@ -2750,6 +2783,67 @@ fn self_targeting_context_set_clear_and_acknowledge_hide_mechanical_inputs() {
     );
     assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
     assert!(data(&status)["context"].is_null());
+}
+
+#[test]
+fn self_targeting_context_set_distinguishes_proven_non_repository_cwd() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let non_repository = tmp.path().join("non-repository");
+    fs::create_dir(&non_repository).expect("non-repository directory");
+    let result = set_context_for_recorded_cwd(
+        &tmp.path().join("non-repository-case"),
+        &non_repository,
+        &non_repository,
+    );
+
+    assert_ne!(result.code, 0);
+    assert_eq!(result.stdout_json()["error"]["code"], "not-in-repository");
+}
+
+#[test]
+fn self_targeting_context_set_keeps_unprovable_cwd_fail_closed() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    let checkout_alias = tmp.path().join("checkout-alias");
+    std::os::unix::fs::symlink(&checkout, &checkout_alias).expect("checkout symlink");
+    let symlinked =
+        set_context_for_recorded_cwd(&tmp.path().join("symlink-case"), &checkout_alias, &checkout);
+    assert_ne!(symlinked.code, 0);
+    assert_eq!(
+        symlinked.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+
+    let missing = tmp.path().join("missing");
+    let missing_result =
+        set_context_for_recorded_cwd(&tmp.path().join("missing-case"), &missing, tmp.path());
+    assert_ne!(missing_result.code, 0);
+    assert_eq!(
+        missing_result.stdout_json()["error"]["code"],
+        "uncovered-mutation-scope"
+    );
+}
+
+#[test]
+fn self_targeting_context_set_keeps_checkout_without_origin_distinct() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    let removed = Command::new("git")
+        .current_dir(&checkout)
+        .args(["remote", "remove", "origin"])
+        .status()
+        .expect("remove origin");
+    assert!(removed.success());
+    let result =
+        set_context_for_recorded_cwd(&tmp.path().join("no-origin-case"), &checkout, &checkout);
+
+    assert_ne!(result.code, 0);
+    assert_eq!(
+        result.stdout_json()["error"]["code"],
+        "repository-unavailable"
+    );
 }
 
 #[test]

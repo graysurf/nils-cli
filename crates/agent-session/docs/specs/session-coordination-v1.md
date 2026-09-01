@@ -952,7 +952,7 @@ The v1 surface distinguishes at least:
 - `mailbox-body-invalid`, `mailbox-body-too-large`, `reply-depth-exceeded`,
   `message-expired`, `message-not-found`;
 - `coordination-store-untrusted`, `coordination-store-corrupt`.
-- `session-not-managed`, `repository-unavailable`,
+- `session-not-managed`, `not-in-repository`, `repository-unavailable`,
   `invalid-acknowledgement-duration`.
 
 Usage errors exit 64, data/contract errors use the workspace data exit code,
@@ -968,6 +968,10 @@ Release readiness requires:
   worktree, optional context, off peers, stale brokers, and target exit;
 - self-targeting status/set/clear/acknowledge coverage proving no manual session
   ID, capability path, context file, revision, or idempotency key is needed;
+- self-targeting set coverage distinguishing a safely resolved cwd outside Git
+  (`not-in-repository`) from symlinked, missing, or otherwise unprovable cwd
+  boundaries (`uncovered-mutation-scope`) and unresolved checkout origins
+  (`repository-unavailable`);
 - advisory/enforce/off and unmanaged cross-product acceptance;
 - table/property coverage for canonicalization, closed scopes, peer selection,
   conflict precedence, and keyed fingerprint epochs;

@@ -520,12 +520,23 @@ pub fn validate_physical_targets(
 }
 
 pub(crate) fn checkout_root(path: &Path) -> Result<PathBuf, CliError> {
+    checkout_root_with(path, physical_target_unavailable)
+}
+
+pub(crate) fn work_context_checkout_root(path: &Path) -> Result<PathBuf, CliError> {
+    checkout_root_with(path, not_in_repository)
+}
+
+fn checkout_root_with(
+    path: &Path,
+    missing_repository: fn() -> CliError,
+) -> Result<PathBuf, CliError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| physical_target_unavailable())?;
     if metadata.file_type().is_symlink() {
         return Err(physical_target_unavailable());
     }
     let canonical = fs::canonicalize(path).map_err(|_| physical_target_unavailable())?;
-    let root = repository_root(&canonical).ok_or_else(physical_target_unavailable)?;
+    let root = repository_root(&canonical).ok_or_else(missing_repository)?;
     fs::canonicalize(root).map_err(|_| physical_target_unavailable())
 }
 
@@ -609,6 +620,14 @@ fn physical_target_unavailable() -> CliError {
     CliError::data(
         "uncovered-mutation-scope",
         "operation target could not be proven inside the physical checkout boundary",
+        None,
+    )
+}
+
+fn not_in_repository() -> CliError {
+    CliError::data(
+        "not-in-repository",
+        "the current cwd is not inside a Git repository",
         None,
     )
 }
