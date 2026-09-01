@@ -106,6 +106,200 @@ fn open_runner_with_token(
     (output.code, output.stdout_json())
 }
 
+#[test]
+fn open_reports_an_exact_typed_non_repository_result() {
+    let fixture = Fixture::new(POLICY);
+    let mut request = common(&fixture, "session-nonrepo", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:nonrepo");
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    let envelope = output.stdout_json();
+    assert_eq!(
+        envelope["schema_version"],
+        "cli.agent-hook.finish-line-open.v1"
+    );
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "finish-line-not-in-repository");
+}
+
+#[test]
+fn open_keeps_a_malformed_repository_boundary_fail_closed() {
+    let fixture = Fixture::new(POLICY);
+    fs::write(fixture.root.join(".git"), "not a gitdir\n").expect("malformed .git");
+    let mut request = common(&fixture, "session-malformed", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:malformed");
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "finish-line-repository-invalid"
+    );
+}
+
+#[test]
+fn open_keeps_a_bare_repository_boundary_fail_closed() {
+    let fixture = Fixture::new(POLICY);
+    let bare = fixture.root.join("bare.git");
+    let status = Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&bare)
+        .status()
+        .expect("git init --bare");
+    assert!(status.success(), "git init --bare failed");
+    let bare_probe = Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()
+        .expect("bare probe");
+    assert!(bare_probe.status.success(), "bare probe failed");
+    assert_eq!(bare_probe.stdout, b"true\n");
+    let mut request = common(&fixture, "session-bare", "turn-1");
+    request["cwd"] = json!(bare);
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:bare");
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "finish-line-repository-invalid"
+    );
+}
+
+#[test]
+fn open_keeps_partial_bare_repository_markers_fail_closed() {
+    for removed in ["HEAD", "objects", "refs"] {
+        let fixture = Fixture::new(POLICY);
+        let bare = fixture.root.join("bare.git");
+        let status = Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare)
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare failed");
+        let target = bare.join(removed);
+        if target.is_dir() {
+            fs::remove_dir_all(&target).expect("remove bare directory marker");
+        } else {
+            fs::remove_file(&target).expect("remove bare file marker");
+        }
+        let mut request = common(&fixture, &format!("session-bare-{removed}"), "turn-1");
+        request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+        request["attempt_token"] = json!(format!("open-token:bare-{removed}"));
+        request["cwd"] = json!(bare);
+        let output = fixture.run(
+            &["finish-line", "open", "--format", "json"],
+            Some(&request.to_string()),
+        );
+
+        assert_eq!(output.code, 65, "removed={removed}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "finish-line-repository-invalid",
+            "removed={removed}"
+        );
+    }
+}
+
+#[test]
+fn open_distinguishes_the_exact_bare_marker_threshold_in_ancestors() {
+    for (name, markers, expected_code) in [
+        (
+            "two-markers",
+            &["HEAD", "objects"] as &[&str],
+            "finish-line-repository-invalid",
+        ),
+        (
+            "one-marker",
+            &["HEAD"] as &[&str],
+            "finish-line-not-in-repository",
+        ),
+    ] {
+        let fixture = Fixture::new(POLICY);
+        let boundary = fixture.root.join("synthetic-bare");
+        fs::create_dir(&boundary).expect("create synthetic bare boundary");
+        for marker in markers {
+            let path = boundary.join(marker);
+            if *marker == "objects" {
+                fs::create_dir(&path).expect("create synthetic bare directory marker");
+            } else {
+                fs::write(&path, "ref: refs/heads/main\n")
+                    .expect("create synthetic bare file marker");
+            }
+        }
+        let cwd = boundary.join("nested/cwd");
+        fs::create_dir_all(&cwd).expect("create nested cwd");
+        let mut request = common(&fixture, &format!("session-{name}"), "turn-1");
+        request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+        request["attempt_token"] = json!(format!("open-token:{name}"));
+        request["cwd"] = json!(cwd);
+
+        let output = fixture.run(
+            &["finish-line", "open", "--format", "json"],
+            Some(&request.to_string()),
+        );
+
+        assert_eq!(output.code, 65, "case={name}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            expected_code,
+            "case={name}"
+        );
+    }
+}
+
+#[test]
+fn open_keeps_unprovable_cwd_boundaries_fail_closed() {
+    let fixture = Fixture::new(POLICY);
+    let symlink = fixture.root.join("cwd-link");
+    std::os::unix::fs::symlink(&fixture.home, &symlink).expect("cwd symlink");
+    let cases = [
+        ("symlink", symlink),
+        ("missing", fixture.root.join("missing")),
+        ("noncanonical", fixture.root.join("home/..")),
+    ];
+
+    for (name, cwd) in cases {
+        let mut request = common(&fixture, &format!("session-{name}"), "turn-1");
+        request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+        request["attempt_token"] = json!(format!("open-token:{name}"));
+        request["cwd"] = json!(cwd);
+        let output = fixture.run(
+            &["finish-line", "open", "--format", "json"],
+            Some(&request.to_string()),
+        );
+
+        assert_eq!(
+            output.code,
+            65,
+            "case={name} stderr={}",
+            output.stderr_text()
+        );
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "finish-line-repository-invalid",
+            "case={name}"
+        );
+    }
+}
+
 fn release_runner(
     fixture: &Fixture,
     session_id: &str,

@@ -1806,40 +1806,38 @@ fn validate_identity<T: IdentityInput>(
 }
 
 fn resolve_git_identity(start: &Path) -> Result<GitRepositoryIdentity, HookError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(start)
-        .args([
+    let output = run_git_rev_parse(
+        start,
+        &[
             "rev-parse",
             "--path-format=absolute",
             "--show-toplevel",
             "--git-common-dir",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| {
-            finish_line_unavailable(
-                "finish-line-git-unavailable",
-                "finish-line could not invoke Git repository discovery",
-            )
-        })?;
-    if !output.status.success() || output.stdout.len() > 4096 {
+        ],
+    )?;
+    if !output.status.success() {
+        let repository_probe = run_git_rev_parse(start, &["rev-parse", "--git-dir"])?;
+        if repository_probe.status.success() {
+            return Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line cwd is not inside an authoritative Git worktree",
+            ));
+        }
+        if !has_git_boundary(start)? {
+            return Err(HookError::data(
+                "finish-line-not-in-repository",
+                "finish-line cwd is not inside a Git repository",
+            ));
+        }
         return Err(HookError::data(
             "finish-line-repository-invalid",
             "finish-line cwd is not inside an authoritative Git repository",
+        ));
+    }
+    if output.stdout.len() > 4096 {
+        return Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git identity is invalid",
         ));
     }
     let fields = std::str::from_utf8(&output.stdout)
@@ -1866,6 +1864,61 @@ fn resolve_git_identity(start: &Path) -> Result<GitRepositoryIdentity, HookError
         )
     })?;
     Ok(GitRepositoryIdentity { root, common_dir })
+}
+
+fn run_git_rev_parse(start: &Path, args: &[&str]) -> Result<std::process::Output, HookError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| {
+            finish_line_unavailable(
+                "finish-line-git-unavailable",
+                "finish-line could not invoke Git repository discovery",
+            )
+        })
+}
+
+fn has_git_boundary(start: &Path) -> Result<bool, HookError> {
+    for ancestor in start.ancestors() {
+        if git_boundary_entry_exists(&ancestor.join(".git"))? {
+            return Ok(true);
+        }
+        let bare_markers = ["HEAD", "objects", "refs", "config"]
+            .iter()
+            .map(|entry| git_boundary_entry_exists(&ancestor.join(entry)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if bare_markers.into_iter().filter(|exists| *exists).count() >= 2 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn git_boundary_entry_exists(path: &Path) -> Result<bool, HookError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git boundary cannot be inspected",
+        )),
+    }
 }
 
 fn validate_identifier(value: &str) -> Result<(), HookError> {
