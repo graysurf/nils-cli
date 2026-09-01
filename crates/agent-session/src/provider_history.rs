@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::provider_prompt::{ProviderPromptSource, parse_history_user_prompt, read_last_prompt};
 
 const SCAN_MAX_ENTRIES: usize = 10_000;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
@@ -20,6 +22,11 @@ const MAX_MESSAGE_CHARS: usize = 64 * 1024;
 const MAX_MESSAGE_SCAN_LINES: usize = 10_000;
 const MESSAGE_SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
 const CATALOG_TTL: Duration = Duration::from_secs(30);
+const LATEST_PREVIEW_PAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const LATEST_PREVIEW_SESSION_MAX_BYTES: usize = 1024 * 1024;
+const LATEST_PREVIEW_CACHE_MAX_ENTRIES: usize = 1024;
+const REVERSE_MESSAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const REVERSE_MESSAGE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistorySource {
@@ -55,6 +62,10 @@ pub(crate) struct HistorySession {
     pub(crate) title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_user_prompt_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_user_prompt_preview: Option<String>,
     pub(crate) cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) repo_name: Option<String>,
@@ -89,6 +100,17 @@ pub(crate) struct HistoryMessagesPage {
     pub(crate) messages: Vec<HistoryMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) older_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HistoryMessageDirection {
+    #[default]
+    Forward,
+    Latest,
+    Older,
 }
 
 #[derive(Debug)]
@@ -143,6 +165,15 @@ struct CatalogSnapshot {
 struct CatalogCache {
     refreshed_at: Option<Instant>,
     snapshot: Option<CatalogSnapshot>,
+    latest_prompt_previews: HashMap<PathBuf, LatestPromptCacheEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct LatestPromptCacheEntry {
+    len: u64,
+    modified: Option<SystemTime>,
+    scanned_bytes: usize,
+    preview: Option<String>,
 }
 
 #[derive(Debug)]
@@ -169,6 +200,7 @@ impl HistoryCatalog {
         cache.refreshed_at = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn list(
         &self,
         machine: &str,
@@ -177,7 +209,52 @@ impl HistoryCatalog {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<HistoryPage, HistoryError> {
-        paginate_snapshot(self.snapshot(), machine, query, provider, cursor, limit)
+        self.list_with_titles(machine, query, provider, cursor, limit, &BTreeMap::new())
+    }
+
+    pub(crate) fn list_with_titles(
+        &self,
+        machine: &str,
+        query: Option<&str>,
+        provider: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        managed_titles: &BTreeMap<String, String>,
+    ) -> Result<HistoryPage, HistoryError> {
+        let mut snapshot = self.snapshot();
+        apply_title_overrides(&mut snapshot.sessions, managed_titles);
+        let mut page = paginate_snapshot(snapshot, machine, query, provider, cursor, limit)?;
+        let mut prompt_cache = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.latest_prompt_previews.len() > LATEST_PREVIEW_CACHE_MAX_ENTRIES {
+                cache.latest_prompt_previews.clear();
+            }
+            cache.latest_prompt_previews.clone()
+        };
+        enrich_latest_prompt_previews(&mut page.sessions, &mut prompt_cache);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (path, incoming) in prompt_cache {
+            let replace = cache
+                .latest_prompt_previews
+                .get(&path)
+                .is_none_or(|current| {
+                    current.len != incoming.len
+                        || current.modified != incoming.modified
+                        || (current.preview.is_none()
+                            && (incoming.preview.is_some()
+                                || incoming.scanned_bytes > current.scanned_bytes))
+                });
+            if replace {
+                cache.latest_prompt_previews.insert(path, incoming);
+            }
+        }
+        Ok(page)
     }
 
     pub(crate) fn messages(
@@ -185,15 +262,30 @@ impl HistoryCatalog {
         history_id: &str,
         cursor: Option<&str>,
         limit: usize,
+        direction: HistoryMessageDirection,
     ) -> Result<HistoryMessagesPage, HistoryError> {
-        let offset = parse_message_cursor(cursor)?;
         let snapshot = self.snapshot();
         let session = snapshot
             .sessions
             .iter()
             .find(|session| session.id == history_id)
             .ok_or(HistoryError::NotFound)?;
-        read_messages(session, offset, limit.clamp(1, 100))
+        match direction {
+            HistoryMessageDirection::Forward => {
+                read_messages(session, parse_message_cursor(cursor)?, limit.clamp(1, 100))
+            }
+            HistoryMessageDirection::Latest => {
+                if cursor.is_some() {
+                    return Err(HistoryError::InvalidCursor);
+                }
+                read_messages_reverse(session, None, limit.clamp(1, 100))
+            }
+            HistoryMessageDirection::Older => read_messages_reverse(
+                session,
+                Some(parse_required_message_cursor(cursor)?),
+                limit.clamp(1, 100),
+            ),
+        }
     }
 
     fn snapshot(&self) -> CatalogSnapshot {
@@ -312,14 +404,29 @@ pub(crate) fn list(
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<HistoryPage, HistoryError> {
-    paginate_snapshot(
+    let mut page = paginate_snapshot(
         scan_catalog(sources, archives_root),
         machine,
         query,
         provider,
         cursor,
         limit,
-    )
+    )?;
+    enrich_latest_prompt_previews(&mut page.sessions, &mut HashMap::new());
+    Ok(page)
+}
+
+fn apply_title_overrides(
+    sessions: &mut [HistorySession],
+    managed_titles: &BTreeMap<String, String>,
+) {
+    for session in sessions {
+        if session.title.is_none()
+            && let Some(title) = managed_titles.get(&session.id)
+        {
+            session.title = Some(title.clone());
+        }
+    }
 }
 
 fn paginate_snapshot(
@@ -462,11 +569,26 @@ pub(crate) fn messages(
     history_id: &str,
     cursor: Option<&str>,
     limit: usize,
+    direction: HistoryMessageDirection,
 ) -> Result<HistoryMessagesPage, HistoryError> {
-    let offset = parse_message_cursor(cursor)?;
     let limit = limit.clamp(1, 100);
     let session = find_session(sources, history_id).ok_or(HistoryError::NotFound)?;
-    read_messages(&session, offset, limit)
+    match direction {
+        HistoryMessageDirection::Forward => {
+            read_messages(&session, parse_message_cursor(cursor)?, limit)
+        }
+        HistoryMessageDirection::Latest => {
+            if cursor.is_some() {
+                return Err(HistoryError::InvalidCursor);
+            }
+            read_messages_reverse(&session, None, limit)
+        }
+        HistoryMessageDirection::Older => read_messages_reverse(
+            &session,
+            Some(parse_required_message_cursor(cursor)?),
+            limit,
+        ),
+    }
 }
 
 fn parse_message_cursor(cursor: Option<&str>) -> Result<u64, HistoryError> {
@@ -475,6 +597,13 @@ fn parse_message_cursor(cursor: Option<&str>) -> Result<u64, HistoryError> {
         .transpose()
         .map_err(|_| HistoryError::InvalidCursor)
         .map(|cursor| cursor.unwrap_or(0))
+}
+
+fn parse_required_message_cursor(cursor: Option<&str>) -> Result<u64, HistoryError> {
+    let value = cursor.ok_or(HistoryError::InvalidCursor)?;
+    value
+        .parse::<u64>()
+        .map_err(|_| HistoryError::InvalidCursor)
 }
 
 #[cfg(test)]
@@ -585,13 +714,17 @@ fn inspect_history_file(
         source.agent_profile.as_deref(),
         &provider_session_id,
     );
+    let first_user_prompt_preview =
+        first_prompt(path, &source.provider, &provider_session_id, deadline);
     Some(HistorySession {
         id,
         provider: source.provider.clone(),
         provider_session_id,
         agent_profile: source.agent_profile.clone(),
         title: None,
-        prompt_preview: first_prompt(path, &source.provider, deadline),
+        prompt_preview: first_user_prompt_preview.clone(),
+        first_user_prompt_preview,
+        last_user_prompt_preview: None,
         repo_name: repo_name(&cwd),
         cwd,
         created_at,
@@ -602,7 +735,12 @@ fn inspect_history_file(
     })
 }
 
-fn first_prompt(path: &Path, provider: &str, deadline: Instant) -> Option<String> {
+fn first_prompt(
+    path: &Path,
+    provider: &str,
+    provider_session_id: &str,
+    deadline: Instant,
+) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
@@ -617,17 +755,75 @@ fn first_prompt(path: &Path, provider: &str, deadline: Instant) -> Option<String
         if bounded == BoundedLine::Oversized {
             continue;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+        let Ok(line) = std::str::from_utf8(&line) else {
             continue;
         };
-        let Some((role, text, _)) = normalize_message(provider, &value) else {
+        let Some(prompt) = parse_history_user_prompt(provider, provider_session_id, line) else {
             continue;
         };
-        if role == "user" && !text.trim().is_empty() {
-            return Some(truncate_chars(text.trim(), MAX_PREVIEW_CHARS));
-        }
+        return Some(truncate_chars(prompt.text.trim(), MAX_PREVIEW_CHARS));
     }
     None
+}
+
+fn enrich_latest_prompt_previews(
+    sessions: &mut [HistorySession],
+    cache: &mut HashMap<PathBuf, LatestPromptCacheEntry>,
+) {
+    enrich_latest_prompt_previews_with(sessions, cache, |source, budget| {
+        read_last_prompt(source, budget)
+            .map(|prompt| truncate_chars(prompt.text.trim(), MAX_PREVIEW_CHARS))
+    });
+}
+
+fn enrich_latest_prompt_previews_with<F>(
+    sessions: &mut [HistorySession],
+    cache: &mut HashMap<PathBuf, LatestPromptCacheEntry>,
+    mut read_preview: F,
+) where
+    F: FnMut(&ProviderPromptSource, usize) -> Option<String>,
+{
+    if cache.len() > LATEST_PREVIEW_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+
+    let budget =
+        LATEST_PREVIEW_SESSION_MAX_BYTES.min(LATEST_PREVIEW_PAGE_MAX_BYTES / sessions.len().max(1));
+    if budget == 0 {
+        return;
+    }
+    for session in sessions.iter_mut() {
+        let Ok(metadata) = fs::metadata(&session.transcript_path) else {
+            continue;
+        };
+        let len = metadata.len();
+        let modified = metadata.modified().ok();
+        if let Some(entry) = cache.get(&session.transcript_path)
+            && entry.len == len
+            && entry.modified == modified
+            && (entry.preview.is_some()
+                || entry.scanned_bytes >= usize::try_from(len).unwrap_or(usize::MAX).min(budget))
+        {
+            session.last_user_prompt_preview = entry.preview.clone();
+            continue;
+        }
+        let preview = ProviderPromptSource::for_history(
+            &session.provider,
+            session.provider_session_id.clone(),
+            session.transcript_path.clone(),
+        )
+        .and_then(|source| read_preview(&source, budget));
+        session.last_user_prompt_preview = preview.clone();
+        cache.insert(
+            session.transcript_path.clone(),
+            LatestPromptCacheEntry {
+                len,
+                modified,
+                scanned_bytes: usize::try_from(len).unwrap_or(usize::MAX).min(budget),
+                preview,
+            },
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -702,6 +898,7 @@ fn read_messages(
             return Ok(HistoryMessagesPage {
                 messages,
                 next_cursor: Some(next.to_string()),
+                older_cursor: None,
             });
         }
         line.clear();
@@ -710,6 +907,7 @@ fn read_messages(
             return Ok(HistoryMessagesPage {
                 messages,
                 next_cursor: None,
+                older_cursor: None,
             });
         }
         scanned += 1;
@@ -737,7 +935,212 @@ fn read_messages(
     Ok(HistoryMessagesPage {
         messages,
         next_cursor: Some(next.to_string()),
+        older_cursor: None,
     })
+}
+
+fn read_messages_reverse(
+    session: &HistorySession,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<HistoryMessagesPage, HistoryError> {
+    let deadline = Instant::now() + MESSAGE_SCAN_MAX_DURATION;
+    let mut file = fs::File::open(&session.transcript_path).map_err(|_| HistoryError::NotFound)?;
+    let file_len = file.metadata().map_err(|_| HistoryError::Io)?.len();
+    read_messages_reverse_from_reader(session, &mut file, file_len, before, limit, deadline)
+}
+
+fn read_messages_reverse_from_reader<R: Read + Seek>(
+    session: &HistorySession,
+    reader: &mut R,
+    file_len: u64,
+    before: Option<u64>,
+    limit: usize,
+    deadline: Instant,
+) -> Result<HistoryMessagesPage, HistoryError> {
+    let end = before.unwrap_or(file_len);
+    if end > file_len {
+        return Err(HistoryError::InvalidCursor);
+    }
+    if end == 0 {
+        return Ok(HistoryMessagesPage {
+            messages: Vec::new(),
+            next_cursor: None,
+            older_cursor: None,
+        });
+    }
+    if before.is_some() {
+        reader
+            .seek(SeekFrom::Start(end.saturating_sub(1)))
+            .map_err(|_| HistoryError::InvalidCursor)?;
+        let mut preceding = [0u8; 1];
+        reader
+            .read_exact(&mut preceding)
+            .map_err(|_| HistoryError::InvalidCursor)?;
+        if preceding[0] != b'\n' {
+            return Err(HistoryError::InvalidCursor);
+        }
+    }
+
+    let lower_bound = end.saturating_sub(REVERSE_MESSAGE_MAX_BYTES);
+    let mut position = end;
+    let mut partial = Vec::new();
+    let mut partial_oversized = false;
+    let mut messages = Vec::new();
+    let mut bound_reached = false;
+    let mut oldest_offset = None;
+    let mut earliest_boundary = None;
+    let mut scanned = 0usize;
+
+    'chunks: while position > lower_bound && messages.len() < limit {
+        if scanned >= MAX_MESSAGE_SCAN_LINES || Instant::now() >= deadline {
+            bound_reached = true;
+            break;
+        }
+        let chunk_start = position
+            .saturating_sub(REVERSE_MESSAGE_CHUNK_BYTES as u64)
+            .max(lower_bound);
+        let chunk_len = usize::try_from(position - chunk_start).map_err(|_| HistoryError::Io)?;
+        let mut chunk = vec![0u8; chunk_len];
+        reader
+            .seek(SeekFrom::Start(chunk_start))
+            .map_err(|_| HistoryError::Io)?;
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|_| HistoryError::Io)?;
+        position = chunk_start;
+
+        let mut right = chunk.len();
+        let mut rightmost = true;
+        while let Some(newline) = chunk[..right].iter().rposition(|byte| *byte == b'\n') {
+            if scanned >= MAX_MESSAGE_SCAN_LINES || Instant::now() >= deadline {
+                bound_reached = true;
+                break 'chunks;
+            }
+            let line_start = newline + 1;
+            let line_offset = chunk_start.saturating_add(line_start as u64);
+            earliest_boundary = Some(line_offset);
+            scanned += 1;
+
+            if rightmost && (!partial.is_empty() || partial_oversized) {
+                if !partial_oversized
+                    && chunk.len().saturating_sub(line_start) + partial.len() <= MAX_LINE_BYTES
+                {
+                    let mut joined =
+                        Vec::with_capacity(chunk.len().saturating_sub(line_start) + partial.len());
+                    joined.extend_from_slice(&chunk[line_start..]);
+                    joined.extend_from_slice(&partial);
+                    push_reverse_message(session, &joined, line_offset, &mut messages);
+                }
+                partial.clear();
+                partial_oversized = false;
+            } else {
+                push_reverse_message(
+                    session,
+                    &chunk[line_start..right],
+                    line_offset,
+                    &mut messages,
+                );
+            }
+            if messages.len() == limit {
+                break 'chunks;
+            }
+            right = newline;
+            rightmost = false;
+        }
+
+        if chunk_start == 0 {
+            if scanned >= MAX_MESSAGE_SCAN_LINES || Instant::now() >= deadline {
+                bound_reached = true;
+                break;
+            }
+            earliest_boundary = Some(0);
+            if rightmost && (!partial.is_empty() || partial_oversized) {
+                if !partial_oversized && chunk.len() + partial.len() <= MAX_LINE_BYTES {
+                    let mut joined = Vec::with_capacity(chunk.len() + partial.len());
+                    joined.extend_from_slice(&chunk);
+                    joined.extend_from_slice(&partial);
+                    push_reverse_message(session, &joined, 0, &mut messages);
+                }
+            } else {
+                push_reverse_message(session, &chunk[..right], 0, &mut messages);
+            }
+            break;
+        }
+
+        let fragment = &chunk[..right];
+        if rightmost {
+            if partial_oversized || fragment.len() + partial.len() > MAX_LINE_BYTES {
+                partial.clear();
+                partial_oversized = true;
+            } else {
+                let mut joined = Vec::with_capacity(fragment.len() + partial.len());
+                joined.extend_from_slice(fragment);
+                joined.extend_from_slice(&partial);
+                partial = joined;
+            }
+        } else if fragment.len() > MAX_LINE_BYTES {
+            partial.clear();
+            partial_oversized = true;
+        } else {
+            partial.clear();
+            partial.extend_from_slice(fragment);
+        }
+    }
+
+    for message in &messages {
+        let Some(offset) = message
+            .id
+            .rsplit('-')
+            .next()
+            .and_then(|value| value.parse().ok())
+        else {
+            continue;
+        };
+        oldest_offset = Some(oldest_offset.map_or(offset, |current: u64| current.min(offset)));
+    }
+    messages.reverse();
+    let unread_older = position > 0
+        || lower_bound > 0
+        || bound_reached
+        || (messages.len() == limit && oldest_offset.is_some_and(|offset| offset > 0));
+    let continuation =
+        oldest_offset.or_else(|| unread_older.then_some(earliest_boundary).flatten());
+    let older_cursor = continuation
+        .filter(|offset| *offset > 0 && unread_older)
+        .map(|offset| offset.to_string());
+    Ok(HistoryMessagesPage {
+        messages,
+        next_cursor: None,
+        older_cursor,
+    })
+}
+
+fn push_reverse_message(
+    session: &HistorySession,
+    raw_line: &[u8],
+    line_offset: u64,
+    messages: &mut Vec<HistoryMessage>,
+) {
+    let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    let Some((role, text, timestamp)) = normalize_message(&session.provider, &value) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    messages.push(HistoryMessage {
+        id: format!("{}-{line_offset}", session.id),
+        role,
+        text: truncate_chars(text.trim(), MAX_MESSAGE_CHARS),
+        timestamp,
+    });
 }
 
 fn normalize_message(provider: &str, value: &Value) -> Option<(String, String, Option<String>)> {
@@ -878,6 +1281,26 @@ fn truncate_chars(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Read, Seek};
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: usize,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.bytes_read += read;
+            Ok(read)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingReader<R> {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
 
     fn history_session(id: &str, updated_at: &str) -> HistorySession {
         HistorySession {
@@ -887,6 +1310,8 @@ mod tests {
             agent_profile: None,
             title: None,
             prompt_preview: None,
+            first_user_prompt_preview: None,
+            last_user_prompt_preview: None,
             cwd: "/work/example".to_string(),
             repo_name: Some("example".to_string()),
             created_at: updated_at.to_string(),
@@ -906,7 +1331,8 @@ mod tests {
             root.join("rollout.jsonl"),
             concat!(
                 "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n",
-                "{\"timestamp\":\"2026-08-31T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"visible preview\"}]}}\n",
+                "{\"timestamp\":\"2026-08-31T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"injected bootstrap wrapper\"}]}}\n",
+                "{\"timestamp\":\"2026-08-31T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"visible preview\"}],\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"turn-1\",\"content_item_kinds\":[\"user.text\"]}}}\n",
                 "{\"timestamp\":\"2026-08-31T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"secret needle\"}]}}\n"
             ),
         )
@@ -928,6 +1354,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(
+            preview.sessions[0].first_user_prompt_preview.as_deref(),
+            Some("visible preview")
+        );
+        assert_eq!(
+            preview.sessions[0].last_user_prompt_preview.as_deref(),
+            Some("visible preview")
+        );
+        let wrapper = list(
+            &sources,
+            &tmp.path().join("archives"),
+            "test",
+            Some("injected bootstrap wrapper"),
+            None,
+            None,
+            25,
+        )
+        .unwrap();
+        assert!(wrapper.sessions.is_empty());
         let body = list(
             &sources,
             &tmp.path().join("archives"),
@@ -939,6 +1384,140 @@ mod tests {
         )
         .unwrap();
         assert!(body.sessions.is_empty());
+    }
+
+    #[test]
+    fn latest_and_older_message_pages_are_bounded_and_chronological() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions/2026/08/31");
+        fs::create_dir_all(&root).unwrap();
+        let mut transcript = String::from(
+            "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n",
+        );
+        for index in 1..=6 {
+            transcript.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-31T00:00:0{index}Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"message {index}\"}}]}}}}\n"
+            ));
+        }
+        fs::write(root.join("rollout.jsonl"), transcript).unwrap();
+        let sources = [HistorySource {
+            provider: "codex".into(),
+            agent_profile: None,
+            root: tmp.path().join("sessions"),
+        }];
+        let history_id = stable_history_id("codex", None, "abc");
+
+        let latest = messages(
+            &sources,
+            &history_id,
+            None,
+            2,
+            HistoryMessageDirection::Latest,
+        )
+        .unwrap();
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 5", "message 6"]
+        );
+        assert!(latest.next_cursor.is_none());
+        let older_cursor = latest.older_cursor.as_deref().expect("older page");
+
+        let older = messages(
+            &sources,
+            &history_id,
+            Some(older_cursor),
+            2,
+            HistoryMessageDirection::Older,
+        )
+        .unwrap();
+        assert_eq!(
+            older
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["message 3", "message 4"]
+        );
+        assert!(older.older_cursor.is_some());
+    }
+
+    #[test]
+    fn dense_latest_page_stops_after_one_reverse_chunk() {
+        let session = history_session("dense", "2026-09-01T00:00:00Z");
+        let mut transcript = vec![b'x'; REVERSE_MESSAGE_CHUNK_BYTES * 2];
+        transcript.push(b'\n');
+        for index in 0..50 {
+            transcript.extend_from_slice(
+                format!(
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"message {index}\"}}]}}}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        let file_len = transcript.len() as u64;
+        let mut reader = CountingReader {
+            inner: Cursor::new(transcript),
+            bytes_read: 0,
+        };
+
+        let page = read_messages_reverse_from_reader(
+            &session,
+            &mut reader,
+            file_len,
+            None,
+            50,
+            Instant::now() + MESSAGE_SCAN_MAX_DURATION,
+        )
+        .unwrap();
+
+        assert_eq!(page.messages.len(), 50);
+        assert!(reader.bytes_read <= REVERSE_MESSAGE_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn empty_bounded_reverse_page_keeps_a_cursor_to_older_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions/2026/08/31");
+        fs::create_dir_all(&root).unwrap();
+        let mut transcript = String::from(
+            "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"older conversation\"}]}}\n",
+        );
+        for _ in 0..=MAX_MESSAGE_SCAN_LINES {
+            transcript.push_str("{\"type\":\"turn_context\"}\n");
+        }
+        fs::write(root.join("rollout.jsonl"), transcript).unwrap();
+        let sources = [HistorySource {
+            provider: "codex".into(),
+            agent_profile: None,
+            root: tmp.path().join("sessions"),
+        }];
+        let history_id = stable_history_id("codex", None, "abc");
+
+        let latest = messages(
+            &sources,
+            &history_id,
+            None,
+            50,
+            HistoryMessageDirection::Latest,
+        )
+        .unwrap();
+        assert!(latest.messages.is_empty());
+        let cursor = latest.older_cursor.as_deref().expect("older cursor");
+
+        let older = messages(
+            &sources,
+            &history_id,
+            Some(cursor),
+            50,
+            HistoryMessageDirection::Older,
+        )
+        .unwrap();
+        assert_eq!(older.messages.len(), 1);
+        assert_eq!(older.messages[0].text, "older conversation");
     }
 
     #[test]
@@ -961,10 +1540,24 @@ mod tests {
             root: tmp.path().join("sessions"),
         }];
         let history_id = stable_history_id("codex", None, "abc");
-        let first = messages(&sources, &history_id, None, 1).unwrap();
+        let first = messages(
+            &sources,
+            &history_id,
+            None,
+            1,
+            HistoryMessageDirection::Forward,
+        )
+        .unwrap();
         assert_eq!(first.messages[0].role, "user");
         assert_eq!(first.messages[0].text, "first");
-        let second = messages(&sources, &history_id, first.next_cursor.as_deref(), 1).unwrap();
+        let second = messages(
+            &sources,
+            &history_id,
+            first.next_cursor.as_deref(),
+            1,
+            HistoryMessageDirection::Forward,
+        )
+        .unwrap();
         assert_eq!(second.messages[0].role, "assistant");
         assert_eq!(second.messages[0].text, "second");
         assert_ne!(first.messages[0].id, second.messages[0].id);
@@ -1018,6 +1611,78 @@ mod tests {
                 .sessions
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn latest_preview_enrichment_respects_the_page_aggregate_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for index in 0..50 {
+            let path = tmp.path().join(format!("history-{index}.jsonl"));
+            fs::File::create(&path)
+                .unwrap()
+                .set_len((LATEST_PREVIEW_SESSION_MAX_BYTES * 2) as u64)
+                .unwrap();
+            let mut session = history_session(&format!("session-{index}"), "2026-09-01T00:00:00Z");
+            session.transcript_path = path;
+            sessions.push(session);
+        }
+        let mut cache = HashMap::new();
+
+        enrich_latest_prompt_previews(&mut sessions, &mut cache);
+
+        assert_eq!(cache.len(), sessions.len());
+        assert!(
+            cache
+                .values()
+                .map(|entry| entry.scanned_bytes)
+                .sum::<usize>()
+                <= LATEST_PREVIEW_PAGE_MAX_BYTES
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.last_user_prompt_preview.is_none())
+        );
+    }
+
+    #[test]
+    fn unchanged_negative_preview_cache_avoids_equal_budget_rescans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for index in 0..50 {
+            let path = tmp.path().join(format!("history-{index}.jsonl"));
+            fs::File::create(&path)
+                .unwrap()
+                .set_len((LATEST_PREVIEW_SESSION_MAX_BYTES * 2) as u64)
+                .unwrap();
+            let mut session = history_session(&format!("session-{index}"), "2026-09-01T00:00:00Z");
+            session.transcript_path = path;
+            sessions.push(session);
+        }
+        let mut cache = HashMap::new();
+        let mut reads = 0usize;
+
+        enrich_latest_prompt_previews_with(&mut sessions, &mut cache, |_, _| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, sessions.len());
+        enrich_latest_prompt_previews_with(&mut sessions, &mut cache, |_, _| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, sessions.len());
+
+        enrich_latest_prompt_previews_with(&mut sessions[..1], &mut cache, |_, _| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, sessions.len() + 1);
+        assert_eq!(
+            cache[&sessions[0].transcript_path].scanned_bytes,
+            LATEST_PREVIEW_SESSION_MAX_BYTES
         );
     }
 
@@ -1089,6 +1754,51 @@ mod tests {
     }
 
     #[test]
+    fn exact_managed_title_is_applied_before_metadata_filtering() {
+        let id = stable_history_id("codex", Some("profile-a"), "provider-id");
+        let mut snapshot = CatalogSnapshot {
+            sessions: vec![HistorySession {
+                id: id.clone(),
+                provider: "codex".to_string(),
+                provider_session_id: "provider-id".to_string(),
+                agent_profile: Some("profile-a".to_string()),
+                title: None,
+                prompt_preview: Some("first prompt".to_string()),
+                first_user_prompt_preview: Some("first prompt".to_string()),
+                last_user_prompt_preview: Some("latest prompt".to_string()),
+                cwd: "/work/example".to_string(),
+                repo_name: Some("example".to_string()),
+                created_at: "2026-08-31T00:00:00Z".to_string(),
+                updated_at: "2026-08-31T00:00:01Z".to_string(),
+                archived_at: None,
+                resumable: true,
+                transcript_path: PathBuf::new(),
+            }],
+            truncated: false,
+        };
+        apply_title_overrides(
+            &mut snapshot.sessions,
+            &BTreeMap::from([(id, "Saved Console title".to_string())]),
+        );
+
+        let page = paginate_snapshot(
+            snapshot,
+            "test",
+            Some("saved console title"),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(
+            page.sessions[0].title.as_deref(),
+            Some("Saved Console title")
+        );
+    }
+
+    #[test]
     fn claude_history_excludes_sidechains_and_pages_visible_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("projects/repo");
@@ -1096,7 +1806,7 @@ mod tests {
         fs::write(
             root.join("claude-id.jsonl"),
             concat!(
-                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"message\":{\"content\":\"first\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
                 "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"content\":\"hidden\"}}\n",
                 "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n"
             ),
@@ -1119,13 +1829,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page.sessions.len(), 1);
-        let first = messages(&sources, &page.sessions[0].id, None, 1).unwrap();
+        let first = messages(
+            &sources,
+            &page.sessions[0].id,
+            None,
+            1,
+            HistoryMessageDirection::Forward,
+        )
+        .unwrap();
         assert_eq!(first.messages[0].text, "first");
         let second = messages(
             &sources,
             &page.sessions[0].id,
             first.next_cursor.as_deref(),
             10,
+            HistoryMessageDirection::Forward,
         )
         .unwrap();
         assert_eq!(second.messages.len(), 1);
@@ -1206,9 +1924,15 @@ mod tests {
         assert_eq!(profile_b.cwd, "/work/profile-b");
         assert!(profile_b.archived_at.is_none());
         assert_eq!(
-            messages(&sources, &profile_b_id, None, 10)
-                .unwrap()
-                .messages[0]
+            messages(
+                &sources,
+                &profile_b_id,
+                None,
+                10,
+                HistoryMessageDirection::Forward,
+            )
+            .unwrap()
+            .messages[0]
                 .text,
             "profile b transcript"
         );
