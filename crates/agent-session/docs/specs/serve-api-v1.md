@@ -58,16 +58,35 @@ is no second state model.
 
 `GET /history/sessions` returns a bounded, cursor-paged catalog of resumable
 Codex and Claude provider sessions. Optional `q` searches only the returned
-metadata fields: archived title, bounded first-prompt preview, provider session
-id, provider, launch-profile id, cwd/repository label, machine, and timestamps.
-It never searches arbitrary conversation text. Optional `provider`, `cursor`,
-and `limit` further bound the result. `data.capabilities` explicitly advertises
-`metadata_search: true`, `full_text_search: false`, `transcript_messages: true`,
-and `archive: true`.
+metadata fields: exact archived/managed title, bounded first-user-prompt
+preview, provider session id, provider, launch-profile id, cwd/repository
+label, machine, and timestamps. It never searches arbitrary conversation
+text or the latest-user-prompt preview. Optional `provider`, `cursor`, and
+`limit` further bound the result. Each item may add
+`first_user_prompt_preview` and `last_user_prompt_preview`; both are bounded
+response-only text and may be absent when provider-aware parsing cannot
+identify a human-submitted prompt within the read budget. `prompt_preview`
+remains the backward-compatible alias for the first-user preview. A matching
+managed record enriches `title` only through the exact provider/profile/session
+history identity; archived metadata stays authoritative, and provider-only
+historical records do not invent a Console title. `data.capabilities` explicitly
+advertises `metadata_search: true`, `full_text_search: false`,
+`transcript_messages: true`, `latest_message_paging: true`, and `archive: true`.
+
+Latest-prompt enrichment is limited to the returned catalog page, uses at most
+1 MiB per transcript and 16 MiB across one page, and is cached in process by
+transcript path, size, and modification time. It never adds a full-catalog
+transcript-body scan.
 
 `GET /history/sessions/{history_id}/messages` resolves the opaque history id
 inside the daemon and returns normalized `user`/`assistant` text messages in
-bounded pages. The browser receives neither provider transcript paths nor raw
+bounded pages. The retained default `direction=forward` uses `next_cursor` as
+before. `direction=latest` accepts no cursor, reads one at-most-16-MiB window
+from the selected transcript tail, and returns the latest page in chronological
+order. `direction=older` requires the prior `older_cursor`, reads only bytes
+before that line boundary, and returns the preceding chronological page plus a
+new optional `older_cursor`. Reverse reads retain the 10,000-line and two-second
+message limits. The browser receives neither provider transcript paths nor raw
 provider JSONL records. Both history reads require the server bearer because
 conversation content is more sensitive than the live list projection.
 

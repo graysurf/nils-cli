@@ -88,6 +88,23 @@ pub(crate) struct ProviderPromptSource {
 }
 
 impl ProviderPromptSource {
+    pub(crate) fn for_history(
+        provider: &str,
+        session_id: impl Into<String>,
+        path: PathBuf,
+    ) -> Option<Self> {
+        let provider = match provider {
+            "codex" => ProviderKind::Codex,
+            "claude" => ProviderKind::Claude,
+            _ => return None,
+        };
+        Some(Self {
+            provider,
+            session_id: session_id.into(),
+            path,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn test_path(
         provider: ProviderKind,
@@ -472,15 +489,48 @@ fn provider_event(prompt: ParsedPrompt) -> ProviderPromptEvent {
 
 fn parse_codex_prompt(line: &str) -> Option<ParsedPrompt> {
     let value: Value = serde_json::from_str(line).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return None;
+    match value.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            let payload = value.get("payload")?;
+            if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+                return None;
+            }
+            let mut prompt = bounded_prompt(payload.get("message").and_then(Value::as_str)?)?;
+            prompt.submitted_at = provider_timestamp(&value);
+            Some(prompt)
+        }
+        Some("response_item") => parse_codex_response_item_prompt(&value),
+        _ => None,
     }
+}
+
+fn parse_codex_response_item_prompt(value: &Value) -> Option<ParsedPrompt> {
     let payload = value.get("payload")?;
-    if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
         return None;
     }
-    let mut prompt = bounded_prompt(payload.get("message").and_then(Value::as_str)?)?;
-    prompt.submitted_at = provider_timestamp(&value);
+    let metadata = payload.get("internal_chat_message_metadata_passthrough")?;
+    let kinds = metadata.get("content_item_kinds")?.as_array()?;
+    if !kinds.iter().any(|kind| kind.as_str() == Some("user.text")) {
+        return None;
+    }
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("input_text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut prompt = bounded_prompt(&text)?;
+    prompt.submitted_at = provider_timestamp(value);
+    prompt.turn_id = metadata
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some(prompt)
 }
 
@@ -547,6 +597,27 @@ fn parse_claude_user_prompt_value(value: &Value, session_id: &str) -> Option<Par
         .and_then(Value::as_str)
         .map(str::to_string);
     Some(prompt)
+}
+
+/// Parse one provider transcript record using the same human-prompt semantics
+/// as the live last-prompt projection. History callers use this for bounded
+/// first-prompt discovery instead of treating every generic `user` role as a
+/// prompt the operator submitted.
+pub(crate) fn parse_history_user_prompt(
+    provider: &str,
+    session_id: &str,
+    line: &str,
+) -> Option<LastPrompt> {
+    let parsed = match provider {
+        "codex" => parse_codex_prompt(line),
+        "claude" => parse_claude_user_prompt(line, session_id),
+        _ => None,
+    }?;
+    Some(LastPrompt {
+        text: parsed.prompt,
+        submitted_at: parsed.submitted_at,
+        truncated: parsed.truncated,
+    })
 }
 
 fn provider_timestamp(value: &Value) -> Option<String> {
@@ -921,15 +992,22 @@ mod tests {
     #[test]
     fn codex_parser_accepts_only_user_messages() {
         let submitted = r#"{"timestamp":"2099-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"edited prompt","images":[],"local_images":[],"text_elements":[]}}"#;
+        let submitted_response_item = r#"{"timestamp":"2099-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"modern prompt"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1","content_item_kinds":["user.text"]}}}"#;
         let agent_output = r#"{"timestamp":"2099-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"assistant output"}}"#;
         let injected_user = r#"{"timestamp":"2099-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"system-injected context"}]}}"#;
+        let instructions = r#"{"timestamp":"2099-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"AGENTS instructions"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1","content_item_kinds":["agents_md.instructions","environments.environment_context"]}}}"#;
 
         assert_eq!(
             parse_codex_prompt(submitted).map(|prompt| prompt.prompt),
             Some("edited prompt".to_string())
         );
+        assert_eq!(
+            parse_codex_prompt(submitted_response_item).map(|prompt| prompt.prompt),
+            Some("modern prompt".to_string())
+        );
         assert_eq!(parse_codex_prompt(agent_output), None);
         assert_eq!(parse_codex_prompt(injected_user), None);
+        assert_eq!(parse_codex_prompt(instructions), None);
     }
 
     #[test]

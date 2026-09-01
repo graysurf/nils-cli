@@ -10,11 +10,11 @@
 //! Every response carries the daemon's `machine` identity so the edge can
 //! aggregate multiple machines. Literal keystroke text is never echoed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -56,7 +56,9 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::codex_app_server::{self, ControlHandle};
 use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
-use crate::provider_history::{self, ArchivedSession, HistoryCatalog, HistoryError, HistorySource};
+use crate::provider_history::{
+    self, ArchivedSession, HistoryCatalog, HistoryError, HistoryMessageDirection, HistorySource,
+};
 use crate::provider_prompt::{
     LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
     ProviderLastPromptRefresh, ProviderLastPromptTracker, ProviderPromptEvent,
@@ -2937,6 +2939,7 @@ struct HistoryListQuery {
 struct HistoryMessagesQuery {
     cursor: Option<String>,
     limit: Option<usize>,
+    direction: Option<HistoryMessageDirection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3195,15 +3198,18 @@ async fn history_list_handler(
         return response;
     }
     let catalog = state.history_catalog.clone();
+    let context = state.context.clone();
     let machine = state.machine.clone();
     let response_machine = machine.clone();
     match tokio::task::spawn_blocking(move || {
-        catalog.list(
+        let titles = managed_history_titles(&context);
+        catalog.list_with_titles(
             &machine,
             query.q.as_deref(),
             query.provider.as_deref(),
             query.cursor.as_deref(),
             query.limit.unwrap_or(50),
+            &titles,
         )
     })
     .await
@@ -3218,6 +3224,7 @@ async fn history_list_handler(
                 "metadata_search": true,
                 "full_text_search": false,
                 "transcript_messages": true,
+                "latest_message_paging": true,
                 "archive": true,
             },
         })),
@@ -3237,7 +3244,12 @@ async fn history_messages_handler(
     }
     let catalog = state.history_catalog.clone();
     match tokio::task::spawn_blocking(move || {
-        catalog.messages(&id, query.cursor.as_deref(), query.limit.unwrap_or(50))
+        catalog.messages(
+            &id,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(50),
+            query.direction.unwrap_or_default(),
+        )
     })
     .await
     {
@@ -3245,10 +3257,57 @@ async fn history_messages_handler(
             "machine": state.machine,
             "messages": page.messages,
             "next_cursor": page.next_cursor,
+            "older_cursor": page.older_cursor,
         })),
         Ok(Err(error)) => history_error_response(error),
         Err(_) => join_err(),
     }
+}
+
+fn managed_history_titles(context: &CliContext) -> BTreeMap<String, String> {
+    let root = context.state_dir.join("sessions");
+    let Ok(entries) = fs::read_dir(root) else {
+        return BTreeMap::new();
+    };
+    let mut candidates: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for entry in entries.flatten() {
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(record) = load_session_record(context, &id) else {
+            continue;
+        };
+        let Some(resume) = record.provider_resume.as_ref() else {
+            continue;
+        };
+        let Some(title) = record
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        else {
+            continue;
+        };
+        let history_id = provider_history::stable_history_id(
+            &resume.provider,
+            crate::session_agent_profile(&record),
+            &resume.session_id,
+        );
+        match candidates.entry(history_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(title.to_string()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_deref() != Some(title) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(history_id, title)| title.map(|title| (history_id, title)))
+        .collect()
 }
 
 fn history_error_response(error: HistoryError) -> Response {
@@ -14265,6 +14324,127 @@ esac
         assert_eq!(body["data"]["sessions"], json!([]));
         assert_eq!(body["data"]["capabilities"]["metadata_search"], true);
         assert_eq!(body["data"]["capabilities"]["full_text_search"], false);
+        assert_eq!(body["data"]["capabilities"]["latest_message_paging"], true);
+    }
+
+    #[test]
+    fn managed_history_titles_use_the_complete_provider_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "managed-title",
+            "codex",
+            "hs-managed-title",
+            tmp.path(),
+            &["resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/managed-title/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["title"] = json!("Saved Console title");
+        record["runtime"]["agent_profile"] = json!("profile-a");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+
+        let titles = managed_history_titles(&context);
+
+        assert_eq!(
+            titles.get(&provider_history::stable_history_id(
+                "codex",
+                Some("profile-a"),
+                "resume-session-id",
+            )),
+            Some(&"Saved Console title".to_string())
+        );
+        assert!(!titles.contains_key(&provider_history::stable_history_id(
+            "codex",
+            None,
+            "resume-session-id",
+        )));
+    }
+
+    #[tokio::test]
+    async fn history_routes_enrich_titles_previews_and_latest_older_pages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let history_root = tmp.path().join("provider/sessions/2026/09/01");
+        fs::create_dir_all(&history_root).unwrap();
+        fs::write(
+            history_root.join("rollout.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-09-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"resume-session-id\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-09-01T00:00:00Z\"}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"bootstrap wrapper\"}]}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"first human prompt\"}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"message 1\"}]}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"message 2\"}]}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"latest human prompt\"}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"message 3\"}]}}\n",
+                "{\"timestamp\":\"2026-09-01T00:00:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"message 4\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        seed_resumable_session(
+            tmp.path(),
+            "managed-title",
+            "codex",
+            "hs-managed-title",
+            tmp.path(),
+            &["resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/managed-title/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["title"] = json!("Saved Console title");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let mut st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        Arc::get_mut(&mut st).unwrap().history_catalog = Arc::new(HistoryCatalog::new(
+            vec![HistorySource {
+                provider: "codex".to_string(),
+                agent_profile: None,
+                root: tmp.path().join("provider/sessions"),
+            }],
+            provider_history::archive_root(tmp.path()),
+        ));
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth("/history/sessions?q=saved%20console", Some(TOKEN)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["sessions"][0];
+        assert_eq!(session["title"], "Saved Console title");
+        assert_eq!(session["first_user_prompt_preview"], "first human prompt");
+        assert_eq!(session["last_user_prompt_preview"], "latest human prompt");
+        let history_id = session["id"].as_str().unwrap();
+
+        let (status, latest) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/history/sessions/{history_id}/messages?direction=latest&limit=2"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={latest}");
+        assert_eq!(latest["data"]["messages"][0]["text"], "message 3");
+        assert_eq!(latest["data"]["messages"][1]["text"], "message 4");
+        let older_cursor = latest["data"]["older_cursor"].as_str().unwrap();
+
+        let (status, older) = call(
+            router(st),
+            get_auth(
+                &format!(
+                    "/history/sessions/{history_id}/messages?direction=older&limit=2&cursor={older_cursor}"
+                ),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={older}");
+        assert_eq!(older["data"]["messages"][0]["text"], "message 1");
+        assert_eq!(older["data"]["messages"][1]["text"], "message 2");
     }
 
     #[tokio::test]
