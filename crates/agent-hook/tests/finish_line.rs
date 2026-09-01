@@ -129,6 +129,75 @@ fn open_reports_an_exact_typed_non_repository_result() {
 }
 
 #[test]
+fn open_tolerates_non_repository_bash_only_when_the_exact_command_is_read_only() {
+    for (name, command, expected_code) in [
+        (
+            "bare-pwd",
+            "pwd",
+            "finish-line-non-repository-operation-unauthorized",
+        ),
+        (
+            "pwd-physical",
+            "/bin/pwd -P",
+            "finish-line-not-in-repository",
+        ),
+        (
+            "absolute-write",
+            "printf x > /tmp/other-repository/tracked.txt",
+            "finish-line-non-repository-operation-unauthorized",
+        ),
+        (
+            "git-output",
+            "git diff --no-index --output=/tmp/other-repository/tracked.txt /tmp/a /tmp/b",
+            "finish-line-non-repository-operation-unauthorized",
+        ),
+        (
+            "untrusted-git",
+            "/tmp/git status",
+            "finish-line-non-repository-operation-unauthorized",
+        ),
+    ] {
+        let fixture = Fixture::new(POLICY);
+        let mut request = common(&fixture, &format!("session-{name}"), "turn-1");
+        request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+        request["attempt_token"] = json!(format!("open-token:{name}"));
+        request["command"] = json!(command);
+
+        let output = fixture.run(
+            &["finish-line", "open", "--format", "json"],
+            Some(&request.to_string()),
+        );
+
+        assert_eq!(output.code, 65, "case={name}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            expected_code,
+            "case={name}"
+        );
+    }
+}
+
+#[test]
+fn open_rejects_an_explicit_null_command_instead_of_treating_it_as_omitted() {
+    let fixture = Fixture::new(POLICY);
+    let mut request = common(&fixture, "session-null-command", "turn-1");
+    request["schema_version"] = json!("agent-hook.finish-line.open.v1");
+    request["attempt_token"] = json!("open-token:null-command");
+    request["command"] = Value::Null;
+
+    let output = fixture.run(
+        &["finish-line", "open", "--format", "json"],
+        Some(&request.to_string()),
+    );
+
+    assert_eq!(output.code, 65);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "finish-line-request-invalid"
+    );
+}
+
+#[test]
 fn open_keeps_a_malformed_repository_boundary_fail_closed() {
     let fixture = Fixture::new(POLICY);
     fs::write(fixture.root.join(".git"), "not a gitdir\n").expect("malformed .git");
@@ -171,7 +240,8 @@ fn open_keeps_a_bare_repository_boundary_fail_closed() {
     request["schema_version"] = json!("agent-hook.finish-line.open.v1");
     request["attempt_token"] = json!("open-token:bare");
 
-    let output = fixture.run(
+    let output = fixture.run_in_cwd(
+        &bare,
         &["finish-line", "open", "--format", "json"],
         Some(&request.to_string()),
     );
@@ -204,7 +274,8 @@ fn open_keeps_partial_bare_repository_markers_fail_closed() {
         request["schema_version"] = json!("agent-hook.finish-line.open.v1");
         request["attempt_token"] = json!(format!("open-token:bare-{removed}"));
         request["cwd"] = json!(bare);
-        let output = fixture.run(
+        let output = fixture.run_in_cwd(
+            &bare,
             &["finish-line", "open", "--format", "json"],
             Some(&request.to_string()),
         );
@@ -251,7 +322,8 @@ fn open_distinguishes_the_exact_bare_marker_threshold_in_ancestors() {
         request["attempt_token"] = json!(format!("open-token:{name}"));
         request["cwd"] = json!(cwd);
 
-        let output = fixture.run(
+        let output = fixture.run_in_cwd(
+            &cwd,
             &["finish-line", "open", "--format", "json"],
             Some(&request.to_string()),
         );
@@ -278,7 +350,8 @@ fn open_does_not_treat_ordinary_bare_marker_names_as_git_evidence() {
     request["attempt_token"] = json!("open-token:marker-collision");
     request["cwd"] = json!(cwd);
 
-    let output = fixture.run(
+    let output = fixture.run_in_cwd(
+        &cwd,
         &["finish-line", "open", "--format", "json"],
         Some(&request.to_string()),
     );
@@ -304,7 +377,8 @@ fn open_ignores_an_oversized_generic_config_without_git_evidence() {
     request["attempt_token"] = json!("open-token:oversized-config");
     request["cwd"] = json!(cwd);
 
-    let output = fixture.run(
+    let output = fixture.run_in_cwd(
+        &cwd,
         &["finish-line", "open", "--format", "json"],
         Some(&request.to_string()),
     );
@@ -342,7 +416,8 @@ fn open_recognizes_every_git_true_spelling_for_a_damaged_bare_repository() {
         request["attempt_token"] = json!(format!("open-token:bare-{name}"));
         request["cwd"] = json!(bare);
 
-        let output = fixture.run(
+        let output = fixture.run_in_cwd(
+            &bare,
             &["finish-line", "open", "--format", "json"],
             Some(&request.to_string()),
         );

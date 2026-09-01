@@ -65,6 +65,10 @@ impl Fixture {
         self.run_with_env(args, stdin, &[])
     }
 
+    pub fn run_in_cwd(&self, cwd: &Path, args: &[&str], stdin: Option<&str>) -> CmdOutput {
+        self.run_with_options(cwd, args, stdin, &[], &[])
+    }
+
     pub fn run_with_env(
         &self,
         args: &[&str],
@@ -81,6 +85,17 @@ impl Fixture {
         envs: &[(&str, &str)],
         removals: &[&str],
     ) -> CmdOutput {
+        self.run_with_options(&self.root, args, stdin, envs, removals)
+    }
+
+    fn run_with_options(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        stdin: Option<&str>,
+        envs: &[(&str, &str)],
+        removals: &[&str],
+    ) -> CmdOutput {
         // Helper resolution, coordination identity, and the state root are all
         // env overrides that outrank what a test can set through `PATH` or the
         // fixture layout, so every one of them has to be dropped unless this
@@ -88,7 +103,7 @@ impl Fixture {
         // `AGENT_SESSION_STATE_DIR` default below and any explicit `envs` entry
         // still reach the child. See `sympoies/nils-cli#1420`.
         let options = CmdOptions::new()
-            .with_cwd(&self.root)
+            .with_cwd(cwd)
             .without_ambient_managed_session_env()
             .with_env_remove("CODEX_HOME")
             .with_env("HOME", self.home.to_str().expect("home UTF-8"))

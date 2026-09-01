@@ -1,6 +1,7 @@
 //! In-process, fail-closed operation-effect classification for timeout posture.
 
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -80,6 +81,9 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
     let Some(command) = crate::adapter::command_text(object) else {
         return OperationEffectClass::Unknown;
     };
+    if audited_non_repository_read_only_bash(command) {
+        return OperationEffectClass::ReadOnly;
+    }
     let mut words = match crate::read_only::parse_simple_command(command) {
         Ok(words) => words,
         Err(_) => return OperationEffectClass::Unknown,
@@ -114,9 +118,6 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
             Some("reset" | "clean" | "update-ref" | "branch") => {
                 OperationEffectClass::LocalDestructive
             }
-            Some("status" | "diff" | "show" | "log" | "rev-parse") => {
-                OperationEffectClass::ReadOnly
-            }
             _ => OperationEffectClass::Unknown,
         };
     }
@@ -138,6 +139,43 @@ fn classify_bash(raw: &[u8], request: &NormalizedRequest) -> OperationEffectClas
         Some("staged-context") => OperationEffectClass::ReadOnly,
         _ => OperationEffectClass::Unknown,
     }
+}
+
+pub(crate) fn audited_non_repository_read_only_bash(command: &str) -> bool {
+    let Ok(mut words) = crate::read_only::parse_simple_command(command) else {
+        return false;
+    };
+    if words.first().map(String::as_str) == Some("builtin")
+        && words.get(1).map(String::as_str) == Some("command")
+    {
+        words.drain(..2);
+    }
+    words
+        .first()
+        .is_some_and(|program| trusted_absolute_pwd(program))
+        && words[1..]
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-L" | "-P" | "--logical" | "--physical"))
+}
+
+fn trusted_absolute_pwd(program: &str) -> bool {
+    if !matches!(program, "/bin/pwd" | "/usr/bin/pwd") {
+        return false;
+    }
+    let Ok(candidate) = fs::canonicalize(program) else {
+        return false;
+    };
+    let trusted = ["/bin/pwd", "/usr/bin/pwd"]
+        .into_iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .any(|path| path == candidate);
+    let Ok(metadata) = fs::metadata(&candidate) else {
+        return false;
+    };
+    trusted
+        && metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.permissions().mode() & 0o022 == 0
 }
 
 fn valid_feature_branch_commit(args: &[String], request: &NormalizedRequest) -> bool {

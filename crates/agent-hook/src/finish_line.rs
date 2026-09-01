@@ -154,6 +154,15 @@ struct OpenRequest {
     turn_id: String,
     cwd: PathBuf,
     attempt_token: String,
+    #[serde(default, deserialize_with = "deserialize_optional_command")]
+    command: Option<String>,
+}
+
+fn deserialize_optional_command<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,8 +676,14 @@ fn parse_request<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, HookEr
 
 fn open(state_root: &Path, request: OpenRequest) -> Result<Outcome, HookError> {
     validate_containment_host()?;
-    let identity = validate_identity(&request, "agent-hook.finish-line.open.v1")?;
     validate_identifier(&request.attempt_token)?;
+    let identity = match validate_identity(&request, "agent-hook.finish-line.open.v1") {
+        Ok(identity) => identity,
+        Err(error) if error.code == "finish-line-not-in-repository" => {
+            return classify_non_repository_open(&request, error);
+        }
+        Err(error) => return Err(error),
+    };
     let lease_expires_at = capability_lease_expiry()?;
     let mut attempted_orphan_reclaim = false;
     loop {
@@ -741,6 +756,47 @@ fn open(state_root: &Path, request: OpenRequest) -> Result<Outcome, HookError> {
             "finish-line DSH runner capability opened\n",
         ));
     }
+}
+
+fn classify_non_repository_open(
+    request: &OpenRequest,
+    non_repository: HookError,
+) -> Result<Outcome, HookError> {
+    let process_dir = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|_| {
+            finish_line_unavailable(
+                "finish-line-repository-unavailable",
+                "finish-line process cwd is unavailable",
+            )
+        })?;
+    if process_dir != request.cwd {
+        return Err(HookError::data(
+            "finish-line-repository-mismatch",
+            "finish-line cwd must match the running process directory",
+        ));
+    }
+    match resolve_git_identity(&process_dir) {
+        Err(error) if error.code == "finish-line-not-in-repository" => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(HookError::data(
+                "finish-line-repository-mismatch",
+                "finish-line process cwd unexpectedly resolved a Git repository",
+            ));
+        }
+    }
+    if let Some(command) = request.command.as_deref()
+        && (command.trim().is_empty()
+            || command.len() > MAX_COMMAND_BYTES
+            || !crate::effect::audited_non_repository_read_only_bash(command))
+    {
+        return Err(HookError::data(
+            "finish-line-non-repository-operation-unauthorized",
+            "finish-line non-repository Bash operations must be audited read-only commands",
+        ));
+    }
+    Err(non_repository)
 }
 
 fn begin(state_root: &Path, request: BeginRequest) -> Result<Outcome, HookError> {
