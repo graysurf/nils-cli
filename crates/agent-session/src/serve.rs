@@ -146,6 +146,10 @@ const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250);
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
+const MANAGED_HISTORY_TITLE_MAX_ENTRIES: usize = 10_000;
+const MANAGED_HISTORY_TITLE_SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
+const MANAGED_HISTORY_TITLE_CACHE_TTL: Duration = Duration::from_secs(30);
+const MANAGED_HISTORY_TITLE_MAX_RECORD_BYTES: u64 = 1024 * 1024;
 const COORDINATION_WAIT_WORKER_LIMIT: usize = 16;
 const COORDINATION_NOTIFICATION_CONCURRENCY: usize = 8;
 const COORDINATION_NOTIFICATION_RETRY: i64 = 1;
@@ -181,8 +185,16 @@ struct ServeState {
     session_collector: SessionCollector,
     launch_profiles: AgentLaunchProfiles,
     history_catalog: Arc<HistoryCatalog>,
+    managed_history_titles: Arc<StdMutex<ManagedHistoryTitleCache>>,
     coordination_wait_workers: Arc<tokio::sync::Semaphore>,
     coordination_notification_wake: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct ManagedHistoryTitleCache {
+    generation: u64,
+    refreshed_at: Option<Instant>,
+    titles: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -756,6 +768,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             session_collector,
             launch_profiles,
             history_catalog,
+            managed_history_titles: Arc::new(StdMutex::new(ManagedHistoryTitleCache::default())),
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
@@ -3198,11 +3211,12 @@ async fn history_list_handler(
         return response;
     }
     let catalog = state.history_catalog.clone();
+    let title_cache = state.managed_history_titles.clone();
     let context = state.context.clone();
     let machine = state.machine.clone();
     let response_machine = machine.clone();
     match tokio::task::spawn_blocking(move || {
-        let titles = managed_history_titles(&context);
+        let titles = managed_history_titles(&context, &title_cache);
         catalog.list_with_titles(
             &machine,
             query.q.as_deref(),
@@ -3264,16 +3278,69 @@ async fn history_messages_handler(
     }
 }
 
-fn managed_history_titles(context: &CliContext) -> BTreeMap<String, String> {
+fn managed_history_titles(
+    context: &CliContext,
+    cache: &StdMutex<ManagedHistoryTitleCache>,
+) -> BTreeMap<String, String> {
+    let generation = {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < MANAGED_HISTORY_TITLE_CACHE_TTL)
+        {
+            return cache.titles.clone();
+        }
+        cache.generation
+    };
+
+    let titles = scan_managed_history_titles(
+        context,
+        MANAGED_HISTORY_TITLE_MAX_ENTRIES,
+        MANAGED_HISTORY_TITLE_SCAN_MAX_DURATION,
+    );
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.generation == generation {
+        cache.refreshed_at = Some(Instant::now());
+        cache.titles = titles.clone();
+    }
+    titles
+}
+
+fn scan_managed_history_titles(
+    context: &CliContext,
+    max_entries: usize,
+    max_duration: Duration,
+) -> BTreeMap<String, String> {
+    scan_managed_history_titles_with_stats(context, max_entries, max_duration).0
+}
+
+fn scan_managed_history_titles_with_stats(
+    context: &CliContext,
+    max_entries: usize,
+    max_duration: Duration,
+) -> (BTreeMap<String, String>, usize) {
     let root = context.state_dir.join("sessions");
     let Ok(entries) = fs::read_dir(root) else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), 0);
     };
+    let deadline = Instant::now() + max_duration;
+    let mut visited = 0;
     let mut candidates: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(max_entries) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        visited += 1;
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        if !managed_history_record_is_bounded(&entry.path()) {
+            continue;
+        }
         let Ok(record) = load_session_record(context, &id) else {
             continue;
         };
@@ -3304,10 +3371,41 @@ fn managed_history_titles(context: &CliContext) -> BTreeMap<String, String> {
             }
         }
     }
-    candidates
+    let titles = candidates
         .into_iter()
         .filter_map(|(history_id, title)| title.map(|title| (history_id, title)))
-        .collect()
+        .collect();
+    (titles, visited)
+}
+
+fn managed_history_record_is_bounded(session_dir: &Path) -> bool {
+    let record_path = session_dir.join("session.json");
+    let Ok(record_metadata) = fs::symlink_metadata(record_path) else {
+        return false;
+    };
+    if !record_metadata.file_type().is_file()
+        || record_metadata.len() > MANAGED_HISTORY_TITLE_MAX_RECORD_BYTES
+    {
+        return false;
+    }
+
+    let sidecar_path = session_dir.join(crate::SESSION_RESUME_FILE);
+    match fs::symlink_metadata(sidecar_path) {
+        Ok(metadata) => {
+            metadata.file_type().is_file()
+                && metadata.len() <= MANAGED_HISTORY_TITLE_MAX_RECORD_BYTES
+        }
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+fn invalidate_managed_history_titles(cache: &StdMutex<ManagedHistoryTitleCache>) {
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.generation = cache.generation.wrapping_add(1);
+    cache.refreshed_at = None;
+    cache.titles.clear();
 }
 
 fn history_error_response(error: HistoryError) -> Response {
@@ -6652,7 +6750,10 @@ async fn update_session_handler(
     })
     .await
     {
-        Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
+        Ok(Ok(session)) => {
+            invalidate_managed_history_titles(&state.managed_history_titles);
+            envelope_ok(json!({ "machine": state.machine, "session": session }))
+        }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -11332,6 +11433,7 @@ mod tests {
             session_collector,
             launch_profiles,
             history_catalog,
+            managed_history_titles: Arc::new(StdMutex::new(ManagedHistoryTitleCache::default())),
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
@@ -14348,7 +14450,8 @@ esac
             host: None,
         };
 
-        let titles = managed_history_titles(&context);
+        let cache = StdMutex::new(ManagedHistoryTitleCache::default());
+        let titles = managed_history_titles(&context, &cache);
 
         assert_eq!(
             titles.get(&provider_history::stable_history_id(
@@ -14363,6 +14466,80 @@ esac
             None,
             "resume-session-id",
         )));
+    }
+
+    #[test]
+    fn managed_history_title_scan_is_cached_and_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for index in 0..3 {
+            let id = format!("managed-title-{index}");
+            let provider_session_id = format!("resume-session-id-{index}");
+            seed_resumable_session(
+                tmp.path(),
+                &id,
+                "codex",
+                &format!("hs-managed-title-{index}"),
+                tmp.path(),
+                &["resume", &provider_session_id],
+            );
+            let record_path = tmp.path().join("sessions").join(&id).join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            record["title"] = json!(format!("Saved title {index}"));
+            record["provider_resume"]["session_id"] = json!(provider_session_id);
+            fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        }
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+
+        let (bounded, visited) =
+            scan_managed_history_titles_with_stats(&context, 2, Duration::from_secs(1));
+        assert_eq!(visited, 2, "the entry limit must stop before N+1");
+        assert!(bounded.len() <= visited);
+        assert!(
+            scan_managed_history_titles(&context, usize::MAX, Duration::ZERO).is_empty(),
+            "an expired deadline must stop before loading a record"
+        );
+
+        let cache = StdMutex::new(ManagedHistoryTitleCache::default());
+        let initial = managed_history_titles(&context, &cache);
+        let history_id = initial
+            .iter()
+            .find_map(|(history_id, title)| (title == "Saved title 0").then(|| history_id.clone()))
+            .expect("the initial title should be indexed");
+
+        let record_path = tmp.path().join("sessions/managed-title-0/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["title"] = json!("Changed title");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        assert_eq!(
+            managed_history_titles(&context, &cache)
+                .get(&history_id)
+                .map(String::as_str),
+            Some("Saved title 0"),
+            "a fresh cache must avoid repeated record I/O"
+        );
+        invalidate_managed_history_titles(&cache);
+        assert_eq!(
+            managed_history_titles(&context, &cache)
+                .get(&history_id)
+                .map(String::as_str),
+            Some("Changed title"),
+            "invalidation must refresh title mutations"
+        );
+
+        let oversized_path = tmp.path().join("sessions/managed-title-1/session.json");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&oversized_path)
+            .unwrap()
+            .set_len(MANAGED_HISTORY_TITLE_MAX_RECORD_BYTES + 1)
+            .unwrap();
+        assert!(!managed_history_record_is_bounded(
+            oversized_path.parent().unwrap()
+        ));
     }
 
     #[tokio::test]
