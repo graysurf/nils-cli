@@ -153,13 +153,16 @@ that every convenience CLI command has an HTTP route.
 
 - `session-not-managed`: run the high-level command inside an
   `agent-session`-managed runtime, or use the explicit raw surface.
+- `not-in-repository`: the safely resolved session cwd has no Git repository
+  ancestor; choose a repository-backed cwd before declaring work context.
 - `repository-unavailable`: pass `--repository owner/repo`; automatic
   inference could not resolve the current checkout origin.
 - `coordination-unauthorized`: confirm the capability belongs to the selected
   live session incarnation.
 - `claim-conflict`: inspect the privacy-safe conflict result before retrying;
   do not blindly overwrite another claim.
-- `uncovered-mutation-scope`: update the claim or narrow the operation targets.
+- `uncovered-mutation-scope`: update the claim or narrow the operation targets;
+  for self-targeting context setup, the cwd boundary could not be proven safe.
 - `coordination-broker-lost` or `coordination-unavailable`: treat the conflict
   view as incomplete. Enforce mode fails closed.
 

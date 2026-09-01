@@ -16,7 +16,7 @@ use super::context::{
     ConflictClassification, ProviderRef, Scope, ScopeKind, WORK_CONTEXT_INPUT_VERSION,
     WORK_CONTEXT_VERSION, WorkContextInput, WorkContextRecord, canonical_repository,
     canonicalize_provider_refs, canonicalize_targets, checkout_root, evaluate,
-    repository_for_checkout, repository_for_checkout_with_timeout,
+    repository_for_checkout, repository_for_checkout_with_timeout, work_context_checkout_root,
 };
 use super::{
     Registry, authenticate_from_file, broker, clean_expired, incarnation, lock_registry, now_epoch,
@@ -182,7 +182,7 @@ pub(crate) fn status(
 
 pub(crate) fn set(context: &CliContext, args: WorkContextSetArgs) -> Result<Value, CliError> {
     let (record, incarnation) = require_self(context)?;
-    let checkout = checkout_root(Path::new(&record.cwd))?;
+    let checkout = work_context_checkout_root(Path::new(&record.cwd))?;
     let repository = args
         .repository
         .map(canonical_repository)
