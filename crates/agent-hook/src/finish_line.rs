@@ -154,6 +154,15 @@ struct OpenRequest {
     turn_id: String,
     cwd: PathBuf,
     attempt_token: String,
+    #[serde(default, deserialize_with = "deserialize_optional_command")]
+    command: Option<String>,
+}
+
+fn deserialize_optional_command<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,8 +676,14 @@ fn parse_request<T: for<'de> Deserialize<'de>>(input: &[u8]) -> Result<T, HookEr
 
 fn open(state_root: &Path, request: OpenRequest) -> Result<Outcome, HookError> {
     validate_containment_host()?;
-    let identity = validate_identity(&request, "agent-hook.finish-line.open.v1")?;
     validate_identifier(&request.attempt_token)?;
+    let identity = match validate_identity(&request, "agent-hook.finish-line.open.v1") {
+        Ok(identity) => identity,
+        Err(error) if error.code == "finish-line-not-in-repository" => {
+            return classify_non_repository_open(&request, error);
+        }
+        Err(error) => return Err(error),
+    };
     let lease_expires_at = capability_lease_expiry()?;
     let mut attempted_orphan_reclaim = false;
     loop {
@@ -741,6 +756,47 @@ fn open(state_root: &Path, request: OpenRequest) -> Result<Outcome, HookError> {
             "finish-line DSH runner capability opened\n",
         ));
     }
+}
+
+fn classify_non_repository_open(
+    request: &OpenRequest,
+    non_repository: HookError,
+) -> Result<Outcome, HookError> {
+    let process_dir = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|_| {
+            finish_line_unavailable(
+                "finish-line-repository-unavailable",
+                "finish-line process cwd is unavailable",
+            )
+        })?;
+    if process_dir != request.cwd {
+        return Err(HookError::data(
+            "finish-line-repository-mismatch",
+            "finish-line cwd must match the running process directory",
+        ));
+    }
+    match resolve_git_identity(&process_dir) {
+        Err(error) if error.code == "finish-line-not-in-repository" => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(HookError::data(
+                "finish-line-repository-mismatch",
+                "finish-line process cwd unexpectedly resolved a Git repository",
+            ));
+        }
+    }
+    if let Some(command) = request.command.as_deref()
+        && (command.trim().is_empty()
+            || command.len() > MAX_COMMAND_BYTES
+            || !crate::effect::audited_non_repository_read_only_bash(command))
+    {
+        return Err(HookError::data(
+            "finish-line-non-repository-operation-unauthorized",
+            "finish-line non-repository Bash operations must be audited read-only commands",
+        ));
+    }
+    Err(non_repository)
 }
 
 fn begin(state_root: &Path, request: BeginRequest) -> Result<Outcome, HookError> {
@@ -1806,40 +1862,38 @@ fn validate_identity<T: IdentityInput>(
 }
 
 fn resolve_git_identity(start: &Path) -> Result<GitRepositoryIdentity, HookError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(start)
-        .args([
+    let output = run_git_rev_parse(
+        start,
+        &[
             "rev-parse",
             "--path-format=absolute",
             "--show-toplevel",
             "--git-common-dir",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| {
-            finish_line_unavailable(
-                "finish-line-git-unavailable",
-                "finish-line could not invoke Git repository discovery",
-            )
-        })?;
-    if !output.status.success() || output.stdout.len() > 4096 {
+        ],
+    )?;
+    if !output.status.success() {
+        let repository_probe = run_git_rev_parse(start, &["rev-parse", "--git-dir"])?;
+        if repository_probe.status.success() {
+            return Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line cwd is not inside an authoritative Git worktree",
+            ));
+        }
+        if !has_git_boundary(start)? {
+            return Err(HookError::data(
+                "finish-line-not-in-repository",
+                "finish-line cwd is not inside a Git repository",
+            ));
+        }
         return Err(HookError::data(
             "finish-line-repository-invalid",
             "finish-line cwd is not inside an authoritative Git repository",
+        ));
+    }
+    if output.stdout.len() > 4096 {
+        return Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git identity is invalid",
         ));
     }
     let fields = std::str::from_utf8(&output.stdout)
@@ -1866,6 +1920,158 @@ fn resolve_git_identity(start: &Path) -> Result<GitRepositoryIdentity, HookError
         )
     })?;
     Ok(GitRepositoryIdentity { root, common_dir })
+}
+
+fn run_git_rev_parse(start: &Path, args: &[&str]) -> Result<std::process::Output, HookError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| {
+            finish_line_unavailable(
+                "finish-line-git-unavailable",
+                "finish-line could not invoke Git repository discovery",
+            )
+        })
+}
+
+fn has_git_boundary(start: &Path) -> Result<bool, HookError> {
+    for ancestor in start.ancestors() {
+        if git_boundary_entry_exists(&ancestor.join(".git"))? {
+            return Ok(true);
+        }
+        let has_objects = git_boundary_directory_exists(&ancestor.join("objects"))?;
+        let has_refs = git_boundary_directory_exists(&ancestor.join("refs"))?;
+        let head = read_git_boundary_file(&ancestor.join("HEAD"), has_objects || has_refs)?;
+        let config = read_git_boundary_file(&ancestor.join("config"), has_objects && has_refs)?;
+        if config.as_deref().is_some_and(git_config_declares_bare)
+            || (head.as_deref().is_some_and(is_git_head) && (has_objects || has_refs))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn git_boundary_entry_exists(path: &Path) -> Result<bool, HookError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git boundary cannot be inspected",
+        )),
+    }
+}
+
+fn read_git_boundary_file(path: &Path, strict: bool) -> Result<Option<Vec<u8>>, HookError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if strict => {
+            return Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ));
+        }
+        Err(_) => return Ok(None),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let mut contents = Vec::new();
+    if File::open(path)
+        .and_then(|file| file.take(4097).read_to_end(&mut contents))
+        .is_err()
+    {
+        return if strict {
+            Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    if contents.len() > 4096 {
+        return if strict {
+            Err(HookError::data(
+                "finish-line-repository-invalid",
+                "finish-line Git boundary cannot be inspected",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(Some(contents))
+}
+
+fn git_boundary_directory_exists(path: &Path) -> Result<bool, HookError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(HookError::data(
+            "finish-line-repository-invalid",
+            "finish-line Git boundary cannot be inspected",
+        )),
+    }
+}
+
+fn is_git_head(contents: &[u8]) -> bool {
+    let value = contents.strip_suffix(b"\n").unwrap_or(contents);
+    value.strip_prefix(b"ref: refs/").is_some_and(|reference| {
+        !reference.is_empty()
+            && reference
+                .iter()
+                .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace())
+    }) || matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn git_config_declares_bare(contents: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            if line.eq_ignore_ascii_case("bare") {
+                return true;
+            }
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("bare")
+            && matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_identifier(value: &str) -> Result<(), HookError> {

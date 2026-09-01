@@ -466,6 +466,20 @@ The request and response contracts are:
   `finish-line-containment-unavailable`. Linux activation also requires the
   trusted fixed systemd binaries, unified cgroup v2, enabled unprivileged user
   namespaces, and a responsive user manager.
+  After the physical cwd boundary is validated, an existing canonical directory
+  with no worktree or bare Git boundary in itself or any ancestor returns exit
+  `65` with the exact code `finish-line-not-in-repository`. A Bash operation
+  may add its exact `command`; the same code is then returned only for the
+  closed audited subset of an absolute, root-owned, non-writable system `pwd`
+  executable with its supported logical or physical flags. Unqualified `pwd`,
+  Git commands, shell composition, and any other command return
+  `finish-line-non-repository-operation-unauthorized`; explicit `null` or any
+  non-string command is request-invalid. Omitting `command` preserves only the
+  location-classification compatibility response and MUST NOT authorize Bash
+  execution; an operational consumer must send and bind the exact command. A
+  present but malformed or otherwise unprovable Git boundary remains
+  `finish-line-repository-invalid`; consumers must branch only on the exact
+  code and never on message text.
 - `begin` adds `operation_id`, a caller-generated unpredictable
   `attempt_token`, and `operation = {"kind":"edit"}`. It atomically advances
   the repository's monotonic integer generation before the edit proceeds. The
