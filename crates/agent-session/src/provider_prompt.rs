@@ -559,8 +559,22 @@ fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
 }
 
 fn parse_claude_user_prompt_value(value: &Value, session_id: &str) -> Option<ParsedPrompt> {
+    if !claude_session_matches(value, session_id) {
+        return None;
+    }
+    let text = claude_user_message_text(value)?;
+    let mut prompt = bounded_prompt(&text)?;
+    prompt.submitted_at = provider_timestamp(value);
+    prompt.turn_id = value
+        .get("uuid")
+        .or_else(|| value.get("messageUuid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(prompt)
+}
+
+pub(crate) fn claude_user_message_text(value: &Value) -> Option<String> {
     if value.get("type").and_then(Value::as_str) != Some("user")
-        || !claude_session_matches(value, session_id)
         || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
         || value.get("isMeta").and_then(Value::as_bool) == Some(true)
         || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
@@ -589,14 +603,7 @@ fn parse_claude_user_prompt_value(value: &Value, session_id: &str) -> Option<Par
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let mut prompt = bounded_prompt(&text)?;
-    prompt.submitted_at = provider_timestamp(value);
-    prompt.turn_id = value
-        .get("uuid")
-        .or_else(|| value.get("messageUuid"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    Some(prompt)
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Parse one provider transcript record using the same human-prompt semantics

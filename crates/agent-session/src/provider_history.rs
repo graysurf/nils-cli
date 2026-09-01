@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::provider_prompt::{ProviderPromptSource, parse_history_user_prompt, read_last_prompt};
+use crate::provider_prompt::{
+    ProviderPromptSource, claude_user_message_text, parse_history_user_prompt, read_last_prompt,
+};
 
 const SCAN_MAX_ENTRIES: usize = 10_000;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
@@ -1172,11 +1174,12 @@ fn normalize_message(provider: &str, value: &Value) -> Option<(String, String, O
                 return None;
             }
             let message = value.get("message")?;
-            Some((
-                role.to_string(),
-                content_text(message.get("content")?),
-                timestamp,
-            ))
+            let text = if role == "user" {
+                claude_user_message_text(value)?
+            } else {
+                content_text(message.get("content")?)
+            };
+            Some((role.to_string(), text, timestamp))
         }
         _ => None,
     }
@@ -1848,6 +1851,64 @@ mod tests {
         .unwrap();
         assert_eq!(second.messages.len(), 1);
         assert_eq!(second.messages[0].text, "second");
+    }
+
+    #[test]
+    fn claude_history_excludes_generated_user_records_and_tool_result_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects/repo");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("claude-id.jsonl"),
+            concat!(
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool\",\"content\":\"tool output\"}]}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"meta context\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"promptSource\":\"system\",\"message\":{\"role\":\"user\",\"content\":\"system context\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"isCompactSummary\":true,\"message\":{\"role\":\"user\",\"content\":\"compact summary\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"transcript-only context\"}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"user\",\"promptSource\":\"typed\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second\"},{\"type\":\"tool_result\",\"tool_use_id\":\"tool\",\"content\":\"hidden tool output\"}]}}\n",
+                "{\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n"
+            ),
+        )
+        .unwrap();
+        let sources = [HistorySource {
+            provider: "claude".into(),
+            agent_profile: None,
+            root: tmp.path().join("projects"),
+        }];
+
+        let page = list(
+            &sources,
+            &tmp.path().join("archives"),
+            "test",
+            Some("first"),
+            Some("claude"),
+            None,
+            10,
+        )
+        .unwrap();
+        let result = messages(
+            &sources,
+            &page.sessions[0].id,
+            None,
+            20,
+            HistoryMessageDirection::Forward,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "first"),
+                ("user", "second"),
+                ("assistant", "answer")
+            ]
+        );
     }
 
     #[test]
