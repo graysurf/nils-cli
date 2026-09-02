@@ -108,6 +108,12 @@ above.
   native WorkspaceLease provider requests. Matching results use
   `agent-hook.workspace-lease.<command>-result.v1` inside the normal
   `cli.agent-hook.workspace-lease-<command>.v1` service envelope.
+- `agent-hook.workspace-lease.{resolve,bind,begin,complete,renew,release}.v2`:
+  strict target-scoped WorkspaceLease provider requests. Matching results use
+  `agent-hook.workspace-lease.<command>-result.v2` inside the same service
+  envelope. The protocol generation is selected by the request schema; a
+  declared `version` that disagrees with that schema is rejected as an
+  unsupported mixed-version request.
 - `agent-hook.workspace-recovery.inspect.v1` and
   `agent-hook.workspace-recovery.verify-handoff.v1`: strict read-only dirty
   checkout inspection and exact clean managed-worktree handoff verification.
@@ -320,8 +326,9 @@ replayed, timed-out, oversized, or unsupported response.
 object from standard input, capped at 256 KiB. Duplicate keys, unknown fields,
 unsupported versions, non-absolute supplied cwd values, invalid lifecycle
 enums, and oversized or control-bearing identity strings fail with exit `65`.
-The public surface is exactly `bind`, `begin`, `complete`, `renew`, and
-`release`; every command defaults to its versioned service JSON envelope.
+The public surface is exactly `resolve`, `bind`, `begin`, `complete`,
+`renew`, and `release`; every command defaults to its versioned service JSON
+envelope. `resolve` exists only in protocol v2.
 
 `bind` accepts the runtime-owned WorkspaceLease v1 facts: request, session,
 optional parent, optional cwd, and DSH session-start source. The provider
@@ -364,6 +371,109 @@ atomic replacement, and a bounded per-workspace cross-process lock. A clean
 expired owner or the exact explicit same-session recovery above can be
 recovered; foreign dirty state and active-operation, malformed, identity-
 mismatched, untrusted, busy, or unknown state are never guessed through.
+
+### Protocol v2: target-scoped repository authority
+
+Protocol v1 binds one immutable session cwd, so one dirty checkout denies every
+later operation in that session. Protocol v2 keeps the durable per-worktree
+authority model unchanged and moves selection from the session anchor to the
+exact operation target.
+
+`resolve` classifies one exact tool execution. It writes no lease or binding
+state and never binds, fences, or denies a lease, but it is not side-effect
+free: like every operation needing the keyed workspace digest it mints the host
+`fingerprint.key` on first use, and it fails closed with
+`workspace-target-unresolvable` when the declared target arguments are
+unusable. It accepts the trusted anchor cwd, the exact
+call/root/tool/arguments/nesting facts, and returns either `not-required` or a
+`targets` array.
+
+A tool is classified when its own declared arguments prove the repository it
+mutates. That is the axis, not whether the tool is a shell:
+
+- `write` and `edit` prove it through `file_path`, and `str_replace_editor`
+  through `path` for `create`, `str_replace`, and `insert`.
+- `artifact_export` proves it through `destination.path` when
+  `destination.class` is `workspace`, a path its own schema constrains to be
+  workspace-relative. The `download` class writes nothing into a repository
+  and proves no target.
+- `runtime_kit_governed_commit` declares no path because it has no target to
+  choose: it always commits the canonical live session workspace. The trusted
+  anchor is therefore the whole proof, and without an anchor there is no
+  admissible target rather than an unscoped commit.
+
+Read-only forms, unknown tools, and arbitrary shell programs resolve to
+`not-required` and run as unscoped native host operations, because their
+repository effects cannot be proven by inspecting a startup directory. For a
+shell that is deliberate rather than incidental: a `workdir` fence is defeated
+by `cd` inside the command string, so honouring one would claim coverage this
+boundary cannot enforce. This removes the v1 fence -- cross-session
+exclusivity, the dirty gate, and the uncertain-outcome gate -- from shell
+mutations, which is an accepted trade-off recorded in
+`sympoies/dsh-runtime-kit#172`; whole-runtime isolation, not a path argument,
+is the boundary that can bound a shell. A non-repository target is omitted, so
+a write outside any checkout needs no repository lease.
+
+Each classified path is resolved against the trusted anchor when relative,
+canonicalized through the same mutation-target binding used by the policy
+boundary (symlinks resolved, non-existent leaves bound to their nearest
+existing ancestor, inherited Git repository-selection state rejected), and
+reduced to its physical Git top-level. Targets are deduplicated and returned
+sorted by their keyed workspace digest. Every tool classified today yields at
+most one target, so that ordering is the wire contract for a future multi-path
+tool rather than a rule exercised now: when one arrives, a deterministic
+acquisition order is what keeps two sessions from deadlocking against each
+other. A relative path with no anchor fails closed rather than guessing a
+repository.
+
+A v2 `bind` accepts either an exact resolved `target` or an anchor `cwd`,
+never both. A target bind rederives canonical identity from the live host
+layout and requires the keyed workspace digest to match, so a forged root, a
+subdirectory, or a drifted checkout cannot select another workspace's
+authority. An anchor bind is an optional eager optimization only: a
+non-repository or absent anchor returns `not-required` instead of minting an
+unmanaged binding, and its denial is local to that one repository. Every other
+v2 binding decision -- `foreign-active`, `dirty`, `uncertain`, expiry,
+tombstoning, and same-session `resume`/`compact` recovery -- is the unchanged
+v1 rule applied per physical worktree. One session therefore owns independent
+bindings for repositories A and B, while two sessions targeting one physical
+worktree still contend.
+
+Every v2 `bound` result names the exact repository target it owns, including
+its `workspace_key`. Convergence between an eager anchor binding and a later
+lazy acquisition of the same repository is the runtime's obligation, not a
+boundary guarantee: the runtime must key its authority set by that
+`workspace_key` and reuse the existing binding for any resolved target with the
+same key. A second bind of a workspace this session already owns is denied
+`foreign-active` like any other contention, and that denial is
+indistinguishable from a genuinely foreign holder, so a runtime that eagerly
+binds its anchor and then binds again per resolved target would contend with
+itself.
+
+A v2 `begin` additionally carries the exact resolved target and proves it is
+the same workspace as the durable binding. Classification already happened in
+`resolve`, so `begin` never reclassifies a tool name and every admitted v2
+operation carries a fence.
+
+That fence is on the workspace the caller **names**, and `begin` does not prove
+that the named target is the one this call's own tool and arguments would
+resolve to: it authenticates `target` against the durable binding, while the
+tool name and arguments enter only the execution digest used for idempotency
+and replay. A caller that names a target it holds while executing against a
+different repository is therefore fenced on the wrong workspace. That caller is
+the trusted same-host runtime, which also supplies `anchor_cwd` to `resolve`
+and can reach any repository through the deliberately unfenced shell path, so
+this is a coordination boundary between cooperating sessions rather than a
+sandbox against a hostile local process. Binding the target to the exact call
+facts -- an authenticated resolve token the runtime passes back through
+`begin` -- is tracked separately, because it needs a matching runtime change. `complete`, `renew`, and `release` keep their v1
+fields, fencing, idempotency, and terminal-outcome rules.
+
+A v2 `resolve` or target result carries the canonical repository root of the
+caller's own exact operation targets. That is the one deliberate exception to
+the projection rule below: it reveals nothing the trusted same-host caller did
+not already supply, and the runtime-kit adapter must not project it into
+model-facing tool output.
 
 Provider-visible results contain opaque IDs, renewal timing, and stable
 `owned`, `unmanaged`, `foreign-active`, `stale-clean`, `dirty`, or `uncertain`

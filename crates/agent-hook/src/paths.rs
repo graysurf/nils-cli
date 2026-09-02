@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::HookError;
@@ -76,20 +76,24 @@ pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&normalized_path).map_err(|_| {
-                HookError::runtime(
-                    format!("{role}-create-failed"),
-                    format!("{role} directory create failed"),
-                )
-            })?;
-            fs::set_permissions(&normalized_path, fs::Permissions::from_mode(0o700)).map_err(
-                |_| {
+            // Create at the intended mode instead of creating and then
+            // chmodding. A concurrent first-use creator would otherwise be
+            // observable between those two steps with the umask-derived mode
+            // still in place, and the trust check above rejects a
+            // group- or other-readable state directory as a hard error rather
+            // than retrying. Protocol v2 makes that window matter: every
+            // classified tool call resolves through this path, where v1
+            // created the directory once per session start.
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&normalized_path)
+                .map_err(|_| {
                     HookError::runtime(
-                        format!("{role}-mode-failed"),
-                        format!("{role} directory mode failed"),
+                        format!("{role}-create-failed"),
+                        format!("{role} directory create failed"),
                     )
-                },
-            )?;
+                })?;
             let metadata = fs::symlink_metadata(&normalized_path).map_err(|_| {
                 HookError::runtime(
                     format!("{role}-unavailable"),

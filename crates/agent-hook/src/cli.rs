@@ -100,6 +100,8 @@ pub enum WorkspaceRecoveryCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceLeaseCommand {
+    /// Classify one tool call into zero or more canonical repository targets.
+    Resolve(WorkspaceLeaseFormatArgs),
     /// Resolve canonical workspace identity and acquire one binding generation.
     Bind(WorkspaceLeaseFormatArgs),
     /// Classify one tool call and fence it before execution.

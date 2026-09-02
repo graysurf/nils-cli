@@ -365,7 +365,18 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:agent-hook-workspace-lease-command-$line[1]:"
         case $line[1] in
-            (bind)
+            (resolve)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(bind)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Automation-safe output format. Workspace lease defaults to strict JSON]:FORMAT:((text\:"Human-readable text output"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -640,6 +651,7 @@ _agent-hook__subcmd__validate_commands() {
 (( $+functions[_agent-hook__subcmd__workspace-lease_commands] )) ||
 _agent-hook__subcmd__workspace-lease_commands() {
     local commands; commands=(
+'resolve:Classify one tool call into zero or more canonical repository targets' \
 'bind:Resolve canonical workspace identity and acquire one binding generation' \
 'begin:Classify one tool call and fence it before execution' \
 'complete:Complete one exact fenced operation' \
@@ -672,6 +684,11 @@ _agent-hook__subcmd__workspace-lease__subcmd__release_commands() {
 _agent-hook__subcmd__workspace-lease__subcmd__renew_commands() {
     local commands; commands=()
     _describe -t commands 'agent-hook workspace-lease renew commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__workspace-lease__subcmd__resolve_commands] )) ||
+_agent-hook__subcmd__workspace-lease__subcmd__resolve_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook workspace-lease resolve commands' commands "$@"
 }
 (( $+functions[_agent-hook__subcmd__workspace-recovery_commands] )) ||
 _agent-hook__subcmd__workspace-recovery_commands() {
