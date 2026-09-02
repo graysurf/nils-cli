@@ -452,8 +452,21 @@ itself.
 
 A v2 `begin` additionally carries the exact resolved target and proves it is
 the same workspace as the durable binding. Classification already happened in
-`resolve`, so an admitted v2 operation is always fenced; `begin` never
-reclassifies a tool name. `complete`, `renew`, and `release` keep their v1
+`resolve`, so `begin` never reclassifies a tool name and every admitted v2
+operation carries a fence.
+
+That fence is on the workspace the caller **names**, and `begin` does not prove
+that the named target is the one this call's own tool and arguments would
+resolve to: it authenticates `target` against the durable binding, while the
+tool name and arguments enter only the execution digest used for idempotency
+and replay. A caller that names a target it holds while executing against a
+different repository is therefore fenced on the wrong workspace. That caller is
+the trusted same-host runtime, which also supplies `anchor_cwd` to `resolve`
+and can reach any repository through the deliberately unfenced shell path, so
+this is a coordination boundary between cooperating sessions rather than a
+sandbox against a hostile local process. Binding the target to the exact call
+facts -- an authenticated resolve token the runtime passes back through
+`begin` -- is tracked separately, because it needs a matching runtime change. `complete`, `renew`, and `release` keep their v1
 fields, fencing, idempotency, and terminal-outcome rules.
 
 A v2 `resolve` or target result carries the canonical repository root of the
