@@ -3342,24 +3342,17 @@ async fn history_star_handler(
             ));
         }
     };
-    let stars_root = provider_history::star_root(&state.context.state_dir);
+    let catalog = state.history_catalog.clone();
     let starred_at = body.starred.then(activity_observed_at);
     let history_id = id.clone();
-    match tokio::task::spawn_blocking(move || match starred_at.clone() {
-        Some(starred_at) => provider_history::write_star(&stars_root, &history_id, &starred_at)
-            .map(|record| Some(record.starred_at)),
-        None => provider_history::remove_star(&stars_root, &history_id).map(|()| None),
-    })
-    .await
+    match tokio::task::spawn_blocking(move || catalog.set_star(&history_id, starred_at.as_deref()))
+        .await
     {
-        Ok(Ok(starred_at)) => {
-            state.history_catalog.invalidate();
-            envelope_ok(json!({
-                "machine": state.machine,
-                "history_id": id,
-                "starred_at": starred_at,
-            }))
-        }
+        Ok(Ok(starred_at)) => envelope_ok(json!({
+            "machine": state.machine,
+            "history_id": id,
+            "starred_at": starred_at,
+        })),
         Ok(Err(error)) => history_error_response(error),
         Err(_) => join_err(),
     }
@@ -14604,7 +14597,23 @@ esac
     #[tokio::test]
     async fn history_star_toggle_stores_and_clears_one_star() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let history_root = tmp.path().join("provider/sessions/2026/09/01");
+        fs::create_dir_all(&history_root).unwrap();
+        fs::write(
+            history_root.join("rollout.jsonl"),
+            "{\"timestamp\":\"2026-09-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-09-01T00:00:00Z\"}}\n",
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        Arc::get_mut(&mut st).unwrap().history_catalog = Arc::new(HistoryCatalog::new(
+            vec![HistorySource {
+                provider: "codex".to_string(),
+                agent_profile: None,
+                root: tmp.path().join("provider/sessions"),
+            }],
+            provider_history::archive_root(tmp.path()),
+            provider_history::star_root(tmp.path()),
+        ));
         let id = provider_history::stable_history_id("codex", None, "session-a");
         let uri = format!("/history/sessions/{id}/star");
         let record = provider_history::star_root(tmp.path()).join(format!("{id}.json"));
@@ -14634,16 +14643,18 @@ esac
         assert_eq!(body["data"]["starred_at"], Value::Null);
         assert!(!record.exists(), "unstarring clears the star record");
 
+        // An id that names no history session never reaches the filesystem.
         let (status, body) = call(
             router(st),
             post_json(
-                "/history/sessions/not-a-digest/star",
+                "/history/sessions/..%2F..%2Fescape/star",
                 Some(TOKEN),
                 json!({ "starred": true }),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+        assert!(!tmp.path().join("escape.json").exists());
     }
 
     #[test]

@@ -279,6 +279,31 @@ impl HistoryCatalog {
         Ok(page)
     }
 
+    /// Set or clear the star on one history session.
+    ///
+    /// The record is keyed by the catalog's own id for the session, never by the
+    /// caller's string: an id that names no session is a not-found instead of an
+    /// orphan record, and no request-controlled value reaches the filesystem.
+    pub(crate) fn set_star(
+        &self,
+        history_id: &str,
+        starred_at: Option<&str>,
+    ) -> Result<Option<String>, HistoryError> {
+        let snapshot = self.snapshot();
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == history_id)
+            .ok_or(HistoryError::NotFound)?;
+        let stored = match starred_at {
+            Some(starred_at) => write_star(&self.stars_root, &session.id, starred_at)
+                .map(|record| Some(record.starred_at)),
+            None => remove_star(&self.stars_root, &session.id).map(|()| None),
+        };
+        self.invalidate();
+        stored
+    }
+
     pub(crate) fn messages(
         &self,
         history_id: &str,
