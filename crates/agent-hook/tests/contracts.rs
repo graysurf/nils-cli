@@ -69,6 +69,45 @@ fn matcher_expression_rejects_regex_constructs() {
     );
 }
 
+/// `runtime-kit.handler.v1` is an allowlist, not arbitrary execution: a handler
+/// ID is admitted only when the compiled map resolves it to one exact
+/// runtime-kit-owned basename. Both halves are asserted so widening the
+/// allowlist stays a deliberate edit rather than a hole.
+#[test]
+fn runtime_kit_handler_allowlist_admits_only_compiled_ids() {
+    const HANDLER_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.09.02.1"
+
+[[rules]]
+id = "runtime.artifact-routing"
+products = ["codex", "claude"]
+events = ["PreToolUse"]
+matcher = "Bash|Write|Edit|NotebookEdit|MultiEdit|apply_patch"
+priority = 100
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "warn"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "HANDLER_ID" }
+"#;
+
+    let admitted = HANDLER_POLICY.replace("HANDLER_ID", "block-agent-artifact-routing");
+    let fixture = Fixture::new(&admitted);
+    let output = fixture.run(&["validate", "--format", "json"], None);
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_json()["ok"], true);
+
+    let rejected = HANDLER_POLICY.replace("HANDLER_ID", "block-agent-artifact-routing-typo");
+    let fixture = Fixture::new(&rejected);
+    let output = fixture.run(&["validate", "--format", "json"], None);
+    assert_eq!(output.code, 65);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "handler-id-unsupported"
+    );
+}
+
 #[test]
 fn session_start_source_is_the_exact_matcher_for_codex_and_claude() {
     let policy = r#"schema_version = "agent-hook.policy.v1"

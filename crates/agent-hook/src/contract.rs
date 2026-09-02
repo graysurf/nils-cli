@@ -790,6 +790,7 @@ pub fn matcher_expression_matches(expression: &str, candidate: &str) -> bool {
 pub fn runtime_handler_filename(id: &str) -> Option<&'static str> {
     Some(match id {
         "agent-scope-lock-guard" => "agent-scope-lock-guard.py",
+        "block-agent-artifact-routing" => "block-agent-artifact-routing.py",
         "block-claude-coauthor-trailer" => "block-claude-coauthor-trailer.py",
         "block-direct-git-commit" => "block-direct-git-commit.py",
         "block-direct-git-worktree" => "block-direct-git-worktree.py",

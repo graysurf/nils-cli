@@ -834,7 +834,8 @@ handler ID through a compiled allowlist to one exact runtime-kit-owned handler
 basename and resolves it only below the active provider's owned hook directory.
 The v1 allowlist is:
 
-`agent-scope-lock-guard`, `block-claude-coauthor-trailer`,
+`agent-scope-lock-guard`, `block-agent-artifact-routing`,
+`block-claude-coauthor-trailer`,
 `block-direct-git-commit`, `block-direct-git-worktree`,
 `block-direct-pr-create`, `block-direct-python`,
 `block-project-memory-write`, `block-unsafe-default-delivery`,
