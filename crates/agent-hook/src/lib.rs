@@ -362,6 +362,11 @@ fn run_data_policy(command: DataPolicyCommand) -> i32 {
 
 fn run_workspace_lease(layout: &Layout, command: WorkspaceLeaseCommand) -> i32 {
     let (name, format, operation) = match command {
+        WorkspaceLeaseCommand::Resolve(args) => (
+            "agent-hook workspace-lease resolve",
+            args.format,
+            workspace_lease::Operation::Resolve,
+        ),
         WorkspaceLeaseCommand::Bind(args) => (
             "agent-hook workspace-lease bind",
             args.format,
