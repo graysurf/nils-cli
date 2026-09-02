@@ -383,9 +383,13 @@ pub(crate) fn run(state_root: &Path, operation: Operation) -> Result<Outcome, Ho
 }
 
 /// Classify one exact tool execution into zero or more canonical repository
-/// targets. Classification owns no durable state: it never binds, fences, or
-/// denies. An operation whose repository effects cannot be proven exactly
-/// resolves to `not-required` and runs as an unscoped native host operation.
+/// targets. Classification writes no lease or binding state and never binds,
+/// fences, or denies a lease. It is not side-effect free: like every operation
+/// that needs the keyed workspace digest it mints the host `fingerprint.key`
+/// on first use, and it fails closed with `workspace-target-unresolvable` when
+/// the declared target arguments are unusable. An operation whose repository
+/// effects cannot be proven exactly resolves to `not-required` and runs as an
+/// unscoped native host operation.
 fn resolve(state_root: &Path, request: ResolveRequest) -> Result<Outcome, HookError> {
     validate_common(
         request.version,
@@ -401,6 +405,10 @@ fn resolve(state_root: &Path, request: ResolveRequest) -> Result<Outcome, HookEr
     ] {
         validate_text(value, field)?;
     }
+    // Classification depends only on the tool name and its declared
+    // arguments, never on nesting depth. The field is required on the wire so
+    // that a resolve and a begin request for the same execution keep one
+    // shape; `begin` does consult it, through `execution_digest`.
     let _ = request.nested;
     let anchor = match request.anchor_cwd.as_deref() {
         Some(path) if !path.is_absolute() => {
@@ -460,8 +468,17 @@ fn resolve_not_required() -> Outcome {
 }
 
 /// Project only the exact structured mutation targets this boundary can prove.
-/// Arbitrary shell programs are deliberately unclassified: the runtime must not
-/// claim a repository fence it cannot enforce, and must not block the command.
+///
+/// The classification axis is whether the tool's own declared arguments prove
+/// the repository it mutates, not whether the tool happens to be a shell. A
+/// tool whose target is provable is fenced; a tool whose target is not provable
+/// is admitted unscoped rather than fenced against a directory that does not
+/// bound its effects.
+///
+/// Arbitrary shell programs stay unclassified for that reason: a `workdir`
+/// fence is defeated by `cd` inside the command string, so honouring one would
+/// claim coverage this boundary cannot enforce. They must not be blocked
+/// either, so they resolve to `not-required`.
 fn mutation_target_paths(
     tool_name: &str,
     arguments: &Value,
@@ -470,7 +487,9 @@ fn mutation_target_paths(
     let Some(input) = arguments.as_object() else {
         return Ok(Vec::new());
     };
-    let raw = match tool_name {
+    // Targets named by a path argument. A relative path is proven only in
+    // combination with the trusted anchor, so it fails closed without one.
+    let declared = match tool_name {
         "write" | "edit" => vec![required_target_text(input.get("file_path"))?],
         "str_replace_editor" => match input.get("command").and_then(Value::as_str) {
             Some("create" | "str_replace" | "insert") => {
@@ -478,9 +497,36 @@ fn mutation_target_paths(
             }
             _ => Vec::new(),
         },
+        // `artifact_export` writes exactly one file when its destination
+        // selects the workspace class, at a path its own schema constrains to
+        // be workspace-relative. The `download` class writes nothing into a
+        // repository and so proves no target.
+        "artifact_export" => match input
+            .get("destination")
+            .and_then(Value::as_object)
+            .and_then(|destination| {
+                destination
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .map(|class| (class, destination))
+            }) {
+            Some(("workspace", destination)) => {
+                vec![required_target_text(destination.get("path"))?]
+            }
+            _ => Vec::new(),
+        },
+        // The governed commit declares no path argument because it has no
+        // target to choose: it always commits the canonical live session
+        // workspace. The trusted anchor is therefore the whole proof, and
+        // without an anchor there is no admissible target rather than an
+        // unscoped commit.
+        "runtime_kit_governed_commit" => {
+            return Ok(vec![anchor.ok_or_else(target_unresolvable)?.to_path_buf()]);
+        }
         _ => Vec::new(),
     };
-    raw.into_iter()
+    declared
+        .into_iter()
         .map(|value| {
             let path = Path::new(value);
             if path.is_absolute() {

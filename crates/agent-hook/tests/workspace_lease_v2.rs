@@ -23,6 +23,9 @@ version = "2026.09.02.1"
 const RESOLVE_RESULT: &str = "agent-hook.workspace-lease.resolve-result.v2";
 const BIND_RESULT: &str = "agent-hook.workspace-lease.bind-result.v2";
 const BEGIN_RESULT: &str = "agent-hook.workspace-lease.begin-result.v2";
+const COMPLETE_RESULT: &str = "agent-hook.workspace-lease.complete-result.v2";
+const RENEW_RESULT: &str = "agent-hook.workspace-lease.renew-result.v2";
+const RELEASE_RESULT: &str = "agent-hook.workspace-lease.release-result.v2";
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -195,7 +198,7 @@ fn complete(
     operation: &Value,
     begin_request_id: &str,
 ) -> Value {
-    ok(
+    let data = ok(
         fixture,
         "complete",
         json!({
@@ -213,11 +216,13 @@ fn complete(
             "tool_name": "write",
             "outcome": "succeeded"
         }),
-    )
+    );
+    assert_eq!(data["schema_version"], COMPLETE_RESULT, "data={data}");
+    data
 }
 
 fn release(fixture: &Fixture, session: &str, request_id: &str, binding: &Value) -> Value {
-    ok(
+    let data = ok(
         fixture,
         "release",
         json!({
@@ -230,7 +235,21 @@ fn release(fixture: &Fixture, session: &str, request_id: &str, binding: &Value) 
             "generation": binding["generation"],
             "reason": "agent-disposed"
         }),
-    )
+    );
+    assert_eq!(data["schema_version"], RELEASE_RESULT, "data={data}");
+    data
+}
+
+fn renew_request(session: &str, request_id: &str, binding: &Value) -> Value {
+    json!({
+        "schema_version": "agent-hook.workspace-lease.renew.v2",
+        "version": 2,
+        "request_id": request_id,
+        "session_id": session,
+        "binding_id": binding["binding_id"],
+        "workspace_id": binding["workspace_id"],
+        "generation": binding["generation"]
+    })
 }
 
 fn only_target(data: &Value) -> Value {
@@ -430,9 +449,10 @@ fn repeated_resolution_of_one_target_set_is_stable() {
     let fixture = Fixture::new(POLICY);
     let root = repo(&fixture.root.join("repo-a"));
 
-    // Acquisition order is the sorted keyed workspace digest, so repeated
-    // resolution of the same operation projects a byte-stable target set and
-    // multi-target acquisition cannot deadlock between sessions.
+    // Repeated resolution of the same repository projects a byte-stable target
+    // set. Every tool classified today yields at most one target, so the sorted
+    // keyed-digest ordering this relies on is the wire contract for a future
+    // multi-path tool rather than a rule exercised here.
     let first = write_targets(&fixture, "session-a", "r-set-1", &root.join("tracked.txt"));
     let second = write_targets(
         &fixture,
@@ -580,7 +600,8 @@ fn an_anchor_bind_is_optional_and_a_non_repository_anchor_needs_no_binding() {
     assert_eq!(unmanaged["kind"], "not-required");
 
     // The eager anchor binding is the same durable authority a later lazy
-    // acquisition of that repository observes.
+    // acquisition of that repository contends for, so another session's target
+    // bind meets it as an active holder.
     let target = only_target(&write_targets(
         &fixture,
         "session-c",
@@ -815,8 +836,10 @@ fn every_v2_binding_names_its_exact_repository_target() {
     let lazy = bind(&fixture, "session-a", "b-a", &target);
     assert_eq!(lazy["target"], target);
 
-    // The eager anchor binding converges on the same canonical target, so one
-    // session never contends with itself over its own anchor repository.
+    // The eager anchor binding names the same canonical target, which is what
+    // lets a runtime key one authority set by workspace instead of contending
+    // with itself. The boundary does not do that keying for it; see
+    // `rebinding_a_workspace_this_session_owns_is_denied_like_any_contention`.
     let anchored = ok(
         &fixture,
         "bind",
@@ -839,4 +862,330 @@ fn every_v2_binding_names_its_exact_repository_target() {
         &solo_root.join("tracked.txt"),
     ));
     assert_eq!(eager["target"], resolved);
+}
+
+#[test]
+fn every_classified_mutation_form_resolves_the_same_target() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+    let file = root.join("tracked.txt");
+    let expected = only_target(&write_targets(&fixture, "session-a", "r-write", &file));
+
+    // The classifier admits three declared forms besides `write`. Each is
+    // resolved positively here, so narrowing any arm fails a case instead of
+    // silently downgrading that mutation to an unfenced operation.
+    for (index, (tool, arguments)) in [
+        (
+            "edit",
+            json!({"file_path": file, "old_string": "base", "new_string": "next"}),
+        ),
+        (
+            "str_replace_editor",
+            json!({"command": "create", "path": file, "file_text": "next"}),
+        ),
+        (
+            "str_replace_editor",
+            json!({"command": "str_replace", "path": file, "old_str": "base", "new_str": "next"}),
+        ),
+        (
+            "str_replace_editor",
+            json!({"command": "insert", "path": file, "insert_line": 1, "new_str": "next"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let data = resolve(
+            &fixture,
+            "session-a",
+            &format!("r-form-{index}"),
+            None,
+            tool,
+            arguments,
+        );
+        assert_eq!(data["schema_version"], RESOLVE_RESULT);
+        assert_eq!(only_target(&data), expected, "tool={tool} index={index}");
+    }
+}
+
+#[test]
+fn a_governed_commit_resolves_its_anchor_and_fails_closed_without_one() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).expect("nested");
+
+    // The governed commit declares no path because it has no target to choose:
+    // it always commits the canonical live session workspace, so the trusted
+    // anchor is the whole proof and converges with a write in that repository.
+    let anchored = only_target(&resolve(
+        &fixture,
+        "session-a",
+        "r-commit",
+        Some(root.as_path()),
+        "runtime_kit_governed_commit",
+        json!({}),
+    ));
+    assert_eq!(anchored["root"], json!(root));
+    assert_eq!(
+        anchored,
+        only_target(&write_targets(
+            &fixture,
+            "session-a",
+            "r-commit-write",
+            &root.join("tracked.txt")
+        )),
+        "a governed commit and a write in one repository must converge"
+    );
+    assert_eq!(
+        only_target(&resolve(
+            &fixture,
+            "session-a",
+            "r-commit-nested",
+            Some(nested.as_path()),
+            "runtime_kit_governed_commit",
+            json!({}),
+        )),
+        anchored,
+        "a subdirectory anchor reduces to the repository top level"
+    );
+
+    // Without an anchor there is no admissible target rather than an unscoped
+    // commit: the one operation the lease exists to coordinate fails closed.
+    let (code, envelope) = invoke(
+        &fixture,
+        "resolve",
+        resolve_request(
+            "session-a",
+            "r-commit-bare",
+            None,
+            "runtime_kit_governed_commit",
+            json!({}),
+        ),
+    );
+    assert_ne!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["error"]["code"], "workspace-target-unresolvable");
+}
+
+#[test]
+fn an_artifact_export_resolves_only_its_workspace_destination() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+
+    // The workspace class writes one file at a path its own schema constrains
+    // to be workspace-relative, so it proves the repository exactly.
+    let exported = only_target(&resolve(
+        &fixture,
+        "session-a",
+        "r-export",
+        Some(root.as_path()),
+        "artifact_export",
+        json!({"ref": "artifact:a1", "destination": {"class": "workspace", "path": "out/report.md"}}),
+    ));
+    assert_eq!(
+        exported,
+        only_target(&write_targets(
+            &fixture,
+            "session-a",
+            "r-export-write",
+            &root.join("out/report.md")
+        )),
+        "an export and a write to one path must converge"
+    );
+
+    // The download class writes nothing into a repository.
+    let downloaded = resolve(
+        &fixture,
+        "session-a",
+        "r-download",
+        Some(root.as_path()),
+        "artifact_export",
+        json!({"ref": "artifact:a1", "destination": {"class": "download"}}),
+    );
+    assert_eq!(downloaded["kind"], "not-required", "data={downloaded}");
+
+    // A workspace destination with no anchor cannot be placed.
+    let (code, envelope) = invoke(
+        &fixture,
+        "resolve",
+        resolve_request(
+            "session-a",
+            "r-export-bare",
+            None,
+            "artifact_export",
+            json!({"ref": "artifact:a1", "destination": {"class": "workspace", "path": "out/report.md"}}),
+        ),
+    );
+    assert_ne!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["error"]["code"], "workspace-target-unresolvable");
+}
+
+#[test]
+fn v2_renew_answers_on_the_v2_result_schema_and_reports_a_lost_binding() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+    let target = only_target(&write_targets(
+        &fixture,
+        "session-a",
+        "r-a",
+        &root.join("tracked.txt"),
+    ));
+    let binding = bind(&fixture, "session-a", "b-a", &target);
+
+    let renewed = ok(
+        &fixture,
+        "renew",
+        renew_request("session-a", "n-a", &binding),
+    );
+    assert_eq!(renewed["schema_version"], RENEW_RESULT, "data={renewed}");
+    assert_eq!(renewed["kind"], "renewed", "data={renewed}");
+
+    // A renewal of a binding this session already released reports the loss on
+    // the v2 result schema rather than resurrecting the authority.
+    assert_eq!(
+        release(&fixture, "session-a", "rel-a", &binding)["kind"],
+        "released"
+    );
+    let lost = ok(
+        &fixture,
+        "renew",
+        renew_request("session-a", "n-lost", &binding),
+    );
+    assert_eq!(lost["schema_version"], RENEW_RESULT, "data={lost}");
+    assert_eq!(lost["kind"], "lost", "data={lost}");
+}
+
+#[test]
+fn a_v2_bind_rejects_a_target_and_an_anchor_together() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+    let target = only_target(&write_targets(
+        &fixture,
+        "session-a",
+        "r-a",
+        &root.join("tracked.txt"),
+    ));
+
+    // Authority comes from exactly one source. Admitting both would let a
+    // forged cwd ride along beside a valid target and be silently ignored.
+    let mut request = bind_request("session-a", "b-both", &target);
+    request["cwd"] = json!(root);
+    let (code, envelope) = invoke(&fixture, "bind", request);
+    assert_ne!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["error"]["code"], "workspace-wire-invalid");
+}
+
+#[test]
+fn resolve_rejects_a_relative_anchor_and_an_unusable_target_path() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+
+    // The anchor is what every relative target is joined against, so a
+    // relative anchor would resolve targets against the boundary's own process
+    // directory and could fence a different repository than the one written.
+    let mut relative = resolve_request(
+        "session-a",
+        "r-rel",
+        None,
+        "write",
+        json!({"file_path": "tracked.txt", "content": "next"}),
+    );
+    relative["anchor_cwd"] = json!("relative/anchor");
+    let (code, envelope) = invoke(&fixture, "resolve", relative);
+    assert_ne!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["error"]["code"], "workspace-cwd-invalid");
+
+    for (label, arguments) in [
+        ("empty", json!({"file_path": "", "content": "next"})),
+        (
+            "nul",
+            json!({"file_path": "trac\u{0}ked.txt", "content": "next"}),
+        ),
+        ("absent", json!({"content": "next"})),
+    ] {
+        let (code, envelope) = invoke(
+            &fixture,
+            "resolve",
+            resolve_request(
+                "session-a",
+                &format!("r-bad-{label}"),
+                Some(root.as_path()),
+                "write",
+                arguments,
+            ),
+        );
+        assert_ne!(code, 0, "label={label} envelope={envelope}");
+        assert_eq!(
+            envelope["error"]["code"], "workspace-target-unresolvable",
+            "label={label}"
+        );
+    }
+}
+
+#[test]
+fn rebinding_a_workspace_this_session_owns_is_denied_like_any_contention() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+
+    let anchored = ok(
+        &fixture,
+        "bind",
+        anchor_bind_request("session-a", "b-anchor", &root, "startup"),
+    );
+    assert_eq!(anchored["kind"], "bound");
+    let target = only_target(&write_targets(
+        &fixture,
+        "session-a",
+        "r-a",
+        &root.join("tracked.txt"),
+    ));
+
+    // The anchor bind already names the workspace key the lazy target resolves
+    // to, and that key is what the runtime must converge on. Convergence is the
+    // runtime's obligation, not a boundary guarantee: rebinding a workspace
+    // this session already owns is denied exactly like a foreign holder, and
+    // the denial cannot be told apart from genuine contention.
+    assert_eq!(anchored["target"]["workspace_key"], target["workspace_key"]);
+    let denied = bind(&fixture, "session-a", "b-again", &target);
+    assert_eq!(denied["kind"], "denied", "data={denied}");
+    assert_eq!(denied["code"], "WORKSPACE_FOREIGN_ACTIVE", "data={denied}");
+}
+
+#[test]
+fn concurrent_first_use_resolution_never_distrusts_the_state_directory() {
+    let fixture = Fixture::new(POLICY);
+    let root = repo(&fixture.root.join("repo-a"));
+    let file = root.join("tracked.txt");
+
+    // v2 makes every classified tool call a first-use creator of the private
+    // state root, where v1 created it once per session start. Creating the
+    // directory and only then chmodding it would let one process observe
+    // another's umask-derived mode and reject it as untrusted, which denies the
+    // tool call outright rather than retrying a bind.
+    let fixture = &fixture;
+    std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|index| {
+                let request = resolve_request(
+                    "session-a",
+                    &format!("r-race-{index}"),
+                    None,
+                    "write",
+                    json!({"file_path": file, "content": "next"}),
+                );
+                scope.spawn(move || {
+                    let output = fixture.run(
+                        &["workspace-lease", "resolve", "--format", "json"],
+                        Some(&request.to_string()),
+                    );
+                    (output.code, output.stdout_json())
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, handle) in handles.into_iter().enumerate() {
+            let (code, envelope) = handle.join().expect("resolve thread");
+            assert_eq!(code, 0, "index={index} envelope={envelope}");
+            assert_eq!(envelope["data"]["kind"], "targets", "index={index}");
+        }
+    });
 }

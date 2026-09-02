@@ -379,25 +379,52 @@ later operation in that session. Protocol v2 keeps the durable per-worktree
 authority model unchanged and moves selection from the session anchor to the
 exact operation target.
 
-`resolve` classifies one exact tool execution and owns no durable state: it
-never binds, fences, writes, or denies. It accepts the trusted anchor cwd, the
-exact call/root/tool/arguments/nesting facts, and returns either
-`not-required` or a `targets` array. Only structured mutations whose path
-arguments are exact are classified: `write`, `edit`, and
-`str_replace_editor` with `create`, `str_replace`, or `insert`. Read-only
-forms, unknown tools, and arbitrary shell programs resolve to `not-required`
-and run as unscoped native host operations, because their repository effects
-cannot be proven by inspecting a startup directory. A non-repository target is
-omitted, so a write outside any checkout needs no repository lease.
+`resolve` classifies one exact tool execution. It writes no lease or binding
+state and never binds, fences, or denies a lease, but it is not side-effect
+free: like every operation needing the keyed workspace digest it mints the host
+`fingerprint.key` on first use, and it fails closed with
+`workspace-target-unresolvable` when the declared target arguments are
+unusable. It accepts the trusted anchor cwd, the exact
+call/root/tool/arguments/nesting facts, and returns either `not-required` or a
+`targets` array.
+
+A tool is classified when its own declared arguments prove the repository it
+mutates. That is the axis, not whether the tool is a shell:
+
+- `write` and `edit` prove it through `file_path`, and `str_replace_editor`
+  through `path` for `create`, `str_replace`, and `insert`.
+- `artifact_export` proves it through `destination.path` when
+  `destination.class` is `workspace`, a path its own schema constrains to be
+  workspace-relative. The `download` class writes nothing into a repository
+  and proves no target.
+- `runtime_kit_governed_commit` declares no path because it has no target to
+  choose: it always commits the canonical live session workspace. The trusted
+  anchor is therefore the whole proof, and without an anchor there is no
+  admissible target rather than an unscoped commit.
+
+Read-only forms, unknown tools, and arbitrary shell programs resolve to
+`not-required` and run as unscoped native host operations, because their
+repository effects cannot be proven by inspecting a startup directory. For a
+shell that is deliberate rather than incidental: a `workdir` fence is defeated
+by `cd` inside the command string, so honouring one would claim coverage this
+boundary cannot enforce. This removes the v1 fence -- cross-session
+exclusivity, the dirty gate, and the uncertain-outcome gate -- from shell
+mutations, which is an accepted trade-off recorded in
+`sympoies/dsh-runtime-kit#172`; whole-runtime isolation, not a path argument,
+is the boundary that can bound a shell. A non-repository target is omitted, so
+a write outside any checkout needs no repository lease.
 
 Each classified path is resolved against the trusted anchor when relative,
 canonicalized through the same mutation-target binding used by the policy
 boundary (symlinks resolved, non-existent leaves bound to their nearest
 existing ancestor, inherited Git repository-selection state rejected), and
 reduced to its physical Git top-level. Targets are deduplicated and returned
-sorted by their keyed workspace digest, so a multi-target acquisition order is
-deterministic and cannot deadlock between sessions. A relative path with no
-anchor fails closed rather than guessing a repository.
+sorted by their keyed workspace digest. Every tool classified today yields at
+most one target, so that ordering is the wire contract for a future multi-path
+tool rather than a rule exercised now: when one arrives, a deterministic
+acquisition order is what keeps two sessions from deadlocking against each
+other. A relative path with no anchor fails closed rather than guessing a
+repository.
 
 A v2 `bind` accepts either an exact resolved `target` or an anchor `cwd`,
 never both. A target bind rederives canonical identity from the live host
@@ -412,10 +439,16 @@ v1 rule applied per physical worktree. One session therefore owns independent
 bindings for repositories A and B, while two sessions targeting one physical
 worktree still contend.
 
-Every v2 `bound` result names the exact repository target it owns, so the
-runtime keys one authority set by canonical workspace rather than by session
-and an eager anchor binding and a later lazy acquisition of the same
-repository converge on one generation.
+Every v2 `bound` result names the exact repository target it owns, including
+its `workspace_key`. Convergence between an eager anchor binding and a later
+lazy acquisition of the same repository is the runtime's obligation, not a
+boundary guarantee: the runtime must key its authority set by that
+`workspace_key` and reuse the existing binding for any resolved target with the
+same key. A second bind of a workspace this session already owns is denied
+`foreign-active` like any other contention, and that denial is
+indistinguishable from a genuinely foreign holder, so a runtime that eagerly
+binds its anchor and then binds again per resolved target would contend with
+itself.
 
 A v2 `begin` additionally carries the exact resolved target and proves it is
 the same workspace as the durable binding. Classification already happened in
