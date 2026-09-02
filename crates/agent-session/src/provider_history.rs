@@ -18,6 +18,8 @@ const SCAN_MAX_ENTRIES: usize = 10_000;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024;
+const MAX_STAR_BYTES: u64 = 4 * 1024;
+const STAR_SCHEMA_VERSION: &str = "agent-session.history-star.v1";
 const MAX_PREVIEW_LINES: usize = 128;
 const MAX_PREVIEW_CHARS: usize = 240;
 const MAX_MESSAGE_CHARS: usize = 64 * 1024;
@@ -53,6 +55,16 @@ pub(crate) struct ArchivedSession {
     pub(crate) archived_at: String,
 }
 
+/// A star is stored on its own, keyed by history id, rather than inside the
+/// archive record: a session can be starred before it is ever archived, and an
+/// archived session can be unstarred later without rewriting archive metadata.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct StarredSession {
+    pub(crate) schema_version: String,
+    pub(crate) history_id: String,
+    pub(crate) starred_at: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct HistorySession {
     pub(crate) id: String,
@@ -75,6 +87,8 @@ pub(crate) struct HistorySession {
     pub(crate) updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) archived_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) starred_at: Option<String>,
     pub(crate) resumable: bool,
     #[serde(skip)]
     transcript_path: PathBuf,
@@ -182,14 +196,20 @@ struct LatestPromptCacheEntry {
 pub(crate) struct HistoryCatalog {
     sources: Vec<HistorySource>,
     archives_root: PathBuf,
+    stars_root: PathBuf,
     cache: Mutex<CatalogCache>,
 }
 
 impl HistoryCatalog {
-    pub(crate) fn new(sources: Vec<HistorySource>, archives_root: PathBuf) -> Self {
+    pub(crate) fn new(
+        sources: Vec<HistorySource>,
+        archives_root: PathBuf,
+        stars_root: PathBuf,
+    ) -> Self {
         Self {
             sources,
             archives_root,
+            stars_root,
             cache: Mutex::new(CatalogCache::default()),
         }
     }
@@ -259,6 +279,31 @@ impl HistoryCatalog {
         Ok(page)
     }
 
+    /// Set or clear the star on one history session.
+    ///
+    /// The record is keyed by the catalog's own id for the session, never by the
+    /// caller's string: an id that names no session is a not-found instead of an
+    /// orphan record, and no request-controlled value reaches the filesystem.
+    pub(crate) fn set_star(
+        &self,
+        history_id: &str,
+        starred_at: Option<&str>,
+    ) -> Result<Option<String>, HistoryError> {
+        let snapshot = self.snapshot();
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == history_id)
+            .ok_or(HistoryError::NotFound)?;
+        let stored = match starred_at {
+            Some(starred_at) => write_star(&self.stars_root, &session.id, starred_at)
+                .map(|record| Some(record.starred_at)),
+            None => remove_star(&self.stars_root, &session.id).map(|()| None),
+        };
+        self.invalidate();
+        stored
+    }
+
     pub(crate) fn messages(
         &self,
         history_id: &str,
@@ -301,7 +346,7 @@ impl HistoryCatalog {
         if fresh && let Some(snapshot) = cache.snapshot.clone() {
             return snapshot;
         }
-        let snapshot = scan_catalog(&self.sources, &self.archives_root);
+        let snapshot = scan_catalog(&self.sources, &self.archives_root, &self.stars_root);
         cache.refreshed_at = Some(Instant::now());
         cache.snapshot = Some(snapshot.clone());
         snapshot
@@ -329,6 +374,89 @@ pub(crate) fn stable_history_id(
 
 pub(crate) fn archive_root(state_dir: &Path) -> PathBuf {
     state_dir.join("history").join("archives")
+}
+
+pub(crate) fn star_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("history").join("stars")
+}
+
+/// Every history id this daemon mints is `stable_history_id`'s `h-<sha256 hex>`.
+/// Star records are named after that id, so anything else is refused before it
+/// can reach the filesystem as a path segment.
+fn is_stable_history_id(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("h-")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Store a star for one history id. Writing is atomic (temp file + rename) so a
+/// concurrent scan never observes a half-written record, and re-starring an
+/// already starred session simply refreshes `starred_at`.
+pub(crate) fn write_star(
+    root: &Path,
+    history_id: &str,
+    starred_at: &str,
+) -> Result<StarredSession, HistoryError> {
+    if !is_stable_history_id(history_id) {
+        return Err(HistoryError::NotFound);
+    }
+    let record = StarredSession {
+        schema_version: STAR_SCHEMA_VERSION.to_string(),
+        history_id: history_id.to_string(),
+        starred_at: starred_at.to_string(),
+    };
+    let root = prepare_star_root(root)?;
+    let path = root.join(format!("{history_id}.json"));
+    let temp = root.join(format!(".{history_id}.tmp-{}", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|_| HistoryError::Io)?;
+    let write = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temp).map_err(|_| HistoryError::Io)?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|_| HistoryError::Io)?;
+        file.sync_all().map_err(|_| HistoryError::Io)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(HistoryError::Io);
+            }
+            Ok(_) | Err(_) => {}
+        }
+        fs::rename(&temp, &path).map_err(|_| HistoryError::Io)
+    })();
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(record)
+}
+
+/// Clear a star. Unstarring a session that was never starred is a no-op success,
+/// so a repeated toggle from two devices settles instead of erroring.
+pub(crate) fn remove_star(root: &Path, history_id: &str) -> Result<(), HistoryError> {
+    if !is_stable_history_id(history_id) {
+        return Err(HistoryError::NotFound);
+    }
+    let path = root.join(format!("{history_id}.json"));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(HistoryError::Io),
+    }
+}
+
+fn prepare_star_root(root: &Path) -> Result<PathBuf, HistoryError> {
+    fs::create_dir_all(root).map_err(|_| HistoryError::Io)?;
+    if fs::symlink_metadata(root)
+        .map_err(|_| HistoryError::Io)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(HistoryError::Io);
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|_| HistoryError::Io)?;
+    Ok(root.to_path_buf())
 }
 
 pub(crate) fn write_archive(
@@ -396,10 +524,18 @@ pub(crate) fn write_archive(
     })
 }
 
+/// The on-disk metadata roots a scan reads alongside the provider transcripts.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryRoots<'a> {
+    pub(crate) archives: &'a Path,
+    pub(crate) stars: &'a Path,
+}
+
 #[cfg(test)]
 pub(crate) fn list(
     sources: &[HistorySource],
-    archives_root: &Path,
+    roots: HistoryRoots<'_>,
     machine: &str,
     query: Option<&str>,
     provider: Option<&str>,
@@ -407,7 +543,7 @@ pub(crate) fn list(
     limit: usize,
 ) -> Result<HistoryPage, HistoryError> {
     let mut page = paginate_snapshot(
-        scan_catalog(sources, archives_root),
+        scan_catalog(sources, roots.archives, roots.stars),
         machine,
         query,
         provider,
@@ -446,13 +582,7 @@ fn paginate_snapshot(
         provider.is_none_or(|value| value == session.provider)
             && matches_metadata(session, machine, query)
     });
-    sessions.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| right.created_at.cmp(&left.created_at))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sessions.sort_by(|left, right| compare_list_keys(&list_key(left), &list_key(right)));
     if let Some(cursor) = cursor {
         sessions.retain(|session| session_is_after_cursor(session, &cursor));
     }
@@ -468,27 +598,63 @@ fn paginate_snapshot(
     })
 }
 
+/// The list order and the cursor share one key so paging stays consistent across
+/// the starred boundary: starred sessions lead, newest star first, and the
+/// unstarred remainder follows in the recency order it always had.
 #[derive(Debug)]
 struct ListCursor {
+    starred_at: Option<String>,
     updated_at: String,
     created_at: String,
     id: String,
 }
 
+fn list_key(session: &HistorySession) -> ListCursor {
+    ListCursor {
+        starred_at: session.starred_at.clone(),
+        updated_at: session.updated_at.clone(),
+        created_at: session.created_at.clone(),
+        id: session.id.clone(),
+    }
+}
+
+fn compare_list_keys(left: &ListCursor, right: &ListCursor) -> std::cmp::Ordering {
+    right
+        .starred_at
+        .is_some()
+        .cmp(&left.starred_at.is_some())
+        .then_with(|| right.starred_at.cmp(&left.starred_at))
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| right.created_at.cmp(&left.created_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
 fn encode_list_cursor(session: &HistorySession) -> String {
     format!(
-        "v1|{}|{}|{}",
-        session.updated_at, session.created_at, session.id
+        "v2|{}|{}|{}|{}",
+        session.starred_at.as_deref().unwrap_or("-"),
+        session.updated_at,
+        session.created_at,
+        session.id
     )
 }
 
 fn parse_list_cursor(value: &str) -> Result<ListCursor, HistoryError> {
     let mut parts = value.split('|');
-    let cursor = ListCursor {
-        updated_at: match parts.next() {
-            Some("v1") => parts.next().unwrap_or_default().to_string(),
+    // A v1 cursor predates stars; treating it as unstarred keeps an in-flight
+    // page from an older client resuming where it left off.
+    let starred_at = match parts.next() {
+        Some("v1") => None,
+        Some("v2") => match parts.next() {
+            Some("-") => None,
+            Some(starred_at) if !starred_at.is_empty() => Some(starred_at.to_string()),
             _ => return Err(HistoryError::InvalidCursor),
         },
+        _ => return Err(HistoryError::InvalidCursor),
+    };
+    let cursor = ListCursor {
+        starred_at,
+        updated_at: parts.next().unwrap_or_default().to_string(),
         created_at: parts.next().unwrap_or_default().to_string(),
         id: parts.next().unwrap_or_default().to_string(),
     };
@@ -503,16 +669,18 @@ fn parse_list_cursor(value: &str) -> Result<ListCursor, HistoryError> {
 }
 
 fn session_is_after_cursor(session: &HistorySession, cursor: &ListCursor) -> bool {
-    session.updated_at < cursor.updated_at
-        || (session.updated_at == cursor.updated_at
-            && (session.created_at < cursor.created_at
-                || (session.created_at == cursor.created_at && session.id > cursor.id)))
+    compare_list_keys(&list_key(session), cursor) == std::cmp::Ordering::Greater
 }
 
-fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnapshot {
+fn scan_catalog(
+    sources: &[HistorySource],
+    archives_root: &Path,
+    stars_root: &Path,
+) -> CatalogSnapshot {
     let deadline = Instant::now() + SCAN_MAX_DURATION;
     let mut truncated = false;
     let archives = read_archives(archives_root, deadline, &mut truncated);
+    let stars = read_stars(stars_root, deadline, &mut truncated);
     let mut visited = 0usize;
     let mut sessions = Vec::new();
     let mut seen = HashSet::new();
@@ -545,6 +713,7 @@ fn scan_catalog(sources: &[HistorySource], archives_root: &Path) -> CatalogSnaps
                 session.repo_name = repo_name(&archive.cwd);
                 session.archived_at = Some(archive.archived_at.clone());
             }
+            session.starred_at = stars.get(&session.id).cloned();
             if !seen.insert(session.id.clone()) {
                 continue;
             }
@@ -732,6 +901,7 @@ fn inspect_history_file(
         created_at,
         updated_at,
         archived_at: None,
+        starred_at: None,
         resumable: true,
         transcript_path: path.to_path_buf(),
     })
@@ -1258,6 +1428,35 @@ fn read_archives(
     archives
 }
 
+fn read_stars(root: &Path, deadline: Instant, truncated: &mut bool) -> BTreeMap<String, String> {
+    let mut stars = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return stars;
+    };
+    for entry in entries.flatten().take(SCAN_MAX_ENTRIES) {
+        if Instant::now() >= deadline {
+            *truncated = true;
+            break;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.len() > MAX_STAR_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(star) = serde_json::from_slice::<StarredSession>(&bytes) else {
+            continue;
+        };
+        stars.insert(star.history_id, star.starred_at);
+    }
+    stars
+}
+
 fn format_system_time(value: SystemTime) -> String {
     jiff::Timestamp::try_from(value)
         .map(|timestamp| timestamp.to_string())
@@ -1320,11 +1519,143 @@ mod tests {
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
             archived_at: None,
+            starred_at: None,
             resumable: true,
             transcript_path: PathBuf::new(),
         }
     }
 
+    #[test]
+    fn starred_sessions_lead_the_list_in_star_recency_order() {
+        let mut older_star = history_session("h-older-star", "2026-08-01T00:00:00Z");
+        older_star.starred_at = Some("2026-08-10T00:00:00Z".to_string());
+        let mut newer_star = history_session("h-newer-star", "2026-08-02T00:00:00Z");
+        newer_star.starred_at = Some("2026-08-11T00:00:00Z".to_string());
+        let recent = history_session("h-recent", "2026-08-31T00:00:00Z");
+        let snapshot = CatalogSnapshot {
+            sessions: vec![recent, older_star, newer_star],
+            truncated: false,
+        };
+
+        let page = paginate_snapshot(snapshot, "test", None, None, None, 25).unwrap();
+
+        assert_eq!(
+            page.sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["h-newer-star", "h-older-star", "h-recent"],
+            "stars lead the list newest-first, ahead of unstarred sessions"
+        );
+    }
+
+    #[test]
+    fn star_cursor_pages_across_the_starred_boundary() {
+        let mut starred = history_session("h-starred", "2026-08-01T00:00:00Z");
+        starred.starred_at = Some("2026-08-10T00:00:00Z".to_string());
+        let recent = history_session("h-recent", "2026-08-31T00:00:00Z");
+        let older = history_session("h-older", "2026-07-01T00:00:00Z");
+        let snapshot = CatalogSnapshot {
+            sessions: vec![recent, starred, older],
+            truncated: false,
+        };
+
+        let first = paginate_snapshot(snapshot.clone(), "test", None, None, None, 1).unwrap();
+        assert_eq!(first.sessions[0].id, "h-starred");
+        let cursor = first.next_cursor.clone().expect("cursor for the next page");
+        let second = paginate_snapshot(snapshot, "test", None, None, Some(&cursor), 25).unwrap();
+
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["h-recent", "h-older"],
+            "a cursor taken inside the starred group resumes at the unstarred remainder"
+        );
+    }
+
+    #[test]
+    fn stars_are_stored_per_history_id_and_cleared_on_unstar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stars = star_root(tmp.path());
+        let id = stable_history_id("codex", None, "session-a");
+
+        write_star(&stars, &id, "2026-08-10T00:00:00Z").unwrap();
+        let mut truncated = false;
+        let stored = read_stars(&stars, Instant::now() + SCAN_MAX_DURATION, &mut truncated);
+        assert_eq!(
+            stored.get(&id).map(String::as_str),
+            Some("2026-08-10T00:00:00Z")
+        );
+
+        remove_star(&stars, &id).unwrap();
+        let mut truncated = false;
+        let cleared = read_stars(&stars, Instant::now() + SCAN_MAX_DURATION, &mut truncated);
+        assert!(
+            cleared.is_empty(),
+            "unstarring removes the stored star record"
+        );
+        assert!(
+            remove_star(&stars, &id).is_ok(),
+            "unstarring an unstarred session stays a no-op success"
+        );
+    }
+
+    #[test]
+    fn star_records_reject_history_ids_that_are_not_stable_digests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stars = star_root(tmp.path());
+
+        assert!(write_star(&stars, "../escape", "2026-08-10T00:00:00Z").is_err());
+        assert!(remove_star(&stars, "../escape").is_err());
+        assert!(!tmp.path().join("escape.json").exists());
+    }
+
+    #[test]
+    fn scanned_sessions_carry_their_stored_star() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions/2026/08/31");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("rollout.jsonl"),
+            "{\"timestamp\":\"2026-08-31T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-08-31T00:00:00Z\"}}\n",
+        )
+        .unwrap();
+        let sources = [HistorySource {
+            provider: "codex".into(),
+            agent_profile: None,
+            root: tmp.path().join("sessions"),
+        }];
+        let stars = star_root(tmp.path());
+        write_star(
+            &stars,
+            &stable_history_id("codex", None, "abc"),
+            "2026-08-10T00:00:00Z",
+        )
+        .unwrap();
+
+        let page = list(
+            &sources,
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &stars,
+            },
+            "test",
+            None,
+            None,
+            None,
+            25,
+        )
+        .unwrap();
+
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(
+            page.sessions[0].starred_at.as_deref(),
+            Some("2026-08-10T00:00:00Z")
+        );
+    }
     #[test]
     fn metadata_search_does_not_match_non_preview_transcript_text() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1348,7 +1679,10 @@ mod tests {
 
         let preview = list(
             &sources,
-            &tmp.path().join("archives"),
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &tmp.path().join("stars"),
+            },
             "test",
             Some("visible"),
             None,
@@ -1367,7 +1701,10 @@ mod tests {
         );
         let wrapper = list(
             &sources,
-            &tmp.path().join("archives"),
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &tmp.path().join("stars"),
+            },
             "test",
             Some("injected bootstrap wrapper"),
             None,
@@ -1378,7 +1715,10 @@ mod tests {
         assert!(wrapper.sessions.is_empty());
         let body = list(
             &sources,
-            &tmp.path().join("archives"),
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &tmp.path().join("stars"),
+            },
             "test",
             Some("secret needle"),
             None,
@@ -1588,6 +1928,7 @@ mod tests {
                 root: tmp.path().join("sessions"),
             }],
             tmp.path().join("archives"),
+            tmp.path().join("stars"),
         );
         assert_eq!(
             catalog
@@ -1774,6 +2115,7 @@ mod tests {
                 created_at: "2026-08-31T00:00:00Z".to_string(),
                 updated_at: "2026-08-31T00:00:01Z".to_string(),
                 archived_at: None,
+                starred_at: None,
                 resumable: true,
                 transcript_path: PathBuf::new(),
             }],
@@ -1823,7 +2165,10 @@ mod tests {
 
         let page = list(
             &sources,
-            &tmp.path().join("archives"),
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &tmp.path().join("stars"),
+            },
             "test",
             Some("first"),
             Some("claude"),
@@ -1880,7 +2225,10 @@ mod tests {
 
         let page = list(
             &sources,
-            &tmp.path().join("archives"),
+            HistoryRoots {
+                archives: &tmp.path().join("archives"),
+                stars: &tmp.path().join("stars"),
+            },
             "test",
             Some("first"),
             Some("claude"),
@@ -1947,6 +2295,7 @@ mod tests {
             },
         ];
         let archives = tmp.path().join("archives");
+        let stars_root = tmp.path().join("stars");
         let profile_a_id = stable_history_id("codex", Some("profile-a"), "shared-id");
         let profile_b_id = stable_history_id("codex", Some("profile-b"), "shared-id");
         write_archive(
@@ -1967,7 +2316,19 @@ mod tests {
         .unwrap()
         .commit();
 
-        let page = list(&sources, &archives, "test", None, None, None, 10).unwrap();
+        let page = list(
+            &sources,
+            HistoryRoots {
+                archives: &archives,
+                stars: &stars_root,
+            },
+            "test",
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
         assert_eq!(page.sessions.len(), 2);
         let profile_a = page
             .sessions
@@ -2003,6 +2364,7 @@ mod tests {
     fn archive_without_provider_transcript_is_not_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let archives = tmp.path().join("archives");
+        let stars_root = tmp.path().join("stars");
         write_archive(
             &archives,
             &ArchivedSession {
@@ -2021,7 +2383,19 @@ mod tests {
         .unwrap()
         .commit();
 
-        let page = list(&[], &archives, "test", None, None, None, 10).unwrap();
+        let page = list(
+            &[],
+            HistoryRoots {
+                archives: &archives,
+                stars: &stars_root,
+            },
+            "test",
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
 
         assert!(page.sessions.is_empty());
     }

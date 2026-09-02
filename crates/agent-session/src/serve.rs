@@ -766,6 +766,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         let history_catalog = Arc::new(HistoryCatalog::new(
             launch_profiles.history_sources(),
             provider_history::archive_root(&context.state_dir),
+            provider_history::star_root(&context.state_dir),
         ));
         let state = Arc::new(ServeState {
             context: context.clone(),
@@ -832,6 +833,7 @@ fn router(state: Arc<ServeState>) -> Router {
             "/history/sessions/{id}/messages",
             get(history_messages_handler),
         )
+        .route("/history/sessions/{id}/star", post(history_star_handler))
         .route("/codex/accounts", get(codex_accounts_handler))
         .route("/activity/events", get(activity_events_handler))
         .route("/usage", get(usage_handler))
@@ -2989,6 +2991,15 @@ struct HistoryMessagesQuery {
 #[serde(deny_unknown_fields)]
 struct ArchiveBody {
     expected_session_incarnation: String,
+    /// Star the archived session as it lands in history. Older clients omit it.
+    #[serde(default)]
+    starred: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryStarBody {
+    starred: bool,
 }
 
 // --- handlers -----------------------------------------------------------------
@@ -3223,6 +3234,7 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
                     "last_prompt": true,
                     "history": true,
                     "archive": true,
+                    "history_star": true,
                     "managed_account_handoff": crate::codex_app_server::MANAGED_ACCOUNT_HANDOFF_CAPABILITY,
                 },
             }))
@@ -3270,6 +3282,7 @@ async fn history_list_handler(
                 "transcript_messages": true,
                 "latest_message_paging": true,
                 "archive": true,
+                "star": true,
             },
         })),
         Ok(Err(error)) => history_error_response(error),
@@ -3302,6 +3315,43 @@ async fn history_messages_handler(
             "messages": page.messages,
             "next_cursor": page.next_cursor,
             "older_cursor": page.older_cursor,
+        })),
+        Ok(Err(error)) => history_error_response(error),
+        Err(_) => join_err(),
+    }
+}
+
+/// Toggle the star on one history session. The star is stored by history id, so
+/// it survives archiving and is shared by every client reading this machine.
+async fn history_star_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<HistoryStarBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-json-body",
+                "history star request requires starred",
+                None,
+            ));
+        }
+    };
+    let catalog = state.history_catalog.clone();
+    let starred_at = body.starred.then(activity_observed_at);
+    let history_id = id.clone();
+    match tokio::task::spawn_blocking(move || catalog.set_star(&history_id, starred_at.as_deref()))
+        .await
+    {
+        Ok(Ok(starred_at)) => envelope_ok(json!({
+            "machine": state.machine,
+            "history_id": id,
+            "starred_at": starred_at,
         })),
         Ok(Err(error)) => history_error_response(error),
         Err(_) => join_err(),
@@ -6980,6 +7030,7 @@ async fn archive_handler(
     let tmux = state.tmux_bin.clone();
     let machine = state.machine.clone();
     let response_machine = machine.clone();
+    let starred = body.starred;
     match tokio::task::spawn_blocking(move || {
         let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
             &context,
@@ -7024,16 +7075,34 @@ async fn archive_handler(
                 })
             },
         )?;
-        Ok((pending_archive.commit(), deleted))
+        let archive = pending_archive.commit();
+        // The session is already archived and gone; a star that cannot be stored
+        // is reported as unstarred rather than failing the archive after the fact.
+        let starred_at = starred
+            .then(activity_observed_at)
+            .and_then(|starred_at| {
+                provider_history::write_star(
+                    &provider_history::star_root(&context.state_dir),
+                    &archive.history_id,
+                    &starred_at,
+                )
+                .ok()
+            })
+            .map(|record| record.starred_at);
+        Ok((archive, starred_at, deleted))
     })
     .await
     {
-        Ok(Ok((archive, deleted))) => {
+        Ok(Ok((archive, starred_at, deleted))) => {
             state.history_catalog.invalidate();
             cleanup_deleted_session_registries(&state, &deleted.registry_fence).await;
+            let mut archived = json!(archive);
+            if let Some(starred_at) = starred_at {
+                archived["starred_at"] = json!(starred_at);
+            }
             envelope_ok(json!({
                 "machine": response_machine,
-                "archived": archive,
+                "archived": archived,
                 "deleted": deleted,
             }))
         }
@@ -11509,6 +11578,7 @@ mod tests {
         let history_catalog = Arc::new(HistoryCatalog::new(
             launch_profiles.history_sources(),
             provider_history::archive_root(state_dir),
+            provider_history::star_root(state_dir),
         ));
         Arc::new(ServeState {
             context: CliContext {
@@ -14521,6 +14591,70 @@ esac
         assert_eq!(body["data"]["capabilities"]["metadata_search"], true);
         assert_eq!(body["data"]["capabilities"]["full_text_search"], false);
         assert_eq!(body["data"]["capabilities"]["latest_message_paging"], true);
+        assert_eq!(body["data"]["capabilities"]["star"], true);
+    }
+
+    #[tokio::test]
+    async fn history_star_toggle_stores_and_clears_one_star() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let history_root = tmp.path().join("provider/sessions/2026/09/01");
+        fs::create_dir_all(&history_root).unwrap();
+        fs::write(
+            history_root.join("rollout.jsonl"),
+            "{\"timestamp\":\"2026-09-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-a\",\"cwd\":\"/work/example\",\"source\":\"cli\",\"timestamp\":\"2026-09-01T00:00:00Z\"}}\n",
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        Arc::get_mut(&mut st).unwrap().history_catalog = Arc::new(HistoryCatalog::new(
+            vec![HistorySource {
+                provider: "codex".to_string(),
+                agent_profile: None,
+                root: tmp.path().join("provider/sessions"),
+            }],
+            provider_history::archive_root(tmp.path()),
+            provider_history::star_root(tmp.path()),
+        ));
+        let id = provider_history::stable_history_id("codex", None, "session-a");
+        let uri = format!("/history/sessions/{id}/star");
+        let record = provider_history::star_root(tmp.path()).join(format!("{id}.json"));
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(&uri, None, json!({ "starred": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(&uri, Some(TOKEN), json!({ "starred": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert!(body["data"]["starred_at"].is_string(), "body={body}");
+        assert!(record.exists(), "starring stores a star record");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(&uri, Some(TOKEN), json!({ "starred": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["starred_at"], Value::Null);
+        assert!(!record.exists(), "unstarring clears the star record");
+
+        // An id that names no history session never reaches the filesystem.
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/history/sessions/..%2F..%2Fescape/star",
+                Some(TOKEN),
+                json!({ "starred": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+        assert!(!tmp.path().join("escape.json").exists());
     }
 
     #[test]
@@ -14676,6 +14810,7 @@ esac
                 root: tmp.path().join("provider/sessions"),
             }],
             provider_history::archive_root(tmp.path()),
+            provider_history::star_root(tmp.path()),
         ));
 
         let (status, body) = call(

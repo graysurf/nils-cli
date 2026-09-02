@@ -18,6 +18,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `POST /sessions` | Bearer | This specification |
 | `GET /history/sessions` | Bearer | This specification |
 | `GET /history/sessions/{history_id}/messages` | Bearer | This specification |
+| `POST /history/sessions/{history_id}/star` | Bearer | This specification |
 | `GET /codex/accounts` | Bearer | This specification |
 | `GET /activity/events` | Bearer | [Activity stream v1](activity-stream-v1.md) |
 | `GET /usage` | Open | This specification |
@@ -71,7 +72,13 @@ managed record enriches `title` only through the exact provider/profile/session
 history identity; archived metadata stays authoritative, and provider-only
 historical records do not invent a Console title. `data.capabilities` explicitly
 advertises `metadata_search: true`, `full_text_search: false`,
-`transcript_messages: true`, `latest_message_paging: true`, and `archive: true`.
+`transcript_messages: true`, `latest_message_paging: true`, `archive: true`, and
+`star: true`.
+
+Starred sessions lead the page, newest star first, and the unstarred remainder
+follows in the retained recency order. Each item may add `starred_at`. Cursors
+stay opaque: the current form is `v2` and carries the star, while a `v1` cursor
+minted before stars existed is still accepted and resumes as unstarred.
 
 Latest-prompt enrichment is limited to the returned catalog page, uses at most
 1 MiB per transcript and 16 MiB across one page, and is cached in process by
@@ -90,8 +97,19 @@ message limits. The browser receives neither provider transcript paths nor raw
 provider JSONL records. Both history reads require the server bearer because
 conversation content is more sensitive than the live list projection.
 
+`POST /history/sessions/{history_id}/star` sets or clears one star, keyed by the
+history id the daemon itself minted: the body is `{ "starred": <bool> }`, the id
+is resolved against the catalog first, and an id that names no history session is
+a not-found rather than a stored record. The response carries `history_id` and
+`starred_at`, which is null once the star is cleared. Clearing a star that was
+never set is a success, so a repeated toggle from two clients settles.
+
 `POST /sessions/{id}/archive` requires
-`expected_session_incarnation`. It writes private, mode-0600 Console metadata
+`expected_session_incarnation` and accepts an optional `starred` boolean, which
+stars the session as it lands in history and is reflected as `archived.starred_at`.
+Older clients omit it. The archive itself is already committed when the star is
+written, so a star that cannot be stored is reported as unstarred rather than
+failing the completed archive. It writes private, mode-0600 Console metadata
 for the captured provider session and then runs the existing verified session
 deletion path. A changed incarnation returns a conflict. If verified deletion
 fails, the new archive metadata is rolled back and the live record remains
@@ -99,8 +117,8 @@ retryable. Archive never deletes or rewrites the provider transcript. Existing
 `DELETE /sessions/{id}` remains the distinct permanent Console-record removal
 operation and likewise does not delete provider history.
 
-`GET /sessions` advertises additive `history` and `archive` capabilities. Older
-daemons omit them and do not serve these routes.
+`GET /sessions` advertises additive `history`, `archive`, and `history_star`
+capabilities. Older daemons omit them and do not serve these routes.
 
 ### Operator provider-turn reconciliation
 
