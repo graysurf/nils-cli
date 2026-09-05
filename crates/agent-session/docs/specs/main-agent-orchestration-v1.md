@@ -1488,6 +1488,33 @@ released-v1 alias progress live even if the alias now resolves to another sessio
 crash therefore cannot create unbounded residue or permanently disable
 admission.
 
+### Daemon-owned group archive
+
+The additive bearer-protected
+`GET /sessions/{id}/orchestration/group-archive` route wraps the exact group
+cleanup preview. `POST` accepts
+`agent-session.main-agent-group-archive-request.v1` with the same Main Agent
+incarnation, run revision, plan digest, mode, and idempotency boundaries. Its
+result is `agent-session.main-agent-group-archive-result.v1` and retains the
+complete cleanup result so clients can present partial worker outcomes without
+inventing a second lifecycle model.
+
+Group Archive executes the same authority sealing, assignment transitions,
+worker-first ordering, run closure, and Main-Agent-last deletion as group
+cleanup. Immediately before each exact member deletion, the daemon prepares
+that member's provider-history archive. Successful verified deletion commits
+the archive; failure rolls it back and keeps the member live. An exact retry
+uses its own derived cleanup receipt namespace, so Archive and Delete cannot
+adopt each other's idempotency records. A crash after verified deletion leaves
+the already-written archive available while the cleanup receipt's pending
+registry fence resumes at the next safe stage.
+
+Missing provider history identity fails at that member before deletion. Earlier
+successfully archived workers remain archived, the Main Agent remains live, and
+the same request can resume after the identity is repaired. Collaborators,
+borrowed sessions, handed-off workers, and assignments from other runs remain
+outside the inherited plan and are never archived by this route.
+
 ## Recovery and failure semantics
 
 Revision conflict returns `orchestration-revision-conflict` with

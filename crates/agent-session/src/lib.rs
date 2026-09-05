@@ -12193,6 +12193,7 @@ fn delete_session_with_expected_incarnation_and_prepare<T, F>(
     id: &str,
     tmux_bin: PathBuf,
     expected_session_incarnation: &str,
+    group_cleanup_owned: bool,
     prepare: F,
 ) -> Result<(T, DeleteResult), CliError>
 where
@@ -12221,19 +12222,97 @@ where
             })),
         ));
     }
-    orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
-        context, &record, None,
-    )?;
-    let prepared = prepare(&record)?;
-    let deleted = delete_session_locked_with_timeouts(
+    if group_cleanup_owned {
+        orchestration::ensure_group_cleanup_may_delete_session(context, &record)?;
+    } else {
+        orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
+            context, &record, None,
+        )?;
+    }
+    delete_session_locked_with_timeouts_and_prepare(
         context,
         record,
         resolved.session_dir,
         &tmux_bin,
         PANE_INPUT_COMMAND_TIMEOUT,
         DELETE_TERMINATION_VERIFY_TIMEOUT,
+        prepare,
+    )
+}
+
+fn prepare_session_archive(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<provider_history::PendingArchive, CliError> {
+    let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
+        CliError::data(
+            "provider-session-unavailable",
+            "session does not have a captured provider session id",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let agent_profile = session_agent_profile(record).map(str::to_string);
+    let archive = provider_history::ArchivedSession {
+        schema_version: "agent-session.history-archive.v1".to_string(),
+        history_id: provider_history::stable_history_id(
+            &provider_resume.provider,
+            agent_profile.as_deref(),
+            &provider_resume.session_id,
+        ),
+        provider: provider_resume.provider.clone(),
+        provider_session_id: provider_resume.session_id.clone(),
+        agent_profile,
+        title: record.title.clone(),
+        cwd: record.cwd.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        archived_at: jiff::Timestamp::now().to_string(),
+    };
+    provider_history::write_archive(
+        &provider_history::archive_root(&context.state_dir),
+        &archive,
+    )
+    .map_err(|_| {
+        CliError::runtime(
+            "history-archive-write-failed",
+            "failed to write session archive metadata",
+            Some(json!({ "id": record.id })),
+        )
+    })
+}
+
+pub(crate) fn archive_session_with_expected_incarnation(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    expected_session_incarnation: &str,
+) -> Result<(provider_history::ArchivedSession, DeleteResult), CliError> {
+    let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
+        context,
+        id,
+        tmux_bin,
+        expected_session_incarnation,
+        false,
+        |record| prepare_session_archive(context, record),
     )?;
-    Ok((prepared, deleted))
+    Ok((pending_archive.commit(), deleted))
+}
+
+pub(crate) fn archive_session_for_group_cleanup_with_expected_incarnation(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    expected_session_incarnation: &str,
+) -> Result<(provider_history::ArchivedSession, DeleteResult), CliError> {
+    let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
+        context,
+        id,
+        tmux_bin,
+        expected_session_incarnation,
+        true,
+        |record| prepare_session_archive(context, record),
+    )?;
+    Ok((pending_archive.commit(), deleted))
 }
 
 fn delete_session_for_terminal_assignment(
@@ -12249,6 +12328,23 @@ fn delete_session_for_terminal_assignment(
         PANE_INPUT_COMMAND_TIMEOUT,
         DELETE_TERMINATION_VERIFY_TIMEOUT,
         terminal_assignment,
+        false,
+    )
+}
+
+pub(crate) fn delete_session_for_group_cleanup(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+) -> Result<DeleteResult, CliError> {
+    delete_session_with_timeouts_for_terminal_assignment(
+        context,
+        id,
+        tmux_bin,
+        PANE_INPUT_COMMAND_TIMEOUT,
+        DELETE_TERMINATION_VERIFY_TIMEOUT,
+        None,
+        true,
     )
 }
 
@@ -12267,6 +12363,7 @@ fn delete_session_with_timeouts(
         kill_timeout,
         verify_timeout,
         None,
+        false,
     )
 }
 
@@ -12277,6 +12374,7 @@ fn delete_session_with_timeouts_for_terminal_assignment(
     kill_timeout: Duration,
     verify_timeout: Duration,
     terminal_assignment: Option<&orchestration::AssignmentRecord>,
+    group_cleanup_owned: bool,
 ) -> Result<DeleteResult, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
@@ -12285,11 +12383,15 @@ fn delete_session_with_timeouts_for_terminal_assignment(
     let record = read_session_record(&resolved.record_path)?;
     ensure_same_session_identity(&observed, &record)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-    orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
-        context,
-        &record,
-        terminal_assignment,
-    )?;
+    if group_cleanup_owned {
+        orchestration::ensure_group_cleanup_may_delete_session(context, &record)?;
+    } else {
+        orchestration::ensure_terminal_assignment_may_delete_runtime_stopped_session(
+            context,
+            &record,
+            terminal_assignment,
+        )?;
+    }
     let failed_canary_proof = terminal_assignment.and_then(|assignment| {
         (assignment.state == "cancelled"
             && assignment.worker.as_ref().is_some_and(|worker| {
@@ -12328,12 +12430,36 @@ fn delete_session_with_timeouts_for_terminal_assignment(
 
 fn delete_session_locked_with_timeouts(
     context: &CliContext,
-    mut record: SessionRecord,
+    record: SessionRecord,
     session_dir: PathBuf,
     tmux_bin: &Path,
     kill_timeout: Duration,
     verify_timeout: Duration,
 ) -> Result<DeleteResult, CliError> {
+    delete_session_locked_with_timeouts_and_prepare(
+        context,
+        record,
+        session_dir,
+        tmux_bin,
+        kill_timeout,
+        verify_timeout,
+        |_| Ok(()),
+    )
+    .map(|(_, deleted)| deleted)
+}
+
+fn delete_session_locked_with_timeouts_and_prepare<T, F>(
+    context: &CliContext,
+    mut record: SessionRecord,
+    session_dir: PathBuf,
+    tmux_bin: &Path,
+    kill_timeout: Duration,
+    verify_timeout: Duration,
+    prepare: F,
+) -> Result<(T, DeleteResult), CliError>
+where
+    F: FnOnce(&SessionRecord) -> Result<T, CliError>,
+{
     ensure_session_lifecycle_mutation_allowed(context, &record)?;
     if dsh_external::is_external_record(&record) {
         // There is no tmux runtime to terminate, so deletion is admitted only
@@ -12375,7 +12501,9 @@ fn delete_session_locked_with_timeouts(
             }
         }
         let registry_fence = SessionRegistryFence::from_record(&record);
-        return finish_session_delete(context, record, session_dir, registry_fence);
+        let prepared = prepare(&record)?;
+        let deleted = finish_session_delete(context, record, session_dir, registry_fence)?;
+        return Ok((prepared, deleted));
     }
     let registry_fence = SessionRegistryFence::from_record(&record);
     gracefully_shutdown_profiled_tmux_session(context, &mut record, tmux_bin, verify_timeout)
@@ -12394,7 +12522,9 @@ fn delete_session_locked_with_timeouts(
     .map_err(|reason| {
         session_termination_error(&record, reason, SessionTerminationOperation::Delete)
     })?;
-    finish_session_delete(context, record, session_dir, registry_fence)
+    let prepared = prepare(&record)?;
+    let deleted = finish_session_delete(context, record, session_dir, registry_fence)?;
+    Ok((prepared, deleted))
 }
 
 fn delete_session_locked_after_failed_canary_proof(

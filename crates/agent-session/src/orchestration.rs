@@ -2244,6 +2244,34 @@ pub(crate) fn ensure_terminal_assignment_may_delete_runtime_stopped_session(
     record: &SessionRecord,
     assignment: Option<&AssignmentRecord>,
 ) -> Result<(), CliError> {
+    ensure_session_delete_authority(context, record, assignment, false)
+}
+
+pub(crate) fn ensure_group_cleanup_may_delete_session(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    ensure_session_delete_authority(context, record, None, true)
+}
+
+fn ensure_session_delete_authority(
+    context: &CliContext,
+    record: &SessionRecord,
+    assignment: Option<&AssignmentRecord>,
+    group_cleanup_owned: bool,
+) -> Result<(), CliError> {
+    if !group_cleanup_owned
+        && let Some(marker) = validated_session_group_cleanup_fence(context, record)?
+    {
+        return Err(CliError::data(
+            "worker-group-cleanup-fenced",
+            "session deletion is fenced by a Main-owned group cleanup",
+            Some(json!({
+                "run_id": marker.run_id,
+                "main_session_id": marker.main.session_id
+            })),
+        ));
+    }
     let runtime_stop = validated_session_runtime_stop_fence(context, record)?;
     let claimed_stop = validated_session_claimed_runtime_stop_identity(context, record)?;
     if runtime_stop.is_none() && claimed_stop.is_none() {
