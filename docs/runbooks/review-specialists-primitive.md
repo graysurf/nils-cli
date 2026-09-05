@@ -126,7 +126,11 @@ Provider profiles are local renderers only. They do not post anything.
 
 `provider-review` and its `pr-comment` alias require `--reviewable`, `--lens`,
 `--scope`, and `--evidence-reviewed`; omitting one fails with
-`provider-review-metadata-required` (exit 64) and writes no body. These profiles
+`provider-review-metadata-required` (exit 64) and writes no body. Supplying one
+of the retired placeholder strings (`not provided`, `unspecified`, `no input
+files`) fails the same way — typing a placeholder conveys no more than omitting
+the flag, and would otherwise reproduce the published header by hand. The
+envelope's `details` names `missing` and `placeholder` separately. These profiles
 render a header that is published verbatim under a reviewer's name, and the
 renderer previously substituted `not provided` / `unspecified` and synthesized
 `Evidence reviewed:` from the input file list — a reasonable default for a local

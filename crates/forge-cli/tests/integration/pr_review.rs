@@ -390,6 +390,72 @@ fn pr_review_validate_specialist_report_rejects_renderer_placeholder_metadata() 
     );
 }
 
+/// The field loop returns on the first violation, so a fixture whose first
+/// field is already a placeholder never evaluates the later sentinels. This
+/// reaches the `unspecified` arm with every other field real — and `Lens:
+/// unspecified` is the exact sentinel from the incident.
+#[test]
+fn pr_review_validate_specialist_report_rejects_unspecified_lens() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: unspecified\n- Lens verdict: pass\n- Scope: review publication\n- Evidence reviewed: focused tests\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| No findings | none | 0.00 | No actionable \\| informational findings. | none |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Lens"),
+        "message={}",
+        env["error"]["message"]
+    );
+}
+
+/// The evidence fallback is the third sentinel; nothing else in the body is
+/// defective, so this reaches that arm specifically.
+#[test]
+fn pr_review_validate_specialist_report_rejects_no_input_files_evidence() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: testing\n- Lens verdict: pass\n- Scope: review publication\n- Evidence reviewed: no input files\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| No findings | none | 0.00 | No actionable \\| informational findings. | none |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+}
+
 /// A real value that merely *contains* a sentinel word must still pass; the
 /// guard matches the whole field, not a substring.
 #[test]

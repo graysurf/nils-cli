@@ -12,6 +12,7 @@ use std::{
     io::Read,
 };
 
+use agent_workflow_primitives::review_specialists::PROVIDER_REVIEW_PLACEHOLDERS;
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
 
@@ -3275,9 +3276,15 @@ fn validate_specialist_review_report(body: &str) -> Result<(), ForgeError> {
         // Non-empty is not enough. `review-specialists` used to substitute these
         // exact sentinels for an absent flag, so a report could satisfy the
         // emptiness check and still publish "Reviewable: not provided" under the
-        // reviewer's name. The renderer now refuses to emit them, and this is the
-        // matching guard for a body built any other way.
-        if matches!(values[0], "not provided" | "unspecified") {
+        // reviewer's name. The renderer now refuses to emit them for a
+        // publication-bound profile; this is the second line for a body from an
+        // older binary or built by hand.
+        //
+        // The list comes from the renderer that produces them, so renaming a
+        // placeholder there cannot silently leave this guard matching nothing.
+        // The renderer's evidence fallback is not in it: that one joins the
+        // input file paths, which has no fixed spelling.
+        if PROVIDER_REVIEW_PLACEHOLDERS.contains(&values[0]) {
             return Err(invalid_specialist_review_report(&format!(
                 "specialist report {field} field is the renderer's placeholder \
                  ({}); bind the real value before publishing",
