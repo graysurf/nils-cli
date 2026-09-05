@@ -14975,6 +14975,52 @@ esac
     }
 
     #[tokio::test]
+    async fn archive_termination_failure_retains_session_without_history_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "archive-stop-failure";
+        let tmux_session = "hs-codex-archive-stop-failure";
+        seed_session_with_runtime(tmp.path(), id, "codex", tmux_session);
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        record["provider_resume"] = json!({
+            "provider": "codex",
+            "session_id": "archive-stop-failure-provider",
+            "captured_at": "2000-01-01T00:00:00Z",
+            "capture_method": "fixture",
+            "resume_args": ["resume", "archive-stop-failure-provider"]
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let pane = TestProcessGroup::spawn();
+        let calls = tmp.path().join("archive-stop-failure.calls");
+        let tmux = failing_delete_tmux(tmp.path(), tmp.path(), id, pane.pid(), &calls);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let history_id =
+            provider_history::stable_history_id("codex", None, "archive-stop-failure-provider");
+        let archive_path = provider_history::archive_root(&st.context.state_dir)
+            .join(format!("{history_id}.json"));
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/archive"),
+                Some(TOKEN),
+                json!({ "expected_session_incarnation": format!("launch-{id}") }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert!(record_path.is_file());
+        assert!(
+            !archive_path.exists(),
+            "a live or unverified runtime must never gain visible archive metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn writes_require_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
@@ -21159,6 +21205,68 @@ esac
             "idempotency_key": "group-archive-retry-0001",
         });
 
+        let main_history_id =
+            provider_history::stable_history_id("claude", None, "archive-main-provider");
+        let main_archive_path = provider_history::archive_root(&st.context.state_dir)
+            .join(format!("{main_history_id}.json"));
+        let mut stale_incarnation = request.clone();
+        stale_incarnation["expected_main_incarnation"] = json!("stale-main-incarnation");
+        stale_incarnation["idempotency_key"] = json!("group-archive-stale-incarnation");
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                stale_incarnation,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+        assert_eq!(body["error"]["code"], "main-session-incarnation-conflict");
+
+        let mut stale_plan = request.clone();
+        stale_plan["expected_plan_digest"] = json!(format!("sha256:{}", "c".repeat(64)));
+        stale_plan["idempotency_key"] = json!("group-archive-stale-plan");
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                stale_plan,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+        assert_eq!(body["error"]["code"], "group-cleanup-plan-conflict");
+        assert!(!main_archive_path.exists());
+
+        let interrupt = st.context.state_dir.join("group-cleanup-interrupt-test");
+        fs::write(&interrupt, "authority_sealed").unwrap();
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                request.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "group-cleanup-test-interrupted");
+
+        for id in [&worker.id, &main.id] {
+            let delete = Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/{id}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = call(router(st.clone()), delete).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+            assert_eq!(body["error"]["code"], "worker-group-cleanup-fenced");
+        }
+        fs::remove_file(interrupt).unwrap();
+
         let (first_status, first_body) = call(
             router(st.clone()),
             post_json(
@@ -21176,6 +21284,40 @@ esac
         );
         assert!(session_dir(&st.context, &worker.id).is_dir());
         assert!(session_dir(&st.context, &main.id).is_dir());
+
+        let mut changed_archive = request.clone();
+        changed_archive["mode"] = json!("force");
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                changed_archive,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "idempotency-conflict");
+
+        let cleanup_request = json!({
+            "schema_version": crate::main_agent::GROUP_CLEANUP_REQUEST_SCHEMA,
+            "expected_main_incarnation": main.runtime.as_ref().unwrap().launch_id,
+            "expected_run_revision": cleanup["run_revision"],
+            "expected_plan_digest": cleanup["plan_digest"],
+            "mode": "safe",
+            "idempotency_key": "group-archive-retry-0001",
+        });
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-cleanup",
+                Some(TOKEN),
+                cleanup_request,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "idempotency-conflict");
 
         worker.provider_resume = Some(crate::ProviderResume {
             provider: "claude".to_string(),

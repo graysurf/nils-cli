@@ -821,6 +821,7 @@ struct GroupCleanupProgressIdentity<'a> {
     requested_session_id: &'a str,
     principal_session_id: &'a str,
     incarnation: &'a str,
+    operation: &'a str,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -21814,23 +21815,13 @@ pub(crate) fn execute_group_archive(
     )?;
     orchestration::validate_digest(&request.expected_plan_digest)?;
     validate_idempotency_key(&request.idempotency_key)?;
-    let digest = crate::coordination::request_digest(
-        "main-agent-group-archive",
-        &json!({
-            "expected_main_incarnation": request.expected_main_incarnation,
-            "expected_run_revision": request.expected_run_revision,
-            "expected_plan_digest": request.expected_plan_digest,
-            "mode": request.mode,
-            "idempotency_key": request.idempotency_key,
-        }),
-    );
     let cleanup_request = GroupCleanupRequest {
         schema_version: GROUP_CLEANUP_REQUEST_SCHEMA.to_string(),
         expected_main_incarnation: request.expected_main_incarnation,
         expected_run_revision: request.expected_run_revision,
         expected_plan_digest: request.expected_plan_digest,
         mode: request.mode,
-        idempotency_key: format!("group-archive-{}", &digest[..32]),
+        idempotency_key: request.idempotency_key,
     };
     execute_group_cleanup_operation(context, main_session_id, cleanup_request, tmux_bin, true)
 }
@@ -21842,9 +21833,14 @@ fn execute_group_cleanup_operation(
     tmux_bin: PathBuf,
     archive: bool,
 ) -> Result<GroupCleanupExecution, CliError> {
+    let operation = if archive {
+        "group-archive"
+    } else {
+        "group-cleanup"
+    };
     let requested_main_session_id = main_session_id.to_string();
     validate_group_cleanup_request(&requested_main_session_id, &request)?;
-    let request_digest = group_cleanup_request_digest(&request);
+    let request_digest = group_cleanup_operation_request_digest(&request, operation);
     let resolved_record = load_session_record(context, main_session_id);
     let canonical_main_session_id = match resolved_record.as_ref() {
         Ok(record) => record.id.clone(),
@@ -21866,6 +21862,7 @@ fn execute_group_cleanup_operation(
                     &request.expected_main_incarnation,
                     &request.idempotency_key,
                     &request_digest,
+                    operation,
                 )?
                 .unwrap_or_else(|| requested_main_session_id.clone())
             }
@@ -21888,6 +21885,7 @@ fn execute_group_cleanup_operation(
             &request.expected_main_incarnation,
             &request.idempotency_key,
             &request_digest,
+            operation,
         )?
     };
     let resume_state = if let Some(replay) = replay {
@@ -21972,6 +21970,7 @@ fn execute_group_cleanup_operation(
         requested_session_id: &requested_main_session_id,
         principal_session_id: main_session_id,
         incarnation: &incarnation,
+        operation,
     };
     let main = record.as_ref().map_or_else(
         || {
@@ -22035,25 +22034,29 @@ fn execute_group_cleanup_operation(
         .cloned()
         .collect::<Vec<_>>();
     worker_refs.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    let mut locked_worker_authorities = Vec::with_capacity(worker_refs.len());
-    for worker in &worker_refs {
-        let locked = crate::lock_exact_session_authority(context, &worker.session_id)?;
+    let mut authority_refs = worker_refs.clone();
+    authority_refs.push(main.clone());
+    authority_refs.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    authority_refs.dedup_by(|left, right| left.session_id == right.session_id);
+    let mut locked_session_authorities = Vec::with_capacity(authority_refs.len());
+    for session in &authority_refs {
+        let locked = crate::lock_exact_session_authority(context, &session.session_id)?;
         if let Some(locked) = locked.as_ref() {
-            let worker_incarnation = locked
+            let session_incarnation = locked
                 .record
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.launch_id.as_str())
                 .unwrap_or_default();
-            if !orchestration::session_ref_matches(worker, &locked.record, worker_incarnation) {
+            if !orchestration::session_ref_matches(session, &locked.record, session_incarnation) {
                 return Err(CliError::data(
                     "session-incarnation-conflict",
-                    "worker session identity changed before group cleanup authority was fenced",
-                    Some(json!({ "session_id": worker.session_id })),
+                    "session identity changed before group cleanup authority was fenced",
+                    Some(json!({ "session_id": session.session_id })),
                 ));
             }
         }
-        locked_worker_authorities.push((worker.clone(), locked));
+        locked_session_authorities.push((session.clone(), locked));
     }
     let plan = if resume_state
         .as_ref()
@@ -22083,6 +22086,7 @@ fn execute_group_cleanup_operation(
                 &incarnation,
                 &request.idempotency_key,
                 &request_digest,
+                operation,
             )?
             .is_some()
         {
@@ -22151,7 +22155,7 @@ fn execute_group_cleanup_operation(
                 main_session_id,
                 &incarnation,
                 &request.idempotency_key,
-                "group-cleanup",
+                operation,
                 &request_digest,
                 group_cleanup_stored_outcome(&initial_value, &initial_resume)?,
             )?;
@@ -22164,11 +22168,11 @@ fn execute_group_cleanup_operation(
         // against resume and broker reprovision. Persist it before sealing the
         // coordination broker and before making assignment terminalization
         // durable; an interrupted retry adopts the same fence.
-        for (worker, present) in &locked_worker_authorities {
+        for (session, present) in &locked_session_authorities {
             if present.is_some() {
                 orchestration::persist_session_group_cleanup_fence(
                     context,
-                    worker,
+                    session,
                     &main,
                     &current_plan.run_id,
                     &current_plan.plan_digest,
@@ -22200,7 +22204,7 @@ fn execute_group_cleanup_operation(
             main_session_id,
             &incarnation,
             &request.idempotency_key,
-            "group-cleanup",
+            operation,
             &request_digest,
             group_cleanup_stored_outcome(&sealed_value, &sealed_resume)?,
         )?;
@@ -22208,11 +22212,11 @@ fn execute_group_cleanup_operation(
         interrupt_group_cleanup_for_test(context, "authority_sealed")?;
         current_plan
     } else {
-        for (worker, present) in &locked_worker_authorities {
+        for (session, present) in &locked_session_authorities {
             if present.is_some() {
                 orchestration::persist_session_group_cleanup_fence(
                     context,
-                    worker,
+                    session,
                     &main,
                     &plan.run_id,
                     &plan.plan_digest,
@@ -22221,7 +22225,7 @@ fn execute_group_cleanup_operation(
         }
         plan
     };
-    drop(locked_worker_authorities);
+    drop(locked_session_authorities);
 
     let mut deleted_registry_fences = resume_state
         .as_ref()
@@ -22459,7 +22463,7 @@ fn execute_group_cleanup_operation(
             &format!("worker_delete_pending:{}", worker_plan.assignment_id),
         )?;
         let deletion = if archive {
-            crate::archive_session_with_expected_incarnation(
+            crate::archive_session_for_group_cleanup_with_expected_incarnation(
                 context,
                 &worker.session_id,
                 tmux_bin.clone(),
@@ -22467,7 +22471,7 @@ fn execute_group_cleanup_operation(
             )
             .map(|(_, deleted)| deleted)
         } else {
-            delete_session(context, &worker.session_id, tmux_bin.clone())
+            crate::delete_session_for_group_cleanup(context, &worker.session_id, tmux_bin.clone())
         };
         match deletion {
             Ok(deleted) => {
@@ -22584,7 +22588,7 @@ fn execute_group_cleanup_operation(
                 main_session_id,
                 &incarnation,
                 &request.idempotency_key,
-                "group-cleanup",
+                operation,
                 &request_digest,
                 group_cleanup_stored_outcome(
                     &value,
@@ -22627,7 +22631,7 @@ fn execute_group_cleanup_operation(
             main_session_id,
             &incarnation,
             &request.idempotency_key,
-            "group-cleanup",
+            operation,
             &request_digest,
             group_cleanup_stored_outcome(&run_closed_value, &run_closed_resume)?,
         )?;
@@ -22670,6 +22674,7 @@ fn execute_group_cleanup_operation(
                 &incarnation,
                 &request,
                 &request_digest,
+                operation,
                 group_cleanup_stored_outcome(&value, &completed_resume)?,
             )?;
             interrupt_group_cleanup_for_test(context, "main_deleted")?;
@@ -22734,7 +22739,7 @@ fn execute_group_cleanup_operation(
     )?;
     interrupt_group_cleanup_for_test(context, "main_delete_pending")?;
     let main_deletion = if archive {
-        crate::archive_session_with_expected_incarnation(
+        crate::archive_session_for_group_cleanup_with_expected_incarnation(
             context,
             main_session_id,
             tmux_bin,
@@ -22742,7 +22747,7 @@ fn execute_group_cleanup_operation(
         )
         .map(|(_, deleted)| deleted)
     } else {
-        delete_session(context, main_session_id, tmux_bin)
+        crate::delete_session_for_group_cleanup(context, main_session_id, tmux_bin)
     };
     let main_deleted = match main_deletion {
         Ok(deleted) => {
@@ -22798,6 +22803,7 @@ fn execute_group_cleanup_operation(
         &incarnation,
         &request,
         &request_digest,
+        operation,
         group_cleanup_stored_outcome(&value, &completed_resume)?,
     )?;
     interrupt_group_cleanup_for_test(context, "main_deleted")?;
@@ -22824,9 +22830,22 @@ fn validate_group_cleanup_request(
     validate_idempotency_key(&request.idempotency_key)
 }
 
+#[cfg(test)]
 fn group_cleanup_request_digest(request: &GroupCleanupRequest) -> String {
+    group_cleanup_operation_request_digest(request, "group-cleanup")
+}
+
+fn group_cleanup_operation_request_digest(
+    request: &GroupCleanupRequest,
+    operation: &str,
+) -> String {
+    let namespace = if operation == "group-archive" {
+        "main-agent-group-archive"
+    } else {
+        "main-agent-group-cleanup"
+    };
     crate::coordination::request_digest(
-        "main-agent-group-cleanup",
+        namespace,
         &json!({
             "expected_main_incarnation": request.expected_main_incarnation,
             "expected_run_revision": request.expected_run_revision,
@@ -22951,6 +22970,7 @@ fn group_cleanup_replay(
     incarnation: &str,
     idempotency_key: &str,
     request_digest: &str,
+    operation: &str,
 ) -> Result<Option<GroupCleanupReplay>, CliError> {
     let registry_outcome = if selector.include_registry_outcome
         && let Some(receipt) = registry.receipts.get(&receipt_key(
@@ -22958,7 +22978,7 @@ fn group_cleanup_replay(
             incarnation,
             idempotency_key,
         )) {
-        if receipt.operation != "group-cleanup" || receipt.request_digest != request_digest {
+        if receipt.operation != operation || receipt.request_digest != request_digest {
             return Err(CliError::data(
                 "idempotency-conflict",
                 "idempotency key was already used for a different request",
@@ -23028,6 +23048,7 @@ fn group_cleanup_replay(
     decode_group_cleanup_replay(receipt.outcome).map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn group_cleanup_replay_with_legacy_alias(
     context: &CliContext,
     registry: &orchestration::Registry,
@@ -23036,6 +23057,7 @@ fn group_cleanup_replay_with_legacy_alias(
     incarnation: &str,
     idempotency_key: &str,
     request_digest: &str,
+    operation: &str,
 ) -> Result<Option<GroupCleanupReplay>, CliError> {
     let Some(legacy_alias) = legacy_alias else {
         return group_cleanup_replay(
@@ -23049,6 +23071,7 @@ fn group_cleanup_replay_with_legacy_alias(
             incarnation,
             idempotency_key,
             request_digest,
+            operation,
         );
     };
     let validate_alias_replay = |replay: &GroupCleanupReplay| {
@@ -23068,6 +23091,7 @@ fn group_cleanup_replay_with_legacy_alias(
         incarnation,
         idempotency_key,
         request_digest,
+        operation,
     )?;
     if let Some(replay) = legacy_replay.as_ref()
         && validate_alias_replay(replay)
@@ -23092,6 +23116,7 @@ fn group_cleanup_replay_with_legacy_alias(
         incarnation,
         idempotency_key,
         request_digest,
+        operation,
     )?;
     if let Some(replay) = canonical_progress.as_ref()
         && validate_alias_replay(replay)
@@ -23111,10 +23136,11 @@ fn recover_completed_group_cleanup_principal(
     incarnation: &str,
     idempotency_key: &str,
     request_digest: &str,
+    operation: &str,
 ) -> Result<Option<String>, CliError> {
     let mut recovered = None;
     for (key, receipt) in &registry.receipts {
-        if receipt.operation != "group-cleanup"
+        if receipt.operation != operation
             || receipt.request_digest != request_digest
             || receipt.outcome["completed"] != true
             || key != &receipt_key(&receipt.principal_session_id, incarnation, idempotency_key)
@@ -23306,6 +23332,7 @@ fn store_group_cleanup_receipt(
             identity.incarnation,
             request,
             request_digest,
+            identity.operation,
             outcome,
         );
     }
@@ -23336,6 +23363,7 @@ fn store_completed_group_cleanup_receipt(
     incarnation: &str,
     request: &GroupCleanupRequest,
     request_digest: &str,
+    operation: &str,
     outcome: Value,
 ) -> Result<(), CliError> {
     let mut locked = orchestration::lock_registry(context)?;
@@ -23356,7 +23384,7 @@ fn store_completed_group_cleanup_receipt(
         if let Some(existing) = locked.registry.receipts.get(key)
             && (existing.principal_session_id != expected_principal
                 || existing.principal_incarnation != incarnation
-                || existing.operation != "group-cleanup"
+                || existing.operation != operation
                 || existing.request_digest != request_digest)
         {
             return Err(CliError::data(
@@ -23400,7 +23428,7 @@ fn store_completed_group_cleanup_receipt(
             IdempotencyReceipt {
                 principal_session_id: legacy_alias.to_string(),
                 principal_incarnation: incarnation.to_string(),
-                operation: "group-cleanup".to_string(),
+                operation: operation.to_string(),
                 request_digest: request_digest.to_string(),
                 outcome: outcome.clone(),
                 created_at_epoch,
@@ -23412,7 +23440,7 @@ fn store_completed_group_cleanup_receipt(
         IdempotencyReceipt {
             principal_session_id: principal_session_id.to_string(),
             principal_incarnation: incarnation.to_string(),
-            operation: "group-cleanup".to_string(),
+            operation: operation.to_string(),
             request_digest: request_digest.to_string(),
             outcome,
             created_at_epoch,
@@ -26806,6 +26834,7 @@ mod tests {
                 requested_session_id: "main-c",
                 principal_session_id: "main-c",
                 incarnation: "main-incarnation",
+                operation: "group-cleanup",
             },
             &request,
             &request_digest,
@@ -27193,6 +27222,7 @@ mod tests {
                     requested_session_id: "main-controller",
                     principal_session_id: "main-controller",
                     incarnation: "main-incarnation",
+                    operation: "group-cleanup",
                 },
                 &request,
                 &request_digest,
@@ -27496,6 +27526,7 @@ mod tests {
                 requested_session_id: "main-controller",
                 principal_session_id: "main-controller",
                 incarnation: "main-incarnation",
+                operation: "group-cleanup",
             },
             &request,
             &request_digest,
@@ -27530,6 +27561,7 @@ mod tests {
                     requested_session_id: "main-controller",
                     principal_session_id: "main-controller",
                     incarnation: "main-incarnation",
+                    operation: "group-cleanup",
                 },
                 &finalizer_request,
                 &finalizer_digest,
@@ -27676,6 +27708,7 @@ mod tests {
             incarnation,
             &request,
             &request_digest,
+            "group-cleanup",
             outcome,
         );
         IDEMPOTENCY_RECEIPT_CAPACITY_FOR_TEST.store(MAX_IDEMPOTENCY_RECEIPTS, Ordering::Release);
@@ -29466,6 +29499,7 @@ mod tests {
             incarnation,
             idempotency_key,
             &request_digest,
+            "group-cleanup",
         ) {
             Ok(_) => panic!("a different live alias must not adopt exact-selector progress"),
             Err(error) => error,
@@ -29503,6 +29537,7 @@ mod tests {
                 incarnation,
                 idempotency_key,
                 &request_digest,
+                "group-cleanup",
             )
             .unwrap()
             .is_none(),
@@ -29546,6 +29581,7 @@ mod tests {
                 incarnation,
                 idempotency_key,
                 &request_digest,
+                "group-cleanup",
             )
             .unwrap(),
             None,
@@ -29570,6 +29606,7 @@ mod tests {
                 incarnation,
                 idempotency_key,
                 &request_digest,
+                "group-cleanup",
             )
             .unwrap()
             .as_deref(),
@@ -29583,6 +29620,7 @@ mod tests {
                 incarnation,
                 idempotency_key,
                 &request_digest,
+                "group-cleanup",
             )
             .unwrap(),
             None,
