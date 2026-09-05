@@ -58,7 +58,9 @@ repo-retro report --repo . --days 7 --mode team --format json
 repo-retro report --repo . --mode maintainer --format markdown
 canary-check run --out /tmp/canary --name smoke --command "cargo test smoke"
 browser-session init --out /tmp/browser --target http://localhost:3000 --goal "verify checkout flow"
+browser-session record-step --out /tmp/browser --action "opened checkout" --status pass --artifact screenshot.png
 review-evidence init --out /tmp/review --subject "PR #123"
+review-evidence record-finding --out /tmp/review --severity medium --path src/lib.rs --summary "missing error path"
 review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
 review-specialists merge --mode delivery --input findings.jsonl --format json
@@ -67,11 +69,19 @@ review-specialists render --profile provider-review --input findings.merged.json
   --scope 'changed test paths' --evidence-reviewed 'focused tests and diff' \
   --out review.md --thread-out review-threads.json
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
+model-cross-check record-observation --out /tmp/cross-check --role checker \
+  --model gpt-5.5 --verdict pass --summary "no blocker found"
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 skill-usage init --out /tmp/workflow --owner-kind workflow --owner-id deliver-pr --intent "deliver change" --user-request-summary "deliver this PR"
 test-first-evidence init --out /tmp/test-first --classification behavior-change \
   --production-path src/lib.rs --changed-behavior "new contract"
 ```
+
+For retained heuristic cases, `heuristic-inbox set-status` changes the case
+state and `heuristic-inbox ingest-evidence` redacts and attaches an evidence
+file. For a testable change that cannot capture a meaningful failing
+test, use `test-first-evidence record-waiver` with the required rationale and
+substitute validation; strict verification rejects an incomplete waiver.
 
 ## `agent-run` flow
 

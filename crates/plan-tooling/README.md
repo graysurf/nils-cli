@@ -3,8 +3,9 @@
 ## Overview
 
 plan-tooling works with Plan Format v1 markdown files. It can parse plans to JSON, validate plan files, compute dependency batches for a
-sprint, scaffold new plans, and generate task-to-PR split grouping primitives in deterministic or auto strategy modes. Runtime execution
-metadata for orchestration is materialized by `plan-issue` from split results plus parsed plan content.
+sprint, scaffold new plans, generate task-to-PR split grouping primitives in deterministic or auto strategy modes, and repair or reconcile
+durable execution-state metadata. Runtime execution metadata for orchestration is materialized by `plan-issue` from split results plus
+parsed plan content.
 
 ## Usage
 
@@ -18,6 +19,9 @@ Commands:
   batches         Compute dependency layers (parallel batches) for a sprint
   artifact-audit  Classify durable coordination artifacts without side effects
   split-prs       Build task-to-PR split records (deterministic/auto)
+  ledger-update   Patch one task-ledger row
+  ledger-sync     Reconcile task-ledger evidence against tracking-issue evidence
+  exec-state-sync Repair tracking and terminal metadata without changing task rows
   scaffold        Create a new plan from template
   completion      Export shell completion script
   help            Display help message
@@ -96,6 +100,27 @@ Help:
   - `split-prs --file docs/plans/example-plan.md --scope sprint --sprint 2 --strategy auto --default-pr-grouping group --format json`
 - rollback switchback:
   - if auto rollout is unhealthy, pin orchestration calls to `--strategy deterministic` until follow-up fixes land.
+
+### ledger-update
+
+- `ledger-update --execution-state <path> --task <id> --status <status>
+  --evidence <text> [--notes <text>] [--dry-run] [--format text|json]`:
+  patch one exact `## Task Ledger` row. Evidence is appended, notes change only
+  when supplied, and every other byte is preserved.
+
+### ledger-sync
+
+- `ledger-sync --bundle <dir> (--body-file <path> --comments-json <path> |
+  --fixture <dir>) [--write] [--format text|json]`: compare empty task-ledger
+  Evidence cells with URLs in tracking-issue state comments. The default is a
+  read-only drift report; `--write` fills eligible empty cells.
+
+### exec-state-sync
+
+- `exec-state-sync (--bundle <dir> | --execution-state <path>)` with one or
+  more header fields such as `--issue-url`, `--status`, or `--handoff` repairs
+  execution-state tracking and terminal metadata. It never changes
+  `## Task Ledger` rows and supports `--dry-run`.
 
 ### scaffold
 

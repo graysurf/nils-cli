@@ -25,6 +25,7 @@ Commands:
          [--from <rfc3339>] [--to <rfc3339>]
   fetch [--limit <n>] [--cursor <opaque>]   Pull records for enrichment workers
   apply (--input <file> | --stdin)          Apply enrichment payloads
+  completion <bash|zsh>                     Print a shell completion script
 ```
 
 ## Commands
@@ -43,6 +44,7 @@ Commands:
 - `report --from/--to`: optional explicit range (RFC3339). Use both together.
 - `fetch`: machine-facing pull for pending enrichment work.
 - `apply`: machine-facing write-back for normalized enrichment results.
+- `completion <bash|zsh>`: print the generated completion script to `stdout`.
 
 ## JSON
 

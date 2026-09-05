@@ -34,6 +34,10 @@ Core runtime-kit operations:
   are rejected.
 - `uninstall` — remove installed renderer output from a product's runtime home.
 - `doctor` — diagnose host setup, runtime roots, and required CLI floors.
+- `bootstrap-host` — preview or apply the ordered host bootstrap phases for
+  Codex, Claude, or both. Select the `core`, `recommended`, or `full` tool
+  profile; the command is non-mutating with `--dry-run` and performs render,
+  install, prune, verification, and checkpoint writes only with `--apply`.
 - `audit-drift` — detect source-vs-rendered, rendered-vs-live, and unsafe drift.
 - `gc-backups` — prune old backups under `<state_home>/backups/`.
 - `list-skills` — enumerate the skills `install` would activate for a

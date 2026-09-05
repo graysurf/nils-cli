@@ -24,4 +24,4 @@
 - Back to crate README: [`../README.md`](../README.md)
 - Redaction library: `nils-scrub`.
 - Plan: agent-runtime-kit `docs/plans/2026-06-14-skill-usage-evidence-archive/`
-  (tracker <https://github.com/graysurf/agent-runtime-kit/issues/352>).
+  (tracker <https://github.com/sympoies/agent-runtime-kit/issues/352>).

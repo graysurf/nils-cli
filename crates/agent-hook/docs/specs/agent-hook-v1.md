@@ -1,6 +1,6 @@
 # agent-hook v1 contract
 
-Status: frozen for `graysurf/agent-runtime-kit#686` Lane A and extended with
+Status: frozen for `sympoies/agent-runtime-kit#686` Lane A and extended with
 the native WorkspaceLease v1 boundary for `sympoies/dsh-runtime-kit#56`.
 
 Ownership: crate-local canonical specification for `nils-agent-hook` and the

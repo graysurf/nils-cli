@@ -35,12 +35,14 @@ Template CLI for nils-cli workspace
 Usage: cli-template [OPTIONS] [COMMAND]
 
 Commands:
-  hello          Print a greeting to stdout
+  hello          Print a greeting to stdout (text only)
   progress-demo  Render a short progress demo (progress on stderr, stdout stays clean)
+  status         Emit a structured status envelope (text or JSON)
   help           Print this message or the help of the given subcommand(s)
 
 Options:
       --log-level <LOG_LEVEL>  Log level (e.g. trace, debug, info, warn, error) [default: info]
+      --format <FORMAT>        Output format (defaults to text) [possible values: text, json]
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -58,17 +60,22 @@ cargo run -p nils-cli-template -- --help
 - `progress-demo`: Render a short progress demo using `nils_term::progress::Progress`. Progress
   ticks render on `stderr`; `stdout` only receives the final `done` line so the command stays
   pipe-safe.
+- `status`: Emit the template's structured status envelope. Use `--format json` for the
+  machine-readable form; `hello` remains text-only even when the global format is `json`.
 
 ## Flags
 
 - `--log-level <LOG_LEVEL>`: `tracing-subscriber` `EnvFilter` directive (`trace|debug|info|warn|error`).
   Default `info`. Invalid values fall back to `RUST_LOG` then to `info`; the command still runs.
+- `--format <text|json>`: Select text or JSON output for commands that support the shared output
+  contract. The default is `text`.
 - `-h, --help`: Print top-level or per-subcommand help.
 - `-V, --version`: Print the crate version sourced from `Cargo.toml`.
 
 ## Output contract
 
-- `stdout`: greeting line (`hello`) or `done` (`progress-demo`).
+- `stdout`: greeting line (`hello`), `done` (`progress-demo`), or the selected status representation
+  (`status`).
 - `stderr`: tracing logs and `nils-term` progress output.
 - Exit code: `0` for the documented commands; clap's standard `2` for argument errors.
 
