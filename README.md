@@ -31,12 +31,12 @@ Completion obligations for those binaries are tracked in
 | ---- | -------- | -------- |
 | API testing | `api-rest`, `api-gql`, `api-grpc`, `api-websocket`, `api-test` | Run protocol-specific API checks or orchestrate a mixed API test suite. |
 | Git tooling | `git-scope`, `git-cli`, `git-summary`, `git-lock` | Inspect changes, run Git helper flows, summarize commits, or manage repo-local commit locks. |
-| Forge automation | `forge-cli` | Drive PR/MR + Issue lifecycle and repository label catalog maintenance on GitHub (via `gh`) or GitLab (via `glab`) through a single provider-neutral surface; covers create / view / edit / comment / ready / merge / close, label list / audit / ensure, CI wait-checks, and the `pr deliver` macro. |
+| Forge automation | `forge-cli`, `github-app-cli` | Drive PR/MR + Issue lifecycle and repository label catalog maintenance on GitHub (via `gh`) or GitLab (via `glab`), or mint GitHub App installation tokens. |
 | Agent policy and evidence | `agent-runtime`, `agent-docs`, `agent-hook`, `agent-memory`, `agent-out`, `agent-session`, `main-agent`, `agent-scope-lock`, `agent-run`, `test-first-evidence`, `web-evidence`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`, `review-evidence`, `review-specialists`, `skill-usage`, `evidence` | Render/install/audit runtime-kit surfaces, resolve agent policy docs, dispatch one shared cross-provider hook policy, manage local agent memory stores, run project commands through explicit env handling, allocate artifact paths, start tmux-backed agent sessions, operate durable Main Agent and interactive worker lifecycles, enforce edit scope, inspect repo retrospectives, merge specialist review evidence, persist deterministic workflow evidence, or migrate and query the durable skill-usage evidence archive. |
-| Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, or run validated commit workflows. |
-| Provider lanes | `codex-cli`, `gemini-cli`, `opencode-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
+| Planning and delivery | `plan-tooling`, `plan-issue`, `plan-issue-local`, `plan-archive`, `semantic-commit` | Validate/split implementation plans, orchestrate issue delivery, rehearse local plan flows, query archived plans, or run validated commit workflows. |
+| Provider lanes | `codex-cli`, `gemini-cli`, `claude-cli`, `opencode-cli` | Run provider-specific diagnostics, auth checks, and workflow adapters. |
 | Markdown rendering | `md-render` | Render `.md.tera` templates from JSON view data through the shared `nils-markdown` engine. |
-| Desktop, media, and local utilities | `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo`, `zsh-kit` | Automate local desktop tasks, capture media, convert images, use interactive shell helpers, record/search local memos, or bootstrap an operator-supplied Zsh repository at runtime. |
+| Desktop, media, and local utilities | `docker-tools`, `macos-agent`, `screen-record`, `image-processing`, `fzf-cli`, `memo`, `secrets`, `zsh-kit` | Operate containers, automate desktop tasks, capture or convert media, use interactive shell helpers, manage the encrypted environment store, record/search local memos, or bootstrap an operator-supplied Zsh repository at runtime. |
 | Development-only/internal | `cli-template` | Validate packaging and new-crate patterns; excluded from user-facing completion obligations. |
 
 ## Workspace layout
@@ -47,8 +47,11 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 
 - [crates/nils-common](crates/nils-common): Shared cross-CLI utilities (including markdown payload validation and markdown-table
   canonicalization helpers).
-- [crates/nils-markdown](crates/nils-markdown): Tera-backed Markdown template engine, shared helpers, golden-test harness, and
+- [crates/nils-markdown](crates/nils-markdown): MiniJinja-backed Markdown template engine, shared helpers, golden-test harness, and
   opt-in `md-render` binary for rendering `.md.tera` templates from JSON view data.
+- [crates/nils-build-info](crates/nils-build-info): Shared build metadata for workspace binaries.
+- [crates/nils-provider-resume](crates/nils-provider-resume): Shared provider session-resume resolution.
+- [crates/nils-scrub](crates/nils-scrub): Shared secret-redaction primitives.
 - [crates/nils-term](crates/nils-term): Terminal UX helpers (TTY detection + progress rendering on stderr).
 - [crates/nils-test-support](crates/nils-test-support): Test-only helpers for deterministic workspace integration tests.
 - [crates/cli-template](crates/cli-template): Minimal example CLI for validating packaging and new-crate patterns.
@@ -73,9 +76,11 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
   PR/MR + Issue lifecycle, repository label catalog maintenance, CI
   wait-checks, and the `pr deliver` macro
   (open draft → CI green → ready → merge).
+- [crates/github-app-cli](crates/github-app-cli): GitHub App installation-token helper for provider automation.
 
 ### Desktop, media, and local utility CLIs
 
+- [crates/docker-tools](crates/docker-tools): Docker helper commands for local container workflows.
 - [crates/macos-agent](crates/macos-agent): macOS desktop automation primitives for app/window discovery, input actions, screenshot, and
   wait helpers.
 - [crates/fzf-cli](crates/fzf-cli): Interactive `fzf` toolbox for files, Git, processes, ports, and shell history.
@@ -86,6 +91,7 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/image-processing](crates/image-processing): Image conversion CLI for `svg/png/webp/jpg` plus SVG validation with JSON/report outputs.
 - [crates/screen-record](crates/screen-record): macOS ScreenCaptureKit + Linux (X11) recorder for a single window or display with optional
   audio.
+- [crates/secrets](crates/secrets): Encrypted environment-store discovery and maintenance commands.
 
 ### Agent policy and evidence tooling
 
@@ -104,12 +110,14 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
 - [crates/agent-scope-lock](crates/agent-scope-lock): Deterministic edit-scope lock CLI for agent workflows (`create`, `read`,
   `validate`, `clear`).
 - [crates/web-evidence](crates/web-evidence): Redacted static HTTP evidence capture for agent workflows (`capture`, `completion`).
+- [crates/nils-evidence](crates/nils-evidence): Durable workflow-evidence archive and query CLI (`evidence`).
 - [crates/agent-workflow-primitives](crates/agent-workflow-primitives): Multi-binary local-first agent workflow primitives
   (`agent-run`, `browser-session`, `canary-check`, `docs-impact`, `heuristic-inbox`, `model-cross-check`, `repo-retro`,
   `review-evidence`, `review-specialists`, `skill-usage`, `test-first-evidence`).
 
 ### Planning, delivery, and provider lanes
 
+- [crates/claude-cli](crates/claude-cli): Provider-specific CLI lane for Claude workflows and usage/auth adapters.
 - [crates/codex-cli](crates/codex-cli): Provider-specific CLI for OpenAI/Codex workflows (auth, diagnostics, execution flows, Starship),
   with adapters over `nils-common::provider_runtime`.
 - [crates/gemini-cli](crates/gemini-cli): Provider-specific CLI lane for Gemini workflows, with adapters over
@@ -127,6 +135,7 @@ Each crate is either a standalone CLI binary, a multi-binary crate, or a shared 
   `Task Decomposition` orchestration remains available through `start-plan`,
   `start-sprint`, etc., with runtime lane metadata materialized from plan
   content + split-prs grouping results.
+- [crates/plan-archive](crates/plan-archive): Query and search interface for archived implementation-plan records.
 
 ## Shared helper policy (`nils-common`)
 
