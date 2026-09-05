@@ -79,7 +79,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let repo_root = crate::repo_root::detect_from(Path::new(&file_arg));
     let display_path = file_arg.clone();
-    let read_path = resolve_repo_relative(&repo_root, Path::new(&file_arg));
+    let read_path = nils_common::fs::resolve_repo_relative(&repo_root, Path::new(&file_arg));
 
     if !read_path.is_file() {
         eprintln!("error: plan file not found: {display_path}");
@@ -142,13 +142,6 @@ pub fn run(args: &[String]) -> i32 {
 
     println!("{json}");
     0
-}
-
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
 }
 
 fn maybe_relativize(path: &Path, repo_root: &Path) -> PathBuf {

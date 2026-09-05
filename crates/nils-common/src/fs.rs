@@ -37,6 +37,17 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Resolve `path` relative to `repo_root`, preserving absolute paths.
+///
+/// This is a lexical join only: it does not canonicalize either path or access
+/// the filesystem.
+pub fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    repo_root.join(path)
+}
+
 /// The user's home directory from `HOME`, treating an unset or empty value as
 /// absent. Reads the environment on every call so subprocess tests can
 /// override it.
@@ -682,6 +693,22 @@ mod tests {
     #[test]
     fn normalize_path_preserves_relative_paths() {
         assert_eq!(normalize_path(Path::new("a/b/c")), PathBuf::from("a/b/c"));
+    }
+
+    #[test]
+    fn resolve_repo_relative_joins_relative_paths_to_the_repository_root() {
+        assert_eq!(
+            resolve_repo_relative(Path::new("/tmp/repo"), Path::new("docs/plans/p.md")),
+            PathBuf::from("/tmp/repo/docs/plans/p.md")
+        );
+    }
+
+    #[test]
+    fn resolve_repo_relative_preserves_absolute_paths() {
+        assert_eq!(
+            resolve_repo_relative(Path::new("/tmp/repo"), Path::new("/opt/plan.md")),
+            PathBuf::from("/opt/plan.md")
+        );
     }
 
     #[test]

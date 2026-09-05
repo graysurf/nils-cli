@@ -221,7 +221,7 @@ fn resolve_repo_root(repo: Option<&str>) -> anyhow::Result<PathBuf> {
 }
 
 fn read_candidate_file(repo_root: &Path, candidate_file: &str) -> anyhow::Result<Vec<String>> {
-    let path = resolve_repo_relative(repo_root, Path::new(candidate_file));
+    let path = nils_common::fs::resolve_repo_relative(repo_root, Path::new(candidate_file));
     let text = std::fs::read_to_string(path)?;
     Ok(text
         .lines()
@@ -233,7 +233,7 @@ fn read_candidate_file(repo_root: &Path, candidate_file: &str) -> anyhow::Result
 
 fn audit_candidate(repo_root: &Path, candidate: &str) -> AuditItem {
     let rel = normalize_repo_path(candidate);
-    let path = resolve_repo_relative(repo_root, Path::new(&rel));
+    let path = nils_common::fs::resolve_repo_relative(repo_root, Path::new(&rel));
     if !path.is_file() {
         return item(
             rel,
@@ -338,13 +338,6 @@ fn item(
         evidence,
         blocking_references,
     }
-}
-
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
 }
 
 fn is_manual_review_path(path: &str) -> bool {

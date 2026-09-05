@@ -583,18 +583,11 @@ pub fn state_dir() -> PathBuf {
 
 pub fn resolve_plan_file(plan_file: &Path) -> PathBuf {
     let repo_root = detect_repo_root();
-    resolve_repo_relative(&repo_root, plan_file)
+    common_fs::resolve_repo_relative(&repo_root, plan_file)
 }
 
 fn detect_repo_root() -> PathBuf {
     common_git::repo_root_or_cwd()
-}
-
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
 }
 
 fn to_split_grouping(grouping: PrGrouping) -> SplitPrGrouping {
