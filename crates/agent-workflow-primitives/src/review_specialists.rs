@@ -250,6 +250,13 @@ fn command_render(args: RenderArgs) -> i32 {
             ),
         );
     }
+    if matches!(
+        args.profile,
+        RenderProfile::ProviderReview | RenderProfile::PrComment
+    ) && let Err(err) = require_provider_review_metadata(&args.provider_review)
+    {
+        return render_error(RENDER_SCHEMA_VERSION, RENDER_COMMAND, format, err);
+    }
     match read_merged(&args.input).and_then(|merged| {
         let context = RenderContext::from_args(
             args.repo.as_deref(),
@@ -434,6 +441,12 @@ fn merge_validated(
 
 fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
     validate_threshold(args.display_threshold)?;
+    if matches!(
+        args.profile,
+        Some(RenderProfile::ProviderReview | RenderProfile::PrComment)
+    ) {
+        require_provider_review_metadata(&args.provider_review)?;
+    }
     let validated = validate_inputs(&args.inputs, PathPolicy::default(), args.mode)?;
     validate_delivery_collisions(&validated.findings, args.mode)?;
     let merged = merge_validated(validated.clone(), args.display_threshold, args.mode);
@@ -1287,20 +1300,20 @@ fn render_issue_body(merged: &MergeResult, context: RenderContext) -> String {
 
 #[cfg(test)]
 fn render_pr_comment(merged: &MergeResult, context: RenderContext) -> String {
+    // Bind real metadata. These goldens are the reference output for the
+    // profile, so they must show a body that can actually be published: the
+    // placeholders this used to pass are now refused by the renderer and
+    // rejected by `forge-cli pr review --specialist-report`.
     let provider_context = ProviderReviewContext {
-        reviewable: "not provided".to_string(),
-        lens: "unspecified".to_string(),
+        reviewable: "PR #1".to_string(),
+        lens: "testing".to_string(),
         verdict: if merged.findings.is_empty() {
             "pass".to_string()
         } else {
             "findings".to_string()
         },
-        scope: "not provided".to_string(),
-        evidence_reviewed: if merged.input_files.is_empty() {
-            "no input files".to_string()
-        } else {
-            merged.input_files.join(", ")
-        },
+        scope: "golden template shape".to_string(),
+        evidence_reviewed: "golden fixture".to_string(),
     };
     render_provider_review_artifacts_with_render_context(merged, &provider_context, &context)
         .expect("provider review template renders")
@@ -1840,11 +1853,13 @@ struct CommonArgs {
 
 #[derive(Debug, Args, Default)]
 struct ProviderReviewArgs {
-    /// PR/MR identifier or URL shown in the provider review body.
+    /// PR/MR identifier or URL shown in the provider review body. Required
+    /// for `--profile provider-review` and `--profile pr-comment`.
     #[arg(long, value_name = "REVIEWABLE")]
     reviewable: Option<String>,
 
-    /// Exactly one reviewer lens represented by this report.
+    /// Exactly one reviewer lens represented by this report. Required for
+    /// `--profile provider-review` and `--profile pr-comment`.
     #[arg(long, value_name = "LENS")]
     lens: Option<String>,
 
@@ -1852,11 +1867,13 @@ struct ProviderReviewArgs {
     #[arg(long = "lens-verdict", value_enum)]
     lens_verdict: Option<ProviderLensVerdict>,
 
-    /// Compact description of files or behavior reviewed.
+    /// Compact description of files or behavior reviewed. Required for
+    /// `--profile provider-review` and `--profile pr-comment`.
     #[arg(long, value_name = "TEXT")]
     scope: Option<String>,
 
-    /// Compact validation, diff, or provider evidence summary.
+    /// Compact validation, diff, or provider evidence summary. Required for
+    /// `--profile provider-review` and `--profile pr-comment`.
     #[arg(long = "evidence-reviewed", value_name = "TEXT")]
     evidence_reviewed: Option<String>,
 }
@@ -2471,6 +2488,99 @@ impl RenderContext {
     }
 }
 
+/// The `provider-review` profile (and its `pr-comment` alias) renders a body
+/// destined for publication under a reviewer's name, so its metadata must be
+/// supplied rather than invented.
+///
+/// The renderer used to substitute `not provided` / `unspecified` for an absent
+/// flag, and to synthesize `Evidence reviewed:` from the input file list. Both
+/// are reasonable for a local report and wrong for a published one: the
+/// placeholder reaches every reader of the PR/MR, and the synthesized evidence
+/// is an artifact path that means nothing off the machine that produced it.
+/// Neither the renderer nor `forge-cli pr review validate --specialist-report`
+/// objected, so a missing flag was discovered only after publication.
+///
+/// `--lens-verdict` is deliberately excluded: its fallback is derived from the
+/// merged findings (`pass` when empty, `findings` otherwise), which is a
+/// correct default rather than a placeholder.
+fn require_provider_review_metadata(args: &ProviderReviewArgs) -> Result<(), CliError> {
+    let supplied = [
+        ("--reviewable", args.reviewable.as_deref()),
+        ("--lens", args.lens.as_deref()),
+        ("--scope", args.scope.as_deref()),
+        ("--evidence-reviewed", args.evidence_reviewed.as_deref()),
+    ];
+
+    let missing = supplied
+        .iter()
+        .filter(|(_, value)| value.map(str::trim).is_none_or(str::is_empty))
+        .map(|(flag, _)| *flag)
+        .collect::<Vec<_>>();
+
+    // Rejecting only the absent flag would leave the incident reproducible by
+    // hand: passing `--lens unspecified` renders the same published header the
+    // renderer's own fallback used to produce. A caller who types a placeholder
+    // has supplied no more information than one who omitted the flag.
+    let placeholder = supplied
+        .iter()
+        .filter(|(flag, _)| !missing.contains(flag))
+        .filter(|(_, value)| {
+            value
+                .map(str::trim)
+                .is_some_and(|value| PROVIDER_REVIEW_PLACEHOLDERS.contains(&value))
+        })
+        .map(|(flag, _)| *flag)
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() && placeholder.is_empty() {
+        return Ok(());
+    }
+
+    let mut detail = Vec::new();
+    if !missing.is_empty() {
+        detail.push(format!("requires {}", missing.join(", ")));
+    }
+    if !placeholder.is_empty() {
+        detail.push(format!(
+            "will not accept a placeholder value for {}",
+            placeholder.join(", ")
+        ));
+    }
+
+    Err(CliError::usage(
+        "provider-review-metadata-required",
+        format!(
+            "the provider-review profile publishes its header verbatim, so it {}",
+            detail.join(", and ")
+        ),
+        Some(json!({ "missing": missing, "placeholder": placeholder })),
+    ))
+}
+
+/// Fixed-spelling placeholders that once stood in for absent `provider-review`
+/// metadata.
+///
+/// They are no longer reachable in produced output: `provider_review_context`
+/// is consumed only by the publication profiles, and
+/// `require_provider_review_metadata` now runs ahead of it on both call sites.
+/// The fallbacks below are retained as the documented provenance of these
+/// strings, and the constant has two live consumers — that same guard, which
+/// also refuses a caller who *types* one of these values, and `forge-cli`'s
+/// `--specialist-report` validator, which rejects them in a body rendered by an
+/// older binary or written by hand. Both read this list rather than repeating
+/// the literals, so renaming a placeholder cannot silently degrade either.
+///
+/// Declared as a slice, not a fixed-size array: this crate publishes to
+/// crates.io, and the design assumes the list grows, so the type must not make
+/// adding an entry a major-version break.
+///
+/// The evidence fallback below is deliberately not listed. When
+/// `--evidence-reviewed` was absent the renderer joined the input file paths,
+/// which has no fixed spelling and is indistinguishable from a legitimate
+/// citation of those files.
+pub const PROVIDER_REVIEW_PLACEHOLDERS: &[&str] =
+    &["not provided", "unspecified", "no input files"];
+
 fn provider_review_context(
     args: &ProviderReviewArgs,
     merged: &MergeResult,
@@ -2479,11 +2589,11 @@ fn provider_review_context(
         reviewable: args
             .reviewable
             .clone()
-            .unwrap_or_else(|| "not provided".to_string()),
+            .unwrap_or_else(|| PROVIDER_REVIEW_PLACEHOLDERS[0].to_string()),
         lens: args
             .lens
             .clone()
-            .unwrap_or_else(|| "unspecified".to_string()),
+            .unwrap_or_else(|| PROVIDER_REVIEW_PLACEHOLDERS[1].to_string()),
         verdict: args
             .lens_verdict
             .map(ProviderLensVerdict::as_str)
@@ -2498,10 +2608,10 @@ fn provider_review_context(
         scope: args
             .scope
             .clone()
-            .unwrap_or_else(|| "not provided".to_string()),
+            .unwrap_or_else(|| PROVIDER_REVIEW_PLACEHOLDERS[0].to_string()),
         evidence_reviewed: args.evidence_reviewed.clone().unwrap_or_else(|| {
             if merged.input_files.is_empty() {
-                "no input files".to_string()
+                PROVIDER_REVIEW_PLACEHOLDERS[2].to_string()
             } else {
                 merged.input_files.join(", ")
             }

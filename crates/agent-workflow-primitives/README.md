@@ -167,6 +167,14 @@ thread when it does not. Summary and thread artifacts are derived from the same
 merged input. The older `pr-comment` profile is a compatibility alias to the
 same renderer and can no longer produce the bullet format.
 
+Both profiles publish their header verbatim, so both require `--reviewable`,
+`--lens`, `--scope`, and `--evidence-reviewed`. Omitting one — or supplying one
+of the retired placeholder strings — exits 64 with
+`provider-review-metadata-required` and writes no body; the renderer used to
+substitute placeholder text instead, which reached a published review.
+`--lens-verdict` stays optional because its fallback is derived from the merged
+findings rather than invented. Every other profile is unaffected.
+
 ## `heuristic-inbox verify` redaction guardrail
 
 `verify` scans both the case body (`ENTRY.md` / `RECORD.md`) and any

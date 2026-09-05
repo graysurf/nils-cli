@@ -124,6 +124,23 @@ Invalid input fails before bundle artifacts are written.
 
 Provider profiles are local renderers only. They do not post anything.
 
+`provider-review` and its `pr-comment` alias require `--reviewable`, `--lens`,
+`--scope`, and `--evidence-reviewed`; omitting one fails with
+`provider-review-metadata-required` (exit 64) and writes no body. Supplying one
+of the retired placeholder strings (`not provided`, `unspecified`, `no input
+files`) fails the same way — typing a placeholder conveys no more than omitting
+the flag, and would otherwise reproduce the published header by hand. The
+envelope's `details` names `missing` and `placeholder` separately. These profiles
+render a header that is published verbatim under a reviewer's name, and the
+renderer previously substituted `not provided` / `unspecified` and synthesized
+`Evidence reviewed:` from the input file list — a reasonable default for a local
+report, and a wrong one for a published body, since the substitution was only
+discovered after publication.
+
+`--lens-verdict` stays optional: its fallback is derived from the merged
+findings (`pass` when empty, `findings` otherwise), which is a correct default
+rather than a placeholder. Every other profile is unaffected.
+
 ## Downstream Skill Adoption
 
 `code-review-specialists` can replace its Python helper by calling:

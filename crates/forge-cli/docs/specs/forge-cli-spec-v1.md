@@ -877,6 +877,19 @@ distinctions that cannot be proven offline.
   closed `pass|findings|blocked|follow-up-pass` verdict vocabulary, and the
   canonical findings table with at least one exactly-five-cell row. Generic
   review comments omit this flag and remain valid.
+  Non-empty is not sufficient: a field whose whole value is one of the
+  renderer's placeholders (`not provided`, `unspecified`, `no input files`) is
+  rejected with `invalid_specialist_review_report`. `review-specialists` no
+  longer emits any of them for a publication-bound profile; this guard is the
+  second line for a body produced by an older binary or built by hand. A real
+  value that merely contains the word — a scope of `behavior left unspecified
+  by the spec` — still passes, because the match is on the whole trimmed field.
+
+  One renderer fallback is deliberately not covered. When `--evidence-reviewed`
+  was absent, the old renderer also substituted the joined list of input file
+  paths, which has no fixed spelling and is indistinguishable from a legitimate
+  citation of those same files. Rejecting it here would need a heuristic; the
+  renderer refusing to emit it is the durable fix.
 - `--metadata-only --expected-head <sha> --native-review-url <url>
   --native-review-author <login>`
   (GitHub-only) records concise

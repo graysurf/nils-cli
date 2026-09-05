@@ -674,6 +674,261 @@ fn review_specialists_bundle_writes_stable_artifacts() {
     assert!(out_dir.join("issue-body.md").is_file());
 }
 
+/// Regression: the `provider-review` profile used to substitute
+/// `not provided` / `unspecified` for an absent metadata flag, and to
+/// synthesize `Evidence reviewed:` from the input file list. Both reached a
+/// published review body. A publication-bound profile must refuse instead.
+#[test]
+fn review_specialists_provider_review_bundle_requires_published_metadata() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"medium","confidence":0.9,"path":"src/lib.rs","line":7,"category":"testing","summary":"Needs metadata","evidence":"e","recommendation":"r","specialist":"testing","fingerprint":"testing:provider-review:metadata","actionable":true}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--profile",
+            "provider-review",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
+    let envelope: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("envelope");
+    assert_eq!(envelope["ok"], Value::Bool(false));
+    assert_eq!(
+        envelope["error"]["code"],
+        "provider-review-metadata-required"
+    );
+    let missing = envelope["error"]["details"]["missing"]
+        .as_array()
+        .expect("missing list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        missing,
+        vec!["--reviewable", "--lens", "--scope", "--evidence-reviewed"]
+    );
+    assert!(
+        !out_dir.join("provider-review.md").exists(),
+        "a rejected bundle must not leave a publishable body behind"
+    );
+}
+
+/// The guard has two independent call sites — `command_render` and
+/// `build_bundle` — and each matches both publication profiles. The bundle case
+/// above covers one arm of one of them; this covers the other call site and the
+/// `pr-comment` alias, so neither can be dropped silently. It also passes a
+/// whitespace-only value rather than omitting the flag, pinning the `trim`.
+#[test]
+fn review_specialists_provider_review_render_alias_requires_published_metadata() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"medium","confidence":0.9,"path":"src/lib.rs","line":7,"category":"testing","summary":"Needs metadata","evidence":"e","recommendation":"r","specialist":"testing","fingerprint":"testing:provider-review:render-alias","actionable":true}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+    let merged_dir = tmp.path().join("merged");
+    let merged_arg = path_arg(&merged_dir);
+
+    let bundle = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &merged_arg,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(bundle.code, 0, "stderr={}", bundle.stderr_text());
+
+    let merged_json = path_arg(&merged_dir.join("findings.merged.json"));
+    let body = tmp.path().join("body.md");
+    let body_arg = path_arg(&body);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "render",
+            "--profile",
+            "pr-comment",
+            "--input",
+            &merged_json,
+            "--out",
+            &body_arg,
+            "--reviewable",
+            "PR #1",
+            "--lens",
+            "testing",
+            "--scope",
+            "   ",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
+    let envelope: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("envelope");
+    assert_eq!(
+        envelope["error"]["code"],
+        "provider-review-metadata-required"
+    );
+    let missing = envelope["error"]["details"]["missing"]
+        .as_array()
+        .expect("missing list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(missing, vec!["--scope", "--evidence-reviewed"]);
+    assert!(
+        !body.exists(),
+        "a rejected render must not leave a publishable body behind"
+    );
+}
+
+/// Rejecting only an absent flag would leave the original incident
+/// reproducible by hand: a caller who types `--lens unspecified` publishes the
+/// same header the renderer's fallback used to produce, and forge-cli's
+/// validator only runs when the caller opts into `--specialist-report`.
+#[test]
+fn review_specialists_provider_review_rejects_supplied_placeholder_metadata() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"medium","confidence":0.9,"path":"src/lib.rs","line":7,"category":"testing","summary":"Typed placeholders","evidence":"e","recommendation":"r","specialist":"testing","fingerprint":"testing:provider-review:typed-placeholder","actionable":true}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--profile",
+            "provider-review",
+            "--reviewable",
+            "not provided",
+            "--lens",
+            "unspecified",
+            "--scope",
+            "not provided",
+            "--evidence-reviewed",
+            "no input files",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 64, "stderr={}", output.stderr_text());
+    let envelope: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("envelope");
+    assert_eq!(
+        envelope["error"]["code"],
+        "provider-review-metadata-required"
+    );
+    let placeholder = envelope["error"]["details"]["placeholder"]
+        .as_array()
+        .expect("placeholder list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        placeholder,
+        vec!["--reviewable", "--lens", "--scope", "--evidence-reviewed"]
+    );
+    assert!(
+        !out_dir.join("provider-review.md").exists(),
+        "a rejected bundle must not leave a publishable body behind"
+    );
+}
+
+/// The guard is scoped to the profiles that publish. A local report bundle
+/// still renders without review metadata.
+#[test]
+fn review_specialists_report_bundle_does_not_require_provider_metadata() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"low","confidence":0.7,"path":"src/lib.rs","line":9,"category":"testing","summary":"Local only","evidence":"e","recommendation":"r","specialist":"testing","fingerprint":"testing:provider-review:local-report","actionable":false}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+    let out_dir = tmp.path().join("bundle");
+    let out_arg = path_arg(&out_dir);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "bundle",
+            "--mode",
+            "delivery",
+            "--input",
+            &input_arg,
+            "--out-dir",
+            &out_arg,
+            "--profile",
+            "report",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert!(out_dir.join("specialist-review.md").is_file());
+}
+
 #[test]
 fn review_specialists_delivery_bundle_threads_only_explicitly_actionable_findings() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

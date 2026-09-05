@@ -1,11 +1,11 @@
 <!-- agent-kit:specialist-review-report:v1 -->
 ## Review Report
 
-- Reviewable: not provided
-- Lens: unspecified
+- Reviewable: PR #1
+- Lens: testing
 - Lens verdict: findings
-- Scope: not provided
-- Evidence reviewed: findings-a.jsonl, findings-b.jsonl
+- Scope: golden template shape
+- Evidence reviewed: golden fixture
 
 | Finding | Severity | Confidence | Evidence | Recommendation |
 | --- | --- | ---: | --- | --- |
