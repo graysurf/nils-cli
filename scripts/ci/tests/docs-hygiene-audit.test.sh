@@ -13,6 +13,7 @@ set -euo pipefail
 # Coverage:
 #   - distinct payloads pass;
 #   - identical payloads across paths are reported as duplicates;
+#   - a missing retention matrix and missing or stale crate-doc rows fail;
 #   - a hash command that exits non-zero is surfaced (not swallowed) -- the
 #     branch hardened after the shasum/sha1sum fallback landed;
 #   - neither shasum nor sha1sum on PATH is a hard error.
@@ -110,9 +111,29 @@ assert_fails() {
 
 # --- distinct payloads pass --------------------------------------------------
 clean_repo="$(make_repo clean)"
+mkdir -p "$clean_repo/docs/specs" "$clean_repo/crates"
 printf '# alpha\n\nUnique payload one.\n' >"$clean_repo/docs/alpha.md"
 printf '# beta\n\nUnique payload two.\n' >"$clean_repo/docs/beta.md"
+printf '%s\n' \
+  '# Workspace Doc Retention Matrix v1' \
+  '## Crate-Local Inventory (Keep)' \
+  '## Crate Top-Level README Inventory (Keep)' \
+  >"$clean_repo/docs/specs/workspace-doc-retention-matrix-v1.md"
 assert_passes "distinct payloads pass" "$clean_repo"
+
+echo "== missing retention matrix is fatal outside test mode =="
+missing_matrix_repo="$(make_repo missing-matrix)"
+run_audit_without_fixture_relaxation "$missing_matrix_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF \
+    "missing required retention matrix: docs/specs/workspace-doc-retention-matrix-v1.md" \
+    <<<"$audit_output"; then
+  fail "missing retention matrix is fatal outside test mode"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "missing retention matrix is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
 
 # Missing production scan targets must not inherit the partial-fixture
 # relaxation used by this black-box suite.
@@ -140,6 +161,12 @@ mkdir -p \
   "$unmatched_glob_repo/crates/api-testing-core/src/websocket" \
   "$unmatched_glob_repo/crates/api-websocket/docs/specs" \
   "$unmatched_glob_repo/crates/image-processing/src"
+printf '%s\n' \
+  '# Workspace Doc Retention Matrix v1' \
+  '## Crate-Local Inventory (Keep)' \
+  '- `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`' \
+  '## Crate Top-Level README Inventory (Keep)' \
+  >"$unmatched_glob_repo/docs/specs/workspace-doc-retention-matrix-v1.md"
 printf '# binary dependencies\n' >"$unmatched_glob_repo/BINARY_DEPENDENCIES.md"
 printf '# macos agent\n' >"$unmatched_glob_repo/crates/macos-agent/README.md"
 printf '# image processing\n' >"$unmatched_glob_repo/crates/image-processing/README.md"
@@ -182,6 +209,32 @@ printf '# shared\n\nByte-identical payload.\n' >"$dup_repo/docs/nested/two.md"
 assert_fails "identical payloads detected" "$dup_repo" 1 \
   "duplicate markdown payload hash detected"
 
+# --- authoritative crate-doc inventory matches the tree ---------------------
+missing_retention_repo="$(make_repo missing-retention)"
+mkdir -p \
+  "$missing_retention_repo/docs/specs" \
+  "$missing_retention_repo/crates/sample/docs/specs"
+printf '%s\n' \
+  '# Workspace Doc Retention Matrix v1' \
+  '## Crate-Local Inventory (Keep)' \
+  '## Crate Top-Level README Inventory (Keep)' \
+  >"$missing_retention_repo/docs/specs/workspace-doc-retention-matrix-v1.md"
+printf '# sample contract\n' \
+  >"$missing_retention_repo/crates/sample/docs/specs/sample-contract.md"
+assert_fails "missing retention row detected" "$missing_retention_repo" 1 \
+  "crate doc missing from retention matrix: crates/sample/docs/specs/sample-contract.md"
+
+stale_retention_repo="$(make_repo stale-retention)"
+mkdir -p "$stale_retention_repo/docs/specs" "$stale_retention_repo/crates"
+printf '%s\n' \
+  '# Workspace Doc Retention Matrix v1' \
+  '## Crate-Local Inventory (Keep)' \
+  '- `crates/sample/docs/specs/removed-contract.md`' \
+  '## Crate Top-Level README Inventory (Keep)' \
+  >"$stale_retention_repo/docs/specs/workspace-doc-retention-matrix-v1.md"
+assert_fails "stale retention row detected" "$stale_retention_repo" 1 \
+  "stale crate doc in retention matrix: crates/sample/docs/specs/removed-contract.md"
+
 # --- a failing hash command is surfaced, not swallowed -----------------------
 # Prepend a shasum stub that exits non-zero ahead of the real PATH so the audit
 # selects it, runs it, and must report the failure instead of passing silently.
@@ -203,7 +256,7 @@ assert_fails "hash command failure surfaced" "$clean_repo" 1 \
 # reason (a missing tool, not the missing hash command).
 curated_bin="$tmp_dir/curated-bin"
 mkdir -p "$curated_bin"
-for tool in git find xargs awk sort uniq rg sed grep; do
+for tool in git comm find xargs awk sort uniq rg sed grep; do
   src="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$src" ]] && ln -s "$src" "$curated_bin/$tool"
 done
@@ -252,7 +305,7 @@ fi
 # now belongs to rg_scan_existing itself.
 late_failing_rg_bin="$tmp_dir/late-failing-rg-bin"
 mkdir -p "$late_failing_rg_bin"
-for tool in git find xargs awk sort uniq shasum sha1sum; do
+for tool in git comm find xargs awk sort uniq sed shasum sha1sum; do
   src="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$src" ]] && ln -s "$src" "$late_failing_rg_bin/$tool"
 done

@@ -2,11 +2,11 @@
 
 Shared Markdown template layer for the nils-cli workspace.
 
-`nils-markdown` is the workspace-wide Tera template engine layer used to
+`nils-markdown` is the workspace-wide MiniJinja template engine layer used to
 emit long-form human-facing Markdown artifacts. The library exposes:
 
-- A deterministic Tera `Engine` builder.
-- An `md_cell` Tera filter wrapping
+- A deterministic MiniJinja `Engine` builder.
+- An `md_cell` MiniJinja filter wrapping
   `nils_common::markdown::canonicalize_table_cell` for pipe-safe table
   cells.
 - A re-export bridge to `nils_common::markdown::*` helpers (`heading`,
@@ -14,7 +14,7 @@ emit long-form human-facing Markdown artifacts. The library exposes:
   `format_json_pretty_sorted`) so consumer crates have one import
   surface.
 - A generic `Engine::register_helper(name, F)` extension point so a
-  consumer crate can attach its own domain-specific Tera helpers
+  consumer crate can attach its own domain-specific MiniJinja helpers
   without `nils-markdown` knowing the consumer's domain.
 - A `golden::assert_render(fixture, engine, template, view)` test
   harness that asserts byte equality against a captured fixture using

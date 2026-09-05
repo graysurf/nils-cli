@@ -74,10 +74,9 @@ Compatibility rules:
   - Cache format, stale suffix rendering, and exit codes stay unchanged.
 - Anchor tests for the cached/refresh paths live under the per-crate `integration` test target:
   - `crates/gemini-cli/tests/integration/prompt_segment_cached.rs`
+  - `crates/gemini-cli/tests/integration/prompt_segment_refresh.rs`
   - `crates/codex-cli/tests/integration/prompt_segment_cached.rs`
   - `crates/codex-cli/tests/integration/prompt_segment_refresh.rs`
-- Coverage gap to track separately: a dedicated `crates/gemini-cli/tests/integration/prompt_segment_refresh.rs` mirroring the codex
-  blocking-path test surface (lock/min-interval/stale-lock recovery) does not exist yet; backlog only — do not patch under this contract.
 
 ### Async rate-limits guardrails
 
@@ -88,7 +87,7 @@ Compatibility rules:
   - Collection results stay deterministically sorted by `name`, never by completion order.
   - Command-level secret discovery failures remain top-level `error.code="secret-discovery-failed"`.
   - Per-secret failures in async JSON keep the full `results` array and return exit `1`.
-  - `--jobs` remains non-fatal on zero/invalid input; later concurrency work must not introduce a new `invalid --jobs` usage error.
+  - `--jobs` bounds both text and JSON worker pools in both lanes and remains non-fatal on zero/invalid input, which falls back to `5`.
   - Missing-access-token fallback remains explicit: successful fallback emits `source="cache-fallback"` with `ok=true`; otherwise the
     result stays an error.
 - JSON error-path invariants:
@@ -99,14 +98,11 @@ Compatibility rules:
   - Stable per-secret async JSON error codes are `missing-access-token`, `request-failed`, `invalid-usage-payload`, and
     `cache-read-failed`.
 - Crate-specific differences to preserve during concurrency refactors:
-  - `codex-cli` text async already uses bounded worker threads and honors `--jobs`, defaulting zero/invalid values to `5`; its watch mode
-    is codex-only and still requires `--async`.
-  - `codex-cli` async JSON is still sequential today; Sprint 4 should change only the execution strategy, not envelopes, ordering,
-    fallback, or return codes.
+  - `codex-cli` text and JSON async use bounded worker threads and honor `--jobs`; its watch mode is codex-only and still requires
+    `--async`.
   - `codex-cli` async JSON already honors `--cached`.
-  - `gemini-cli` text async is sequential today because it delegates to `run_all_mode(...)`; `jobs` exists in `RateLimitsOptions` but is
-    unused.
-  - `gemini-cli` async JSON is sequential and keeps a `missing-access-token -> cache-fallback` special case.
+  - `gemini-cli` text and JSON async use bounded worker threads and honor `--jobs`; async JSON keeps a
+    `missing-access-token -> cache-fallback` special case.
   - `gemini-cli` text async honors `--cached`, but async JSON currently does not branch on `args.cached` and still fetches from the
     network. Treat that difference as part of the current observable contract until an intentional contract update says otherwise.
 
@@ -114,7 +110,7 @@ Compatibility rules:
 
 Per-crate integration tests are consolidated under a single `--test integration` target; filter to the relevant submodule by name:
 
-- `cargo test -p nils-gemini-cli --test integration -- prompt_segment_cached`
+- `cargo test -p nils-gemini-cli --test integration -- prompt_segment_cached prompt_segment_refresh`
 - `cargo test -p nils-gemini-cli --test integration -- rate_limits_async rate_limits_network`
 - `cargo test -p nils-codex-cli --test integration -- prompt_segment_cached prompt_segment_refresh`
 - `cargo test -p nils-codex-cli --test integration -- rate_limits_async`

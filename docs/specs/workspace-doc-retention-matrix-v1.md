@@ -20,15 +20,21 @@ Decision fields:
 | `AGENTS.md` | `workspace-level` | `canonical` | `keep` | Agent execution policy for this repository. |
 | `BINARY_DEPENDENCIES.md` | `workspace-level` | `canonical` | `keep` | Shared runtime/tooling dependency contract. |
 | `docs/runbooks/cli-completion-development-standard.md` | `workspace-level` | `canonical` | `keep` | Canonical completion architecture and checks. |
+| `docs/runbooks/cli-help-style-guide.md` | `workspace-level` | `canonical` | `keep` | Workspace help-text style and command-ordering guidance. |
 | `docs/runbooks/crates-io-status-script-runbook.md` | `workspace-level` | `canonical` | `keep` | Workspace crates.io status workflow. |
+| `docs/runbooks/markdown-template-development-standard.md` | `workspace-level` | `canonical` | `keep` | Shared Markdown template authoring and golden-test workflow. |
 | `docs/runbooks/new-cli-crate-development-standard.md` | `workspace-level` | `canonical` | `keep` | New CLI crate standards. |
+| `docs/runbooks/review-specialists-primitive.md` | `workspace-level` | `canonical` | `keep` | Shared specialist-review evidence contract. |
 | `docs/runbooks/test-cleanup-governance.md` | `workspace-level` | `canonical` | `keep` | Stale-test lifecycle and CI guardrails. |
+| `docs/specs/cli-output-contract-v1.md` | `workspace-level` | `canonical` | `keep` | Workspace CLI output envelope and exit-code contract. |
 | `docs/specs/cli-service-json-contract-guideline-v1.md` | `workspace-level` | `canonical` | `keep` | Service-consumed CLI JSON contract guidance. |
 | `docs/specs/codex-gemini-cli-parity-contract-v1.md` | `workspace-level` | `canonical` | `keep` | Shared Codex/Gemini parity contract. |
 | `docs/specs/codex-gemini-runtime-contract.md` | `workspace-level` | `canonical` | `keep` | Shared provider runtime contract. |
 | `docs/specs/completion-contract-template.md` | `workspace-level` | `canonical` | `keep` | Per-crate completion migration contract template. |
 | `docs/specs/completion-coverage-matrix-v1.md` | `workspace-level` | `canonical` | `keep` | Completion obligations and enforcement metadata matrix. |
+| `docs/specs/crate-cli-naming-convention-v1.md` | `workspace-level` | `canonical` | `keep` | Workspace crate and binary naming contract. |
 | `docs/specs/crate-docs-placement-policy.md` | `workspace-level` | `canonical` | `keep` | Workspace docs placement policy. |
+| `docs/specs/test-temp-directory-policy.md` | `workspace-level` | `canonical` | `keep` | Test temporary-directory ownership and leak prevention policy. |
 | `docs/specs/third-party-artifacts-contract-v1.md` | `workspace-level` | `canonical` | `keep` | Third-party artifacts generation contract. |
 | `docs/specs/workspace-ci-entrypoint-inventory-v1.md` | `workspace-level` | `canonical` | `keep` | CI owner-script inventory and keep/delete criteria. |
 | `docs/specs/workspace-shared-crate-boundary-v1.md` | `workspace-level` | `canonical` | `keep` | Shared crate ownership boundaries. |
@@ -58,22 +64,33 @@ below; the canonical `find` glob `crates/*/README.md` excludes any `README.md` u
 because BSD-style `-path` lets `*` cross slash boundaries.
 
 - `crates/agent-hook/docs/reports/agent-hook-completion-migration-contract.md`
+- `crates/agent-hook/docs/reports/dsh-finish-line-security-evidence.md`
 - `crates/agent-hook/docs/specs/agent-hook-v1.md`
+- `crates/agent-hook/docs/specs/data-policy-v1.md`
+- `crates/agent-hook/docs/specs/finish-line-acceptance-v1.md`
 - `crates/agent-runtime/docs/determinism.md`
 - `crates/agent-session/docs/provider-turn-signal-evidence.md`
 - `crates/agent-session/docs/reports/agent-session-completion-migration-contract.md`
+- `crates/agent-session/docs/runbooks/main-agent-orchestration.md`
 - `crates/agent-session/docs/runbooks/serve-daemon.md`
 - `crates/agent-session/docs/runbooks/work-coordination.md`
 - `crates/agent-session/docs/specs/activity-stream-v1.md`
+- `crates/agent-session/docs/specs/control-plane-observation-v1.md`
+- `crates/agent-session/docs/specs/main-agent-dsh-external-runtime-v1.md`
+- `crates/agent-session/docs/specs/main-agent-orchestration-v1.md`
 - `crates/agent-session/docs/specs/serve-api-v1.md`
 - `crates/agent-session/docs/specs/session-coordination-v1.md`
 - `crates/agent-session/docs/specs/session-maintenance-v1.md`
-- `crates/agent-session/docs/specs/main-agent-orchestration-v1.md`
+- `crates/agent-session/docs/specs/session-maintenance-v2.md`
 - `crates/agent-session/docs/turn-state-contract.md`
 - `crates/api-websocket/docs/specs/websocket-cli-contract-v1.md`
 - `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`
+- `crates/claude-cli/docs/runbooks/usage-consumer.md`
+- `crates/claude-cli/docs/specs/claude-cli-json-contract-v1.md`
 - `crates/codex-cli/docs/runbooks/json-consumers.md`
 - `crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
+- `crates/codex-cli/docs/specs/execution-capsule-v1.md`
+- `crates/forge-cli/docs/runbooks/pr-head-repair-loop.md`
 - `crates/forge-cli/docs/specs/forge-cli-spec-v1.md`
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
 - `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`

@@ -7,7 +7,7 @@ what guarantees they must preserve.
 
 ## When to author a template
 
-Author a Tera template when a Rust function emits long-form Markdown
+Author a `.md.tera` MiniJinja template when a Rust function emits long-form Markdown
 that:
 
 - Goes to a provider surface (PR comments, issue bodies, dashboards,
@@ -44,9 +44,9 @@ Concretely:
 
 ## Required helpers
 
-- `nils_markdown::Engine::builder()` constructs a deterministic Tera
+- `nils_markdown::Engine::builder()` constructs a deterministic MiniJinja
   engine (autoescape off, no `now()` call). Always start engines
-  from this builder; never construct `tera::Tera` directly.
+  from this builder; never construct `minijinja::Environment` directly.
 - `nils_markdown::Engine::register_template(name, body)` registers a
   template under a name. Bundle template bodies with
   `include_str!("../templates/.../foo.md.tera")` per Decision 13 of
@@ -56,7 +56,7 @@ Concretely:
   entry points. The `md-render` binary uses `render_value` because
   it consumes JSON files; in-crate consumers use `render` because
   they hold typed view structs.
-- The `md_cell` Tera filter wraps
+- The `md_cell` MiniJinja filter wraps
   `nils_common::markdown::canonicalize_table_cell` for pipe-safe
   table cells. Always use `{{ value | md_cell }}` inside Markdown
   table cells, never raw `{{ value }}`.
@@ -101,7 +101,7 @@ byte-identical bytes (see PR #548's fix).
 
 ## Whitespace pitfalls
 
-Tera's whitespace control (`{%-` strips preceding, `-%}` strips
+MiniJinja's Jinja-style whitespace control (`{%-` strips preceding, `-%}` strips
 trailing) makes conditional sections tricky:
 
 - For a section that may be empty, render the inner body

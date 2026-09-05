@@ -8,6 +8,7 @@ Usage:
 
 Checks documentation hygiene policy:
   - known transient development records are removed and not referenced from active docs
+  - the authoritative crate-doc retention inventory matches the tracked docs tree
   - crate docs indexes avoid unexpected deep links to root docs
   - duplicate markdown payloads are not present across active docs trees
   - legacy-removal guardrails stay enforced for docs and runtime surfaces
@@ -169,6 +170,55 @@ for path in "${removed_transient_docs[@]}"; do
     done <<<"$refs"
   fi
 done
+
+retention_matrix="docs/specs/workspace-doc-retention-matrix-v1.md"
+if [[ ! -f "$retention_matrix" ]]; then
+  if [[ "${DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS:-0}" != "1" ]]; then
+    echo "error: missing required retention matrix: $retention_matrix" >&2
+    exit 2
+  fi
+elif [[ ! -d crates ]]; then
+  if [[ "${DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS:-0}" != "1" ]]; then
+    echo "error: missing required crate-doc root: crates" >&2
+    exit 2
+  fi
+else
+  actual_crate_docs="$(
+    find crates -type f -name '*.md' \
+      -not -path '*/tests/*' \
+      -not -path '*/src/*' \
+      -not -path '*/assets/*' \
+      -not -path 'crates/*/README.md' \
+      -not -path 'crates/plan-tooling/plan-template.md' \
+      | sort
+  )"
+  declared_crate_docs="$(
+    sed -n '/^## Crate-Local Inventory (Keep)$/,/^## Crate Top-Level README Inventory (Keep)$/p' \
+      "$retention_matrix" \
+      | sed -n 's/^- `\([^`]*\.md\)`$/\1/p' \
+      | sort
+  )"
+
+  missing_retention_rows="$(
+    comm -23 \
+      <(printf '%s\n' "$actual_crate_docs") \
+      <(printf '%s\n' "$declared_crate_docs")
+  )"
+  stale_retention_rows="$(
+    comm -13 \
+      <(printf '%s\n' "$actual_crate_docs") \
+      <(printf '%s\n' "$declared_crate_docs")
+  )"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    record_issue error "crate doc missing from retention matrix: $path"
+  done <<<"$missing_retention_rows"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    record_issue error "stale crate doc in retention matrix: $path"
+  done <<<"$stale_retention_rows"
+fi
 
 deep_links="$(rg_scan_existing -n '\.\./\.\./\.\./docs/' --audit-paths crates/*/docs/README.md)"
 if [[ -n "$deep_links" ]]; then

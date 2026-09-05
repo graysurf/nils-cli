@@ -97,6 +97,8 @@ records the keep/delete decision plus the active caller evidence.
 | `scripts/ci/release-tarball-third-party-audit.sh` | keep | `.github/workflows/release.yml` `build` job |
 | `scripts/ci/release-only-checks.sh` | keep | exact-base reduced lane in `.github/workflows/ci.yml` `test` and `test_macos` jobs + `scripts/ci/tests/release-workflow-contract.test.sh` |
 | `scripts/ci/skill-shell-suites.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step (runs every `.agents/skills/*/tests/test_*.sh` suite) |
+| `scripts/ci/tempdir-leak-audit.sh` | keep | `scripts/ci/nils-cli-local-fast.sh` unconditional static leak gate + `docs/specs/test-temp-directory-policy.md` |
+| `scripts/ci/tempdir-leak-probe.sh` | keep | `scripts/ci/nils-cli-local-fast.sh` workspace-test isolation + `docs/specs/test-temp-directory-policy.md` |
 | `scripts/ci/test-stale-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step |
 | `scripts/ci/third-party-artifacts-audit.sh` | keep | `DEVELOPMENT.md` full checks list + `project-verify-required-checks.sh` step + dependabot bump skill |
 | `scripts/ci/verify-signed-commits.sh` | keep | `lefthook.yml` pre-push hook |
