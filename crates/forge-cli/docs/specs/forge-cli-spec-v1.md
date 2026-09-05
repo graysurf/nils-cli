@@ -877,6 +877,13 @@ distinctions that cannot be proven offline.
   closed `pass|findings|blocked|follow-up-pass` verdict vocabulary, and the
   canonical findings table with at least one exactly-five-cell row. Generic
   review comments omit this flag and remain valid.
+  Non-empty is not sufficient: a field whose whole value is the renderer's
+  placeholder (`not provided`, `unspecified`) is rejected with
+  `invalid_specialist_review_report`. `review-specialists` no longer emits those
+  sentinels for a publication-bound profile, and this guard covers a body built
+  by any other means. A real value that merely contains the word — a scope of
+  `behavior left unspecified by the spec` — still passes, because the match is
+  on the whole field.
 - `--metadata-only --expected-head <sha> --native-review-url <url>
   --native-review-author <login>`
   (GitHub-only) records concise

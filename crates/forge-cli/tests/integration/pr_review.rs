@@ -352,6 +352,72 @@ fn pr_review_validate_specialist_report_accepts_the_canonical_table_shape() {
     assert_eq!(env["data"]["comment"]["specialist_report"], true);
 }
 
+/// Regression: the emptiness check alone let the renderer's own placeholders
+/// through, so a report could publish `Reviewable: not provided` /
+/// `Lens: unspecified` / `Scope: not provided` under the reviewer's name. This
+/// body is the shape that actually reached a published review.
+#[test]
+fn pr_review_validate_specialist_report_rejects_renderer_placeholder_metadata() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: not provided\n- Lens: unspecified\n- Lens verdict: findings\n- Scope: not provided\n- Evidence reviewed: findings.jsonl\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| Stale binding | medium | 0.95 | README.md:277 | Update the commit |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_specialist_review_report");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("placeholder"),
+        "message={}",
+        env["error"]["message"]
+    );
+}
+
+/// A real value that merely *contains* a sentinel word must still pass; the
+/// guard matches the whole field, not a substring.
+#[test]
+fn pr_review_validate_specialist_report_accepts_metadata_containing_sentinel_words() {
+    let stub = StubEnv::new();
+    let report = "<!-- agent-kit:specialist-review-report:v1 -->\n## Review Report\n\n- Reviewable: PR #44\n- Lens: testing\n- Lens verdict: pass\n- Scope: behavior left unspecified by the spec\n- Evidence reviewed: focused tests\n\n| Finding | Severity | Confidence | Evidence | Recommendation |\n| --- | --- | ---: | --- | --- |\n| No findings | none | 0.00 | No actionable \\| informational findings. | none |\n";
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "local",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "validate",
+            "--specialist-report",
+            "--comment",
+            report,
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["comment"]["specialist_report"], true);
+}
+
 #[test]
 fn pr_review_validate_accepts_renderer_output_with_an_already_escaped_pipe() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

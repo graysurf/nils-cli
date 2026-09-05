@@ -250,6 +250,13 @@ fn command_render(args: RenderArgs) -> i32 {
             ),
         );
     }
+    if matches!(
+        args.profile,
+        RenderProfile::ProviderReview | RenderProfile::PrComment
+    ) && let Err(err) = require_provider_review_metadata(&args.provider_review)
+    {
+        return render_error(RENDER_SCHEMA_VERSION, RENDER_COMMAND, format, err);
+    }
     match read_merged(&args.input).and_then(|merged| {
         let context = RenderContext::from_args(
             args.repo.as_deref(),
@@ -434,6 +441,12 @@ fn merge_validated(
 
 fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
     validate_threshold(args.display_threshold)?;
+    if matches!(
+        args.profile,
+        Some(RenderProfile::ProviderReview | RenderProfile::PrComment)
+    ) {
+        require_provider_review_metadata(&args.provider_review)?;
+    }
     let validated = validate_inputs(&args.inputs, PathPolicy::default(), args.mode)?;
     validate_delivery_collisions(&validated.findings, args.mode)?;
     let merged = merge_validated(validated.clone(), args.display_threshold, args.mode);
@@ -2469,6 +2482,47 @@ impl RenderContext {
             git_ref: git_ref.map(ToOwned::to_owned),
         }
     }
+}
+
+/// The `provider-review` profile (and its `pr-comment` alias) renders a body
+/// destined for publication under a reviewer's name, so its metadata must be
+/// supplied rather than invented.
+///
+/// The renderer used to substitute `not provided` / `unspecified` for an absent
+/// flag, and to synthesize `Evidence reviewed:` from the input file list. Both
+/// are reasonable for a local report and wrong for a published one: the
+/// placeholder reaches every reader of the PR/MR, and the synthesized evidence
+/// is an artifact path that means nothing off the machine that produced it.
+/// Neither the renderer nor `forge-cli pr review validate --specialist-report`
+/// objected, so a missing flag was discovered only after publication.
+///
+/// `--lens-verdict` is deliberately excluded: its fallback is derived from the
+/// merged findings (`pass` when empty, `findings` otherwise), which is a
+/// correct default rather than a placeholder.
+fn require_provider_review_metadata(args: &ProviderReviewArgs) -> Result<(), CliError> {
+    let missing = [
+        ("--reviewable", args.reviewable.as_deref()),
+        ("--lens", args.lens.as_deref()),
+        ("--scope", args.scope.as_deref()),
+        ("--evidence-reviewed", args.evidence_reviewed.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.map(str::trim).is_none_or(str::is_empty))
+    .map(|(flag, _)| flag)
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(CliError::usage(
+        "provider-review-metadata-required",
+        format!(
+            "the provider-review profile publishes its header verbatim, so it requires {}",
+            missing.join(", ")
+        ),
+        Some(json!({ "missing": missing })),
+    ))
 }
 
 fn provider_review_context(

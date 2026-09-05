@@ -3272,6 +3272,18 @@ fn validate_specialist_review_report(body: &str) -> Result<(), ForgeError> {
                 "specialist report requires exactly one non-empty {field} field"
             )));
         }
+        // Non-empty is not enough. `review-specialists` used to substitute these
+        // exact sentinels for an absent flag, so a report could satisfy the
+        // emptiness check and still publish "Reviewable: not provided" under the
+        // reviewer's name. The renderer now refuses to emit them, and this is the
+        // matching guard for a body built any other way.
+        if matches!(values[0], "not provided" | "unspecified") {
+            return Err(invalid_specialist_review_report(&format!(
+                "specialist report {field} field is the renderer's placeholder \
+                 ({}); bind the real value before publishing",
+                values[0]
+            )));
+        }
     }
 
     let verdict = lines
