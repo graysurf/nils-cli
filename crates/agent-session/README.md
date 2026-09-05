@@ -57,7 +57,9 @@ agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
 agent-session delete <id>
+agent-session completion zsh
 main-agent capabilities --provider codex --format json
+main-agent packet-schema --format json
 main-agent self readiness --format json
 main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json
 main-agent self show --format json
@@ -78,6 +80,7 @@ main-agent worker cancel ASSIGNMENT_ID --if-revision 3 --reason "pre-claim boots
 main-agent worker reassign ASSIGNMENT_ID --assignment-file replacement.json --if-revision 3 --reason "pre-claim bootstrap failure" --idempotency-key reassign-001 --format json
 main-agent worker list --format json
 main-agent checkpoint --file checkpoint.json --if-revision 2 --idempotency-key checkpoint-001 --format json
+main-agent completion zsh
 ```
 
 `main-agent` is the typed, authenticated facade for durable Main Agent runs and
@@ -109,8 +112,13 @@ checkpoint objects to that pre-created mode-0600 file and pass the same path to
 path under a repository or project output tree.
 Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
 for packet examples, revision and retry rules, interactive worker acceptance,
-resume/rebind, relationship transfers, and terminal cleanup. In particular,
-fresh worker launch first validates that `launch.cwd` is an existing canonical
+resume/rebind, relationship transfers, and terminal cleanup.
+The top-level relationship and lifecycle commands are `collaborate`, `borrow`,
+`handoff`, `adopt`, `close`, and `closeout`; `packet-schema` prints a valid
+objective-packet example for `init`. Use `completion <bash|zsh>` on either
+binary to generate its shell completion script.
+
+In particular, fresh worker launch first validates that `launch.cwd` is an existing canonical
 directory. Fresh Codex launch also requires explicit trust for that exact
 directory in the active Codex configuration; missing or unverifiable trust
 fails with typed guidance before assignment persistence or provider launch.

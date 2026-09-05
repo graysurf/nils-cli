@@ -45,6 +45,17 @@ Shell wrapper scripts are deprecated for this crate path. Use `plan-issue` / `pl
 - `accept-sprint`: enforce merged-PR gate and mark sprint accepted.
 - `multi-sprint-guide`: print repeated command flow for a whole plan.
 
+### Approval resolution
+
+- `resolve-approval --pr <number>`: find PR comments containing the literal
+  `Decision: merge` marker. Text mode prints a URL only when exactly one comment
+  matches and fails on zero or multiple matches. `--format json` returns all
+  candidates newest-first and exposes the newest candidate in `url` for
+  explicit inspection. Neither mode authenticates the comment author or
+  validates the complete review-evidence body, so verify both before passing a
+  selected URL to `accept-sprint --approved-comment-url`. This command is
+  available only through the live `plan-issue` binary.
+
 ### Shell completion
 
 - `completion <bash|zsh>`: export completion script for each binary.

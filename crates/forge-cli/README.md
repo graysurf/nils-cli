@@ -19,6 +19,7 @@ maintenance). Two backends ship together: GitHub (wraps `gh`) and GitLab
 cargo run -p nils-forge-cli -- --help
 cargo run -p nils-forge-cli -- inbox status --format json
 cargo run -p nils-forge-cli -- auth status --format json
+cargo run -p nils-forge-cli -- completion zsh
 cargo run -p nils-forge-cli -- label audit --catalog labels.yaml --format json
 cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-file review.md --mirror-issue --issue 456 --format json
@@ -35,6 +36,11 @@ cargo run -p nils-forge-cli -- pr merge 123 --expected-head <reviewed-sha> --rev
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
 cargo run -p nils-forge-cli -- repo push-default --default-branch-receipt receipt.json --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
+
+Repository-scoped commands derive their target from the selected Git remote.
+Use `--remote <name>` to select a remote other than `origin`. For the local
+provider, `--store-root <path>` overrides `FORGE_CLI_LOCAL_STORE`; it does not
+affect GitHub or GitLab operations.
 
 `repo push-default` is a narrow, policy-driven exception to PR delivery. It
 requires a clean non-default checkout whose `HEAD` is exactly one locally

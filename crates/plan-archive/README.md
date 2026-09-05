@@ -7,6 +7,21 @@ Skills in `agent-runtime-kit` (`meta:plan-archive-migrate` and
 `meta:plan-archive-query`) wrap this binary; this crate does not talk
 to provider APIs directly.
 
+## Current command surface
+
+- `validate-hosts`, `validate-local`, and `validate-metadata` validate the
+  archive schemas.
+- `discover` scans local plan folders for migration candidates; `migrate`
+  previews or applies one migration.
+- `refresh` fetches and scrubs provider snapshots; `query` reads the cached
+  index; `catalog` derives the archive catalog.
+- `search <term>` performs case-insensitive full-text search across cached
+  issue, PR, and MR bodies and comments and returns hit-level results with the
+  owning plan.
+- `completion <bash|zsh>` prints the generated shell completion script.
+
+Run `plan-archive <command> --help` for the authoritative option surface.
+
 ## Sprint 1 surface
 
 Sprint 1 (Plan 1 of the plan-archive system) ships the three schema
@@ -26,9 +41,9 @@ validators that later subcommands depend on:
   `metadata-captured-classification-missing` warning) and rejects
   plans that name no `refs.issue|pr|mr`.
 
-`migrate`, `refresh`, and `query` are declared in the CLI surface but
-respond with `subcommand-not-implemented` in Sprint 1; their bodies
-land in Sprints 3–5.
+The Sprint 1 baseline declared `migrate`, `refresh`, and `query` but returned
+`subcommand-not-implemented`; the later sections document the implementations
+that landed in Sprints 3–5.
 
 ## Sprint 2 surface
 

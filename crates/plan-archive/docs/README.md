@@ -4,10 +4,9 @@
 
 ## Specs
 
-- None yet. The Sprint 1 surface (schema validators) is documented in the crate
-  [`README.md`](../README.md); per-subcommand spec docs will land alongside the
-  `migrate` (Sprint 3), `refresh` (Sprint 4), and `query` (Sprint 5)
-  implementations.
+- None yet. The implemented validator, discovery, migration, refresh, query,
+  catalog, search, and completion surfaces are documented in the crate
+  [`README.md`](../README.md).
 
 ## Runbooks
 

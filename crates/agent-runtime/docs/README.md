@@ -29,4 +29,4 @@ live in the consuming repo
 
 - Back to crate README: [`../README.md`](../README.md)
 - Consuming repo: [`sympoies/agent-runtime-kit`](https://github.com/sympoies/agent-runtime-kit)
-- Tracking issue: [`graysurf/agent-runtime-kit#1`](https://github.com/graysurf/agent-runtime-kit/issues/1)
+- Tracking issue: [`sympoies/agent-runtime-kit#1`](https://github.com/sympoies/agent-runtime-kit/issues/1)
