@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nils_common::git as common_git;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
@@ -176,7 +176,8 @@ pub fn run(args: &[String]) -> i32 {
             p.set_message(display_path.clone());
         }
 
-        let read_path = resolve_repo_relative(&repo_root, Path::new(&display_path));
+        let read_path =
+            nils_common::fs::resolve_repo_relative(&repo_root, Path::new(&display_path));
         if !read_path.is_file() {
             errors.push(format!("{display_path}: file not found"));
             if let Some(p) = progress.as_ref() {
@@ -372,13 +373,6 @@ fn find_plan_files(repo_root: &Path) -> Vec<String> {
     }
     out.sort();
     out
-}
-
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
 }
 
 /// Apply mechanical fixers to the plan and, when discoverable, the sibling

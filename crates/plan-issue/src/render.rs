@@ -194,7 +194,7 @@ pub fn render_plan_issue_body(
 
 fn load_pre_sprint_plan_lines(plan_file: &Path) -> Option<Vec<String>> {
     let repo_root = detect_repo_root();
-    let resolved = resolve_repo_relative(&repo_root, plan_file);
+    let resolved = common_fs::resolve_repo_relative(&repo_root, plan_file);
     let text = fs::read_to_string(&resolved).ok()?;
     let lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
     if lines.is_empty() {
@@ -520,7 +520,7 @@ fn normalize_pr_display(value: &str) -> String {
 
 fn extract_sprint_section(plan_file: &Path, sprint: i32) -> Result<String, String> {
     let repo_root = detect_repo_root();
-    let resolved = resolve_repo_relative(&repo_root, plan_file);
+    let resolved = common_fs::resolve_repo_relative(&repo_root, plan_file);
     let text = std::fs::read_to_string(&resolved).map_err(|err| {
         format!(
             "failed to read plan file {}: {err}",
@@ -555,11 +555,4 @@ fn extract_sprint_section(plan_file: &Path, sprint: i32) -> Result<String, Strin
 
 fn detect_repo_root() -> PathBuf {
     common_git::repo_root_or_cwd()
-}
-
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
 }

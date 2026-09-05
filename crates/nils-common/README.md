@@ -37,7 +37,8 @@ Workspace-level keep/delete ownership decisions are tracked in
 - `git`: `git` command wrappers for repo probes, `rev-parse` helpers, staged-path listing, name-status-z parsing, lockfile detection, and
   scope suggestion primitives for commit tooling.
 - `clipboard`: best-effort clipboard copy with explicit tool priority.
-- `fs`: atomic write, timestamp write/remove, UTF-8 text write, SHA-256 hashing, and cross-platform replace helpers with structured errors.
+- `fs`: lexical path normalization and repository-relative resolution, atomic write, timestamp write/remove, UTF-8 text write, SHA-256
+  hashing, and cross-platform replace helpers with structured errors.
 - `markdown`: markdown payload validation (with violation reporting), markdown-table-safe cell canonicalization, markdown heading/code-block
   rendering, and stable JSON pretty-format helpers used by orchestration/reporting CLIs.
 - `agent_attribution`: the single definition of agent self-attribution markers (generator marker lines, model / vendor `Co-Authored-By`

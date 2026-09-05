@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const TEMPLATE: &str = include_str!("../plan-template.md");
 
@@ -108,7 +108,7 @@ pub fn run(args: &[String]) -> i32 {
         return die_usage("missing required --slug or --file");
     };
 
-    let out_path = resolve_repo_relative(&repo_root, Path::new(&out_file_raw));
+    let out_path = nils_common::fs::resolve_repo_relative(&repo_root, Path::new(&out_file_raw));
     let out_path_str = out_path.to_string_lossy();
     if !out_path_str.ends_with("-plan.md") {
         return die_usage("--file must end with -plan.md");
@@ -162,13 +162,6 @@ fn default_slug_plan_path(slug: &str) -> String {
     format!("docs/plans/{slug}/{filename}")
 }
 
-fn resolve_repo_relative(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    repo_root.join(path)
-}
-
 fn write_template(dest: &Path, title: Option<&str>) -> anyhow::Result<()> {
     if let Some(title) = title {
         let mut lines = TEMPLATE.lines();
@@ -203,8 +196,7 @@ fn relativize_for_created(path: &Path, repo_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TEMPLATE, default_slug_plan_path, is_kebab_case, relativize_for_created,
-        resolve_repo_relative, write_template,
+        TEMPLATE, default_slug_plan_path, is_kebab_case, relativize_for_created, write_template,
     };
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -228,19 +220,6 @@ mod tests {
         assert_eq!(
             default_slug_plan_path("hello-world-plan"),
             "docs/plans/hello-world-plan/hello-world-plan.md"
-        );
-    }
-
-    #[test]
-    fn resolve_repo_relative_joins_relative_and_preserves_absolute() {
-        let repo = PathBuf::from("/tmp/repo");
-        assert_eq!(
-            resolve_repo_relative(&repo, std::path::Path::new("docs/plans/p.md")),
-            PathBuf::from("/tmp/repo/docs/plans/p.md")
-        );
-        assert_eq!(
-            resolve_repo_relative(&repo, std::path::Path::new("/opt/plan.md")),
-            PathBuf::from("/opt/plan.md")
         );
     }
 
