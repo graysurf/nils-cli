@@ -58,7 +58,7 @@ use crate::codex_app_server::{self, ControlHandle};
 use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_history::{
-    self, ArchivedSession, HistoryCatalog, HistoryError, HistoryMessageDirection, HistorySource,
+    self, HistoryCatalog, HistoryError, HistoryMessageDirection, HistorySource,
 };
 use crate::provider_prompt::{
     LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
@@ -68,12 +68,12 @@ use crate::provider_prompt::{
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
     SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
-    WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
-    delete_session, delete_session_with_expected_incarnation_and_prepare, glance_session,
-    load_session_record, non_empty_env, prepare_session_attachment, profile_unavailable,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
+    WorkdirSearchOptions, archive_session_with_expected_incarnation,
+    canonicalize_structured_title_pair, cleanup_session_delete_tombstones, delete_session,
+    glance_session, load_session_record, non_empty_env, prepare_session_attachment,
+    profile_unavailable, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
+    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title_if_revision,
 };
 
@@ -953,6 +953,10 @@ fn router(state: Arc<ServeState>) -> Router {
         .route(
             "/sessions/{id}/orchestration/group-cleanup",
             get(group_cleanup_preview_handler).post(group_cleanup_execute_handler),
+        )
+        .route(
+            "/sessions/{id}/orchestration/group-archive",
+            get(group_archive_preview_handler).post(group_archive_execute_handler),
         )
         .route(
             "/sessions/{id}",
@@ -3234,6 +3238,7 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
                     "last_prompt": true,
                     "history": true,
                     "archive": true,
+                    "group_archive": true,
                     "history_star": true,
                     "managed_account_handoff": crate::codex_app_server::MANAGED_ACCOUNT_HANDOFF_CAPABILITY,
                 },
@@ -7032,50 +7037,12 @@ async fn archive_handler(
     let response_machine = machine.clone();
     let starred = body.starred;
     match tokio::task::spawn_blocking(move || {
-        let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
+        let (archive, deleted) = archive_session_with_expected_incarnation(
             &context,
             &id,
             tmux,
             &body.expected_session_incarnation,
-            |record| {
-                let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
-                    CliError::data(
-                        "provider-session-unavailable",
-                        "session does not have a captured provider session id",
-                        Some(json!({ "id": record.id })),
-                    )
-                })?;
-                let agent_profile = crate::session_agent_profile(record).map(str::to_string);
-                let archive = ArchivedSession {
-                    schema_version: "agent-session.history-archive.v1".to_string(),
-                    history_id: provider_history::stable_history_id(
-                        &provider_resume.provider,
-                        agent_profile.as_deref(),
-                        &provider_resume.session_id,
-                    ),
-                    provider: provider_resume.provider.clone(),
-                    provider_session_id: provider_resume.session_id.clone(),
-                    agent_profile,
-                    title: record.title.clone(),
-                    cwd: record.cwd.clone(),
-                    created_at: record.created_at.clone(),
-                    updated_at: record.updated_at.clone(),
-                    archived_at: activity_observed_at(),
-                };
-                provider_history::write_archive(
-                    &provider_history::archive_root(&context.state_dir),
-                    &archive,
-                )
-                .map_err(|_| {
-                    CliError::runtime(
-                        "history-archive-write-failed",
-                        "failed to write session archive metadata",
-                        Some(json!({ "id": record.id })),
-                    )
-                })
-            },
         )?;
-        let archive = pending_archive.commit();
         // The session is already archived and gone; a star that cannot be stored
         // is reported as unstarred rather than failing the archive after the fact.
         let starred_at = starred
@@ -7156,6 +7123,73 @@ async fn group_cleanup_execute_handler(
                 cleanup_deleted_session_registries(&state, fence).await;
             }
             envelope_ok(json!({ "machine": state.machine, "cleanup": execution.value }))
+        }
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn group_archive_preview_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::main_agent::preview_group_cleanup(&context, &id)
+    })
+    .await
+    {
+        Ok(Ok(cleanup)) => envelope_ok(json!({
+            "machine": state.machine,
+            "archive": {
+                "schema_version": "agent-session.main-agent-group-archive.v1",
+                "cleanup": cleanup,
+            },
+        })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn group_archive_execute_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<crate::main_agent::GroupArchiveRequest>, JsonRejection>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let request = match coordination_json(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::main_agent::execute_group_archive(&context, &id, request, tmux)
+    })
+    .await
+    {
+        Ok(Ok(execution)) => {
+            if !execution.deleted_registry_fences.is_empty() {
+                state.history_catalog.invalidate();
+            }
+            for fence in &execution.deleted_registry_fences {
+                cleanup_deleted_session_registries(&state, fence).await;
+            }
+            envelope_ok(json!({
+                "machine": state.machine,
+                "archive": {
+                    "schema_version": crate::main_agent::GROUP_ARCHIVE_RESULT_SCHEMA,
+                    "completed": execution.value["completed"],
+                    "cleanup": execution.value,
+                },
+            }))
         }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
@@ -13118,6 +13152,33 @@ esac
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
 
+        let (status, body) = call(
+            router(st.clone()),
+            get("/sessions/steer/orchestration/group-archive"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/steer/orchestration/group-archive",
+                None,
+                json!({
+                    "schema_version": crate::main_agent::GROUP_ARCHIVE_REQUEST_SCHEMA,
+                    "expected_main_incarnation": "launch-steer",
+                    "expected_run_revision": 1,
+                    "expected_plan_digest": format!("sha256:{}", "a".repeat(64)),
+                    "mode": "safe",
+                    "idempotency_key": "archive-001"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
         let response = router(st)
             .oneshot(get_auth("/activity/events", Some(TOKEN)))
             .await
@@ -14571,6 +14632,7 @@ esac
             ])
         );
         assert!(session["provider_resume"].get("storage_only").is_none());
+        assert_eq!(body["data"]["capabilities"]["group_archive"], true);
     }
 
     #[tokio::test]
@@ -20954,6 +21016,222 @@ esac
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn group_archive_excludes_related_sessions_and_retries_missing_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let cleanup_tmux = tmp.path().join("tmux-missing-session");
+        fs::write(
+            &cleanup_tmux,
+            "#!/bin/sh\nprintf \"%s\\n\" \"can't find session: test\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cleanup_tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let st = state(&state_dir, Some(TOKEN), cleanup_tmux);
+
+        let mut main =
+            provider_discovery_record("archive-main", "hs-archive-main", "launch-archive-main", 1);
+        crate::mark_tmux_runtime_never_launched(&mut main);
+        fs::create_dir_all(session_dir(&st.context, &main.id)).unwrap();
+        crate::write_session_record(&st.context, &main).unwrap();
+
+        let mut worker = provider_discovery_record(
+            "archive-worker",
+            "hs-archive-worker",
+            "launch-archive-worker",
+            1,
+        );
+        worker.provider_resume = None;
+        crate::mark_tmux_runtime_never_launched(&mut worker);
+        fs::create_dir_all(session_dir(&st.context, &worker.id)).unwrap();
+        crate::write_session_record(&st.context, &worker).unwrap();
+
+        let mut collaborator = provider_discovery_record(
+            "archive-collaborator",
+            "hs-archive-collaborator",
+            "launch-archive-collaborator",
+            1,
+        );
+        crate::mark_tmux_runtime_never_launched(&mut collaborator);
+        fs::create_dir_all(session_dir(&st.context, &collaborator.id)).unwrap();
+        crate::write_session_record(&st.context, &collaborator).unwrap();
+
+        let mut borrower = provider_discovery_record(
+            "archive-borrower",
+            "hs-archive-borrower",
+            "launch-archive-borrower",
+            1,
+        );
+        crate::mark_tmux_runtime_never_launched(&mut borrower);
+        fs::create_dir_all(session_dir(&st.context, &borrower.id)).unwrap();
+        crate::write_session_record(&st.context, &borrower).unwrap();
+
+        let session_ref = |record: &SessionRecord| crate::orchestration::SessionRef {
+            machine: None,
+            session_id: record.id.clone(),
+            session_incarnation: record.runtime.as_ref().unwrap().launch_id.clone(),
+            session_created_at: record.created_at.clone(),
+        };
+        let main_ref = session_ref(&main);
+        let worker_ref = session_ref(&worker);
+        let collaborator_ref = session_ref(&collaborator);
+        let borrower_ref = session_ref(&borrower);
+        {
+            let mut locked = crate::orchestration::lock_registry(&st.context).unwrap();
+            locked.registry.runs.insert(
+                "archive-run".to_string(),
+                crate::orchestration::RunRecord {
+                    schema_version: crate::orchestration::RUN_SCHEMA.to_string(),
+                    run_id: "archive-run".to_string(),
+                    revision: 1,
+                    state: "active".to_string(),
+                    tier: "L2".to_string(),
+                    objective_summary: "Archive the managed group".to_string(),
+                    objective_packet_digest: format!("sha256:{}", "a".repeat(64)),
+                    controller: main_ref.clone(),
+                    durable_refs: Vec::new(),
+                    ephemeral: false,
+                    checkpoint: None,
+                    created_at: "2030-01-01T00:00:00Z".to_string(),
+                    updated_at: "2030-01-01T00:00:00Z".to_string(),
+                },
+            );
+            locked.registry.assignments.insert(
+                "archive-assignment".to_string(),
+                crate::orchestration::AssignmentRecord {
+                    schema_version: crate::orchestration::ASSIGNMENT_SCHEMA.to_string(),
+                    assignment_id: "archive-assignment".to_string(),
+                    run_id: "archive-run".to_string(),
+                    revision: 1,
+                    state: "accepted".to_string(),
+                    task_summary: "Archive one managed worker".to_string(),
+                    private_packet_digest: format!("sha256:{}", "b".repeat(64)),
+                    primary_manager: main_ref,
+                    worker: Some(worker_ref),
+                    previous_worker: None,
+                    collaborators: vec![collaborator_ref],
+                    borrowed_by: vec![crate::orchestration::TimedRelationship {
+                        session: borrower_ref,
+                        expires_at: "2099-12-31T00:00:00Z".to_string(),
+                        expires_at_epoch: 4_102_358_400,
+                    }],
+                    repository: None,
+                    worktree: None,
+                    base_ref: None,
+                    scopes: Vec::new(),
+                    durable_refs: Vec::new(),
+                    depends_on: Vec::new(),
+                    checkpoint: None,
+                    result_summary: None,
+                    blocker_summary: None,
+                    submit_recovery: None,
+                    worker_quarantine: None,
+                    account_handoff: None,
+                    runtime_stop: None,
+                    claim_revocation: None,
+                    readiness_stop_proof: None,
+                    created_at: "2030-01-01T00:00:00Z".to_string(),
+                    updated_at: "2030-01-01T00:00:00Z".to_string(),
+                },
+            );
+            locked.save().unwrap();
+        }
+
+        let (preview_status, preview_body) = call(
+            router(st.clone()),
+            get_auth(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(preview_status, StatusCode::OK, "body={preview_body}");
+        let cleanup = &preview_body["data"]["archive"]["cleanup"];
+        assert_eq!(cleanup["workers"].as_array().unwrap().len(), 1);
+        let request = json!({
+            "schema_version": crate::main_agent::GROUP_ARCHIVE_REQUEST_SCHEMA,
+            "expected_main_incarnation": main.runtime.as_ref().unwrap().launch_id,
+            "expected_run_revision": cleanup["run_revision"],
+            "expected_plan_digest": cleanup["plan_digest"],
+            "mode": "safe",
+            "idempotency_key": "group-archive-retry-0001",
+        });
+
+        let (first_status, first_body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                request.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "body={first_body}");
+        assert_eq!(first_body["data"]["archive"]["completed"], false);
+        assert_eq!(
+            first_body["data"]["archive"]["cleanup"]["failure"]["code"],
+            "provider-session-unavailable"
+        );
+        assert!(session_dir(&st.context, &worker.id).is_dir());
+        assert!(session_dir(&st.context, &main.id).is_dir());
+
+        worker.provider_resume = Some(crate::ProviderResume {
+            provider: "claude".to_string(),
+            session_id: "archive-worker-provider".to_string(),
+            captured_at: "2026-09-05T00:00:00Z".to_string(),
+            capture_method: "claude-explicit-session-id".to_string(),
+            resume_args: vec![
+                "--resume".to_string(),
+                "archive-worker-provider".to_string(),
+            ],
+            extra: std::collections::BTreeMap::new(),
+        });
+        crate::write_session_record(&st.context, &worker).unwrap();
+
+        let (retry_status, retry_body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/archive-main/orchestration/group-archive",
+                Some(TOKEN),
+                request,
+            ),
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::OK, "body={retry_body}");
+        assert_eq!(retry_body["data"]["archive"]["completed"], true);
+        assert_eq!(
+            retry_body["data"]["archive"]["cleanup"]["workers"][0]["outcome"],
+            "deleted"
+        );
+        assert!(!session_dir(&st.context, &worker.id).exists());
+        assert!(!session_dir(&st.context, &main.id).exists());
+        assert!(session_dir(&st.context, &collaborator.id).is_dir());
+        assert!(session_dir(&st.context, &borrower.id).is_dir());
+
+        for provider_id in ["archive-worker-provider", "archive-main-provider"] {
+            let history_id = provider_history::stable_history_id("claude", None, provider_id);
+            let archive_path = provider_history::archive_root(&st.context.state_dir)
+                .join(format!("{history_id}.json"));
+            assert!(archive_path.is_file(), "missing archive for {provider_id}");
+        }
+        let collaborator_history_id =
+            provider_history::stable_history_id("claude", None, "archive-collaborator-provider");
+        assert!(
+            !provider_history::archive_root(&st.context.state_dir)
+                .join(format!("{collaborator_history_id}.json"))
+                .exists(),
+            "collaborator must remain outside the archive group"
+        );
+        let borrower_history_id =
+            provider_history::stable_history_id("claude", None, "archive-borrower-provider");
+        assert!(
+            !provider_history::archive_root(&st.context.state_dir)
+                .join(format!("{borrower_history_id}.json"))
+                .exists(),
+            "borrowed session must remain outside the archive group"
+        );
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `POST /sessions/{id}/archive` | Bearer | This specification |
 | `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints), successor [v2](session-maintenance-v2.md#negotiation) |
 | `GET and POST /sessions/{id}/orchestration/group-cleanup` | Bearer | [Main Agent orchestration v1](main-agent-orchestration-v1.md#daemon-owned-group-cleanup) |
+| `GET and POST /sessions/{id}/orchestration/group-archive` | Bearer | [Main Agent orchestration v1](main-agent-orchestration-v1.md#daemon-owned-group-archive) |
 | `PUT /sessions/{id}/account` | Bearer | This specification |
 | `GET /sessions/{id}/auto-resume` | Open | This specification |
 | `PUT and DELETE /sessions/{id}/auto-resume` | Bearer | This specification |
@@ -117,8 +118,9 @@ retryable. Archive never deletes or rewrites the provider transcript. Existing
 `DELETE /sessions/{id}` remains the distinct permanent Console-record removal
 operation and likewise does not delete provider history.
 
-`GET /sessions` advertises additive `history`, `archive`, and `history_star`
-capabilities. Older daemons omit them and do not serve these routes.
+`GET /sessions` advertises additive `history`, `archive`, `group_archive`, and
+`history_star` capabilities. Older daemons omit them and do not serve these
+routes.
 
 ### Operator provider-turn reconciliation
 
@@ -385,6 +387,7 @@ recorded in `sympoies/nils-cli#1409`.
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`,
   `POST /sessions/{id}/orchestration/group-cleanup`,
+  `POST /sessions/{id}/orchestration/group-archive`,
   `DELETE /sessions/{id}` — writes, require a bearer token.
 - `GET /sessions/{id}/orchestration/group-cleanup` returns an exact,
   metadata-only cleanup preview for the session's active Main Agent run. The
@@ -399,6 +402,18 @@ recorded in `sympoies/nils-cli#1409`.
   each reported deleted, absent, not-started, or failed worker outcome. Workers
   not yet attempted after a failure remain live and are omitted from that
   partial result.
+- `GET /sessions/{id}/orchestration/group-archive` returns the same exact
+  worker-first plan under an additive group-archive envelope. `POST` requires
+  `agent-session.main-agent-group-archive-request.v1` with the same incarnation,
+  run-revision, plan-digest, mode, and idempotency fences. Execution reuses the
+  daemon-owned cleanup lifecycle, but prepares each member's provider-history
+  archive before that exact runtime is stopped and commits it only after
+  deletion succeeds. A missing provider identity or archive write failure
+  leaves that member live, returns a retryable partial cleanup result, and never
+  falls back to archiving the Main Agent alone. Collaborators, borrowed
+  sessions, and workers managed by another Main Agent remain outside the plan.
+  Exact retries resume the durable worker-first cleanup receipt; an interruption
+  after verified deletion cannot lose the already-written archive metadata.
 - `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. The compatibility route accepts
   `{ "text": "...", "expected_session_incarnation": "launch-id" }`; the incarnation is optional for older clients, and
   a new daemon validates it against the authoritative runtime under the session-record lock before provider dispatch.

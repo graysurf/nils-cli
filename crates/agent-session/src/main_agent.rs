@@ -737,6 +737,10 @@ pub(crate) const GROUP_CLEANUP_REQUEST_SCHEMA: &str =
     "agent-session.main-agent-group-cleanup-request.v1";
 pub(crate) const GROUP_CLEANUP_RESULT_SCHEMA: &str =
     "agent-session.main-agent-group-cleanup-result.v1";
+pub(crate) const GROUP_ARCHIVE_REQUEST_SCHEMA: &str =
+    "agent-session.main-agent-group-archive-request.v1";
+pub(crate) const GROUP_ARCHIVE_RESULT_SCHEMA: &str =
+    "agent-session.main-agent-group-archive-result.v1";
 const GROUP_CLEANUP_MAX_ASSIGNMENTS: usize = 64;
 const MANAGED_ACCOUNT_HANDOFF_CAPABILITY: &str =
     crate::codex_app_server::MANAGED_ACCOUNT_HANDOFF_CAPABILITY;
@@ -751,6 +755,17 @@ pub(crate) enum GroupCleanupMode {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupCleanupRequest {
+    pub schema_version: String,
+    pub expected_main_incarnation: String,
+    pub expected_run_revision: u64,
+    pub expected_plan_digest: String,
+    pub mode: GroupCleanupMode,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupArchiveRequest {
     pub schema_version: String,
     pub expected_main_incarnation: String,
     pub expected_run_revision: u64,
@@ -21779,6 +21794,54 @@ pub(crate) fn execute_group_cleanup(
     request: GroupCleanupRequest,
     tmux_bin: PathBuf,
 ) -> Result<GroupCleanupExecution, CliError> {
+    execute_group_cleanup_operation(context, main_session_id, request, tmux_bin, false)
+}
+
+pub(crate) fn execute_group_archive(
+    context: &CliContext,
+    main_session_id: &str,
+    request: GroupArchiveRequest,
+    tmux_bin: PathBuf,
+) -> Result<GroupCleanupExecution, CliError> {
+    crate::validate_id(main_session_id)?;
+    if request.schema_version != GROUP_ARCHIVE_REQUEST_SCHEMA {
+        return Err(invalid_input("group archive request schema is unsupported"));
+    }
+    orchestration::validate_slug(
+        "main session incarnation",
+        &request.expected_main_incarnation,
+        128,
+    )?;
+    orchestration::validate_digest(&request.expected_plan_digest)?;
+    validate_idempotency_key(&request.idempotency_key)?;
+    let digest = crate::coordination::request_digest(
+        "main-agent-group-archive",
+        &json!({
+            "expected_main_incarnation": request.expected_main_incarnation,
+            "expected_run_revision": request.expected_run_revision,
+            "expected_plan_digest": request.expected_plan_digest,
+            "mode": request.mode,
+            "idempotency_key": request.idempotency_key,
+        }),
+    );
+    let cleanup_request = GroupCleanupRequest {
+        schema_version: GROUP_CLEANUP_REQUEST_SCHEMA.to_string(),
+        expected_main_incarnation: request.expected_main_incarnation,
+        expected_run_revision: request.expected_run_revision,
+        expected_plan_digest: request.expected_plan_digest,
+        mode: request.mode,
+        idempotency_key: format!("group-archive-{}", &digest[..32]),
+    };
+    execute_group_cleanup_operation(context, main_session_id, cleanup_request, tmux_bin, true)
+}
+
+fn execute_group_cleanup_operation(
+    context: &CliContext,
+    main_session_id: &str,
+    request: GroupCleanupRequest,
+    tmux_bin: PathBuf,
+    archive: bool,
+) -> Result<GroupCleanupExecution, CliError> {
     let requested_main_session_id = main_session_id.to_string();
     validate_group_cleanup_request(&requested_main_session_id, &request)?;
     let request_digest = group_cleanup_request_digest(&request);
@@ -22395,7 +22458,18 @@ pub(crate) fn execute_group_cleanup(
             context,
             &format!("worker_delete_pending:{}", worker_plan.assignment_id),
         )?;
-        match delete_session(context, &worker.session_id, tmux_bin.clone()) {
+        let deletion = if archive {
+            crate::archive_session_with_expected_incarnation(
+                context,
+                &worker.session_id,
+                tmux_bin.clone(),
+                &worker.session_incarnation,
+            )
+            .map(|(_, deleted)| deleted)
+        } else {
+            delete_session(context, &worker.session_id, tmux_bin.clone())
+        };
+        match deletion {
             Ok(deleted) => {
                 interrupt_group_cleanup_for_test(
                     context,
@@ -22659,7 +22733,18 @@ pub(crate) fn execute_group_cleanup(
         ),
     )?;
     interrupt_group_cleanup_for_test(context, "main_delete_pending")?;
-    let main_deleted = match delete_session(context, main_session_id, tmux_bin) {
+    let main_deletion = if archive {
+        crate::archive_session_with_expected_incarnation(
+            context,
+            main_session_id,
+            tmux_bin,
+            &incarnation,
+        )
+        .map(|(_, deleted)| deleted)
+    } else {
+        delete_session(context, main_session_id, tmux_bin)
+    };
+    let main_deleted = match main_deletion {
         Ok(deleted) => {
             interrupt_group_cleanup_for_test(context, "main_deleted_uncheckpointed")?;
             deleted

@@ -12236,6 +12236,63 @@ where
     Ok((prepared, deleted))
 }
 
+fn prepare_session_archive(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<provider_history::PendingArchive, CliError> {
+    let provider_resume = record.provider_resume.as_ref().ok_or_else(|| {
+        CliError::data(
+            "provider-session-unavailable",
+            "session does not have a captured provider session id",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let agent_profile = session_agent_profile(record).map(str::to_string);
+    let archive = provider_history::ArchivedSession {
+        schema_version: "agent-session.history-archive.v1".to_string(),
+        history_id: provider_history::stable_history_id(
+            &provider_resume.provider,
+            agent_profile.as_deref(),
+            &provider_resume.session_id,
+        ),
+        provider: provider_resume.provider.clone(),
+        provider_session_id: provider_resume.session_id.clone(),
+        agent_profile,
+        title: record.title.clone(),
+        cwd: record.cwd.clone(),
+        created_at: record.created_at.clone(),
+        updated_at: record.updated_at.clone(),
+        archived_at: jiff::Timestamp::now().to_string(),
+    };
+    provider_history::write_archive(
+        &provider_history::archive_root(&context.state_dir),
+        &archive,
+    )
+    .map_err(|_| {
+        CliError::runtime(
+            "history-archive-write-failed",
+            "failed to write session archive metadata",
+            Some(json!({ "id": record.id })),
+        )
+    })
+}
+
+pub(crate) fn archive_session_with_expected_incarnation(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    expected_session_incarnation: &str,
+) -> Result<(provider_history::ArchivedSession, DeleteResult), CliError> {
+    let (pending_archive, deleted) = delete_session_with_expected_incarnation_and_prepare(
+        context,
+        id,
+        tmux_bin,
+        expected_session_incarnation,
+        |record| prepare_session_archive(context, record),
+    )?;
+    Ok((pending_archive.commit(), deleted))
+}
+
 fn delete_session_for_terminal_assignment(
     context: &CliContext,
     id: &str,
