@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `c7c28df187cb5cc3d197dcb2f892db94eb77c7c59af3bf1244974699e898c5f9`
+- Cargo.lock SHA256: `8bf77c500844d4f5dcdd368c869b5674ca03159e3d292528d3d9722848cbe904`
 - Third-party crates (`source != null`): 496
 
 ## Notice Extraction Policy
@@ -1431,7 +1431,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE`
 
-### indexmap 2.14.0
+### indexmap 2.14.1
 
 - License: `Apache-2.0 OR MIT`
 - Source: `crates.io`
@@ -1500,21 +1500,21 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### jaq-core 3.1.0
+### jaq-core 3.1.1
 
 - License: `MIT`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jaq-json 2.0.2
+### jaq-json 2.0.3
 
 - License: `MIT`
 - Source: `crates.io`
 - Notice files: No explicit NOTICE file discovered.
 - License file reference: none declared
 
-### jaq-std 3.0.2
+### jaq-std 3.0.3
 
 - License: `MIT`
 - Source: `crates.io`
@@ -3629,7 +3629,7 @@ This file documents third-party notice-file discovery for Rust crates used by th
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
 
-### uuid 1.25.0
+### uuid 1.26.0
 
 - License: `Apache-2.0 OR MIT`
 - Source: `crates.io`

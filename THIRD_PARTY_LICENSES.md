@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `c7c28df187cb5cc3d197dcb2f892db94eb77c7c59af3bf1244974699e898c5f9`
+- Cargo.lock SHA256: `8bf77c500844d4f5dcdd368c869b5674ca03159e3d292528d3d9722848cbe904`
 - Third-party crates (`source != null`): 496
 - Workspace crates (`source == null`, excluded below): 46
 
@@ -217,7 +217,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | image | 0.25.10 | MIT OR Apache-2.0 | crates.io |
 | image-webp | 0.2.4 | MIT OR Apache-2.0 | crates.io |
 | imagesize | 0.15.0 | MIT | crates.io |
-| indexmap | 2.14.0 | Apache-2.0 OR MIT | crates.io |
+| indexmap | 2.14.1 | Apache-2.0 OR MIT | crates.io |
 | indicatif | 0.18.6 | MIT | crates.io |
 | inotify | 0.11.4 | ISC | crates.io |
 | inotify-sys | 0.1.8 | ISC | crates.io |
@@ -225,9 +225,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | is_executable | 1.0.6 | MIT OR Apache-2.0 | crates.io |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | crates.io |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | crates.io |
-| jaq-core | 3.1.0 | MIT | crates.io |
-| jaq-json | 2.0.2 | MIT | crates.io |
-| jaq-std | 3.0.2 | MIT | crates.io |
+| jaq-core | 3.1.1 | MIT | crates.io |
+| jaq-json | 2.0.3 | MIT | crates.io |
+| jaq-std | 3.0.3 | MIT | crates.io |
 | jiff | 0.2.35 | Unlicense OR MIT | crates.io |
 | jiff-core | 0.1.0 | Unlicense OR MIT | crates.io |
 | jiff-static | 0.2.35 | Unlicense OR MIT | crates.io |
@@ -474,7 +474,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | usvg | 0.48.1 | Apache-2.0 OR MIT | crates.io |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | crates.io |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | crates.io |
-| uuid | 1.25.0 | Apache-2.0 OR MIT | crates.io |
+| uuid | 1.26.0 | Apache-2.0 OR MIT | crates.io |
 | uuid-simd | 0.8.0 | MIT | crates.io |
 | valuable | 0.1.1 | MIT | crates.io |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | crates.io |
