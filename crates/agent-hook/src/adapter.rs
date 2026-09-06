@@ -1502,6 +1502,8 @@ mod tests {
                 config_digest: "sha256:config".to_string(),
                 policy_digest: "sha256:policy".to_string(),
                 recovery_applied: false,
+                enforcement: None,
+                downgraded_by: None,
                 provider_output: Some(json!({
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
@@ -1549,6 +1551,8 @@ mod tests {
                     config_digest: "sha256:config".to_string(),
                     policy_digest: "sha256:policy".to_string(),
                     recovery_applied: false,
+                    enforcement: None,
+                    downgraded_by: None,
                     provider_output: Some(provider_output.clone()),
                 };
 
@@ -1576,6 +1580,8 @@ mod tests {
                 config_digest: "sha256:config".to_string(),
                 policy_digest: "sha256:policy".to_string(),
                 recovery_applied: false,
+                enforcement: None,
+                downgraded_by: None,
                 provider_output: Some(json!({
                     "additionalContext": "first context",
                     "hookSpecificOutput": {

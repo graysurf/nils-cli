@@ -201,6 +201,8 @@ pub(crate) fn degraded_decision(
             .map(|loaded| loaded.policy_digest.clone())
             .unwrap_or_default(),
         recovery_applied: false,
+        enforcement: None,
+        downgraded_by: None,
         provider_output: None,
     };
     Record::new("coordination", lane_code, Severity::Warn)
@@ -258,6 +260,8 @@ pub(crate) fn terminal_exit_for_error(
         config_digest: String::new(),
         policy_digest: String::new(),
         recovery_applied: false,
+        enforcement: None,
+        downgraded_by: None,
         provider_output: None,
     };
     Record::new("stop", STOP_REENTRY_TERMINAL, Severity::Warn)
@@ -432,6 +436,8 @@ mod tests {
             config_digest: "sha256:config".to_string(),
             policy_digest: "sha256:policy".to_string(),
             recovery_applied: false,
+            enforcement: None,
+            downgraded_by: None,
             provider_output: Some(serde_json::json!({"decision": "block"})),
         }
     }

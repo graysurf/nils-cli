@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::HookError;
 use crate::model::{DecisionAction, NormalizedRequest, OperationEffectClass};
-use crate::policy_parity::DshCapabilityGroup;
+use crate::policy_parity::{DshCapabilityGroup, DshTier};
 
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_PARSE_DEPTH: usize = 5;
@@ -49,11 +49,13 @@ impl Outcome {
         }
     }
 
+    /// A denial. Tier B seams always carry their remediation so the model is
+    /// told the governed replacement, not only the code.
     fn block(group: DshCapabilityGroup) -> Self {
         Self {
             action: DecisionAction::Block,
             code: group.as_str().to_string(),
-            context: None,
+            context: group.remediation().map(str::to_string),
         }
     }
 
@@ -81,31 +83,129 @@ pub(crate) fn evaluate(
     effect: OperationEffectClass,
     run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
 ) -> Result<Outcome, HookError> {
-    let invocations = if command_dependent(group, request) {
-        let Some(command) = command(raw) else {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
+    let outcome = evaluate_group(group, request, raw, effect, run_child)?;
+    debug_assert!(
+        group.tier() != DshTier::Reminder || outcome.action != DecisionAction::Block,
+        "Tier C group {} must never block",
+        group.as_str()
+    );
+    Ok(outcome)
+}
+
+/// Outcome of an unclassifiable shell command for one group.
+///
+/// Tier A groups keep failing closed. A Tier B group blocks only when one of
+/// its subject executables appears in the raw command (or the command cannot
+/// be read at all); otherwise it explains the retry as context. Tier C groups
+/// never block: the label reminder stays silent and the other reminders carry
+/// the retry guidance as context.
+fn unclassifiable(
+    group: DshCapabilityGroup,
+    command: Option<&str>,
+    guidance: &'static str,
+) -> Outcome {
+    match group.tier() {
+        DshTier::Integrity => Outcome::block_with_context(group, guidance),
+        DshTier::GovernedSeam => {
+            if command.is_none_or(|command| names_subject(group, command)) {
+                Outcome::block_with_context(group, guidance)
+            } else {
+                Outcome::context(group, guidance)
+            }
+        }
+        DshTier::Reminder => {
+            if group == DshCapabilityGroup::ForgeLabelReminder {
                 Outcome::allow(group)
             } else {
-                Outcome::block_with_context(group, SHELL_COMMAND_INVALID_CONTEXT)
-            });
+                Outcome::context(group, guidance)
+            }
+        }
+    }
+}
+
+fn python_advisory(group: DshCapabilityGroup, manager: &str) -> Outcome {
+    Outcome::context(
+        group,
+        format!(
+            "This project is managed by {manager}, so a bare `python` interpreter may not see its dependencies. Prefer `uv run python ...` or the project interpreter at `.venv/bin/python`; the command itself is not blocked."
+        ),
+    )
+}
+
+/// Whether an unclassifiable raw command names what a Tier B seam protects.
+///
+/// Delivery seams are keyed by their executable (`git`, `gh`, `glab`,
+/// `semantic-commit`); the two content seams are keyed by the thing they
+/// protect, an agent-memory path or a machine-local path, so `perl -pi` on a
+/// memory note still fails closed while `sed -i` on an ordinary file does not.
+fn names_subject(group: DshCapabilityGroup, command: &str) -> bool {
+    match group {
+        DshCapabilityGroup::BlockProjectMemoryWrite => command
+            .split(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`' | '$' | '"' | '\''
+                    )
+            })
+            .any(|word| word_mentions(word, &is_memory_note_path)),
+        DshCapabilityGroup::PortablePathsScan => nonportable_machine_path(command),
+        _ => mentions_subject(command, group.shell_subjects()),
+    }
+}
+
+/// Whether any word of the raw command names one of the subjects, comparing
+/// the basename of each shell word so `/usr/bin/git` and `git` both count.
+fn mentions_subject(command: &str, subjects: &[&str]) -> bool {
+    !subjects.is_empty()
+        && command
+            .split(|byte: char| {
+                byte.is_whitespace()
+                    || matches!(
+                        byte,
+                        ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`' | '$' | '"' | '\'' | '='
+                    )
+            })
+            .filter(|word| !word.is_empty())
+            .any(|word| subjects.contains(&basename(word)))
+}
+
+fn evaluate_group(
+    group: DshCapabilityGroup,
+    request: &NormalizedRequest,
+    raw: &[u8],
+    effect: OperationEffectClass,
+    run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
+) -> Result<Outcome, HookError> {
+    let invocations = if command_dependent(group, request) {
+        let Some(command) = command(raw) else {
+            return Ok(unclassifiable(group, None, SHELL_COMMAND_INVALID_CONTEXT));
         };
         let invocations = parse_invocations(&command);
+        if group == DshCapabilityGroup::BlockDirectPython {
+            // A bare interpreter is itself a command consumer, so it is always
+            // "unclassifiable" shell; the reminder is about the interpreter,
+            // not about nesting, and it names the manager when one is found.
+            if let Some(manager) = direct_python(&invocations, request) {
+                return Ok(python_advisory(group, manager));
+            }
+        }
         if invocations
             .iter()
             .any(|invocation| invocation.unresolved_nested)
         {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
-                Outcome::allow(group)
-            } else {
-                Outcome::block_with_context(group, SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT)
-            });
+            return Ok(unclassifiable(
+                group,
+                Some(&command),
+                SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT,
+            ));
         }
         if sequential_shell_context_unknown(&invocations) {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
-                Outcome::allow(group)
-            } else {
-                Outcome::block_with_context(group, SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT)
-            });
+            return Ok(unclassifiable(
+                group,
+                Some(&command),
+                SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT,
+            ));
         }
         invocations
     } else {
@@ -115,7 +215,12 @@ pub(crate) fn evaluate(
         DshCapabilityGroup::BlockDirectGitCommit => direct_git_commit(&invocations, run_child)?,
         DshCapabilityGroup::BlockDirectGitWorktree => direct_git_worktree(&invocations),
         DshCapabilityGroup::BlockDirectPrCreate => direct_pr_create(&invocations),
-        DshCapabilityGroup::BlockDirectPython => direct_python(&invocations, request),
+        DshCapabilityGroup::BlockDirectPython => {
+            return Ok(match direct_python(&invocations, request) {
+                Some(manager) => python_advisory(group, manager),
+                None => Outcome::allow(group),
+            });
+        }
         DshCapabilityGroup::SemanticCommitBodyGate => {
             if request.matcher.as_deref() == Some(GOVERNED_COMMIT_TOOL) {
                 !governed_commit_arguments_valid(raw)
@@ -2290,13 +2395,16 @@ fn api_create(words: &[String], endpoint: &str) -> bool {
     }) && method_post
 }
 
-fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> bool {
-    let managed = request
+/// Name of the Python manager detected in the binding roots when a bare
+/// interpreter is invoked outside it; `None` when the command is unaffected.
+fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> Option<&'static str> {
+    let manager = request
         .binding_roots
         .iter()
-        .any(|root| python_manager(root));
-    managed
-        && invocations.iter().any(|invocation| {
+        .find_map(|root| python_manager(root))?;
+    invocations
+        .iter()
+        .any(|invocation| {
             invocation.words.first().is_some_and(|word| {
                 let name = basename(word);
                 (name == "python"
@@ -2308,17 +2416,23 @@ fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> boo
                     && !word.contains("/venv/bin/")
             })
         })
+        .then_some(manager)
 }
 
-fn python_manager(start: &Path) -> bool {
-    start.ancestors().any(|root| {
-        root.join("uv.lock").exists()
-            || root.join(".venv/pyvenv.cfg").exists()
-            || root.join("venv/pyvenv.cfg").exists()
+fn python_manager(start: &Path) -> Option<&'static str> {
+    start.ancestors().find_map(|root| {
+        if root.join("uv.lock").exists()
             || fs::read_to_string(root.join("pyproject.toml")).is_ok_and(|text| {
                 text.lines()
                     .any(|line| line.trim_start().starts_with("[tool.uv"))
             })
+        {
+            Some("uv")
+        } else if root.join(".venv/pyvenv.cfg").exists() || root.join("venv/pyvenv.cfg").exists() {
+            Some("a venv")
+        } else {
+            None
+        }
     })
 }
 

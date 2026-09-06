@@ -120,8 +120,11 @@ above.
   Both return `agent-hook.workspace-recovery.result.v1` inside the matching
   `cli.agent-hook.workspace-recovery-<command>.v1` service envelope.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
-  optional bounded context or replacement, shadow observations, and config /
-  policy digests.
+  optional bounded context or replacement, shadow observations, config /
+  policy digests, and two optional audit fields: `enforcement` (`block`,
+  `advise`, or `context`; absent for a plain allow) and `downgraded_by` (the
+  `<config path> [overrides.<rule id>]` of the `advise` override that
+  projected a block; absent when nothing was downgraded).
 - `agent-hook.trace.v1`: timing, rule IDs, disposition classes, and digests;
   never raw payload, paths, identities, message content, or capabilities.
 - `agent-hook.setup-plan.v2`: product, install/remove operation, owned
@@ -909,8 +912,14 @@ branch, push, and fetch shapes are classified against the resolved `git -C` or
 semantic `--repo` target. `fetch --update-head-ok`, protected fetch
 destinations, and stdin/server-driven ref-update plumbing are denied. A shell
 builtin or assignment that can retarget cwd, exported variables, tracing hooks,
-command lookup, or aliases before a later command makes every
-command-dependent group fail closed. Git command-consuming forms such as
+command lookup, or aliases before a later command makes the command
+unclassifiable. An unclassifiable, invalid, or nested-unresolved command fails
+closed for every Tier A group and for a Tier B group whose subject appears in
+the raw command (`git` for the commit, worktree, and default-delivery seams,
+`gh`/`glab` for pull-request creation, `semantic-commit` for the body gate, an
+agent-memory path for the project-memory seam, a machine-local path for the
+portable-paths seam) or whose command field cannot be read at all; every other
+Tier B or Tier C group explains the retry as context. Git command-consuming forms such as
 rebase exec and submodule foreach, plus explicit transport-helper selection,
 are rejected rather than partially parsed.
 Exact abort/quit recovery and owned delivery CLIs remain admissible.
@@ -1131,11 +1140,54 @@ Ingress registration is not capability health. When the selected policy binds
 through the override or `PATH` before reporting an otherwise converged provider as
 healthy, and fails with `activity-helper-unresolvable` when it cannot.
 
-Rule modes are `enforce`, `shadow`, and `disabled`. Shadow evaluation records
-only a redacted observation: it cannot affect exit status/output authority,
-rewrite input, mutate capability/rule/session state, perform reclaim/adoption,
-or consume recovery. Policy order and results are deterministic across
-providers for overlapping capabilities.
+Rule modes are `enforce`, `advise`, `shadow`, and `disabled`, with authority
+3, 2, 1, 0. `advise` evaluates exactly like `enforce`, with the same side
+effects and child budget, but projects a `Block` outcome to `Context` carrying
+the same code, the rule's remediation (a Tier B group's governed replacement,
+or the shell retry guidance), and one final line `downgraded to advise by
+<config path> [overrides.<rule id>]`. Allow and Context outcomes are unchanged.
+Shadow evaluation records only a redacted observation: it cannot affect exit
+status/output authority, rewrite input, mutate capability/rule/session state,
+perform reclaim/adoption, or consume recovery. Policy order and results are
+deterministic across providers for overlapping capabilities.
+
+`dsh.policy.v1` groups carry one of three enforcement tiers, frozen with the
+capability-group fixture and reported per rule by `inventory` as `tier` and
+`enforcement_default`:
+
+- `integrity` (Tier A: `owner-unclaimed`, `semantic-conflict`,
+  `operation-lifecycle`, `agent-scope-lock-guard`, `checkout-lease-guard`,
+  `mcp-secret-scan`, `finish-line-record`) blocks and must be declared
+  `enforce`, `closed`, and `locked`; anything else fails with
+  `tier-a-rule-not-locked` (or the older `coordination-rule-not-locked` for the
+  operation lifecycle).
+- `governed-seam` (Tier B: `block-direct-git-commit`,
+  `block-direct-git-worktree`, `block-direct-pr-create`,
+  `block-unsafe-default-delivery`, `semantic-commit-body-gate`,
+  `block-project-memory-write`, `portable-paths-scan`, `pre-edit-intent-gate`)
+  blocks by default and must be `closed` and `locked` or `downgrade-only`; a
+  `free` declaration fails with `tier-b-rule-not-downgradable`. Every Tier B
+  denial carries remediation naming the governed replacement. A config
+  override to `advise` is the only downgrade runtime-kit writes.
+- `reminder` (Tier C: `agent-activity`, `block-direct-python`,
+  `forge-label-reminder`, `memory-write-principle-reminder`,
+  `session-start-healthcheck`, `skill-usage-reminder`,
+  `stop-pre-pr-reminder`, `user-prompt-agent-memory`) yields context only,
+  must be `locked` (`tier-c-rule-not-locked`), and its group evaluator never
+  returns a block (asserted in debug builds; the identity-incomplete activity
+  failure in the dispatcher is not a group outcome). `block-direct-python` is
+  therefore advisory: under a uv or venv project it names the manager and the
+  expected interpreter instead of denying.
+
+An `advise` override is rejected with `rule-override-advise-unsupported` when
+one of the rule's product events cannot render context.
+
+A DSH `Context` outcome is emitted once per session: when the same
+`(session id, rule id, context digest)` was already emitted, the outcome
+becomes an allow whose code carries the `:advisory-repeated` suffix. The
+markers live under the subject's agent-docs state home in
+`agent-hook/dsh-advisory-dedupe/<sha256(session)>/`; when that directory cannot
+be created privately the reminder keeps rendering (fail open, reminders only).
 
 Ordinary selected rules are evaluated and aggregated before the typed session
 coordination phase. A blocking `PreToolUse` aggregate returns without invoking
@@ -1164,8 +1216,8 @@ and every non-bootstrap request remain subject to ordinary owner-liveness.
 Override classes:
 
 - `locked`: user config cannot change mode, priority, posture, or parameters.
-- `downgrade-only`: config may move `enforce -> shadow -> disabled`, never in
-  the other direction and never change typed parameters.
+- `downgrade-only`: config may move `enforce -> advise -> shadow -> disabled`,
+  never in the other direction and never change typed parameters.
 - `free`: config may choose any mode but still cannot add a command/capability
   or change the policy rule identity.
 

@@ -663,6 +663,7 @@ mod tests {
             },
             config_digest: "sha256:config".to_string(),
             policy_digest: "sha256:policy".to_string(),
+            config_path: directory.join("config.toml"),
         };
         let request = NormalizedRequest {
             schema_version: "agent-hook.normalized-request.v1".to_string(),

@@ -17,8 +17,8 @@ use crate::degradation::StopCoordinationOutcome;
 use crate::error::HookError;
 use crate::liveness;
 use crate::model::{
-    Capability, DECISION_VERSION, DecisionAction, DecisionReason, FailurePosture, LoadedPolicy,
-    NormalizedDecision, NormalizedRequest, OperationEffectClass, Product, RuleMode,
+    Capability, DECISION_VERSION, DecisionAction, DecisionReason, Enforcement, FailurePosture,
+    LoadedPolicy, NormalizedDecision, NormalizedRequest, OperationEffectClass, Product, RuleMode,
     ShadowObservation, TimeoutPosture,
 };
 
@@ -245,7 +245,7 @@ pub fn prepare<'a>(
         .filter(|prepared| !prepared.recovery)
         .filter(|prepared| !coordination_capability(&prepared.rule.capability))
         .filter(|prepared| match prepared.mode {
-            RuleMode::Enforce => matches!(
+            RuleMode::Enforce | RuleMode::Advise => matches!(
                 prepared.rule.capability,
                 Capability::SessionActivity { .. }
                     | Capability::ExecutionReadOnly { .. }
@@ -270,7 +270,7 @@ pub fn prepare<'a>(
 
     let reason_count = rules
         .iter()
-        .filter(|prepared| prepared.mode == RuleMode::Enforce)
+        .filter(|prepared| prepared.mode.executes())
         .count();
     if reason_count > MAX_REASONS {
         return Err(HookError::data(
@@ -384,6 +384,8 @@ fn evaluate_with_io(
     let mut enforced = Vec::new();
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
+    let mut advised = BTreeSet::new();
+    let mut downgraded_by = None;
     let mut execution_budgets = ExecutionBudgets::new();
     let activity_recovery_candidate = exact_capability_recovery_candidate_for_session_coordination(
         request,
@@ -391,7 +393,7 @@ fn evaluate_with_io(
         prepared.session_coordination.is_some(),
     );
     let operation_effect = if prepared.rules.iter().any(|prepared_rule| {
-        prepared_rule.mode == RuleMode::Enforce
+        prepared_rule.mode.executes()
             && (prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
                 || activity_capability(&prepared_rule.rule.capability)
                 || matches!(
@@ -579,13 +581,31 @@ fn evaluate_with_io(
                 &error,
             ),
         };
+        let mut outcome = outcome;
+        if prepared_rule.mode == RuleMode::Advise && outcome.action == DecisionAction::Block {
+            let source = format!("{} [overrides.{}]", loaded.config_path.display(), rule.id);
+            outcome = advise_projection(outcome, &source);
+            advised.insert(rule.id.clone());
+            downgraded_by.get_or_insert(source);
+        }
+        if matches!(rule.capability, Capability::DshPolicy { .. }) {
+            dedupe_dsh_advisory(request, &rule.id, &mut outcome);
+        }
         enforced.push((rule.id.clone(), outcome));
         if let Some(code) = activity_lane_reason {
             enforced.push((rule.id.clone(), simple(DecisionAction::Warn, code)));
         }
     }
 
-    let decision = aggregate(loaded, request, enforced, shadow, recovery_applied)?;
+    let decision = aggregate(
+        loaded,
+        request,
+        enforced,
+        shadow,
+        recovery_applied,
+        &advised,
+        downgraded_by,
+    )?;
     apply_session_coordination(
         Some(loaded),
         decision,
@@ -1408,12 +1428,83 @@ fn simple(action: DecisionAction, code: &str) -> RuleOutcome {
     }
 }
 
+/// Project a blocked outcome to context under `advise`.
+///
+/// The code is preserved so audits and runtime-kit keep the same identity; the
+/// text is the rule's own remediation (or its shell guidance) followed by one
+/// line naming the config override that downgraded it.
+fn advise_projection(outcome: RuleOutcome, source: &str) -> RuleOutcome {
+    let remediation = outcome
+        .context
+        .filter(|context| !context.trim().is_empty())
+        .unwrap_or_else(|| format!("{} would have been blocked.", outcome.code));
+    RuleOutcome {
+        action: DecisionAction::Context,
+        code: outcome.code,
+        context: Some(format!("{remediation}\ndowngraded to advise by {source}")),
+        replacement: None,
+        provider_output: None,
+    }
+}
+
+/// Emit each DSH advisory once per session.
+///
+/// A `Context` outcome whose `(session, rule id, context digest)` was already
+/// emitted in this session becomes an allow with a `:advisory-repeated` code.
+/// State lives under the subject's agent-docs state home; when that directory
+/// cannot be used privately the reminder simply keeps rendering (fail open,
+/// reminders only).
+fn dedupe_dsh_advisory(request: &NormalizedRequest, rule_id: &str, outcome: &mut RuleOutcome) {
+    use sha2::{Digest, Sha256};
+
+    if request.product != Product::Dsh || outcome.action != DecisionAction::Context {
+        return;
+    }
+    let (Some(subject), Some(context)) = (request.dsh_subject.as_ref(), outcome.context.as_deref())
+    else {
+        return;
+    };
+    let hex = |bytes: &[u8]| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let directory = subject
+        .agent_docs_state_home
+        .join("agent-hook/dsh-advisory-dedupe")
+        .join(hex(subject.session_id.as_bytes()));
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return;
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).is_err()
+    {
+        return;
+    }
+    let marker = directory.join(hex(format!("{rule_id}\n{context}").as_bytes()));
+    if marker.exists() {
+        *outcome = simple(
+            DecisionAction::Allow,
+            &format!("{}:advisory-repeated", outcome.code),
+        );
+        return;
+    }
+    let _ = nils_common::fs::write_atomic(&marker, b"", 0o600);
+}
+
 fn aggregate(
     loaded: &LoadedPolicy,
     request: &NormalizedRequest,
     outcomes: Vec<(String, RuleOutcome)>,
     shadow: Vec<ShadowObservation>,
     recovery_applied: bool,
+    advised: &BTreeSet<String>,
+    downgraded_by: Option<String>,
 ) -> Result<NormalizedDecision, HookError> {
     let mut action = DecisionAction::Allow;
     let mut reasons = Vec::new();
@@ -1479,6 +1570,25 @@ fn aggregate(
         }
         Some(joined)
     };
+    let enforcement = match action {
+        DecisionAction::Block => Some(Enforcement::Block),
+        DecisionAction::Context => Some(
+            if reasons
+                .iter()
+                .any(|reason| reason.disposition == "context" && advised.contains(&reason.rule_id))
+            {
+                Enforcement::Advise
+            } else {
+                Enforcement::Context
+            },
+        ),
+        DecisionAction::Allow | DecisionAction::Warn | DecisionAction::Transform => None,
+    };
+    let downgraded_by = downgraded_by.filter(|_| {
+        reasons
+            .iter()
+            .any(|reason| reason.disposition == "context" && advised.contains(&reason.rule_id))
+    });
     Ok(NormalizedDecision {
         schema_version: DECISION_VERSION.to_string(),
         request_id: request.request_id.clone(),
@@ -1492,6 +1602,8 @@ fn aggregate(
         config_digest: loaded.config_digest.clone(),
         policy_digest: loaded.policy_digest.clone(),
         recovery_applied,
+        enforcement,
+        downgraded_by,
         provider_output,
     })
 }
@@ -2338,6 +2450,7 @@ mod tests {
             },
             config_digest: "sha256:config".to_string(),
             policy_digest: "sha256:policy".to_string(),
+            config_path: PathBuf::from("/config.toml"),
         }
     }
 

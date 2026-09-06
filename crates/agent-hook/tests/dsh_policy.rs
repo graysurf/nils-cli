@@ -64,6 +64,67 @@ fn request(fixture: &Fixture, tool: &str, arguments: Value) -> String {
     request_for_session(fixture, "dsh-session-1", tool, arguments)
 }
 
+/// Assert the tier contract for one unclassifiable or unsafe shell command.
+///
+/// Tier A groups fail closed. A Tier B group blocks only when one of its
+/// subject executables is named in the command (or the command field cannot be
+/// read at all); otherwise it explains the retry as context. Tier C reminders
+/// never block: they yield context carrying the group's code.
+fn assert_shell_outcome(
+    output: &nils_test_support::cmd::CmdOutput,
+    group: &str,
+    command: Option<&str>,
+) {
+    let subjects: &[&str] = match group {
+        "block-direct-git-commit"
+        | "block-direct-git-worktree"
+        | "block-unsafe-default-delivery" => &["git"],
+        "block-direct-pr-create" => &["gh", "glab"],
+        "semantic-commit-body-gate" => &["semantic-commit"],
+        _ => &[],
+    };
+    let tier_a = matches!(group, "checkout-lease-guard" | "mcp-secret-scan");
+    let tier_c = matches!(
+        group,
+        "block-direct-python" | "forge-label-reminder" | "memory-write-principle-reminder"
+    );
+    let names_subject = command.is_none_or(|command| match group {
+        "block-project-memory-write" => {
+            command.contains("/.config/agent-memory/")
+                || command.contains("/.codex/memories/")
+                || (command.contains("/.claude/projects/") && command.contains("/memory/"))
+        }
+        "portable-paths-scan" => command.contains("/Users/") || command.contains("/home/"),
+        _ => command
+            .split(|ch: char| ch.is_whitespace() || ";|&()<>`$\"'=".contains(ch))
+            .filter(|word| !word.is_empty())
+            .any(|word| subjects.contains(&word.rsplit('/').next().unwrap_or(word))),
+    });
+    let envelope = output.stdout_json();
+    if tier_a || (!tier_c && names_subject) {
+        assert_eq!(
+            output.code,
+            1,
+            "group={group} command={command:?} envelope={}",
+            output.stdout_text()
+        );
+        assert_eq!(envelope["data"]["action"], "block", "group={group}");
+    } else {
+        assert_eq!(
+            output.code,
+            0,
+            "group={group} command={command:?} envelope={}",
+            output.stdout_text()
+        );
+        assert_eq!(
+            envelope["data"]["action"], "context",
+            "group={group} command={command:?}"
+        );
+        assert_eq!(envelope["data"]["reasons"][0]["code"], group);
+        assert_eq!(envelope["data"]["reasons"][0]["disposition"], "context");
+    }
+}
+
 fn request_for_session(
     fixture: &Fixture,
     session_id: &str,
@@ -1485,14 +1546,24 @@ fn deterministic_command_groups_block_direct_and_nested_unsafe_forms() {
             &["dispatch", "--product", "dsh", "--format", "json"],
             Some(&request(&fixture, "bash", json!({"command": command}))),
         );
-        assert_eq!(
-            output.code,
-            1,
-            "group={group} stderr={}",
-            output.stderr_text()
-        );
         let envelope = output.stdout_json();
-        assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        if group == "block-direct-python" {
+            // Tier C: the interpreter reminder names the manager and never blocks.
+            assert_eq!(output.code, 0, "command={command} envelope={envelope}");
+            assert_eq!(envelope["data"]["action"], "context", "command={command}");
+            assert_eq!(
+                envelope["data"]["enforcement"], "context",
+                "command={command}"
+            );
+        } else {
+            assert_eq!(
+                output.code,
+                1,
+                "group={group} stderr={}",
+                output.stderr_text()
+            );
+            assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        }
         assert_eq!(envelope["data"]["reasons"][0]["code"], group);
     }
 }
@@ -1525,13 +1596,7 @@ fn command_and_process_substitutions_fail_closed_for_every_command_group() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_outcome(&output, group, Some(&command));
         }
     }
 }
@@ -1567,13 +1632,7 @@ fn command_consumers_fail_closed_for_every_command_group() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_outcome(&output, group, Some(&command));
         }
     }
 }
@@ -1603,13 +1662,7 @@ fn general_purpose_interpreters_fail_closed_for_every_command_group() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_outcome(&output, group, Some(command));
         }
     }
 }
@@ -1739,27 +1792,33 @@ fn command_dependent_groups_fail_closed_when_parsing_is_indeterminate() {
     let oversized = format!("printf {}", "x".repeat(256 * 1024));
 
     for group in groups {
-        let fixture = Fixture::new(&policy(group, "dsh"));
-        for arguments in [
-            json!({}),
-            json!({"command": "'unterminated"}),
-            json!({"command": nested}),
-            json!({"command": oversized}),
-            json!({"command": "if true; then git commit -m test; fi"}),
-            json!({"command": "(git commit -m test)"}),
-            json!({"command": "runner=git; \"$runner\" commit -m test"}),
+        for (arguments, readable) in [
+            (json!({}), None),
+            (json!({"command": "'unterminated"}), Some("'unterminated")),
+            (json!({"command": nested}), Some(nested.as_str())),
+            // Oversized commands cannot be read, so every Tier B seam blocks.
+            (json!({"command": oversized}), None),
+            (
+                json!({"command": "if true; then git commit -m test; fi"}),
+                Some("if true; then git commit -m test; fi"),
+            ),
+            (
+                json!({"command": "(git commit -m test)"}),
+                Some("(git commit -m test)"),
+            ),
+            (
+                json!({"command": "runner=git; \"$runner\" commit -m test"}),
+                Some("runner=git; \"$runner\" commit -m test"),
+            ),
         ] {
+            // One fixture per command: a repeated context in one session is
+            // deduplicated to allow by design.
+            let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", arguments)),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_outcome(&output, group, readable);
         }
     }
 }
@@ -1801,13 +1860,7 @@ fn command_dependent_groups_reject_inline_execution_context_retargeting() {
             &["dispatch", "--product", "dsh", "--format", "json"],
             Some(&request(&fixture, "bash", json!({"command": command}))),
         );
-        assert_eq!(
-            output.code,
-            1,
-            "group={group} command={command} envelope={}",
-            output.stdout_text()
-        );
-        assert_eq!(output.stdout_json()["data"]["action"], "block");
+        assert_shell_outcome(&output, group, Some(command));
     }
 }
 
@@ -1836,22 +1889,18 @@ fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
     ];
 
     for group in groups {
-        let fixture = Fixture::new(&policy(group, "dsh"));
-        if group == "block-direct-python" {
-            fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
-        }
         for command in commands {
+            // One fixture per command: a repeated context in one session is
+            // deduplicated to allow by design.
+            let fixture = Fixture::new(&policy(group, "dsh"));
+            if group == "block-direct-python" {
+                fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
+            }
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_outcome(&output, group, Some(command));
         }
     }
 }
@@ -1883,18 +1932,22 @@ fn sequential_shell_state_denial_explains_one_immediate_retry_path() {
         .as_array()
         .expect("blocking reasons");
     assert_eq!(reasons.len(), 7);
-    for (reason, expected) in reasons.iter().zip([
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+    // `git` and `gh` are named, so their Tier B seams and the Tier A lease
+    // guard block; the python reminder and the semantic-commit seam (whose
+    // subject is absent) explain the retry as context instead.
+    for (reason, (expected, disposition)) in reasons.iter().zip([
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "block"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ]) {
         assert_eq!(reason["code"], expected);
-        assert_eq!(reason["disposition"], "block");
+        assert_eq!(reason["disposition"], disposition, "{expected}");
     }
+    assert_eq!(decision["data"]["enforcement"], "block");
     let context = decision["data"]["context"]
         .as_str()
         .expect("shell denial guidance");
@@ -3428,13 +3481,22 @@ fn task_3_3_tool_reminders_are_context_only_and_inline_env_cannot_suppress_them(
         "PreToolUse",
         Some("bash"),
     ));
-    for command in [
+    for (index, command) in [
         "forge-cli pr deliver",
         "FORGE_NO_LABELS=1 forge-cli issue create --title test",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Distinct sessions: the same reminder renders once per session.
         let output = labels.run(
             &["dispatch", "--product", "dsh", "--format", "json"],
-            Some(&request(&labels, "bash", json!({"command": command}))),
+            Some(&request_for_session(
+                &labels,
+                &format!("dsh-session-labels-{index}"),
+                "bash",
+                json!({"command": command}),
+            )),
         );
         assert_eq!(
             output.code,

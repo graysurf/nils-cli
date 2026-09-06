@@ -1,4 +1,4 @@
-use agent_hook::policy_parity::{DSH_CAPABILITY_GROUP_SCHEMA_VERSION, DshCapabilityGroup};
+use agent_hook::policy_parity::{DSH_CAPABILITY_GROUP_SCHEMA_VERSION, DshCapabilityGroup, DshTier};
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 
@@ -14,6 +14,7 @@ struct Fixture {
 struct CapabilityFixture {
     id: DshCapabilityGroup,
     migration_task: String,
+    tier: DshTier,
 }
 
 #[test]
@@ -39,6 +40,76 @@ fn dsh_capability_group_schema_matches_the_frozen_migration_fixture() {
             .iter()
             .all(|entry| matches!(entry.migration_task.as_str(), "2.3" | "3.2" | "3.3" | "3.4"))
     );
+    for entry in &fixture.capabilities {
+        assert_eq!(
+            entry.tier,
+            entry.id.tier(),
+            "{} tier drifted from the frozen table",
+            entry.id.as_str()
+        );
+    }
+}
+
+#[test]
+fn every_dsh_capability_group_has_exactly_one_tier_with_the_accepted_defaults() {
+    let integrity = [
+        DshCapabilityGroup::OwnerUnclaimed,
+        DshCapabilityGroup::SemanticConflict,
+        DshCapabilityGroup::OperationLifecycle,
+        DshCapabilityGroup::AgentScopeLockGuard,
+        DshCapabilityGroup::CheckoutLeaseGuard,
+        DshCapabilityGroup::McpSecretScan,
+        DshCapabilityGroup::FinishLineRecord,
+    ];
+    let governed = [
+        DshCapabilityGroup::BlockDirectGitCommit,
+        DshCapabilityGroup::BlockDirectGitWorktree,
+        DshCapabilityGroup::BlockDirectPrCreate,
+        DshCapabilityGroup::BlockUnsafeDefaultDelivery,
+        DshCapabilityGroup::SemanticCommitBodyGate,
+        DshCapabilityGroup::BlockProjectMemoryWrite,
+        DshCapabilityGroup::PortablePathsScan,
+        DshCapabilityGroup::PreEditIntentGate,
+    ];
+    let reminders = [
+        DshCapabilityGroup::ForgeLabelReminder,
+        DshCapabilityGroup::MemoryWritePrincipleReminder,
+        DshCapabilityGroup::SkillUsageReminder,
+        DshCapabilityGroup::StopPrePrReminder,
+        DshCapabilityGroup::UserPromptAgentMemory,
+        DshCapabilityGroup::SessionStartHealthcheck,
+        DshCapabilityGroup::AgentActivity,
+        DshCapabilityGroup::BlockDirectPython,
+    ];
+    assert_eq!(
+        integrity.len() + governed.len() + reminders.len(),
+        DshCapabilityGroup::ALL.len()
+    );
+    for group in DshCapabilityGroup::ALL {
+        let expected = if integrity.contains(&group) {
+            DshTier::Integrity
+        } else if governed.contains(&group) {
+            DshTier::GovernedSeam
+        } else {
+            assert!(reminders.contains(&group), "{} is untiered", group.as_str());
+            DshTier::Reminder
+        };
+        assert_eq!(group.tier(), expected, "{}", group.as_str());
+        assert_eq!(
+            group.remediation().is_some(),
+            group.tier() == DshTier::GovernedSeam,
+            "{}: exactly the Tier B seams carry remediation",
+            group.as_str()
+        );
+        assert!(
+            group.shell_subjects().is_empty() || group.tier() == DshTier::GovernedSeam,
+            "{}: only Tier B groups narrow the shell classification by subject",
+            group.as_str()
+        );
+    }
+    assert_eq!(DshTier::Integrity.enforcement_default(), "block");
+    assert_eq!(DshTier::GovernedSeam.enforcement_default(), "block");
+    assert_eq!(DshTier::Reminder.enforcement_default(), "context");
 }
 
 #[test]
