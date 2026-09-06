@@ -2595,6 +2595,59 @@ fn native_governed_commit_requires_the_exact_linked_worktree_and_pinned_remote_d
 }
 
 #[test]
+fn native_governed_commit_outside_any_repository_is_not_a_default_branch_mutation() {
+    let fixture = Fixture::new(&policy_for_matcher(
+        "block-unsafe-default-delivery",
+        "dsh",
+        "runtime_kit_governed_commit",
+    ));
+    let plain = fixture.state_home.join("plain-notes");
+    fs::create_dir_all(&plain).expect("plain directory");
+    fs::write(plain.join("notes.md"), "notes\n").expect("notes file");
+    assert!(
+        !plain
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists()),
+        "fixture must sit outside every repository"
+    );
+    let arguments = json!({
+        "type": "feat",
+        "subject": "add the notes index",
+        "body_bullets": ["Index the notes so the next reader finds them."],
+        "expected_head": "0123456789abcdef0123456789abcdef01234567",
+    });
+
+    // There is no default branch to protect outside a repository: the seam
+    // admits the call so the runtime can answer with its typed no-repository
+    // result instead of the model seeing a default-branch denial.
+    let admitted = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &plain,
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(admitted.code, 0, "envelope={}", admitted.stdout_text());
+    assert_eq!(admitted.stdout_json()["data"]["action"], "allow");
+
+    // Invalid arguments stay denied wherever the session runs.
+    let invalid = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &plain,
+            "runtime_kit_governed_commit",
+            json!({ "type": "feat", "subject": "x", "body_bullets": [], "expected_head": "abc" }),
+        )),
+    );
+    assert_eq!(invalid.code, 1, "envelope={}", invalid.stdout_text());
+}
+
+#[test]
 fn unsafe_default_delivery_rejects_duplicate_semantic_targets() {
     let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
     git(&fixture, &["init", "--quiet", "--initial-branch=main"]);

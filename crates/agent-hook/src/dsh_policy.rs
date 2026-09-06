@@ -2924,6 +2924,12 @@ fn governed_commit_delivery_blocked(
     let Some(execution) = request.execution_path.as_ref() else {
         return Ok(true);
     };
+    if !inside_repository(execution) {
+        // A non-repository execution path has no default branch to protect.
+        // The seam admits the call and the runtime's tool answers with its
+        // typed `no-repository` result instead of the model seeing a denial.
+        return Ok(false);
+    }
     let Some(layout) = git_layout(execution) else {
         return Ok(true);
     };
@@ -2942,6 +2948,21 @@ fn governed_commit_delivery_blocked(
         return Ok(true);
     };
     Ok(current_branch(&layout).is_none_or(|current| current == default))
+}
+
+/// Whether any ancestor of `start` carries a `.git` entry. A repository whose
+/// layout cannot be resolved still counts as inside one and keeps failing
+/// closed in `git_layout`.
+fn inside_repository(start: &Path) -> bool {
+    let start = if start.is_file() {
+        start.parent()
+    } else {
+        Some(start)
+    };
+    start.is_some_and(|path| {
+        path.ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+    })
 }
 
 fn target_is_git_metadata(target: &Path, layout: &GitLayout) -> bool {

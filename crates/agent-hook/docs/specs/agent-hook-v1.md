@@ -907,7 +907,9 @@ the remote default. Multiple remotes must advertise the same default; missing,
 contradictory, or drifted evidence is fail-closed, and native
 write/edit/str-replace targets inside Git metadata are denied. The structured
 `runtime_kit_governed_commit` tool is admissible only from its exact linked
-worktree binding and has no repository-routing argument. Raw merge, pull,
+worktree binding and has no repository-routing argument; outside any
+repository there is no default branch to protect, so the seam admits the tool
+and the runtime answers with its typed `no-repository` result. Raw merge, pull,
 cherry-pick, rebase, revert, am, reset, update-ref,
 branch, push, and fetch shapes are classified against the resolved `git -C` or
 semantic `--repo` target. `fetch --update-head-ok`, protected fetch
