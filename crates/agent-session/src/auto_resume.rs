@@ -18,13 +18,11 @@ const AUTO_RESUME_SCHEMA_VERSION: &str = "agent-session.auto-resume.v1";
 const AUTO_RESUME_FILE: &str = "auto-resume.json";
 const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
 const RETRY_DELAYS_SECONDS: [i64; 5] = [30, 60, 120, 300, 600];
-// Upper bound on consecutive authoritative-arming fallback wakes (Claude
-// "session limit": armed by an authoritative rate-limit but no usage window
-// reaches `used_percent >= 100`). Each re-arm that lands in the fallback path
-// consumes one; the budget is preserved across re-arms and only cleared by a
-// normal exhausted-window schedule or a manual re-enable, so a session that
-// resumes and is immediately re-blocked cannot loop forever.
-const MAX_FALLBACK_SCHEDULES: u32 = 8;
+// Claude can report an authoritative session rate limit while its usage helper
+// exposes percentage windows without reset timestamps. Back off from five
+// minutes to at most one probe per hour until the provider accepts a
+// continuation or the user/session state cancels the claim.
+const UNKNOWN_RESET_PROBE_DELAYS_SECONDS: [i64; 4] = [300, 900, 1_800, 3_600];
 const PROTOCOL_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) const CONTINUATION_MESSAGE: &str = "Continue the interrupted task from where you stopped. First inspect the current session and repository state, then continue toward the existing objective. Do not repeat completed work.";
@@ -49,12 +47,10 @@ struct DurableAutoResume {
     attempt: u32,
     #[serde(default)]
     ever_scheduled: bool,
-    // Number of consecutive fallback wakes scheduled off a usage-window reset
-    // while the session was armed by an authoritative provider rate-limit but
-    // no usage window reported `used_percent >= 100` (the Claude "session
-    // limit" case). Bounds a session that keeps re-arming without any usage
-    // window ever reaching exhaustion. Preserved across re-arms; reset when a
-    // normal exhausted-window schedule succeeds or the control is re-enabled.
+    // Number of consecutive fallback probes scheduled while the session was
+    // armed by an authoritative provider rate-limit but no usage window
+    // reported `used_percent >= 100`. Preserved across re-arms so an unknown
+    // reset does not probe more often than the bounded cadence above.
     #[serde(default)]
     fallback_schedules: u32,
 }
@@ -580,6 +576,14 @@ pub(crate) fn pending_sessions(
                 continue;
             }
         };
+        if legacy_usage_window_terminal(&state) {
+            match load_session_record(context, &id) {
+                Ok(record) if record.agent == "claude" => pending.usage_ids.push(id),
+                Ok(_) => {}
+                Err(err) => pending.error_codes.push(err.code().to_string()),
+            }
+            continue;
+        }
         if !state.enabled {
             continue;
         }
@@ -840,6 +844,20 @@ where
         write_state(context, &record.id, &state)?;
         return Ok(TickOutcome::TerminalFailure);
     }
+    if record.agent == "claude" && legacy_usage_window_terminal(&state) {
+        if !blocked_claim_is_eligible(context, &record, &state) {
+            state.failure_reason = Some("session_state_changed".to_string());
+            state.updated_at = now;
+            write_state(context, &record.id, &state)?;
+            return Ok(TickOutcome::TerminalFailure);
+        }
+        state.enabled = true;
+        state.state = "armed".to_string();
+        state.updated_at = now.clone();
+        state.failure_reason = None;
+        state.attempt = 0;
+        state.ever_scheduled = false;
+    }
     if !state.enabled
         || !matches!(
             state.state.as_str(),
@@ -894,26 +912,27 @@ where
         // (see `arm_usage_exhaustion`), yet no usage window reports
         // `used_percent >= 100`. This is the Claude "session limit" case: the
         // provider throttles the session while its percentage windows stay
-        // below 100%, and the stop hook exposes no structured reset time. Fail
-        // closed only when we cannot derive a wake time; otherwise trust the
-        // authoritative arming and schedule a single fallback wake at the
-        // soonest usage-window reset, re-verifying eligibility at wake before
-        // submitting. `fallback_schedules` bounds a session that keeps
-        // re-arming without any window ever reaching exhaustion.
-        let fallback_reset = usage
-            .soonest_reset_epoch
-            .filter(|reset| *reset > now_epoch)
-            .filter(|_| state.fallback_schedules < MAX_FALLBACK_SCHEDULES);
-        let Some(reset) = fallback_reset else {
-            return record_retry(
-                context,
-                &record,
-                state,
-                now_epoch,
-                "usage_window_not_exhausted",
-            );
+        // below 100%, and the stop hook exposes no structured reset time. Trust
+        // the authoritative arming and schedule a fallback wake at the soonest
+        // usage-window reset, re-verifying eligibility at wake before
+        // submitting. When no future reset timestamp is available, keep the
+        // claim alive with a low-frequency continuation probe; a repeated
+        // structured rate-limit re-arms the same durable flow.
+        let fallback_reset = match usage.soonest_reset_epoch.filter(|reset| *reset > now_epoch) {
+            Some(reset) => reset,
+            None if record.agent == "claude" => now_epoch
+                .saturating_add(unknown_reset_probe_delay_seconds(state.fallback_schedules)),
+            None => {
+                return record_retry(
+                    context,
+                    &record,
+                    state,
+                    now_epoch,
+                    "usage_window_not_exhausted",
+                );
+            }
         };
-        let wake_epoch = reset
+        let wake_epoch = fallback_reset
             + bounded_jitter_seconds(&record.id, state.blocked_turn_id.as_deref().unwrap_or(""));
         state.state = "scheduled".to_string();
         state.updated_at = now;
@@ -927,17 +946,7 @@ where
         return Ok(TickOutcome::Scheduled);
     }
 
-    let activity = crate::activity::state_for_view(context, &record);
-    let eligible = activity.as_ref().is_some_and(|activity| {
-        activity.phase == crate::activity::TurnPhase::Waiting
-            && activity.revision == state.blocked_revision.unwrap_or_default()
-            && activity
-                .current_turn
-                .as_ref()
-                .and_then(|turn| turn.attention.as_ref())
-                .is_none()
-    });
-    if !eligible {
+    if !blocked_claim_is_eligible(context, &record, &state) {
         state.enabled = false;
         state.state = "terminal_failure".to_string();
         state.updated_at = now;
@@ -985,6 +994,32 @@ where
     }
 }
 
+fn legacy_usage_window_terminal(state: &DurableAutoResume) -> bool {
+    !state.enabled
+        && state.state == "terminal_failure"
+        && state.failure_reason.as_deref() == Some("usage_window_not_exhausted")
+        && state.blocked_turn_id.is_some()
+        && state.blocked_revision.is_some()
+}
+
+fn blocked_claim_is_eligible(
+    context: &CliContext,
+    record: &SessionRecord,
+    state: &DurableAutoResume,
+) -> bool {
+    crate::activity::state_for_view(context, record)
+        .as_ref()
+        .is_some_and(|activity| {
+            activity.phase == crate::activity::TurnPhase::Waiting
+                && activity.revision == state.blocked_revision.unwrap_or_default()
+                && activity
+                    .current_turn
+                    .as_ref()
+                    .and_then(|turn| turn.attention.as_ref())
+                    .is_none()
+        })
+}
+
 fn runtime_matches(record: &SessionRecord, expected_launch_id: Option<&str>) -> bool {
     expected_launch_id.is_none_or(|expected| {
         record
@@ -1025,6 +1060,13 @@ fn bounded_jitter_seconds(id: &str, blocked_turn_id: &str) -> i64 {
     hasher.update([0]);
     hasher.update(blocked_turn_id.as_bytes());
     i64::from(hasher.finalize()[0] % 31)
+}
+
+fn unknown_reset_probe_delay_seconds(fallback_schedules: u32) -> i64 {
+    let index = usize::try_from(fallback_schedules)
+        .unwrap_or(usize::MAX)
+        .min(UNKNOWN_RESET_PROBE_DELAYS_SECONDS.len() - 1);
+    UNKNOWN_RESET_PROBE_DELAYS_SECONDS[index]
 }
 
 fn epoch_string(epoch: i64) -> Result<String, CliError> {
@@ -1312,9 +1354,11 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_arming_without_reset_epoch_stays_fail_closed() {
-        // Without any usage window reset epoch there is no wake time to trust,
-        // so the historical retry-then-terminal fail-closed behavior is kept.
+    fn authoritative_arming_without_reset_epoch_schedules_a_probe() {
+        // A structured provider rate-limit is authoritative even when the
+        // usage helper cannot expose a reset timestamp. Keep the claim alive
+        // and schedule a bounded probe instead of retrying into a permanent
+        // terminal failure.
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = seed_session(&tmp);
         set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
@@ -1342,21 +1386,77 @@ mod tests {
             |_| panic!("must not submit without a reset epoch"),
         )
         .unwrap();
-        assert_eq!(outcome, TickOutcome::Retrying);
+        assert_eq!(outcome, TickOutcome::Scheduled);
         let state = read_state(&context, &record.id, "ignored").unwrap();
-        assert_eq!(
-            state.failure_reason.as_deref(),
-            Some("usage_window_not_exhausted")
-        );
-        assert!(!state.ever_scheduled);
-        assert_eq!(state.fallback_schedules, 0);
+        assert_eq!(state.state, "scheduled");
+        let wake = epoch_from_string(state.scheduled_at.as_deref().unwrap()).unwrap();
+        assert!(wake >= base + UNKNOWN_RESET_PROBE_DELAYS_SECONDS[0]);
+        assert!(wake <= base + UNKNOWN_RESET_PROBE_DELAYS_SECONDS[0] + 30);
+        assert!(state.failure_reason.is_none());
+        assert!(state.ever_scheduled);
+        assert_eq!(state.fallback_schedules, 1);
     }
 
     #[test]
-    fn fallback_scheduling_is_bounded_across_rearms() {
-        // A session that keeps re-arming without any usage window ever reaching
-        // exhaustion (e.g. resume immediately re-blocked) must not schedule
-        // fallback wakes forever; after the budget it fails closed.
+    fn codex_arming_without_reset_epoch_remains_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = seed_session(&tmp);
+        record.agent = "codex".to_string();
+        let runtime = record.runtime.as_mut().unwrap();
+        runtime.kind = "codex_app_server".to_string();
+        runtime
+            .extra
+            .insert("codex_app_server_protocol".to_string(), json!("v2"));
+        for (key, suffix) in [
+            ("codex_app_server_socket", "sock"),
+            ("codex_app_server_proxy", "proxy"),
+            ("codex_app_server_thread_handoff", "thread"),
+            ("codex_app_server_thread_attached", "attached"),
+        ] {
+            runtime.extra.insert(
+                key.to_string(),
+                json!(format!("/run/user/1000/agent-session/codex-test.{suffix}")),
+            );
+        }
+        crate::write_session_record(&context, &record).unwrap();
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-1".to_string(),
+            0,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        let outcome = tick(
+            &context,
+            &record.id,
+            1_893_456_000,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
+            },
+            |_| panic!("Codex must not probe without an authoritative open window"),
+        )
+        .unwrap();
+        assert_eq!(outcome, TickOutcome::Retrying);
+        assert_eq!(
+            read_state(&context, &record.id, "ignored")
+                .unwrap()
+                .failure_reason
+                .as_deref(),
+            Some("usage_window_not_exhausted")
+        );
+    }
+
+    #[test]
+    fn fallback_scheduling_remains_live_across_rearms() {
+        // A session that keeps re-arming because the provider still reports a
+        // rate limit must retain its scheduled recovery instead of exhausting
+        // a retry budget and becoming terminal.
         let tmp = tempfile::TempDir::new().unwrap();
         let (context, record) = seed_session(&tmp);
         set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
@@ -1365,10 +1465,11 @@ mod tests {
             authoritative: true,
             has_exhausted_windows: false,
             exhausted_reset_epochs: Vec::new(),
-            soonest_reset_epoch: Some(base + 300),
+            soonest_reset_epoch: None,
         };
 
-        for i in 0..MAX_FALLBACK_SCHEDULES {
+        let expected_delays = [300, 900, 1_800, 3_600, 3_600, 3_600];
+        for (i, expected_delay) in expected_delays.into_iter().enumerate() {
             let revision = waiting_revision(&context, &record);
             arm_usage_exhaustion(
                 &context,
@@ -1380,23 +1481,103 @@ mod tests {
             .unwrap();
             let outcome = tick(&context, &record.id, base, &snap, |_| Ok(())).unwrap();
             assert_eq!(outcome, TickOutcome::Scheduled, "arm {i} should schedule");
+            let wake = epoch_from_string(
+                read_state(&context, &record.id, "ignored")
+                    .unwrap()
+                    .scheduled_at
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(wake >= base + expected_delay);
+            assert!(wake <= base + expected_delay + 30);
         }
 
+        let state = read_state(&context, &record.id, "ignored").unwrap();
+        assert_eq!(state.state, "scheduled");
+        assert!(state.enabled);
+        assert_eq!(state.fallback_schedules, 6);
+        assert!(state.failure_reason.is_none());
+        let wake = epoch_from_string(state.scheduled_at.as_deref().unwrap()).unwrap();
+        assert!(wake >= base + 3_600);
+        assert!(wake <= base + 3_630);
+    }
+
+    #[test]
+    fn legacy_usage_window_terminal_is_recovered_only_while_still_eligible() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
         let revision = waiting_revision(&context, &record);
         arm_usage_exhaustion(
             &context,
             &record.id,
-            "turn-final".to_string(),
+            "turn-1".to_string(),
             revision,
             "2030-01-01T00:00:01Z",
         )
         .unwrap();
-        let outcome = tick(&context, &record.id, base, &snap, |_| Ok(())).unwrap();
-        assert_eq!(outcome, TickOutcome::Retrying);
-        let state = read_state(&context, &record.id, "ignored").unwrap();
+        let mut pre_upgrade = read_state(&context, &record.id, "ignored").unwrap();
+        pre_upgrade.enabled = false;
+        pre_upgrade.state = "terminal_failure".to_string();
+        pre_upgrade.failure_reason = Some("usage_window_not_exhausted".to_string());
+        write_state(&context, &record.id, &pre_upgrade).unwrap();
+
+        let base = 1_893_456_000;
         assert_eq!(
-            state.failure_reason.as_deref(),
-            Some("usage_window_not_exhausted")
+            pending_sessions(&context, base).unwrap().usage_ids,
+            vec![record.id.clone()]
+        );
+        let outcome = tick(
+            &context,
+            &record.id,
+            base,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
+            },
+            |_| panic!("the recovered claim must wait before probing"),
+        )
+        .unwrap();
+        assert_eq!(outcome, TickOutcome::Scheduled);
+        let recovered = read_state(&context, &record.id, "ignored").unwrap();
+        assert!(recovered.enabled);
+        assert_eq!(recovered.state, "scheduled");
+
+        let mut stale = recovered;
+        stale.enabled = false;
+        stale.state = "terminal_failure".to_string();
+        stale.scheduled_at = None;
+        stale.failure_reason = Some("usage_window_not_exhausted".to_string());
+        stale.blocked_revision = Some(revision.saturating_sub(1));
+        write_state(&context, &record.id, &stale).unwrap();
+        let outcome = tick(
+            &context,
+            &record.id,
+            base + 1,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
+            },
+            |_| panic!("a stale pre-upgrade claim must never submit"),
+        )
+        .unwrap();
+        assert_eq!(outcome, TickOutcome::TerminalFailure);
+        let stale = read_state(&context, &record.id, "ignored").unwrap();
+        assert!(!stale.enabled);
+        assert_eq!(
+            stale.failure_reason.as_deref(),
+            Some("session_state_changed")
+        );
+        assert!(
+            pending_sessions(&context, base + 1)
+                .unwrap()
+                .usage_ids
+                .is_empty()
         );
     }
 
