@@ -306,7 +306,8 @@ fn direct_python_under_a_managed_project_is_advisory() {
         .as_str()
         .expect("shell guidance");
     assert!(!context.contains("managed by"), "{context}");
-    assert!(context.contains("Retry now"), "{context}");
+    assert!(context.contains("could not be classified"), "{context}");
+    assert!(!context.contains("was blocked"), "{context}");
     let (_, envelope) = dispatch(&unmanaged, "dsh-session-1", "uv run python -c 'print(1)'");
     assert_eq!(envelope["data"]["action"], "allow");
 }
@@ -379,6 +380,160 @@ fn unclassifiable_shell_blocks_only_tier_b_groups_whose_subject_appears() {
     assert_eq!(reasons[0]["disposition"], "block");
     assert_eq!(reasons[1]["code"], "portable-paths-scan");
     assert_eq!(reasons[1]["disposition"], "context");
+    assert!(
+        envelope["data"]["context"]
+            .as_str()
+            .expect("denial guidance")
+            .contains("was blocked before command dispatch"),
+        "a denial keeps the blocked wording: {envelope}"
+    );
+}
+
+#[test]
+fn quoted_or_escaped_subjects_still_keep_a_tier_b_seam_failing_closed() {
+    // shell_words::split unquotes these to `git`/`gh`; the subject check must
+    // see the same token rather than the raw spelling.
+    for (group, command) in [
+        (
+            "block-direct-git-commit",
+            "export EDITOR=vi; \\git commit -m x",
+        ),
+        (
+            "block-direct-git-commit",
+            "export EDITOR=vi; g''it commit -m x",
+        ),
+        (
+            "block-direct-git-commit",
+            "export EDITOR=vi; \"g\"it commit -m x",
+        ),
+        (
+            "block-direct-git-commit",
+            "export EDITOR=vi; gi\\t commit -m x",
+        ),
+        (
+            "block-direct-git-worktree",
+            "cd /tmp; /usr/bin/g'i't worktree remove ../x",
+        ),
+        ("block-direct-pr-create", "export EDITOR=vi; \\gh pr create"),
+        (
+            "semantic-commit-body-gate",
+            "export EDITOR=vi; semantic-\"commit\" commit -m x",
+        ),
+    ] {
+        let fixture = Fixture::new(&policy_for(group, "downgrade-only"));
+        let (code, envelope) = dispatch(&fixture, "dsh-session-1", command);
+        assert_eq!(
+            code, 1,
+            "group={group} command={command} envelope={envelope}"
+        );
+        assert_eq!(envelope["data"]["action"], "block", "command={command}");
+        assert_eq!(envelope["data"]["reasons"][0]["code"], group);
+    }
+}
+
+#[test]
+fn content_seams_keep_failing_closed_when_an_unclassifiable_command_names_their_subject() {
+    let memory = Fixture::new(&policy_for("block-project-memory-write", "downgrade-only"));
+    let (code, envelope) = dispatch(
+        &memory,
+        "dsh-session-1",
+        "export EDITOR=vi; perl -pi -e 's/a/b/' .config/agent-memory/candidates/dsh/notes.md",
+    );
+    assert_eq!(code, 1, "a memory note is named: {envelope}");
+    assert_eq!(envelope["data"]["action"], "block");
+    let (code, envelope) = dispatch(
+        &memory,
+        "dsh-session-2",
+        "export EDITOR=vi; perl -pi -e 's/a/b/' notes.md",
+    );
+    assert_eq!(code, 0, "no memory path is named: {envelope}");
+    assert_eq!(envelope["data"]["action"], "context");
+
+    let portable = Fixture::new(&policy_for("portable-paths-scan", "downgrade-only"));
+    let (code, envelope) = dispatch(
+        &portable,
+        "dsh-session-1",
+        "export EDITOR=vi; sed -i 's#x#/Users/someone/project#' README.md",
+    );
+    assert_eq!(code, 1, "a machine-local path is named: {envelope}");
+    assert_eq!(envelope["data"]["action"], "block");
+    let (code, envelope) = dispatch(
+        &portable,
+        "dsh-session-2",
+        "export EDITOR=vi; sed -i 's#x#$HOME/project#' README.md",
+    );
+    assert_eq!(code, 0, "a portable path is fine: {envelope}");
+    assert_eq!(envelope["data"]["action"], "context");
+}
+
+#[test]
+fn a_natural_context_under_an_advise_rule_is_not_reported_as_a_downgrade() {
+    let fixture = Fixture::new(&policy_for("block-direct-git-commit", "downgrade-only"));
+    add_override(&fixture, RULE_ID, "advise");
+    let (code, envelope) = dispatch(
+        &fixture,
+        "dsh-session-1",
+        "export EDITOR=vi; sed -i 's/a/b/' notes.md",
+    );
+    assert_eq!(code, 0, "envelope={envelope}");
+    assert_eq!(envelope["data"]["action"], "context");
+    assert_eq!(envelope["data"]["enforcement"], "context");
+    assert!(envelope["data"].get("downgraded_by").is_none());
+    assert!(
+        !envelope["data"]["context"]
+            .as_str()
+            .expect("context")
+            .contains("downgraded to advise"),
+        "{envelope}"
+    );
+}
+
+fn codex_block_policy(mode: &str) -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "codex-advise"
+version = "2026.09.06.1"
+
+[[rules]]
+id = "{RULE_ID}"
+products = ["codex"]
+events = ["PermissionRequest"]
+priority = 10
+mode = "{mode}"
+failure_posture = "closed"
+override_class = "downgrade-only"
+capability = {{ id = "decision.block.v1", reason_code = "codex-permission-denied", message = "denied by policy" }}
+"#
+    )
+}
+
+#[test]
+fn advise_is_rejected_where_the_bound_event_cannot_render_context() {
+    // Codex PermissionRequest supports block but not context, so an advise
+    // projection there would be a silent allow.
+    let declared = Fixture::new(&codex_block_policy("advise"));
+    let output = declared.run(&["validate", "--format", "json"], None);
+    assert_eq!(output.code, 65, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "rule-override-advise-unsupported"
+    );
+
+    let overridden = Fixture::new(&codex_block_policy("enforce"));
+    add_override(&overridden, RULE_ID, "advise");
+    let output = overridden.run(&["validate", "--format", "json"], None);
+    assert_eq!(output.code, 65, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "rule-override-advise-unsupported"
+    );
+
+    let inventory = Fixture::new(&codex_block_policy("enforce"));
+    let output = inventory.run(&["inventory", "--format", "json"], None);
+    assert_eq!(output.code, 0);
+    let rule = output.stdout_json()["data"]["rules"][0].clone();
+    assert_eq!(rule["tier"], Value::Null, "non-DSH rules carry no tier");
+    assert_eq!(rule["enforcement_default"], Value::Null);
 }
 
 #[test]
@@ -416,6 +571,7 @@ fn a_repeated_advisory_is_allowed_within_one_session_and_reset_across_sessions()
         "the advise projection dedupes too"
     );
     assert_eq!(second["data"]["enforcement"], Value::Null);
+    assert!(second["data"].get("downgraded_by").is_none());
 }
 
 #[test]
@@ -425,11 +581,46 @@ fn dedupe_fails_open_without_a_private_state_home() {
     let state_home = fixture.state_home.join("dsh-runtime-kit");
     fs::create_dir_all(&state_home).expect("state home");
     fs::write(state_home.join("agent-hook"), "not a directory").expect("collision");
-    let (_, first) = dispatch(&fixture, "dsh-session-1", "python -c 'print(1)'");
-    assert_eq!(first["data"]["action"], "context");
-    let (_, second) = dispatch(&fixture, "dsh-session-1", "python -c 'print(1)'");
+    for _ in 0..2 {
+        let (_, envelope) = dispatch(&fixture, "dsh-session-1", "python -c 'print(1)'");
+        assert_eq!(
+            envelope["data"]["action"], "context",
+            "without dedupe state the reminder keeps rendering"
+        );
+        assert_eq!(
+            envelope["data"]["reasons"][0]["code"],
+            "block-direct-python"
+        );
+    }
+
+    // A symlinked per-session marker directory is never trusted either.
+    let linked = Fixture::new(&policy_for("block-direct-python", "locked"));
+    fs::write(linked.root.join("uv.lock"), "version = 1\n").expect("uv marker");
+    let dedupe_root = linked
+        .state_home
+        .join("dsh-runtime-kit/agent-hook/dsh-advisory-dedupe");
+    let (_, first) = dispatch(&linked, "dsh-session-1", "python -c 'print(1)'");
+    assert_eq!(first["data"]["action"], "context", "{first}");
+    let session_dir = fs::read_dir(&dedupe_root)
+        .expect("dedupe root")
+        .map(|entry| entry.expect("entry").path())
+        .next()
+        .expect("one per-session marker directory");
+    fs::remove_dir_all(&session_dir).expect("drop the real directory");
+    let elsewhere = linked.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("target dir");
+    std::os::unix::fs::symlink(&elsewhere, &session_dir).expect("symlink");
+    for _ in 0..2 {
+        let (_, envelope) = dispatch(&linked, "dsh-session-1", "python -c 'print(1)'");
+        assert_eq!(envelope["data"]["action"], "context", "{envelope}");
+        assert_eq!(
+            envelope["data"]["reasons"][0]["code"],
+            "block-direct-python"
+        );
+    }
     assert_eq!(
-        second["data"]["action"], "context",
-        "without dedupe state the reminder keeps rendering"
+        fs::read_dir(&elsewhere).expect("target dir").count(),
+        0,
+        "nothing is written through the symlink"
     );
 }

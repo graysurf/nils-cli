@@ -64,65 +64,42 @@ fn request(fixture: &Fixture, tool: &str, arguments: Value) -> String {
     request_for_session(fixture, "dsh-session-1", tool, arguments)
 }
 
-/// Assert the tier contract for one unclassifiable or unsafe shell command.
-///
-/// Tier A groups fail closed. A Tier B group blocks only when one of its
-/// subject executables is named in the command (or the command field cannot be
-/// read at all); otherwise it explains the retry as context. Tier C reminders
-/// never block: they yield context carrying the group's code.
-fn assert_shell_outcome(
+/// Assert one explicitly expected disposition (`block` or `context`) for a
+/// single-group dispatch. The expectation is written out per case by the
+/// caller; this helper only checks the envelope shape that goes with it.
+fn assert_shell_disposition(
     output: &nils_test_support::cmd::CmdOutput,
     group: &str,
-    command: Option<&str>,
+    command: &str,
+    expected: &str,
 ) {
-    let subjects: &[&str] = match group {
-        "block-direct-git-commit"
-        | "block-direct-git-worktree"
-        | "block-unsafe-default-delivery" => &["git"],
-        "block-direct-pr-create" => &["gh", "glab"],
-        "semantic-commit-body-gate" => &["semantic-commit"],
-        _ => &[],
-    };
-    let tier_a = matches!(group, "checkout-lease-guard" | "mcp-secret-scan");
-    let tier_c = matches!(
-        group,
-        "block-direct-python" | "forge-label-reminder" | "memory-write-principle-reminder"
-    );
-    let names_subject = command.is_none_or(|command| match group {
-        "block-project-memory-write" => {
-            command.contains("/.config/agent-memory/")
-                || command.contains("/.codex/memories/")
-                || (command.contains("/.claude/projects/") && command.contains("/memory/"))
-        }
-        "portable-paths-scan" => command.contains("/Users/") || command.contains("/home/"),
-        _ => command
-            .split(|ch: char| ch.is_whitespace() || ";|&()<>`$\"'=".contains(ch))
-            .filter(|word| !word.is_empty())
-            .any(|word| subjects.contains(&word.rsplit('/').next().unwrap_or(word))),
-    });
     let envelope = output.stdout_json();
-    if tier_a || (!tier_c && names_subject) {
-        assert_eq!(
-            output.code,
-            1,
-            "group={group} command={command:?} envelope={}",
-            output.stdout_text()
-        );
-        assert_eq!(envelope["data"]["action"], "block", "group={group}");
-    } else {
-        assert_eq!(
-            output.code,
-            0,
-            "group={group} command={command:?} envelope={}",
-            output.stdout_text()
-        );
-        assert_eq!(
-            envelope["data"]["action"], "context",
-            "group={group} command={command:?}"
-        );
-        assert_eq!(envelope["data"]["reasons"][0]["code"], group);
-        assert_eq!(envelope["data"]["reasons"][0]["disposition"], "context");
+    match expected {
+        "block" => {
+            assert_eq!(
+                output.code,
+                1,
+                "group={group} command={command} envelope={}",
+                output.stdout_text()
+            );
+            assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        }
+        "context" => {
+            assert_eq!(
+                output.code,
+                0,
+                "group={group} command={command} envelope={}",
+                output.stdout_text()
+            );
+            assert_eq!(
+                envelope["data"]["action"], "context",
+                "group={group} command={command}"
+            );
+            assert_eq!(envelope["data"]["reasons"][0]["disposition"], "context");
+        }
+        other => panic!("unknown expectation {other}"),
     }
+    assert_eq!(envelope["data"]["reasons"][0]["code"], group);
 }
 
 fn request_for_session(
@@ -1569,23 +1546,40 @@ fn deterministic_command_groups_block_direct_and_nested_unsafe_forms() {
 }
 
 #[test]
-fn command_and_process_substitutions_fail_closed_for_every_command_group() {
+fn command_and_process_substitutions_are_classified_by_tier_for_every_command_group() {
+    // The substituted inner command always names the group's own subject, so
+    // every Tier B seam and the Tier A lease guard block; the python reminder
+    // (Tier C) explains the gap as context.
     let cases = [
         (
             "block-direct-git-commit",
             "git commit --allow-empty -m bypass",
+            "block",
         ),
-        ("block-direct-git-worktree", "git worktree remove ../other"),
-        ("block-direct-pr-create", "gh pr create --draft"),
-        ("block-direct-python", "python -c 'print(1)'"),
+        (
+            "block-direct-git-worktree",
+            "git worktree remove ../other",
+            "block",
+        ),
+        ("block-direct-pr-create", "gh pr create --draft", "block"),
+        ("block-direct-python", "python -c 'print(1)'", "context"),
         (
             "semantic-commit-body-gate",
             "semantic-commit commit --type feat --subject bypass",
+            "block",
         ),
-        ("block-unsafe-default-delivery", "git push origin main"),
-        ("checkout-lease-guard", "git commit --allow-empty -m bypass"),
+        (
+            "block-unsafe-default-delivery",
+            "git push origin main",
+            "block",
+        ),
+        (
+            "checkout-lease-guard",
+            "git commit --allow-empty -m bypass",
+            "block",
+        ),
     ];
-    for (group, inner) in cases {
+    for (group, inner, expected) in cases {
         for command in [
             format!("printf '%s\\n' \"$({inner})\""),
             format!("printf '%s\\n' \"`{inner}`\""),
@@ -1596,57 +1590,97 @@ fn command_and_process_substitutions_fail_closed_for_every_command_group() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_shell_outcome(&output, group, Some(&command));
+            assert_shell_disposition(&output, group, &command, expected);
         }
     }
 }
 
 #[test]
-fn command_consumers_fail_closed_for_every_command_group() {
+fn command_consumers_are_classified_by_tier_for_every_command_group() {
+    // (group, inner, expected when the consumer carries the inner command,
+    // expected when it sources an opaque script that names no subject)
     let cases = [
         (
             "block-direct-git-commit",
             "git commit --allow-empty -m bypass",
+            "block",
+            "context",
         ),
-        ("block-direct-git-worktree", "git worktree remove ../other"),
-        ("block-direct-pr-create", "gh pr create --draft"),
-        ("block-direct-python", "python -c 'print(1)'"),
+        (
+            "block-direct-git-worktree",
+            "git worktree remove ../other",
+            "block",
+            "context",
+        ),
+        (
+            "block-direct-pr-create",
+            "gh pr create --draft",
+            "block",
+            "context",
+        ),
+        (
+            "block-direct-python",
+            "python -c 'print(1)'",
+            "context",
+            "context",
+        ),
         (
             "semantic-commit-body-gate",
             "semantic-commit commit --type feat --subject bypass",
+            "block",
+            "context",
         ),
-        ("block-unsafe-default-delivery", "git push origin main"),
-        ("checkout-lease-guard", "git commit --allow-empty -m bypass"),
+        (
+            "block-unsafe-default-delivery",
+            "git push origin main",
+            "block",
+            "context",
+        ),
+        (
+            "checkout-lease-guard",
+            "git commit --allow-empty -m bypass",
+            "block",
+            "block",
+        ),
     ];
-    for (group, inner) in cases {
-        for command in [
-            format!("trap {} EXIT", shell_words::quote(inner)),
-            format!("printf '%s\\n' {} | sh", shell_words::quote(inner)),
-            format!("sh <<< {}", shell_words::quote(inner)),
-            "source ./repository-script.sh".to_string(),
-            ". ./repository-script.sh".to_string(),
-            "bash ./repository-script.sh".to_string(),
+    for (group, inner, when_named, when_opaque) in cases {
+        for (command, expected) in [
+            (
+                format!("trap {} EXIT", shell_words::quote(inner)),
+                when_named,
+            ),
+            (
+                format!("printf '%s\\n' {} | sh", shell_words::quote(inner)),
+                when_named,
+            ),
+            (format!("sh <<< {}", shell_words::quote(inner)), when_named),
+            ("source ./repository-script.sh".to_string(), when_opaque),
+            (". ./repository-script.sh".to_string(), when_opaque),
+            ("bash ./repository-script.sh".to_string(), when_opaque),
         ] {
             let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_shell_outcome(&output, group, Some(&command));
+            assert_shell_disposition(&output, group, &command, expected);
         }
     }
 }
 
 #[test]
-fn general_purpose_interpreters_fail_closed_for_every_command_group() {
+fn general_purpose_interpreters_are_classified_by_tier_for_every_command_group() {
+    // Every command embeds `git commit`, so the git-keyed seams and the Tier A
+    // lease guard block; the seams keyed on `gh` or `semantic-commit` and the
+    // python reminder explain the gap as context.
     let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "context"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ];
     let commands = [
         "awk 'BEGIN { system(\"git commit --allow-empty -m bypass\") }'",
@@ -1655,14 +1689,14 @@ fn general_purpose_interpreters_fail_closed_for_every_command_group() {
         "Rscript -e 'system(\"git commit --allow-empty -m bypass\")'",
         "R -e 'system(\"git commit --allow-empty -m bypass\")'",
     ];
-    for group in groups {
+    for (group, expected) in groups {
         for command in commands {
             let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_shell_outcome(&output, group, Some(command));
+            assert_shell_disposition(&output, group, command, expected);
         }
     }
 }
@@ -1775,83 +1809,141 @@ fn deterministic_command_groups_preserve_owned_and_read_only_workflows() {
 }
 
 #[test]
-fn command_dependent_groups_fail_closed_when_parsing_is_indeterminate() {
-    let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
-    ];
+fn command_dependent_groups_are_classified_by_tier_when_parsing_is_indeterminate() {
     let mut nested = "git commit -m test".to_string();
     for _ in 0..7 {
         nested = format!("sh -c {}", shell_words::quote(&nested));
     }
     let oversized = format!("printf {}", "x".repeat(256 * 1024));
+    // The seven cases in order: missing field, unterminated quote, nested
+    // beyond the parse depth (names git), oversized (unreadable), `if` block
+    // (names git), subshell (names git), variable runner (names git).
+    let cases = [
+        json!({}),
+        json!({"command": "'unterminated"}),
+        json!({"command": nested}),
+        json!({"command": oversized}),
+        json!({"command": "if true; then git commit -m test; fi"}),
+        json!({"command": "(git commit -m test)"}),
+        json!({"command": "runner=git; \"$runner\" commit -m test"}),
+    ];
+    // An unreadable command field (missing or oversized) blocks every Tier B
+    // seam; a readable one blocks only the seams whose subject it names.
+    let expectations = [
+        (
+            "block-direct-git-commit",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "block-direct-git-worktree",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "block-direct-pr-create",
+            [
+                "block", "context", "context", "block", "context", "context", "context",
+            ],
+        ),
+        (
+            "block-direct-python",
+            [
+                "context", "context", "context", "context", "context", "context", "context",
+            ],
+        ),
+        (
+            "semantic-commit-body-gate",
+            [
+                "block", "context", "context", "block", "context", "context", "context",
+            ],
+        ),
+        (
+            "block-unsafe-default-delivery",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "checkout-lease-guard",
+            [
+                "block", "block", "block", "block", "block", "block", "block",
+            ],
+        ),
+    ];
 
-    for group in groups {
-        for (arguments, readable) in [
-            (json!({}), None),
-            (json!({"command": "'unterminated"}), Some("'unterminated")),
-            (json!({"command": nested}), Some(nested.as_str())),
-            // Oversized commands cannot be read, so every Tier B seam blocks.
-            (json!({"command": oversized}), None),
-            (
-                json!({"command": "if true; then git commit -m test; fi"}),
-                Some("if true; then git commit -m test; fi"),
-            ),
-            (
-                json!({"command": "(git commit -m test)"}),
-                Some("(git commit -m test)"),
-            ),
-            (
-                json!({"command": "runner=git; \"$runner\" commit -m test"}),
-                Some("runner=git; \"$runner\" commit -m test"),
-            ),
-        ] {
+    for (group, expected) in expectations {
+        for (arguments, expected) in cases.iter().zip(expected) {
             // One fixture per command: a repeated context in one session is
             // deduplicated to allow by design.
             let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
-                Some(&request(&fixture, "bash", arguments)),
+                Some(&request(&fixture, "bash", arguments.clone())),
             );
-            assert_shell_outcome(&output, group, readable);
+            let label = arguments.to_string();
+            let label = if label.len() > 80 {
+                &label[..80]
+            } else {
+                &label
+            };
+            assert_shell_disposition(&output, group, label, expected);
         }
     }
 }
 
 #[test]
-fn command_dependent_groups_reject_inline_execution_context_retargeting() {
+fn command_dependent_groups_classify_inline_execution_context_retargeting_by_tier() {
     let cases = [
-        ("block-direct-git-commit", "PATH=/tmp:$PATH git status"),
-        ("block-direct-git-worktree", "GIT_DIR=/tmp/repo git status"),
-        ("block-direct-pr-create", "PATH=/tmp:$PATH gh status"),
+        (
+            "block-direct-git-commit",
+            "PATH=/tmp:$PATH git status",
+            "block",
+        ),
+        (
+            "block-direct-git-worktree",
+            "GIT_DIR=/tmp/repo git status",
+            "block",
+        ),
+        (
+            "block-direct-pr-create",
+            "PATH=/tmp:$PATH gh status",
+            "block",
+        ),
         (
             "block-direct-python",
             "LD_PRELOAD=/tmp/fake.so uv run python -V",
+            "context",
         ),
         (
             "semantic-commit-body-gate",
             "PATH=/tmp:$PATH semantic-commit commit --message 'feat: change\\n\\nBody.'",
+            "block",
         ),
         (
             "block-unsafe-default-delivery",
             "GIT_CONFIG_GLOBAL=/tmp/config git status",
+            "block",
         ),
         (
             "block-direct-git-commit",
             "PS4='$(git update-ref refs/heads/main refs/heads/feature)' bash -xc 'git status'",
+            "block",
         ),
         (
             "block-direct-git-commit",
             "PROMPT_COMMAND='git update-ref refs/heads/main refs/heads/feature' bash -ic 'git status'",
+            "block",
         ),
-        ("checkout-lease-guard", "BASH_ENV=/tmp/profile printf ok"),
+        (
+            "checkout-lease-guard",
+            "BASH_ENV=/tmp/profile printf ok",
+            "block",
+        ),
     ];
-    for (group, command) in cases {
+    for (group, command, expected) in cases {
         let fixture = Fixture::new(&policy(group, "dsh"));
         if group == "block-direct-python" {
             fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
@@ -1860,20 +1952,23 @@ fn command_dependent_groups_reject_inline_execution_context_retargeting() {
             &["dispatch", "--product", "dsh", "--format", "json"],
             Some(&request(&fixture, "bash", json!({"command": command}))),
         );
-        assert_shell_outcome(&output, group, Some(command));
+        assert_shell_disposition(&output, group, command, expected);
     }
 }
 
 #[test]
-fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
+fn command_dependent_groups_classify_sequential_shell_state_retargeting_by_tier() {
+    // Every command ends in `git status`, so the git-keyed seams and the Tier
+    // A lease guard block while the `gh`/`semantic-commit` seams and the
+    // python reminder explain the gap as context.
     let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "context"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ];
     let commands = [
         "export PATH=/tmp; git status",
@@ -1888,7 +1983,7 @@ fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
         "cd /tmp; git status",
     ];
 
-    for group in groups {
+    for (group, expected) in groups {
         for command in commands {
             // One fixture per command: a repeated context in one session is
             // deduplicated to allow by design.
@@ -1900,7 +1995,7 @@ fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_shell_outcome(&output, group, Some(command));
+            assert_shell_disposition(&output, group, command, expected);
         }
     }
 }

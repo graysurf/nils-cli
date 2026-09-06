@@ -583,7 +583,11 @@ fn evaluate_with_io(
         };
         let mut outcome = outcome;
         if prepared_rule.mode == RuleMode::Advise && outcome.action == DecisionAction::Block {
-            let source = format!("{} [overrides.{}]", loaded.config_path.display(), rule.id);
+            let source = format!(
+                "{} [overrides.{}]",
+                portable_path(&loaded.config_path),
+                rule.id
+            );
             outcome = advise_projection(outcome, &source);
             advised.insert(rule.id.clone());
             downgraded_by.get_or_insert(source);
@@ -1447,13 +1451,29 @@ fn advise_projection(outcome: RuleOutcome, source: &str) -> RuleOutcome {
     }
 }
 
+/// Render the config path with the home directory folded to `$HOME`, so the
+/// downgrade source shown to the model and recorded in `downgraded_by` never
+/// carries a machine-local absolute path (the portable-paths convention).
+fn portable_path(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) if !home.as_os_str().is_empty() => path
+            .strip_prefix(&home)
+            .map(|rest| format!("$HOME/{}", rest.display()))
+            .unwrap_or(rendered),
+        _ => rendered,
+    }
+}
+
 /// Emit each DSH advisory once per session.
 ///
 /// A `Context` outcome whose `(session, rule id, context digest)` was already
 /// emitted in this session becomes an allow with a `:advisory-repeated` code.
-/// State lives under the subject's agent-docs state home; when that directory
-/// cannot be used privately the reminder simply keeps rendering (fail open,
-/// reminders only).
+/// This covers every DSH context outcome, including the shell-classification
+/// guidance and an `advise` projection, so a test that dispatches repeatedly
+/// must vary the session id. State lives under the subject's agent-docs state
+/// home; when that directory cannot be used privately the reminder simply
+/// keeps rendering (fail open, reminders only).
 fn dedupe_dsh_advisory(request: &NormalizedRequest, rule_id: &str, outcome: &mut RuleOutcome) {
     use sha2::{Digest, Sha256};
 

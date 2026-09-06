@@ -291,6 +291,9 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
         if let Capability::DshPolicy { group } = &rule.capability {
             validate_dsh_tier(rule, group.tier())?;
         }
+        if rule.mode == RuleMode::Advise {
+            validate_advise_renders(rule)?;
+        }
         for product in &rule.products {
             for event in &rule.events {
                 validate_capability_binding(*product, event, &rule.capability)?;
@@ -334,18 +337,27 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
             OverrideClass::DowngradeOnly | OverrideClass::Free => {}
         }
-        if override_value.mode == RuleMode::Advise
-            && rule.products.iter().any(|product| {
-                rule.events
-                    .iter()
-                    .any(|event| !supports_context(*product, event))
-            })
-        {
-            return Err(HookError::data(
-                "rule-override-advise-unsupported",
-                "advise projects blocks to context, which one of the rule's product events cannot render",
-            ));
+        if override_value.mode == RuleMode::Advise {
+            validate_advise_renders(rule)?;
         }
+    }
+    Ok(())
+}
+
+/// `advise` projects a block to context, so every product event the rule is
+/// bound to must be able to render context; otherwise the projection would be
+/// a silent allow. Checked for a declared `mode = "advise"` and for a config
+/// override alike.
+fn validate_advise_renders(rule: &PolicyRule) -> Result<(), HookError> {
+    if rule.products.iter().any(|product| {
+        rule.events
+            .iter()
+            .any(|event| !supports_context(*product, event))
+    }) {
+        return Err(HookError::data(
+            "rule-override-advise-unsupported",
+            "advise projects blocks to context, which one of the rule's product events cannot render",
+        ));
     }
     Ok(())
 }
@@ -355,7 +367,8 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
 /// Tier A must stay enforce, fail closed, and locked; Tier B must fail closed
 /// and may be locked or downgrade-only, never free; Tier C must be locked so
 /// a reminder cannot be reconfigured into anything else. A Tier C evaluator
-/// never returns a block, which `dsh_policy::evaluate` asserts.
+/// never returns a block, which `dsh_policy::evaluate` debug-asserts and the
+/// dsh_policy tests cover on the shell-classification paths.
 fn validate_dsh_tier(
     rule: &PolicyRule,
     tier: crate::policy_parity::DshTier,

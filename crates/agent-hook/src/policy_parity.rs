@@ -162,7 +162,27 @@ impl DshCapabilityGroup {
             | Self::BlockUnsafeDefaultDelivery => &["git"],
             Self::BlockDirectPrCreate => &["gh", "glab"],
             Self::SemanticCommitBodyGate => &["semantic-commit"],
-            _ => &[],
+            // Keyed by the protected content (a memory path, a machine-local
+            // path) in `dsh_policy::names_subject`, not by an executable.
+            Self::BlockProjectMemoryWrite | Self::PortablePathsScan => &[],
+            // Not command-classified: the gate runs on the edit, not on shell.
+            Self::PreEditIntentGate => &[],
+            // Tier A and Tier C groups never narrow by subject.
+            Self::AgentActivity
+            | Self::OwnerUnclaimed
+            | Self::SemanticConflict
+            | Self::OperationLifecycle
+            | Self::AgentScopeLockGuard
+            | Self::BlockDirectPython
+            | Self::CheckoutLeaseGuard
+            | Self::FinishLineRecord
+            | Self::ForgeLabelReminder
+            | Self::McpSecretScan
+            | Self::MemoryWritePrincipleReminder
+            | Self::SessionStartHealthcheck
+            | Self::SkillUsageReminder
+            | Self::StopPrePrReminder
+            | Self::UserPromptAgentMemory => &[],
         }
     }
 

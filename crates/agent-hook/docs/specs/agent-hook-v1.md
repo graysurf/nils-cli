@@ -122,7 +122,8 @@ above.
 - `agent-hook.normalized-decision.v1`: aggregate action, ordered reason codes,
   optional bounded context or replacement, shadow observations, config /
   policy digests, and two optional audit fields: `enforcement` (`block`,
-  `advise`, or `context`; absent for a plain allow) and `downgraded_by` (the
+  `advise`, or `context`; absent for an allow, warn, or transform aggregate)
+  and `downgraded_by` (the
   `<config path> [overrides.<rule id>]` of the `advise` override that
   projected a block; absent when nothing was downgraded).
 - `agent-hook.trace.v1`: timing, rule IDs, disposition classes, and digests;
@@ -1179,8 +1180,19 @@ capability-group fixture and reported per rule by `inventory` as `tier` and
   therefore advisory: under a uv or venv project it names the manager and the
   expected interpreter instead of denying.
 
-An `advise` override is rejected with `rule-override-advise-unsupported` when
-one of the rule's product events cannot render context.
+A rule declared `mode = "advise"` and a config override to `advise` are both
+rejected with `rule-override-advise-unsupported` when one of the rule's product
+events cannot render context, because the projection would otherwise be a
+silent allow. The `downgraded to advise by` line and `downgraded_by` render the
+config path with the home directory folded to `$HOME`.
+
+Consumer migration (dsh-runtime-kit): an unclassifiable Bash command now
+blocks only Tier A groups and the Tier B groups whose subject the command
+names, its non-blocking explanation is carried as context rather than as a
+denial, and `block-direct-python` never appears as a blocking reason. A
+consumer heuristic that expected every command-dependent group to block at
+once (runtime-kit's opaque-shell fan-out fallback) can be retired; the
+decision `context` already carries nils' own guidance.
 
 A DSH `Context` outcome is emitted once per session: when the same
 `(session id, rule id, context digest)` was already emitted, the outcome
