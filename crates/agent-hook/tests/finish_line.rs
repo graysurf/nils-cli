@@ -129,32 +129,33 @@ fn open_reports_an_exact_typed_non_repository_result() {
 }
 
 #[test]
-fn open_tolerates_non_repository_bash_only_when_the_exact_command_is_read_only() {
+fn open_reports_not_in_repository_for_every_bash_command_outside_a_repository() {
+    // Outside every repository there is no finish-line contract to satisfy, so
+    // the exact location code is the answer for any command: the consumer
+    // classifies the identity as obligation-free and its ordinary policy
+    // transport still governs the command (issue dsh-runtime-kit#199).
     for (name, command, expected_code) in [
-        (
-            "bare-pwd",
-            "pwd",
-            "finish-line-non-repository-operation-unauthorized",
-        ),
+        ("bare-pwd", "pwd", "finish-line-not-in-repository"),
         (
             "pwd-physical",
             "/bin/pwd -P",
             "finish-line-not-in-repository",
         ),
+        ("read", "cat notes.md", "finish-line-not-in-repository"),
         (
             "absolute-write",
             "printf x > /tmp/other-repository/tracked.txt",
-            "finish-line-non-repository-operation-unauthorized",
+            "finish-line-not-in-repository",
         ),
         (
             "git-output",
             "git diff --no-index --output=/tmp/other-repository/tracked.txt /tmp/a /tmp/b",
-            "finish-line-non-repository-operation-unauthorized",
+            "finish-line-not-in-repository",
         ),
         (
             "untrusted-git",
             "/tmp/git status",
-            "finish-line-non-repository-operation-unauthorized",
+            "finish-line-not-in-repository",
         ),
     ] {
         let fixture = Fixture::new(POLICY);

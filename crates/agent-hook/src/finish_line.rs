@@ -786,15 +786,12 @@ fn classify_non_repository_open(
             ));
         }
     }
-    if let Some(command) = request.command.as_deref()
-        && (command.trim().is_empty()
-            || command.len() > MAX_COMMAND_BYTES
-            || !crate::effect::audited_non_repository_read_only_bash(command))
-    {
-        return Err(HookError::data(
-            "finish-line-non-repository-operation-unauthorized",
-            "finish-line non-repository Bash operations must be audited read-only commands",
-        ));
+    // Outside every repository there is no validation contract to satisfy,
+    // so the exact location code is the answer for any well-formed command.
+    // The consumer classifies the identity as obligation-free; execution
+    // authority stays with its ordinary policy transport, never with this open.
+    if let Some(command) = request.command.as_deref() {
+        validate_command(command)?;
     }
     Err(non_repository)
 }
