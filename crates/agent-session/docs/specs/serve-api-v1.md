@@ -338,9 +338,10 @@ recorded in `sympoies/nils-cli#1409`.
   and `scheduler_error`. Consumers must preserve
   the object but render unknown future state or reason values as a safe generic
   unavailable/failure condition; they must not infer permission to submit from
-  an unknown value. `scheduled_at` is present only while a reset wake is
-  scheduled, and `failure_reason` is present only when the latest transition
-  records a safe operational reason.
+  an unknown value. `scheduled_at` is present only while the daemon has a next
+  scheduled wake, either for a provider reset or an unknown-reset continuation
+  probe. `failure_reason` is present only when the latest transition records a
+  safe operational reason.
 - The daemon owns scheduling. It waits for the latest reset among all exhausted
   windows, adds bounded deterministic jitter, re-collects usage at wake, checks
   that the session activity revision is still eligible, and durably claims the
