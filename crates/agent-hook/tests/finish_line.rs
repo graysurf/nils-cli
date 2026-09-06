@@ -130,6 +130,7 @@ fn open_reports_an_exact_typed_non_repository_result() {
 
 #[test]
 fn open_reports_not_in_repository_for_every_bash_command_outside_a_repository() {
+    let oversized = "x".repeat(16 * 1024 + 1);
     // Outside every repository there is no finish-line contract to satisfy, so
     // the exact location code is the answer for any command: the consumer
     // classifies the identity as obligation-free and its ordinary policy
@@ -156,6 +157,18 @@ fn open_reports_not_in_repository_for_every_bash_command_outside_a_repository() 
             "untrusted-git",
             "/tmp/git status",
             "finish-line-not-in-repository",
+        ),
+        // A malformed command is the one non-location answer left on this path.
+        ("empty-command", "", "finish-line-command-invalid"),
+        (
+            "control-byte",
+            "cat\u{0}notes.md",
+            "finish-line-command-invalid",
+        ),
+        (
+            "oversized",
+            oversized.as_str(),
+            "finish-line-command-invalid",
         ),
     ] {
         let fixture = Fixture::new(POLICY);
