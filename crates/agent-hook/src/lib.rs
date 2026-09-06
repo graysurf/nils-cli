@@ -218,6 +218,10 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                             )
                         })
                         .collect::<BTreeMap<_, _>>();
+                    let tier = match &rule.capability {
+                        Capability::DshPolicy { group } => Some(group.tier()),
+                        _ => None,
+                    };
                     json!({
                         "id": rule.id,
                         "products": rule.products,
@@ -230,6 +234,8 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                         "timeout_posture": rule.timeout_posture,
                         "override_class": rule.override_class,
                         "capability_id": capability_id(&rule.capability),
+                        "tier": tier.map(policy_parity::DshTier::as_str),
+                        "enforcement_default": tier.map(policy_parity::DshTier::enforcement_default),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1047,6 +1053,8 @@ fn emergency_decision<'a>(
             config_digest: manifest.config_digest.clone(),
             policy_digest: manifest.policy_digest.clone(),
             recovery_applied: true,
+            enforcement: None,
+            downgraded_by: None,
             provider_output: None,
         },
         coordination_rule,

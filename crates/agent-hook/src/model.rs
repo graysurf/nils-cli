@@ -122,6 +122,10 @@ pub struct PolicyRule {
 pub enum RuleMode {
     #[default]
     Enforce,
+    /// Evaluate exactly like `enforce`, but project a `Block` outcome to
+    /// `Context` carrying the same code, the rule's remediation, and one line
+    /// naming the downgrade source. Allow and Context outcomes are unchanged.
+    Advise,
     Shadow,
     Disabled,
 }
@@ -131,9 +135,27 @@ impl RuleMode {
         match self {
             Self::Disabled => 0,
             Self::Shadow => 1,
-            Self::Enforce => 2,
+            Self::Advise => 2,
+            Self::Enforce => 3,
         }
     }
+
+    /// Whether the rule's capability runs with real side effects and its
+    /// outcome joins the aggregate decision (`enforce` and `advise`).
+    pub fn executes(self) -> bool {
+        matches!(self, Self::Enforce | Self::Advise)
+    }
+}
+
+/// Effective enforcement of an aggregate decision, for audit without parsing
+/// text: `block` denies, `advise` is a block projected to context by a
+/// downgrade, `context` is a reminder that was never a block.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Enforcement {
+    Block,
+    Advise,
+    Context,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -342,6 +364,14 @@ pub struct NormalizedDecision {
     pub policy_digest: String,
     #[serde(default)]
     pub recovery_applied: bool,
+    /// Effective enforcement of the aggregate; absent for a plain allow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement: Option<Enforcement>,
+    /// `<config path> [overrides.<rule id>]` of the first `advise` downgrade
+    /// that projected a block in this decision; absent when nothing was
+    /// downgraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgraded_by: Option<String>,
     #[serde(skip)]
     pub provider_output: Option<serde_json::Value>,
 }
@@ -352,6 +382,8 @@ pub struct LoadedPolicy {
     pub bundle: PolicyBundle,
     pub config_digest: String,
     pub policy_digest: String,
+    /// Absolute path of the loaded config; named by `downgraded_by`.
+    pub config_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

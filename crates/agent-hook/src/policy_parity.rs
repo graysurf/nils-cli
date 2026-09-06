@@ -120,4 +120,134 @@ impl DshCapabilityGroup {
     pub const fn task_3_4(self) -> bool {
         matches!(self, Self::AgentActivity | Self::OperationLifecycle)
     }
+
+    /// Enforcement tier accepted on the runtime-kit tracker (dsh-runtime-kit#197,
+    /// child #199). Every group has exactly one tier; `tests/policy_parity.rs`
+    /// freezes the table.
+    pub const fn tier(self) -> DshTier {
+        match self {
+            Self::OwnerUnclaimed
+            | Self::SemanticConflict
+            | Self::OperationLifecycle
+            | Self::AgentScopeLockGuard
+            | Self::CheckoutLeaseGuard
+            | Self::McpSecretScan
+            | Self::FinishLineRecord => DshTier::Integrity,
+            Self::BlockDirectGitCommit
+            | Self::BlockDirectGitWorktree
+            | Self::BlockDirectPrCreate
+            | Self::BlockUnsafeDefaultDelivery
+            | Self::SemanticCommitBodyGate
+            | Self::BlockProjectMemoryWrite
+            | Self::PortablePathsScan
+            | Self::PreEditIntentGate => DshTier::GovernedSeam,
+            Self::AgentActivity
+            | Self::BlockDirectPython
+            | Self::ForgeLabelReminder
+            | Self::MemoryWritePrincipleReminder
+            | Self::SessionStartHealthcheck
+            | Self::SkillUsageReminder
+            | Self::StopPrePrReminder
+            | Self::UserPromptAgentMemory => DshTier::Reminder,
+        }
+    }
+
+    /// Executable names whose presence in a raw shell command keeps the
+    /// fail-closed shell classification for a Tier B group. A group without
+    /// subjects never blocks on an unclassifiable command; it yields context.
+    pub const fn shell_subjects(self) -> &'static [&'static str] {
+        match self {
+            Self::BlockDirectGitCommit
+            | Self::BlockDirectGitWorktree
+            | Self::BlockUnsafeDefaultDelivery => &["git"],
+            Self::BlockDirectPrCreate => &["gh", "glab"],
+            Self::SemanticCommitBodyGate => &["semantic-commit"],
+            // Keyed by the protected content (a memory path, a machine-local
+            // path) in `dsh_policy::names_subject`, not by an executable.
+            Self::BlockProjectMemoryWrite | Self::PortablePathsScan => &[],
+            // Not command-classified: the gate runs on the edit, not on shell.
+            Self::PreEditIntentGate => &[],
+            // Tier A and Tier C groups never narrow by subject.
+            Self::AgentActivity
+            | Self::OwnerUnclaimed
+            | Self::SemanticConflict
+            | Self::OperationLifecycle
+            | Self::AgentScopeLockGuard
+            | Self::BlockDirectPython
+            | Self::CheckoutLeaseGuard
+            | Self::FinishLineRecord
+            | Self::ForgeLabelReminder
+            | Self::McpSecretScan
+            | Self::MemoryWritePrincipleReminder
+            | Self::SessionStartHealthcheck
+            | Self::SkillUsageReminder
+            | Self::StopPrePrReminder
+            | Self::UserPromptAgentMemory => &[],
+        }
+    }
+
+    /// Remediation carried by every Tier B denial and by its `advise`
+    /// projection. It names the governed replacement rather than the failure.
+    pub const fn remediation(self) -> Option<&'static str> {
+        match self {
+            Self::BlockDirectGitCommit => Some(
+                "Direct `git commit` is a governed seam. Commit through `semantic-commit commit` (for example `semantic-commit commit -F <message-file>`) from a managed worktree; it validates the message and records the delivery.",
+            ),
+            Self::BlockDirectGitWorktree => Some(
+                "Direct `git worktree` is a governed seam. Create, list, and remove agent worktrees through `git-cli worktree add|list|remove` so ownership and cleanup stay recorded.",
+            ),
+            Self::BlockDirectPrCreate => Some(
+                "Direct pull-request creation is a governed seam. Open and deliver records through `forge-cli pr deliver` (or `forge-cli pr create`), which renders the body, applies labels, and runs the review gates.",
+            ),
+            Self::BlockUnsafeDefaultDelivery => Some(
+                "Mutating the default branch directly is a governed seam. Deliver through a feature branch and `forge-cli pr deliver`; when direct-main delivery was explicitly authorized, use the `semantic-commit default-branch` receipt flow or `forge-cli repo push-default`.",
+            ),
+            Self::SemanticCommitBodyGate => Some(
+                "The commit message needs a body. Re-run `semantic-commit commit` with at least one `--body-bullet` or a message file whose body explains the user-visible change.",
+            ),
+            Self::BlockProjectMemoryWrite => Some(
+                "Project truth belongs in repository-owned documents, not agent memory. Record it in AGENTS.md, DEVELOPMENT.md, or docs/ and keep memory for personal setup and preferences.",
+            ),
+            Self::PortablePathsScan => Some(
+                "A machine-local path is about to land in a portable surface. Replace it with `$HOME`, a repository-relative path, or a placeholder before writing.",
+            ),
+            Self::PreEditIntentGate => Some(
+                "The edit needs a current agent-docs intent. Run `agent-docs session prepare --intent <intent>` for the relevant intent, then retry the edit.",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Enforcement tier of a DSH capability group.
+///
+/// - `Integrity` (Tier A): blocks and can never be downgraded; the contract
+///   rejects any declaration that is not enforce, fail closed, and locked.
+/// - `GovernedSeam` (Tier B): blocks by default; a config override may
+///   downgrade it to `advise`, which projects the block to context.
+/// - `Reminder` (Tier C): emits context only and never blocks.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum DshTier {
+    Integrity,
+    GovernedSeam,
+    Reminder,
+}
+
+impl DshTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Integrity => "integrity",
+            Self::GovernedSeam => "governed-seam",
+            Self::Reminder => "reminder",
+        }
+    }
+
+    /// Enforcement the tier applies before any override.
+    pub const fn enforcement_default(self) -> &'static str {
+        match self {
+            Self::Integrity | Self::GovernedSeam => "block",
+            Self::Reminder => "context",
+        }
+    }
 }

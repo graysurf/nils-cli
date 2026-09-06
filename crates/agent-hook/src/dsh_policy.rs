@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::HookError;
 use crate::model::{DecisionAction, NormalizedRequest, OperationEffectClass};
-use crate::policy_parity::DshCapabilityGroup;
+use crate::policy_parity::{DshCapabilityGroup, DshTier};
 
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_PARSE_DEPTH: usize = 5;
@@ -49,11 +49,13 @@ impl Outcome {
         }
     }
 
+    /// A denial. Tier B seams always carry their remediation so the model is
+    /// told the governed replacement, not only the code.
     fn block(group: DshCapabilityGroup) -> Self {
         Self {
             action: DecisionAction::Block,
             code: group.as_str().to_string(),
-            context: None,
+            context: group.remediation().map(str::to_string),
         }
     }
 
@@ -81,31 +83,163 @@ pub(crate) fn evaluate(
     effect: OperationEffectClass,
     run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
 ) -> Result<Outcome, HookError> {
-    let invocations = if command_dependent(group, request) {
-        let Some(command) = command(raw) else {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
+    let outcome = evaluate_group(group, request, raw, effect, run_child)?;
+    debug_assert!(
+        group.tier() != DshTier::Reminder || outcome.action != DecisionAction::Block,
+        "Tier C group {} must never block",
+        group.as_str()
+    );
+    Ok(outcome)
+}
+
+/// Guidance for one class of unclassifiable shell: the `blocked` text is used
+/// when the group denies, the `allowed` text when it lets the command run and
+/// only explains why it could not be classified.
+struct ShellGuidance {
+    blocked: &'static str,
+    allowed: &'static str,
+}
+
+/// The parsed command, when the command field was readable.
+struct ParsedCommand<'a> {
+    raw: &'a str,
+    invocations: &'a [Invocation],
+}
+
+/// Outcome of an unclassifiable shell command for one group.
+///
+/// Tier A groups keep failing closed. A Tier B group blocks only when its
+/// subject appears in the command (or the command cannot be read at all);
+/// otherwise it explains the classification gap as context. Tier C groups
+/// never block: the label reminder stays silent and the other reminders carry
+/// the explanation as context.
+fn unclassifiable(
+    group: DshCapabilityGroup,
+    command: Option<&ParsedCommand<'_>>,
+    guidance: &ShellGuidance,
+) -> Outcome {
+    match group.tier() {
+        DshTier::Integrity => Outcome::block_with_context(group, guidance.blocked),
+        DshTier::GovernedSeam => {
+            if command.is_none_or(|command| names_subject(group, command)) {
+                Outcome::block_with_context(group, guidance.blocked)
+            } else {
+                Outcome::context(group, guidance.allowed)
+            }
+        }
+        DshTier::Reminder => {
+            if group == DshCapabilityGroup::ForgeLabelReminder {
                 Outcome::allow(group)
             } else {
-                Outcome::block_with_context(group, SHELL_COMMAND_INVALID_CONTEXT)
-            });
+                Outcome::context(group, guidance.allowed)
+            }
+        }
+    }
+}
+
+fn python_advisory(group: DshCapabilityGroup, manager: &str) -> Outcome {
+    Outcome::context(
+        group,
+        format!(
+            "This project is managed by {manager}, so a bare `python` interpreter may not see its dependencies. Prefer `uv run python ...` or the project interpreter at `.venv/bin/python`; the command itself is not blocked."
+        ),
+    )
+}
+
+/// Whether an unclassifiable command names what a Tier B seam protects.
+///
+/// Delivery seams are keyed by their executable (`git`, `gh`, `glab`,
+/// `semantic-commit`); the two content seams are keyed by the thing they
+/// protect, an agent-memory path or a machine-local path, so `perl -pi` on a
+/// memory note still fails closed while `sed -i` on an ordinary file does not.
+/// Both the raw text and the parsed, unquoted invocation words are inspected,
+/// so `\git`, `g''it`, and `"g"it` count as `git`.
+fn names_subject(group: DshCapabilityGroup, command: &ParsedCommand<'_>) -> bool {
+    let words = || {
+        shell_words(command.raw).chain(
+            command
+                .invocations
+                .iter()
+                .flat_map(|invocation| invocation.words.iter().map(String::as_str)),
+        )
+    };
+    match group {
+        DshCapabilityGroup::BlockProjectMemoryWrite => {
+            words().any(|word| word_mentions(&unquote(word), &is_memory_note_path))
+        }
+        DshCapabilityGroup::PortablePathsScan => {
+            nonportable_machine_path(command.raw)
+                || words().any(|word| nonportable_machine_path(&unquote(word)))
+        }
+        _ => {
+            let subjects = group.shell_subjects();
+            !subjects.is_empty() && words().any(|word| subjects.contains(&basename(&unquote(word))))
+        }
+    }
+}
+
+/// Split a raw command into candidate shell words on whitespace and the
+/// operators, expansions, and quotes that separate them.
+fn shell_words(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`' | '$' | '"' | '\'' | '='
+                )
+        })
+        .filter(|word| !word.is_empty())
+}
+
+/// Drop the quoting the shell would remove before lookup, so an obfuscated
+/// spelling compares like its plain form.
+fn unquote(word: &str) -> String {
+    word.chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"'))
+        .collect()
+}
+
+fn evaluate_group(
+    group: DshCapabilityGroup,
+    request: &NormalizedRequest,
+    raw: &[u8],
+    effect: OperationEffectClass,
+    run_child: &mut dyn FnMut(Command) -> Result<Output, HookError>,
+) -> Result<Outcome, HookError> {
+    let invocations = if command_dependent(group, request) {
+        let Some(command) = command(raw) else {
+            return Ok(unclassifiable(group, None, &SHELL_COMMAND_INVALID));
         };
         let invocations = parse_invocations(&command);
+        if group == DshCapabilityGroup::BlockDirectPython {
+            // A bare interpreter is itself a command consumer, so it is always
+            // "unclassifiable" shell; the reminder is about the interpreter,
+            // not about nesting, and it names the manager when one is found.
+            if let Some(manager) = direct_python(&invocations, request) {
+                return Ok(python_advisory(group, manager));
+            }
+        }
+        let parsed = ParsedCommand {
+            raw: &command,
+            invocations: &invocations,
+        };
         if invocations
             .iter()
             .any(|invocation| invocation.unresolved_nested)
         {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
-                Outcome::allow(group)
-            } else {
-                Outcome::block_with_context(group, SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT)
-            });
+            return Ok(unclassifiable(
+                group,
+                Some(&parsed),
+                &SHELL_COMMAND_UNCLASSIFIABLE,
+            ));
         }
         if sequential_shell_context_unknown(&invocations) {
-            return Ok(if group == DshCapabilityGroup::ForgeLabelReminder {
-                Outcome::allow(group)
-            } else {
-                Outcome::block_with_context(group, SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT)
-            });
+            return Ok(unclassifiable(
+                group,
+                Some(&parsed),
+                &SHELL_CONTEXT_UNCLASSIFIABLE,
+            ));
         }
         invocations
     } else {
@@ -115,7 +249,12 @@ pub(crate) fn evaluate(
         DshCapabilityGroup::BlockDirectGitCommit => direct_git_commit(&invocations, run_child)?,
         DshCapabilityGroup::BlockDirectGitWorktree => direct_git_worktree(&invocations),
         DshCapabilityGroup::BlockDirectPrCreate => direct_pr_create(&invocations),
-        DshCapabilityGroup::BlockDirectPython => direct_python(&invocations, request),
+        DshCapabilityGroup::BlockDirectPython => {
+            return Ok(match direct_python(&invocations, request) {
+                Some(manager) => python_advisory(group, manager),
+                None => Outcome::allow(group),
+            });
+        }
         DshCapabilityGroup::SemanticCommitBodyGate => {
             if request.matcher.as_deref() == Some(GOVERNED_COMMIT_TOOL) {
                 !governed_commit_arguments_valid(raw)
@@ -221,9 +360,18 @@ const MEMORY_WRITE_CONTEXT: &str = "Writing to agent memory: write only an untru
 const FORGE_LABEL_CONTEXT: &str = "forge-cli is about to create or deliver a record without --label. Consider labels from the repository catalog or taxonomy for triage and automation; labels remain optional, but an inline environment assignment is not authorization to suppress this reminder.";
 const SKILL_USAGE_CONTEXT: &str = "This request appears to match a skill-backed workflow. Use DSH's native skill catalog and skill tool before acting; load every explicitly named or clearly applicable skill and follow its complete instructions.";
 const PRE_PR_CONTEXT: &str = "delivery-readiness reminder: this feature branch has non-trivial changes relative to the default branch. Run the repository validation and review gates before delivery; a PR is the default unless the current request explicitly authorizes governed direct-main delivery.";
-const SHELL_COMMAND_INVALID_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because its command field was missing, empty, oversized, or invalid. Retry now with one bounded command in a separate Bash tool call. No operator intervention is required.";
-const SHELL_COMMAND_UNCLASSIFIABLE_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because nested or dynamic shell execution could not be classified safely. Retry now by invoking the final executable or executable repository script directly in one Bash tool call, without a bash/sh/eval wrapper or an indirect command variable. Split compound operations into separate Bash tool calls. No operator intervention is required.";
-const SHELL_CONTEXT_UNCLASSIFIABLE_CONTEXT: &str = "The Bash tool call was blocked before command dispatch because a preceding shell-state command such as `set`, `export`, or `cd` makes later commands impossible to classify safely. Retry now with separate Bash tool calls, one command per call; omit shell-state preambles and use the tool's `workdir` field instead of `cd`. No operator intervention is required.";
+const SHELL_COMMAND_INVALID: ShellGuidance = ShellGuidance {
+    blocked: "The Bash tool call was blocked before command dispatch because its command field was missing, empty, oversized, or invalid. Retry now with one bounded command in a separate Bash tool call. No operator intervention is required.",
+    allowed: "The Bash tool call could not be classified before dispatch because its command field was missing, empty, oversized, or invalid; it was allowed because it names no governed seam. Prefer one bounded command per Bash tool call.",
+};
+const SHELL_COMMAND_UNCLASSIFIABLE: ShellGuidance = ShellGuidance {
+    blocked: "The Bash tool call was blocked before command dispatch because nested or dynamic shell execution could not be classified safely. Retry now by invoking the final executable or executable repository script directly in one Bash tool call, without a bash/sh/eval wrapper or an indirect command variable. Split compound operations into separate Bash tool calls. No operator intervention is required.",
+    allowed: "The Bash tool call could not be classified before dispatch because nested or dynamic shell execution hides the final command; it was allowed because it names no governed seam. Prefer invoking the final executable or executable repository script directly in one Bash tool call, without a bash/sh/eval wrapper or an indirect command variable, and split compound operations into separate Bash tool calls.",
+};
+const SHELL_CONTEXT_UNCLASSIFIABLE: ShellGuidance = ShellGuidance {
+    blocked: "The Bash tool call was blocked before command dispatch because a preceding shell-state command such as `set`, `export`, or `cd` makes later commands impossible to classify safely. Retry now with separate Bash tool calls, one command per call; omit shell-state preambles and use the tool's `workdir` field instead of `cd`. No operator intervention is required.",
+    allowed: "The Bash tool call could not be classified before dispatch because a preceding shell-state command such as `set`, `export`, or `cd` hides what later commands resolve to; it was allowed because it names no governed seam. Prefer separate Bash tool calls, one command per call, without shell-state preambles, and use the tool's `workdir` field instead of `cd`.",
+};
 
 fn sanitize_companion_env(command: &mut Command, retained_names: &[&str]) {
     let retained = retained_names
@@ -2290,13 +2438,16 @@ fn api_create(words: &[String], endpoint: &str) -> bool {
     }) && method_post
 }
 
-fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> bool {
-    let managed = request
+/// Name of the Python manager detected in the binding roots when a bare
+/// interpreter is invoked outside it; `None` when the command is unaffected.
+fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> Option<&'static str> {
+    let manager = request
         .binding_roots
         .iter()
-        .any(|root| python_manager(root));
-    managed
-        && invocations.iter().any(|invocation| {
+        .find_map(|root| python_manager(root))?;
+    invocations
+        .iter()
+        .any(|invocation| {
             invocation.words.first().is_some_and(|word| {
                 let name = basename(word);
                 (name == "python"
@@ -2308,17 +2459,23 @@ fn direct_python(invocations: &[Invocation], request: &NormalizedRequest) -> boo
                     && !word.contains("/venv/bin/")
             })
         })
+        .then_some(manager)
 }
 
-fn python_manager(start: &Path) -> bool {
-    start.ancestors().any(|root| {
-        root.join("uv.lock").exists()
-            || root.join(".venv/pyvenv.cfg").exists()
-            || root.join("venv/pyvenv.cfg").exists()
+fn python_manager(start: &Path) -> Option<&'static str> {
+    start.ancestors().find_map(|root| {
+        if root.join("uv.lock").exists()
             || fs::read_to_string(root.join("pyproject.toml")).is_ok_and(|text| {
                 text.lines()
                     .any(|line| line.trim_start().starts_with("[tool.uv"))
             })
+        {
+            Some("uv")
+        } else if root.join(".venv/pyvenv.cfg").exists() || root.join("venv/pyvenv.cfg").exists() {
+            Some("a venv")
+        } else {
+            None
+        }
     })
 }
 

@@ -64,6 +64,44 @@ fn request(fixture: &Fixture, tool: &str, arguments: Value) -> String {
     request_for_session(fixture, "dsh-session-1", tool, arguments)
 }
 
+/// Assert one explicitly expected disposition (`block` or `context`) for a
+/// single-group dispatch. The expectation is written out per case by the
+/// caller; this helper only checks the envelope shape that goes with it.
+fn assert_shell_disposition(
+    output: &nils_test_support::cmd::CmdOutput,
+    group: &str,
+    command: &str,
+    expected: &str,
+) {
+    let envelope = output.stdout_json();
+    match expected {
+        "block" => {
+            assert_eq!(
+                output.code,
+                1,
+                "group={group} command={command} envelope={}",
+                output.stdout_text()
+            );
+            assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        }
+        "context" => {
+            assert_eq!(
+                output.code,
+                0,
+                "group={group} command={command} envelope={}",
+                output.stdout_text()
+            );
+            assert_eq!(
+                envelope["data"]["action"], "context",
+                "group={group} command={command}"
+            );
+            assert_eq!(envelope["data"]["reasons"][0]["disposition"], "context");
+        }
+        other => panic!("unknown expectation {other}"),
+    }
+    assert_eq!(envelope["data"]["reasons"][0]["code"], group);
+}
+
 fn request_for_session(
     fixture: &Fixture,
     session_id: &str,
@@ -1485,36 +1523,63 @@ fn deterministic_command_groups_block_direct_and_nested_unsafe_forms() {
             &["dispatch", "--product", "dsh", "--format", "json"],
             Some(&request(&fixture, "bash", json!({"command": command}))),
         );
-        assert_eq!(
-            output.code,
-            1,
-            "group={group} stderr={}",
-            output.stderr_text()
-        );
         let envelope = output.stdout_json();
-        assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        if group == "block-direct-python" {
+            // Tier C: the interpreter reminder names the manager and never blocks.
+            assert_eq!(output.code, 0, "command={command} envelope={envelope}");
+            assert_eq!(envelope["data"]["action"], "context", "command={command}");
+            assert_eq!(
+                envelope["data"]["enforcement"], "context",
+                "command={command}"
+            );
+        } else {
+            assert_eq!(
+                output.code,
+                1,
+                "group={group} stderr={}",
+                output.stderr_text()
+            );
+            assert_eq!(envelope["data"]["action"], "block", "group={group}");
+        }
         assert_eq!(envelope["data"]["reasons"][0]["code"], group);
     }
 }
 
 #[test]
-fn command_and_process_substitutions_fail_closed_for_every_command_group() {
+fn command_and_process_substitutions_are_classified_by_tier_for_every_command_group() {
+    // The substituted inner command always names the group's own subject, so
+    // every Tier B seam and the Tier A lease guard block; the python reminder
+    // (Tier C) explains the gap as context.
     let cases = [
         (
             "block-direct-git-commit",
             "git commit --allow-empty -m bypass",
+            "block",
         ),
-        ("block-direct-git-worktree", "git worktree remove ../other"),
-        ("block-direct-pr-create", "gh pr create --draft"),
-        ("block-direct-python", "python -c 'print(1)'"),
+        (
+            "block-direct-git-worktree",
+            "git worktree remove ../other",
+            "block",
+        ),
+        ("block-direct-pr-create", "gh pr create --draft", "block"),
+        ("block-direct-python", "python -c 'print(1)'", "context"),
         (
             "semantic-commit-body-gate",
             "semantic-commit commit --type feat --subject bypass",
+            "block",
         ),
-        ("block-unsafe-default-delivery", "git push origin main"),
-        ("checkout-lease-guard", "git commit --allow-empty -m bypass"),
+        (
+            "block-unsafe-default-delivery",
+            "git push origin main",
+            "block",
+        ),
+        (
+            "checkout-lease-guard",
+            "git commit --allow-empty -m bypass",
+            "block",
+        ),
     ];
-    for (group, inner) in cases {
+    for (group, inner, expected) in cases {
         for command in [
             format!("printf '%s\\n' \"$({inner})\""),
             format!("printf '%s\\n' \"`{inner}`\""),
@@ -1525,69 +1590,97 @@ fn command_and_process_substitutions_fail_closed_for_every_command_group() {
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_disposition(&output, group, &command, expected);
         }
     }
 }
 
 #[test]
-fn command_consumers_fail_closed_for_every_command_group() {
+fn command_consumers_are_classified_by_tier_for_every_command_group() {
+    // (group, inner, expected when the consumer carries the inner command,
+    // expected when it sources an opaque script that names no subject)
     let cases = [
         (
             "block-direct-git-commit",
             "git commit --allow-empty -m bypass",
+            "block",
+            "context",
         ),
-        ("block-direct-git-worktree", "git worktree remove ../other"),
-        ("block-direct-pr-create", "gh pr create --draft"),
-        ("block-direct-python", "python -c 'print(1)'"),
+        (
+            "block-direct-git-worktree",
+            "git worktree remove ../other",
+            "block",
+            "context",
+        ),
+        (
+            "block-direct-pr-create",
+            "gh pr create --draft",
+            "block",
+            "context",
+        ),
+        (
+            "block-direct-python",
+            "python -c 'print(1)'",
+            "context",
+            "context",
+        ),
         (
             "semantic-commit-body-gate",
             "semantic-commit commit --type feat --subject bypass",
+            "block",
+            "context",
         ),
-        ("block-unsafe-default-delivery", "git push origin main"),
-        ("checkout-lease-guard", "git commit --allow-empty -m bypass"),
+        (
+            "block-unsafe-default-delivery",
+            "git push origin main",
+            "block",
+            "context",
+        ),
+        (
+            "checkout-lease-guard",
+            "git commit --allow-empty -m bypass",
+            "block",
+            "block",
+        ),
     ];
-    for (group, inner) in cases {
-        for command in [
-            format!("trap {} EXIT", shell_words::quote(inner)),
-            format!("printf '%s\\n' {} | sh", shell_words::quote(inner)),
-            format!("sh <<< {}", shell_words::quote(inner)),
-            "source ./repository-script.sh".to_string(),
-            ". ./repository-script.sh".to_string(),
-            "bash ./repository-script.sh".to_string(),
+    for (group, inner, when_named, when_opaque) in cases {
+        for (command, expected) in [
+            (
+                format!("trap {} EXIT", shell_words::quote(inner)),
+                when_named,
+            ),
+            (
+                format!("printf '%s\\n' {} | sh", shell_words::quote(inner)),
+                when_named,
+            ),
+            (format!("sh <<< {}", shell_words::quote(inner)), when_named),
+            ("source ./repository-script.sh".to_string(), when_opaque),
+            (". ./repository-script.sh".to_string(), when_opaque),
+            ("bash ./repository-script.sh".to_string(), when_opaque),
         ] {
             let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_disposition(&output, group, &command, expected);
         }
     }
 }
 
 #[test]
-fn general_purpose_interpreters_fail_closed_for_every_command_group() {
+fn general_purpose_interpreters_are_classified_by_tier_for_every_command_group() {
+    // Every command embeds `git commit`, so the git-keyed seams and the Tier A
+    // lease guard block; the seams keyed on `gh` or `semantic-commit` and the
+    // python reminder explain the gap as context.
     let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "context"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ];
     let commands = [
         "awk 'BEGIN { system(\"git commit --allow-empty -m bypass\") }'",
@@ -1596,20 +1689,14 @@ fn general_purpose_interpreters_fail_closed_for_every_command_group() {
         "Rscript -e 'system(\"git commit --allow-empty -m bypass\")'",
         "R -e 'system(\"git commit --allow-empty -m bypass\")'",
     ];
-    for group in groups {
+    for (group, expected) in groups {
         for command in commands {
             let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_disposition(&output, group, command, expected);
         }
     }
 }
@@ -1722,77 +1809,141 @@ fn deterministic_command_groups_preserve_owned_and_read_only_workflows() {
 }
 
 #[test]
-fn command_dependent_groups_fail_closed_when_parsing_is_indeterminate() {
-    let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
-    ];
+fn command_dependent_groups_are_classified_by_tier_when_parsing_is_indeterminate() {
     let mut nested = "git commit -m test".to_string();
     for _ in 0..7 {
         nested = format!("sh -c {}", shell_words::quote(&nested));
     }
     let oversized = format!("printf {}", "x".repeat(256 * 1024));
+    // The seven cases in order: missing field, unterminated quote, nested
+    // beyond the parse depth (names git), oversized (unreadable), `if` block
+    // (names git), subshell (names git), variable runner (names git).
+    let cases = [
+        json!({}),
+        json!({"command": "'unterminated"}),
+        json!({"command": nested}),
+        json!({"command": oversized}),
+        json!({"command": "if true; then git commit -m test; fi"}),
+        json!({"command": "(git commit -m test)"}),
+        json!({"command": "runner=git; \"$runner\" commit -m test"}),
+    ];
+    // An unreadable command field (missing or oversized) blocks every Tier B
+    // seam; a readable one blocks only the seams whose subject it names.
+    let expectations = [
+        (
+            "block-direct-git-commit",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "block-direct-git-worktree",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "block-direct-pr-create",
+            [
+                "block", "context", "context", "block", "context", "context", "context",
+            ],
+        ),
+        (
+            "block-direct-python",
+            [
+                "context", "context", "context", "context", "context", "context", "context",
+            ],
+        ),
+        (
+            "semantic-commit-body-gate",
+            [
+                "block", "context", "context", "block", "context", "context", "context",
+            ],
+        ),
+        (
+            "block-unsafe-default-delivery",
+            [
+                "block", "context", "block", "block", "block", "block", "block",
+            ],
+        ),
+        (
+            "checkout-lease-guard",
+            [
+                "block", "block", "block", "block", "block", "block", "block",
+            ],
+        ),
+    ];
 
-    for group in groups {
-        let fixture = Fixture::new(&policy(group, "dsh"));
-        for arguments in [
-            json!({}),
-            json!({"command": "'unterminated"}),
-            json!({"command": nested}),
-            json!({"command": oversized}),
-            json!({"command": "if true; then git commit -m test; fi"}),
-            json!({"command": "(git commit -m test)"}),
-            json!({"command": "runner=git; \"$runner\" commit -m test"}),
-        ] {
+    for (group, expected) in expectations {
+        for (arguments, expected) in cases.iter().zip(expected) {
+            // One fixture per command: a repeated context in one session is
+            // deduplicated to allow by design.
+            let fixture = Fixture::new(&policy(group, "dsh"));
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
-                Some(&request(&fixture, "bash", arguments)),
+                Some(&request(&fixture, "bash", arguments.clone())),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            let label = arguments.to_string();
+            let label = if label.len() > 80 {
+                &label[..80]
+            } else {
+                &label
+            };
+            assert_shell_disposition(&output, group, label, expected);
         }
     }
 }
 
 #[test]
-fn command_dependent_groups_reject_inline_execution_context_retargeting() {
+fn command_dependent_groups_classify_inline_execution_context_retargeting_by_tier() {
     let cases = [
-        ("block-direct-git-commit", "PATH=/tmp:$PATH git status"),
-        ("block-direct-git-worktree", "GIT_DIR=/tmp/repo git status"),
-        ("block-direct-pr-create", "PATH=/tmp:$PATH gh status"),
+        (
+            "block-direct-git-commit",
+            "PATH=/tmp:$PATH git status",
+            "block",
+        ),
+        (
+            "block-direct-git-worktree",
+            "GIT_DIR=/tmp/repo git status",
+            "block",
+        ),
+        (
+            "block-direct-pr-create",
+            "PATH=/tmp:$PATH gh status",
+            "block",
+        ),
         (
             "block-direct-python",
             "LD_PRELOAD=/tmp/fake.so uv run python -V",
+            "context",
         ),
         (
             "semantic-commit-body-gate",
             "PATH=/tmp:$PATH semantic-commit commit --message 'feat: change\\n\\nBody.'",
+            "block",
         ),
         (
             "block-unsafe-default-delivery",
             "GIT_CONFIG_GLOBAL=/tmp/config git status",
+            "block",
         ),
         (
             "block-direct-git-commit",
             "PS4='$(git update-ref refs/heads/main refs/heads/feature)' bash -xc 'git status'",
+            "block",
         ),
         (
             "block-direct-git-commit",
             "PROMPT_COMMAND='git update-ref refs/heads/main refs/heads/feature' bash -ic 'git status'",
+            "block",
         ),
-        ("checkout-lease-guard", "BASH_ENV=/tmp/profile printf ok"),
+        (
+            "checkout-lease-guard",
+            "BASH_ENV=/tmp/profile printf ok",
+            "block",
+        ),
     ];
-    for (group, command) in cases {
+    for (group, command, expected) in cases {
         let fixture = Fixture::new(&policy(group, "dsh"));
         if group == "block-direct-python" {
             fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
@@ -1801,26 +1952,23 @@ fn command_dependent_groups_reject_inline_execution_context_retargeting() {
             &["dispatch", "--product", "dsh", "--format", "json"],
             Some(&request(&fixture, "bash", json!({"command": command}))),
         );
-        assert_eq!(
-            output.code,
-            1,
-            "group={group} command={command} envelope={}",
-            output.stdout_text()
-        );
-        assert_eq!(output.stdout_json()["data"]["action"], "block");
+        assert_shell_disposition(&output, group, command, expected);
     }
 }
 
 #[test]
-fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
+fn command_dependent_groups_classify_sequential_shell_state_retargeting_by_tier() {
+    // Every command ends in `git status`, so the git-keyed seams and the Tier
+    // A lease guard block while the `gh`/`semantic-commit` seams and the
+    // python reminder explain the gap as context.
     let groups = [
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "context"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ];
     let commands = [
         "export PATH=/tmp; git status",
@@ -1835,23 +1983,19 @@ fn command_dependent_groups_reject_sequential_shell_state_retargeting() {
         "cd /tmp; git status",
     ];
 
-    for group in groups {
-        let fixture = Fixture::new(&policy(group, "dsh"));
-        if group == "block-direct-python" {
-            fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
-        }
+    for (group, expected) in groups {
         for command in commands {
+            // One fixture per command: a repeated context in one session is
+            // deduplicated to allow by design.
+            let fixture = Fixture::new(&policy(group, "dsh"));
+            if group == "block-direct-python" {
+                fs::write(fixture.root.join("uv.lock"), "version = 1\n").expect("uv marker");
+            }
             let output = fixture.run(
                 &["dispatch", "--product", "dsh", "--format", "json"],
                 Some(&request(&fixture, "bash", json!({"command": command}))),
             );
-            assert_eq!(
-                output.code,
-                1,
-                "group={group} command={command} envelope={}",
-                output.stdout_text()
-            );
-            assert_eq!(output.stdout_json()["data"]["action"], "block");
+            assert_shell_disposition(&output, group, command, expected);
         }
     }
 }
@@ -1883,18 +2027,22 @@ fn sequential_shell_state_denial_explains_one_immediate_retry_path() {
         .as_array()
         .expect("blocking reasons");
     assert_eq!(reasons.len(), 7);
-    for (reason, expected) in reasons.iter().zip([
-        "block-direct-git-commit",
-        "block-direct-git-worktree",
-        "block-direct-pr-create",
-        "block-direct-python",
-        "semantic-commit-body-gate",
-        "block-unsafe-default-delivery",
-        "checkout-lease-guard",
+    // `git` and `gh` are named, so their Tier B seams and the Tier A lease
+    // guard block; the python reminder and the semantic-commit seam (whose
+    // subject is absent) explain the retry as context instead.
+    for (reason, (expected, disposition)) in reasons.iter().zip([
+        ("block-direct-git-commit", "block"),
+        ("block-direct-git-worktree", "block"),
+        ("block-direct-pr-create", "block"),
+        ("block-direct-python", "context"),
+        ("semantic-commit-body-gate", "context"),
+        ("block-unsafe-default-delivery", "block"),
+        ("checkout-lease-guard", "block"),
     ]) {
         assert_eq!(reason["code"], expected);
-        assert_eq!(reason["disposition"], "block");
+        assert_eq!(reason["disposition"], disposition, "{expected}");
     }
+    assert_eq!(decision["data"]["enforcement"], "block");
     let context = decision["data"]["context"]
         .as_str()
         .expect("shell denial guidance");
@@ -3428,13 +3576,22 @@ fn task_3_3_tool_reminders_are_context_only_and_inline_env_cannot_suppress_them(
         "PreToolUse",
         Some("bash"),
     ));
-    for command in [
+    for (index, command) in [
         "forge-cli pr deliver",
         "FORGE_NO_LABELS=1 forge-cli issue create --title test",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Distinct sessions: the same reminder renders once per session.
         let output = labels.run(
             &["dispatch", "--product", "dsh", "--format", "json"],
-            Some(&request(&labels, "bash", json!({"command": command}))),
+            Some(&request_for_session(
+                &labels,
+                &format!("dsh-session-labels-{index}"),
+                "bash",
+                json!({"command": command}),
+            )),
         );
         assert_eq!(
             output.code,
