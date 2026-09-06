@@ -2950,14 +2950,20 @@ fn governed_commit_delivery_blocked(
     Ok(current_branch(&layout).is_none_or(|current| current == default))
 }
 
-/// Whether any ancestor of `start` carries a `.git` entry. A repository whose
-/// layout cannot be resolved still counts as inside one and keeps failing
-/// closed in `git_layout`.
+/// Whether any ancestor of the resolved `start` carries a `.git` entry. The
+/// path is canonicalized first so a symlinked cwd that lexically hides its
+/// repository root still counts as inside it, and a path that cannot be
+/// resolved is treated as inside a repository so the caller keeps failing
+/// closed. A repository whose layout cannot be resolved also stays inside one
+/// and fails closed in `git_layout`.
 fn inside_repository(start: &Path) -> bool {
-    let start = if start.is_file() {
-        start.parent()
+    let Ok(resolved) = fs::canonicalize(start) else {
+        return true;
+    };
+    let start = if resolved.is_file() {
+        resolved.parent().map(Path::to_path_buf)
     } else {
-        Some(start)
+        Some(resolved)
     };
     start.is_some_and(|path| {
         path.ancestors()

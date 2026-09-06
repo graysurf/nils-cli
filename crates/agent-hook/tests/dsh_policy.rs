@@ -2633,6 +2633,52 @@ fn native_governed_commit_outside_any_repository_is_not_a_default_branch_mutatio
     assert_eq!(admitted.code, 0, "envelope={}", admitted.stdout_text());
     assert_eq!(admitted.stdout_json()["data"]["action"], "allow");
 
+    // A symlinked cwd that lexically hides its repository root is still inside
+    // that repository: the admission uses the resolved path, so the primary
+    // checkout keeps failing closed exactly as before.
+    git(&fixture, &["init", "--quiet", "--initial-branch=main"]);
+    fs::create_dir_all(fixture.root.join("src")).expect("src directory");
+    let hidden = std::env::temp_dir().join(format!("nils-hidden-cwd-{}", std::process::id()));
+    let _ = fs::remove_file(&hidden);
+    std::os::unix::fs::symlink(fixture.root.join("src"), &hidden).expect("symlinked cwd");
+    assert!(
+        !hidden
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists()),
+        "the symlink itself must sit outside every repository"
+    );
+    let hidden_repository = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &hidden,
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(
+        hidden_repository.code,
+        1,
+        "envelope={}",
+        hidden_repository.stdout_text()
+    );
+
+    // A cwd that cannot be resolved is not proof of a missing repository.
+    let missing = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &fixture.state_home.join("does-not-exist"),
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(missing.code, 1, "envelope={}", missing.stdout_text());
+
+    let _ = fs::remove_file(&hidden);
+
     // Invalid arguments stay denied wherever the session runs.
     let invalid = fixture.run(
         &["dispatch", "--product", "dsh", "--format", "json"],
