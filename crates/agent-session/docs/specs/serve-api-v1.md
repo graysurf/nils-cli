@@ -338,16 +338,26 @@ recorded in `sympoies/nils-cli#1409`.
   and `scheduler_error`. Consumers must preserve
   the object but render unknown future state or reason values as a safe generic
   unavailable/failure condition; they must not infer permission to submit from
-  an unknown value. `scheduled_at` is present only while a reset wake is
-  scheduled, and `failure_reason` is present only when the latest transition
-  records a safe operational reason.
+  an unknown value. `scheduled_at` is present only while the daemon has a next
+  scheduled wake, either for a provider reset or an unknown-reset continuation
+  probe. `failure_reason` is present only when the latest transition records a
+  safe operational reason.
 - The daemon owns scheduling. It waits for the latest reset among all exhausted
   windows, adds bounded deterministic jitter, re-collects usage at wake, checks
   that the session activity revision is still eligible, and durably claims the
   submission before sending one fixed product-owned continuation message.
+  When an authoritative Claude rate limit has no exhausted percentage window
+  or future reset timestamp, the daemon keeps the claim scheduled and uses a
+  low-frequency continuation probe (backing off through five, fifteen, thirty,
+  and sixty minutes after repeated structured rate-limit failures) until it
+  succeeds or a user/session-state change cancels it. On upgrade, the daemon
+  recovers the exact pre-upgrade terminal `usage_window_not_exhausted` state only
+  while its blocked activity revision is still eligible; other terminal states
+  remain fail-closed.
   Restart recovery scans pending records; duplicate events/ticks cannot submit
-  twice, cancellation is serialized against wake-up, and bounded retry ends in
-  an observable terminal failure.
+  twice, cancellation is serialized against wake-up, and bounded retry for
+  non-authoritative usage or scheduler failures ends in an observable terminal
+  failure.
   Claude usage checks use the existing provider helper. Codex app-server
   sessions use `account/rateLimits/read` on their bound control connection and
   submit the continuation with `turn/start`; only a response carrying the
