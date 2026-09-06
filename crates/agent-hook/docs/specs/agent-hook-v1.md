@@ -583,14 +583,13 @@ The request and response contracts are:
   After the physical cwd boundary is validated, an existing canonical directory
   with no worktree or bare Git boundary in itself or any ancestor returns exit
   `65` with the exact code `finish-line-not-in-repository`. A Bash operation
-  may add its exact `command`; the same code is then returned only for the
-  closed audited subset of an absolute, root-owned, non-writable system `pwd`
-  executable with its supported logical or physical flags. Unqualified `pwd`,
-  Git commands, shell composition, and any other command return
-  `finish-line-non-repository-operation-unauthorized`; explicit `null` or any
-  non-string command is request-invalid. Omitting `command` preserves only the
-  location-classification compatibility response and MUST NOT authorize Bash
-  execution; an operational consumer must send and bind the exact command. A
+  may add its exact `command`; the same code is returned for any command,
+  because outside every repository there is no validation contract to satisfy.
+  A malformed command is `finish-line-command-invalid`. The consumer classifies
+  that identity as obligation-free (ordinary shell, no
+  edit generation, no stop boundary) while its ordinary policy transport keeps
+  governing the command; `finish-line open` never authorizes execution by
+  itself. Explicit `null` or any non-string command is request-invalid. A
   present but malformed or otherwise unprovable Git boundary remains
   `finish-line-repository-invalid`; consumers must branch only on the exact
   code and never on message text.
