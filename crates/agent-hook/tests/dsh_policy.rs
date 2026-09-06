@@ -2595,6 +2595,105 @@ fn native_governed_commit_requires_the_exact_linked_worktree_and_pinned_remote_d
 }
 
 #[test]
+fn native_governed_commit_outside_any_repository_is_not_a_default_branch_mutation() {
+    let fixture = Fixture::new(&policy_for_matcher(
+        "block-unsafe-default-delivery",
+        "dsh",
+        "runtime_kit_governed_commit",
+    ));
+    let plain = fixture.state_home.join("plain-notes");
+    fs::create_dir_all(&plain).expect("plain directory");
+    fs::write(plain.join("notes.md"), "notes\n").expect("notes file");
+    assert!(
+        !plain
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists()),
+        "fixture must sit outside every repository"
+    );
+    let arguments = json!({
+        "type": "feat",
+        "subject": "add the notes index",
+        "body_bullets": ["Index the notes so the next reader finds them."],
+        "expected_head": "0123456789abcdef0123456789abcdef01234567",
+    });
+
+    // There is no default branch to protect outside a repository: the seam
+    // admits the call so the runtime can answer with its typed no-repository
+    // result instead of the model seeing a default-branch denial.
+    let admitted = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &plain,
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(admitted.code, 0, "envelope={}", admitted.stdout_text());
+    assert_eq!(admitted.stdout_json()["data"]["action"], "allow");
+
+    // A symlinked cwd that lexically hides its repository root is still inside
+    // that repository: the admission uses the resolved path, so the primary
+    // checkout keeps failing closed exactly as before.
+    git(&fixture, &["init", "--quiet", "--initial-branch=main"]);
+    fs::create_dir_all(fixture.root.join("src")).expect("src directory");
+    let hidden = std::env::temp_dir().join(format!("nils-hidden-cwd-{}", std::process::id()));
+    let _ = fs::remove_file(&hidden);
+    std::os::unix::fs::symlink(fixture.root.join("src"), &hidden).expect("symlinked cwd");
+    assert!(
+        !hidden
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists()),
+        "the symlink itself must sit outside every repository"
+    );
+    let hidden_repository = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &hidden,
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(
+        hidden_repository.code,
+        1,
+        "envelope={}",
+        hidden_repository.stdout_text()
+    );
+
+    // A cwd that cannot be resolved is not proof of a missing repository.
+    let missing = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &fixture.state_home.join("does-not-exist"),
+            "runtime_kit_governed_commit",
+            arguments.clone(),
+        )),
+    );
+    assert_eq!(missing.code, 1, "envelope={}", missing.stdout_text());
+
+    let _ = fs::remove_file(&hidden);
+
+    // Invalid arguments stay denied wherever the session runs.
+    let invalid = fixture.run(
+        &["dispatch", "--product", "dsh", "--format", "json"],
+        Some(&request_for_path(
+            &fixture,
+            "dsh-session-1",
+            &plain,
+            "runtime_kit_governed_commit",
+            json!({ "type": "feat", "subject": "x", "body_bullets": [], "expected_head": "abc" }),
+        )),
+    );
+    assert_eq!(invalid.code, 1, "envelope={}", invalid.stdout_text());
+}
+
+#[test]
 fn unsafe_default_delivery_rejects_duplicate_semantic_targets() {
     let fixture = Fixture::new(&policy("block-unsafe-default-delivery", "dsh"));
     git(&fixture, &["init", "--quiet", "--initial-branch=main"]);

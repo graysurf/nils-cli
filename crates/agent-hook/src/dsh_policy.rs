@@ -2924,6 +2924,12 @@ fn governed_commit_delivery_blocked(
     let Some(execution) = request.execution_path.as_ref() else {
         return Ok(true);
     };
+    if !inside_repository(execution) {
+        // A non-repository execution path has no default branch to protect.
+        // The seam admits the call and the runtime's tool answers with its
+        // typed `no-repository` result instead of the model seeing a denial.
+        return Ok(false);
+    }
     let Some(layout) = git_layout(execution) else {
         return Ok(true);
     };
@@ -2942,6 +2948,27 @@ fn governed_commit_delivery_blocked(
         return Ok(true);
     };
     Ok(current_branch(&layout).is_none_or(|current| current == default))
+}
+
+/// Whether any ancestor of the resolved `start` carries a `.git` entry. The
+/// path is canonicalized first so a symlinked cwd that lexically hides its
+/// repository root still counts as inside it, and a path that cannot be
+/// resolved is treated as inside a repository so the caller keeps failing
+/// closed. A repository whose layout cannot be resolved also stays inside one
+/// and fails closed in `git_layout`.
+fn inside_repository(start: &Path) -> bool {
+    let Ok(resolved) = fs::canonicalize(start) else {
+        return true;
+    };
+    let start = if resolved.is_file() {
+        resolved.parent().map(Path::to_path_buf)
+    } else {
+        Some(resolved)
+    };
+    start.is_some_and(|path| {
+        path.ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+    })
 }
 
 fn target_is_git_metadata(target: &Path, layout: &GitLayout) -> bool {
